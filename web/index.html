@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Coldstart</title>
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+<div class="wrap">
+
+  <div class="top">
+    <div class="brand">
+      <h1>Coldstart</h1>
+      <span class="sub">local model control</span>
+    </div>
+    <div class="gpuchip mono">
+      <span class="dot"></span>
+      RTX PRO 6000 Blackwell · <span id="gpuUsed">92,571</span> / 97,887 MiB
+    </div>
+  </div>
+
+  <div class="vram">
+    <div class="vram-head">
+      <span class="lbl">VRAM allocation</span>
+      <span class="val mono" id="vramTxt">weights 78.5 · KV 8.8 · overhead 4.7 · free 3.6 GiB</span>
+    </div>
+    <div class="bar" id="bar">
+      <div class="seg weights" id="segW">weights</div>
+      <div class="seg kv" id="segK">KV</div>
+      <div class="seg overhead" id="segO"></div>
+      <div class="seg free" id="segF"></div>
+    </div>
+    <div class="legend">
+      <span><i style="background:var(--accent)"></i>model weights</span>
+      <span><i style="background:var(--ok)"></i>KV cache — this is what buys context &amp; agents</span>
+      <span><i style="background:var(--line-strong)"></i>activations, CUDA graphs</span>
+      <span><i style="border:1px solid var(--line-strong)"></i>unallocated</span>
+    </div>
+  </div>
+
+  <div class="grid">
+
+    <!-- model rail -->
+    <div class="panel">
+      <div class="panel-h"><span>Models on disk</span><span class="mono" id="mcount">6</span></div>
+      <div class="mlist" id="mlist"></div>
+    </div>
+
+    <!-- main -->
+    <div class="panel">
+      <div class="status">
+        <div class="status-row">
+          <span class="pill" id="pill"><span class="d"></span><span id="pillTxt">Serving</span></span>
+          <div>
+            <div class="status-model" id="sModel">Flash-Next</div>
+            <div class="status-meta mono" id="sMeta">:8001 · 262,144 ctx · 99.3 tok/s · up 12m</div>
+          </div>
+          <span class="queued mono" id="queued"><span id="qN">0</span> agents holding</span>
+        </div>
+
+        <div class="phases" id="phases">
+          <div class="eta">
+            <span>Elapsed <span class="el mono" id="elapsed">0:00</span></span>
+            <span id="etaTxt">typically 4m10s warm · 9m50s cold</span>
+          </div>
+          <div class="ptrack" id="ptrack"></div>
+          <div class="plabels" id="plabels"></div>
+          <div class="pnote" id="pnote"></div>
+        </div>
+      </div>
+
+      <div class="alloc">
+        <div class="field">
+          <div class="flabel">
+            <span class="k">GPU memory utilization</span>
+            <span class="v mono" id="utilV">0.96</span>
+          </div>
+          <input type="range" id="util" min="40" max="98" value="96" aria-label="GPU memory utilization">
+          <div class="ticks mono"><span>0.40</span><span>0.70</span><span>0.98</span></div>
+        </div>
+
+        <div class="field">
+          <div class="flabel"><span class="k">Context per agent</span></div>
+          <div class="segbtns" id="ctxBtns"></div>
+        </div>
+
+        <div class="field">
+          <div class="derived">
+            <div class="dcell">
+              <div class="k">KV budget</div>
+              <div class="n mono" id="dKv">8.8<span style="font-size:13px;font-weight:400"> GiB</span></div>
+              <div class="s mono" id="dKvTok">304,653 tokens</div>
+            </div>
+            <div class="dcell">
+              <div class="k">Parallel agents <span class="tag meas" id="dBadge">measured</span></div>
+              <div class="n mono" id="dAgents">1</div>
+              <div class="s" id="dAgentsS">at 262,144 context</div>
+            </div>
+            <div class="dcell">
+              <div class="k">Max single context</div>
+              <div class="n mono" id="dCtx">262,144</div>
+              <div class="s" id="dCtxS">model ceiling reached</div>
+            </div>
+          </div>
+
+          <div class="alert crit" id="alertC"><b>⚠</b><span id="alertCT"></span></div>
+          <div class="alert warn" id="alertW"><b>!</b><span id="alertWT"></span></div>
+        </div>
+      </div>
+
+      <div class="banner" id="banner">
+        <b id="banTitle"></b>
+        <span id="banBody"></span>
+        <div class="act">
+          <button type="button" id="banRetry">Retry now</button>
+          <button type="button" id="banDismiss">Dismiss</button>
+        </div>
+      </div>
+
+      <div class="pref">
+        <span class="chk ok"><span class="m">✓</span> GPU free</span>
+        <span class="chk ok"><span class="m">✓</span> weights cached</span>
+        <span class="chk warn"><span class="m">!</span> ptrace_scope 0 — will re-harden</span>
+        <span class="chk ok"><span class="m">✓</span> disk 412 GiB</span>
+      </div>
+
+      <div class="actions">
+        <div class="toggles">
+          <label class="tog"><input type="checkbox" id="autoR" checked> Auto-restart on crash</label>
+          <label class="tog"><input type="checkbox" id="notify"> Notify when ready</label>
+        </div>
+        <button class="btn pri" id="apply" disabled>Apply &amp; restart</button>
+        <button class="btn" id="smoke">Smoke test</button>
+        <button class="btn" id="stop">Stop</button>
+        <span class="dirty" id="dirty">unsaved changes</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel live">
+    <div class="panel-h">
+      <span>Live utilization</span>
+      <span class="mono" style="font-size:10px">/metrics · 2s</span>
+    </div>
+
+    <div class="livegrid">
+      <div class="lcol">
+        <div class="lk">KV blocks in use <span style="text-transform:none;font-weight:400">(in-flight, 0 when idle)</span></div>
+        <div class="lbig mono" id="kvPct">0%</div>
+        <div class="lsub mono" id="kvTok">0 / 304,653 tokens</div>
+        <canvas id="spark" width="420" height="42" aria-label="KV cache usage over time"></canvas>
+        <div class="lrow">
+          <div><div class="lk">Running</div><div class="n mono" id="mRun">0</div></div>
+          <div><div class="lk">Waiting</div><div class="n mono" id="mWait">0</div></div>
+          <div><div class="lk">Preemptions</div><div class="n mono" id="mPre">—</div></div>
+          <div><div class="lk">Prefix cache</div><div class="n mono" id="hitRate">—</div></div>
+        </div>
+      </div>
+
+      <div class="lcol">
+        <div class="lk">Average context per request</div>
+        <div class="lbig mono" id="avgCtx">194,532</div>
+        <div class="lsub" id="avgSrc">6 requests · synthetic test traffic</div>
+        <div class="winsel" id="winsel"></div>
+        <div class="hint">
+          vLLM's counters reset on restart. Averages are only worth betting on once
+          they reflect your real agent workload, not a benchmark.
+        </div>
+      </div>
+
+      <div class="lcol">
+        <div class="lk">How many agents fit</div>
+        <div class="twoup">
+          <div class="cap">
+            <div class="t">Safe floor</div>
+            <div class="n mono" id="capWorst">1</div>
+            <div class="d">every agent at full 262k</div>
+          </div>
+          <div class="cap bet">
+            <div class="t">At observed avg</div>
+            <div class="n mono" id="capAvg">1</div>
+            <div class="d" id="capAvgD">at 194,532 avg</div>
+          </div>
+        </div>
+        <div class="setrow">
+          <input type="number" id="subN" min="1" max="64" value="64" aria-label="Max concurrent Codex subagents">
+          <button class="btn" id="subApply">Set subagents</button>
+        </div>
+        <div class="hint">
+          Writes <span class="mono">max_concurrent_threads_per_session</span>. Applies to the
+          next Codex launch, not a running session.
+        </div>
+      </div>
+    </div>
+
+    <div class="oversub" id="oversub"></div>
+  </div>
+
+  <div class="panel log">
+    <div class="panel-h"><span>Server log</span><span class="mono" style="font-size:10px">serve.log</span></div>
+    <div class="logbody mono" id="log"></div>
+  </div>
+
+  <div class="foot">
+    <b>Live data.</b> Capacity is computed server-side from measured boot logs — Flash-Next
+    weights 78.47 GiB / KV 30.39 KiB per token / 304,653 tokens; 27B NVFP4 20.75 GiB / 37.99 KiB
+    per token / 627,117 tokens. Models never booted here are marked <span class="tag est">estimated</span>.
+    <br><br>
+    <b>Server control is not wired yet.</b> Start / stop / restart require supervisor.py, which is
+    not built. Use <span class="mono">./codex-qwen.sh</span> or
+    <span class="mono">vllm-qwen38next/serve.sh</span> from a terminal.
+  </div>
+</div><script src="/assets/app.js"></script>
+</body>
+</html>

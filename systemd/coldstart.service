@@ -1,0 +1,59 @@
+[Unit]
+# Coldstart — local web GUI + API + gateway proxy managing the vLLM server.
+# Runs as a systemd --user unit (no sudo anywhere in this project).
+#
+# ASSUMPTION FLAGGED: ExecStart below imports `coldstart.app:app` as the
+# FastAPI application object. SPEC.md names every endpoint (§8) and every
+# module up through gateway.py/supervisor.py but never states the filename
+# that assembles them into one ASGI `app` — that wiring is owned by
+# whichever agent builds the API layer, not by this file's owner. If that
+# module ends up named something other than coldstart/app.py, update the
+# ExecStart line below (and run.sh) to match before enabling this unit.
+Description=Coldstart — vLLM server manager (GUI + API + gateway)
+
+# Deliberately NOT ordered after/wants network-online.target — SPEC.md
+# correction C9 notes that target is inert for a *user* unit anyway, and
+# Coldstart's own job (reconciling desired/actual server state, serving a
+# loopback-only GUI) needs no network. graphical-session.target matches the
+# sibling qwen-vllm.service unit's own choice for a desktop-session box.
+After=graphical-session.target
+
+# Same spirit as qwen-vllm.service's own StartLimitBurst: give up loudly
+# rather than hot-loop forever against a persistently broken install (e.g.
+# a missing coldstart.app import) — 20 restarts in 30s means something is
+# actually broken, not a transient hiccup RestartSec=1 should ride out.
+StartLimitIntervalSec=30
+StartLimitBurst=20
+
+[Service]
+Type=exec
+WorkingDirectory=%h/coldstart
+# %h is the user's home. Adjust WorkingDirectory if you cloned elsewhere.
+WorkingDirectory=%h/coldstart
+ExecStart=%h/coldstart/.venv/bin/uvicorn coldstart.app:app --host 127.0.0.1 --port 8010
+
+# Always, not on-failure: SPEC.md §11's honest-limits list says outright
+# "If Coldstart dies the gateway dies (~1s RestartSec window)" — the whole
+# point of this unit is that a clean exit is exactly as worth restarting
+# from as a crash, since either one means the GUI/gateway/supervisor loop
+# is gone and the desired/actual reconciliation on the next start is what
+# puts things back together (SPEC.md §6's "Startup reconciliation").
+Restart=always
+RestartSec=1
+
+TimeoutStartSec=30
+TimeoutStopSec=15
+# KillMode=mixed, NOT control-group. start_new_session=True gives the vLLM tree
+# its own session but does NOT move it out of this unit's cgroup, so
+# control-group would SIGKILL the model server on every Coldstart restart --
+# destroying exactly the survive-a-restart property procctl detaches for.
+# mixed signals only the main process; the detached tree is left alone.
+KillMode=mixed
+KillSignal=SIGTERM
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=coldstart
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,50 @@
+# Coldstart configuration. Copy to `coldstart.toml` and edit.
+# Every value is optional — Coldstart detects what it can.
+
+# Where run state is kept (desired state, boot history, measurements).
+# state_dir = "./state"
+
+# Hugging Face model cache. Detected from HF_HUB_CACHE / HF_HOME if unset.
+# model_cache = "~/.cache/huggingface/hub"
+
+# Total VRAM in MiB. Detected via nvidia-smi if unset.
+# gpu_total_mib = 24564
+
+# VRAM that is neither weights nor KV cache (activations, CUDA graphs).
+# Raise it if your predictions come out optimistic.
+# overhead_gib = 4.7
+
+# If any of these files exists, Coldstart refuses to start a server —
+# something else (a training run) wants the GPU.
+# training_markers = ["~/run/training_in_progress"]
+
+# listen_host = "127.0.0.1"
+# listen_port = 8010
+
+# --- Backends -----------------------------------------------------------
+# A backend is a script you already use to start a model server. Coldstart
+# runs it and passes settings through the environment, so your launcher keeps
+# owning the flags.
+
+[backends.vllm]
+launcher = "~/serve.sh"
+port = 8000
+log_path = "~/serve.log"
+
+# Which architectures (config.json -> architectures[0]) this backend can load.
+# Models with an architecture no backend claims are listed but not startable.
+architectures = ["Qwen3ForCausalLM", "LlamaForCausalLM", "MistralForCausalLM"]
+
+# Environment variables your launcher reads. Left side is Coldstart's setting
+# name, right side is your variable.
+[backends.vllm.env_map]
+port = "PORT"
+max_model_len = "MAX_LEN"
+util = "GPU_UTIL"
+max_num_seqs = "MAX_SEQS"
+served_name = "SERVED_NAME"
+
+# Set if starting this backend needs a terminal (e.g. an interactive sudo
+# prompt). Coldstart will not try to restart it unattended; it reports
+# blocked-needs-human instead of looping forever.
+# needs_tty = true

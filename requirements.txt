@@ -1,0 +1,15 @@
+# Coldstart runtime dependencies — SPEC.md §1: "Python 3.13 + FastAPI +
+# uvicorn + httpx". Nothing else. Install ONLY into
+# /home/pctablet505/Projects/coldstart/.venv-gui — never into the sibling
+# projects' .venv-llm or .venv-next (SETUP.md:229's documented foot-gun:
+# uv re-resolving there downgrades a pinned CUDA toolchain and reintroduces
+# a PTX blocker).
+#
+# fastapi/uvicorn exact-pinned, httpx pinned to its 0.28 line, per the
+# task's explicit instruction. pytest is intentionally left unpinned
+# (dev/test dependency only, never imported by runtime code) so `uv pip
+# install -U` naturally tracks the latest release.
+fastapi==0.136.3
+uvicorn==0.52.4
+httpx==0.28.*
+pytest

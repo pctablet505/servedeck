@@ -1,0 +1,11 @@
+# Trimmed fixture: 2 MB log reduced to the lines under test.
+# (Header avoids the searched token so it is not matched as a log line.)
+(EngineCore pid=597049) INFO 08-27 21:01:39 [shm_broadcast.py:801] No available shared memory broadcast block found in 60 seconds. This typically happens when some processes are hanging or doing some time-consuming work (e.g. compilation, weight/kv cache quantization).
+(EngineCore pid=597049) INFO 08-27 21:02:39 [shm_broadcast.py:801] No available shared memory broadcast block found in 60 seconds. This typically happens when some processes are hanging or doing some time-consuming work (e.g. compilation, weight/kv cache quantization).
+(EngineCore pid=597049) INFO 08-27 21:03:39 [shm_broadcast.py:801] No available shared memory broadcast block found in 60 seconds. This typically happens when some processes are hanging or doing some time-consuming work (e.g. compilation, weight/kv cache quantization).
+(EngineCore pid=597049) INFO 08-27 21:04:39 [shm_broadcast.py:801] No available shared memory broadcast block found in 60 seconds. This typically happens when some processes are hanging or doing some time-consuming work (e.g. compilation, weight/kv cache quantization).
+(Worker pid=597157) ERROR 08-27 21:06:02 [multiproc_executor.py:1051] RuntimeError: Ninja build failed. Ninja output:
+(Worker pid=597157) ERROR 08-27 21:06:02 [multiproc_executor.py:1051] RuntimeError: Ninja build failed. Ninja output:
+(Worker pid=597157) ERROR 08-27 21:06:02 [multiproc_executor.py:1051] /usr/bin/x86_64-linux-gnu-ld.bfd: cannot find -lcudart: No such file or directory
+(Worker pid=597157) ERROR 08-27 21:06:02 [multiproc_executor.py:1051] /usr/bin/x86_64-linux-gnu-ld.bfd: cannot find -lnvrtc: No such file or directory
+(Worker pid=597157) ERROR 08-27 21:06:02 [multiproc_executor.py:1051] FAILED: [code=1] /home/user/.cache/flashinfer/0.6.16.post3/120f/cached_ops/fused_moe_120/fused_moe_120.so 

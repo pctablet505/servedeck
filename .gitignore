@@ -1,0 +1,10 @@
+.venv/
+.venv-gui/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# runtime state — machine-specific, never committed
+state/
+coldstart.toml
+web/fonts/
