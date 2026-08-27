@@ -32,12 +32,12 @@ proxy:
 --------------------------------------------------------------------------
 INTEGRATION CONTRACT — read this if you are wiring app.py / supervisor.py
 --------------------------------------------------------------------------
-coldstart/supervisor.py (SPEC §6) is owned by a different agent and did
+servedeck/supervisor.py (SPEC §6) is owned by a different agent and did
 not exist yet when this file was written. Rather than import it (and
 either break at import time or freeze this file to a guess at its
 exact shape), this module depends on it only *structurally*, through the
 ``SupervisorView`` Protocol below. Anything — a class instance, or a bare
-module (``import coldstart.supervisor as supervisor_mod``; modules satisfy
+module (``import servedeck.supervisor as supervisor_mod``; modules satisfy
 Protocols too, since this is duck typing) — that exposes:
 
   desired_state()      -> "STOPPED" | "RUNNING"
@@ -147,7 +147,7 @@ _FIXED_PASSTHROUGH_PATHS = (
 @dataclass(frozen=True)
 class HoldStatus:
     """Best-effort description of "what's happening right now", used only
-    to fill in the ``coldstart`` block of a 503 body while a request is
+    to fill in the ``servedeck`` block of a 503 body while a request is
     parked or being shed. Never consulted for routing decisions."""
 
     phase_code: str  # e.g. "loading_weights" (phases.Phase value) or a
@@ -160,7 +160,7 @@ class HoldStatus:
 
 @runtime_checkable
 class SupervisorView(Protocol):
-    """Structural contract this module needs from coldstart.supervisor.
+    """Structural contract this module needs from servedeck.supervisor.
     See the module docstring's INTEGRATION CONTRACT section."""
 
     def desired_state(self) -> str: ...
@@ -270,9 +270,9 @@ def _error_body(
     return {
         "error": {
             "message": message,
-            "type": "coldstart_upstream_unavailable",
+            "type": "servedeck_upstream_unavailable",
             "code": code,
-            "coldstart": {
+            "servedeck": {
                 "phase": phase,
                 "eta_s": eta_s,
                 "parked": parked,

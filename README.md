@@ -1,4 +1,4 @@
-# Coldstart
+# Servedeck
 
 A local web dashboard for a self-hosted LLM server. It answers the questions
 you actually have while running one:
@@ -21,7 +21,7 @@ Sizing a KV cache by hand is easy to get wrong, and wrong in an expensive
 direction: you either waste half the card or discover at minute nine of a boot
 that the context you asked for never fit.
 
-Coldstart computes the same arithmetic vLLM does, before you start, and refuses
+Servedeck computes the same arithmetic vLLM does, before you start, and refuses
 configurations that cannot work — with the reason and a suggested fix.
 
 On the machine it was built for, its predictions match the engine's own
@@ -42,14 +42,14 @@ reported numbers to within **0.02%**.
 ## Install
 
 ```bash
-git clone https://github.com/pctablet505/coldstart && cd coldstart
+git clone https://github.com/pctablet505/servedeck && cd servedeck
 ./setup.sh                    # creates .venv, installs deps
-cp coldstart.toml.example coldstart.toml
-$EDITOR coldstart.toml        # point it at your launcher
+cp servedeck.toml.example servedeck.toml
+$EDITOR servedeck.toml        # point it at your launcher
 ./run.sh                      # → http://127.0.0.1:8010
 ```
 
-Nothing is installed system-wide. Coldstart binds `127.0.0.1` only, makes no
+Nothing is installed system-wide. Servedeck binds `127.0.0.1` only, makes no
 external network requests, and never runs `sudo`.
 
 ---
@@ -66,7 +66,7 @@ log_path = "~/serve.log"
 architectures = ["Qwen3ForCausalLM", "LlamaForCausalLM"]
 ```
 
-Coldstart passes settings to your launcher through environment variables, so
+Servedeck passes settings to your launcher through environment variables, so
 your script keeps owning the flags:
 
 ```toml
@@ -131,11 +131,11 @@ Two things that trip people up, both handled:
 
 **KV cost is not context-invariant.** The same model measured 30.4 KiB/token at
 262k context and 33.9 at 131k — block sizing depends on the configured length.
-Coldstart tracks the rate per context and says when it's reusing one measured
+Servedeck tracks the rate per context and says when it's reusing one measured
 elsewhere.
 
 **On-disk size is not loaded size.** A checkpoint with host-offloaded layers can
-be 126 GB on disk and 78 GB in VRAM. Coldstart refuses to estimate weights for
+be 126 GB on disk and 78 GB in VRAM. Servedeck refuses to estimate weights for
 architectures where that's known to be untrue, rather than being confidently
 wrong by 37%.
 

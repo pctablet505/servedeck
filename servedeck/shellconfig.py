@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 from typing import Mapping
 
-from coldstart import paths
+from servedeck import paths
 
 # codex-qwen.sh's save_config_kv() always emits exactly `KEY="value"\n`
 # (one assignment per line, double-quoted, no escaping of embedded quotes)
@@ -45,7 +45,7 @@ ALLOWED_SET_KEYS: frozenset[str] = frozenset(
         "PORT",
         "MAX_MODEL_LEN",
         "MAX_NUM_SEQS",
-        "COLDSTART_URL",
+        "SERVEDECK_URL",
         "USE_COLDSTART",
     }
 )
@@ -95,7 +95,7 @@ def read_config() -> dict[str, str]:
 
 
 def _base_url(cfg: Mapping[str, str]) -> str:
-    """Mirrors codex-qwen.sh's recompute_derived(): COLDSTART_URL, if set
+    """Mirrors codex-qwen.sh's recompute_derived(): SERVEDECK_URL, if set
     and non-empty, wins outright; otherwise http://localhost:$PORT/v1.
     PORT itself defaults to "8001" here — codex-qwen.sh's own current
     top-level default (BACKEND=flashnext, PORT=8001) — because
@@ -104,9 +104,9 @@ def _base_url(cfg: Mapping[str, str]) -> str:
     completely normal and must fall back to the same default the shell
     script itself would use, not an arbitrary one.
     """
-    coldstart_url = cfg.get("COLDSTART_URL", "").strip()
-    if coldstart_url:
-        return coldstart_url.rstrip("/") + "/v1"
+    servedeck_url = cfg.get("SERVEDECK_URL", "").strip()
+    if servedeck_url:
+        return servedeck_url.rstrip("/") + "/v1"
     port = cfg.get("PORT", "").strip() or "8001"
     return f"http://localhost:{port}/v1"
 

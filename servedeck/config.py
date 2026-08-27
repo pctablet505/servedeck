@@ -2,8 +2,8 @@
 
 Resolution order, first match wins:
 
-1. ``COLDSTART_*`` environment variables
-2. ``coldstart.toml`` — next to the package, or at ``$COLDSTART_CONFIG``
+1. ``SERVEDECK_*`` environment variables
+2. ``servedeck.toml`` — next to the package, or at ``$SERVEDECK_CONFIG``
 3. Auto-detection (GPU size from ``nvidia-smi``, model cache from ``$HF_HOME``)
 4. Documented defaults
 
@@ -123,7 +123,7 @@ def detect_gpu_total_mib() -> int:
 
 
 def default_model_cache() -> Path:
-    if v := os.environ.get("COLDSTART_MODEL_CACHE"):
+    if v := os.environ.get("SERVEDECK_MODEL_CACHE"):
         return Path(v).expanduser()
     if v := os.environ.get("HF_HUB_CACHE"):
         return Path(v).expanduser()
@@ -133,12 +133,12 @@ def default_model_cache() -> Path:
 
 
 def _config_file() -> Path | None:
-    if v := os.environ.get("COLDSTART_CONFIG"):
+    if v := os.environ.get("SERVEDECK_CONFIG"):
         p = Path(v).expanduser()
         return p if p.is_file() else None
     for candidate in (
-        Path.cwd() / "coldstart.toml",
-        Path(__file__).resolve().parent.parent / "coldstart.toml",
+        Path.cwd() / "servedeck.toml",
+        Path(__file__).resolve().parent.parent / "servedeck.toml",
     ):
         if candidate.is_file():
             return candidate
@@ -177,7 +177,7 @@ def load(path: Path | None = None) -> Config:
             raw = tomllib.load(fh)
 
     state_dir = Path(
-        os.environ.get("COLDSTART_STATE_DIR")
+        os.environ.get("SERVEDECK_STATE_DIR")
         or raw.get("state_dir")
         or (Path(__file__).resolve().parent.parent / "state")
     ).expanduser()
@@ -186,7 +186,7 @@ def load(path: Path | None = None) -> Config:
         _parse_backend(name, spec) for name, spec in (raw.get("backends") or {}).items()
     )
 
-    gpu_total = int(os.environ.get("COLDSTART_GPU_TOTAL_MIB") or raw.get("gpu_total_mib") or 0)
+    gpu_total = int(os.environ.get("SERVEDECK_GPU_TOTAL_MIB") or raw.get("gpu_total_mib") or 0)
     if not gpu_total:
         gpu_total = detect_gpu_total_mib()
 
@@ -198,8 +198,8 @@ def load(path: Path | None = None) -> Config:
         gpu_total_mib=gpu_total,
         overhead_gib=float(raw.get("overhead_gib", DEFAULT_OVERHEAD_GIB)),
         frag_margin_mib=int(raw.get("frag_margin_mib", DEFAULT_FRAG_MARGIN_MIB)),
-        listen_host=str(os.environ.get("COLDSTART_HOST") or raw.get("listen_host", "127.0.0.1")),
-        listen_port=int(os.environ.get("COLDSTART_PORT") or raw.get("listen_port", 8010)),
+        listen_host=str(os.environ.get("SERVEDECK_HOST") or raw.get("listen_host", "127.0.0.1")),
+        listen_port=int(os.environ.get("SERVEDECK_PORT") or raw.get("listen_port", 8010)),
         shell_config_script=Path(shell_script).expanduser() if shell_script else None,
         training_markers=tuple(raw.get("training_markers", ())),
     )

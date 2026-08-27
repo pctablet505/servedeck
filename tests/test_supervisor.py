@@ -14,7 +14,7 @@ import asyncio
 import types
 from pathlib import Path
 
-from coldstart import phases, preflight, procctl, supervisor
+from servedeck import phases, preflight, procctl, supervisor
 
 _CFG = dict(
     repo_id="RadixArk/Qwen3.8-Flash-Next-NVFP4",

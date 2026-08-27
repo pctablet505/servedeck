@@ -1,4 +1,4 @@
-"""Console entry point: `coldstart` starts the dashboard."""
+"""Console entry point: `servedeck` starts the dashboard."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ def main(argv: list[str] | None = None) -> int:
     from . import config
 
     cfg = config.get()
-    ap = argparse.ArgumentParser(prog="coldstart", description="Local LLM server dashboard")
+    ap = argparse.ArgumentParser(prog="servedeck", description="Local LLM server dashboard")
     ap.add_argument("--host", default=cfg.listen_host)
     ap.add_argument("--port", type=int, default=cfg.listen_port)
     ap.add_argument("--reload", action="store_true", help="auto-reload on code changes")
@@ -19,17 +19,17 @@ def main(argv: list[str] | None = None) -> int:
     try:
         import uvicorn
     except ImportError:
-        print("uvicorn is not installed. Try: pip install 'coldstart-llm[server]'", file=sys.stderr)
+        print("uvicorn is not installed. Try: pip install 'servedeck-llm[server]'", file=sys.stderr)
         return 1
 
     if not cfg.backends:
         print(
             "No backends configured — the dashboard will start, but it cannot\n"
-            "identify your model server. Copy coldstart.toml.example to\n"
-            "coldstart.toml and add one. See docs/CONFIGURATION.md.",
+            "identify your model server. Copy servedeck.toml.example to\n"
+            "servedeck.toml and add one. See docs/CONFIGURATION.md.",
             file=sys.stderr,
         )
-    uvicorn.run("coldstart.app:app", host=args.host, port=args.port, reload=args.reload)
+    uvicorn.run("servedeck.app:app", host=args.host, port=args.port, reload=args.reload)
     return 0
 
 

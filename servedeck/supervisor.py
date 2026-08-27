@@ -49,7 +49,7 @@ from typing import Any, Awaitable, Callable, Literal, Mapping, Sequence
 
 import httpx
 
-from coldstart import gpu, history, logtail, paths, phases, preflight, procctl, shellconfig
+from servedeck import gpu, history, logtail, paths, phases, preflight, procctl, shellconfig
 
 # ---------------------------------------------------------------------------
 # Types & constants — SPEC.md §6

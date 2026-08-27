@@ -1,15 +1,15 @@
 """SPEC.md §2 rule 1: no pattern-matching process-table lookup tool may
-ever be invoked anywhere in the coldstart package — that family of tools
+ever be invoked anywhere in the servedeck package — that family of tools
 matches against a process's FULL COMMAND LINE, including the calling
 shell's own, and has repeatedly killed shells during this project's
 development (SETUP.md:401). This test greps the actual shipped package
-source (`coldstart/`, not `tests/`) for those tool names and fails on any
+source (`servedeck/`, not `tests/`) for those tool names and fails on any
 hit, comments included — matching procctl.py's own module docstring, which
 deliberately avoids spelling the names out for exactly this reason.
 
 This file is the one place in the whole tree allowed to spell them out: a
 search needs its own search terms, and grepping this file against itself
-would be a tautology, so only `coldstart/` is walked below.
+would be a tautology, so only `servedeck/` is walked below.
 
 It also exercises SPEC.md §2 rules 2/3 end to end against a real (harmless,
 non-vLLM) child process: `launch()` must give the child its own session
@@ -21,11 +21,11 @@ from __future__ import annotations
 
 import os
 
-from coldstart import paths, procctl
+from servedeck import paths, procctl
 
-_PACKAGE_DIR = paths.COLDSTART_PKG_DIR
+_PACKAGE_DIR = paths.SERVEDECK_PKG_DIR
 
-# The literal names. Spelled out ONLY here (and nowhere under coldstart/)
+# The literal names. Spelled out ONLY here (and nowhere under servedeck/)
 # precisely because this is the file whose job is to make sure of that.
 _FORBIDDEN_TOKENS = ("pgrep", "pkill", "killall")
 

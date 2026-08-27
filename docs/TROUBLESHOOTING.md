@@ -7,10 +7,10 @@ content type stays cached.
 
 ## "No models found"
 
-Coldstart scans `model_cache` for `models--*` directories. Check the path:
+Servedeck scans `model_cache` for `models--*` directories. Check the path:
 
 ```bash
-python -c "from coldstart import config; print(config.get().model_cache)"
+python -c "from servedeck import config; print(config.get().model_cache)"
 ```
 
 A model needs `config.json` and at least one `.safetensors` file. GGUF-only
@@ -37,14 +37,14 @@ manually.
 
 ## Every config is refused for VRAM
 
-Your server is probably already running and holding the card. Coldstart
+Your server is probably already running and holding the card. Servedeck
 discounts VRAM held by *its own* backend, identified by the process tree of
 whatever owns the configured port. If you started the server another way, it
 may not be attributed.
 
 ## Predictions are optimistic
 
-Raise `overhead_gib`. Coldstart also learns: after each successful boot it
+Raise `overhead_gib`. Servedeck also learns: after each successful boot it
 records the real weights and KV size, and later estimates for that model are
 labelled **measured** instead of **estimated**.
 
@@ -59,7 +59,7 @@ grep -nE "ValueError|RuntimeError|CUDA error|out of memory" <your-log> | tail -5
 - **Crashed while serving** → a restart is likely to recover it.
 - **Failed to boot** → restarting loops forever. Read the error first.
 
-Coldstart makes the same distinction: it only auto-restarts a server that had
+Servedeck makes the same distinction: it only auto-restarts a server that had
 reached a serving state.
 
 ## KV usage jumps between 0% and some number

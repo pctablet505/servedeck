@@ -54,7 +54,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from coldstart import paths
+from servedeck import paths
 
 # ---------------------------------------------------------------------------
 # Data
@@ -629,14 +629,14 @@ def stop(handle: ServerHandle, timeout_s: float = 60, escalate: bool = True) -> 
 
 
 # ---------------------------------------------------------------------------
-# __main__ — python -m coldstart.procctl --scan
+# __main__ — python -m servedeck.procctl --scan
 # ---------------------------------------------------------------------------
 
 
 def _main(argv: list[str] | None = None) -> int:
     import argparse
 
-    parser = argparse.ArgumentParser(prog="python -m coldstart.procctl")
+    parser = argparse.ArgumentParser(prog="python -m servedeck.procctl")
     parser.add_argument(
         "--scan", action="store_true", help="scan for live vLLM-tree processes and orphaned VLLM:: children"
     )

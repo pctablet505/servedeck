@@ -1,6 +1,6 @@
 # Coldstart runtime dependencies — SPEC.md §1: "Python 3.13 + FastAPI +
 # uvicorn + httpx". Nothing else. Install ONLY into
-# /home/pctablet505/Projects/coldstart/.venv-gui — never into the sibling
+# /home/pctablet505/Projects/servedeck/.venv-gui — never into the sibling
 # projects' .venv-llm or .venv-next (SETUP.md:229's documented foot-gun:
 # uv re-resolving there downgrades a pinned CUDA toolchain and reintroduces
 # a PTX blocker).

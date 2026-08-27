@@ -1,13 +1,13 @@
 .venv/
-.venv-gui/
+.venv/
 __pycache__/
 *.pyc
 .pytest_cache/
 
 # runtime state — machine-specific, never committed
 state/
-coldstart.toml
-coldstart/web/fonts/
+servedeck.toml
+servedeck/web/fonts/
 dist/
 build/
 *.egg-info/

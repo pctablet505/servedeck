@@ -1,4 +1,4 @@
-"""coldstart.registry — model discovery, servability, and the observation store.
+"""servedeck.registry — model discovery, servability, and the observation store.
 
 Implements SPEC.md §4 (REGISTRY):
   * Discovery over ``~/.cache/huggingface/hub/models--*/``.
@@ -7,7 +7,7 @@ Implements SPEC.md §4 (REGISTRY):
   * ``resolve_inputs(repo_id, util, ctx)`` and its three-tier lookup.
 
 This module is pure discovery + bookkeeping: it does not launch anything, does not
-compute VRAM budgets (that is coldstart/capacity.py's job — see SPEC §3), and never
+compute VRAM budgets (that is servedeck/capacity.py's job — see SPEC §3), and never
 fabricates a number that was not either read from disk or explicitly given in
 SPEC §0's ground-truth table.
 """
@@ -70,8 +70,8 @@ _CONFIG_FIELD_NAMES = (
 
 
 def default_hub_dir() -> Path:
-    """~/.cache/huggingface/hub, overridable via COLDSTART_HF_HUB_DIR (tests only)."""
-    override = os.environ.get("COLDSTART_HF_HUB_DIR")
+    """~/.cache/huggingface/hub, overridable via SERVEDECK_HF_HUB_DIR (tests only)."""
+    override = os.environ.get("SERVEDECK_HF_HUB_DIR")
     if override:
         return Path(override)
     return Path.home() / ".cache" / "huggingface" / "hub"
@@ -357,7 +357,7 @@ def _kv_rate_of(obs: dict[str, Any]) -> float | None:
 class ResolvedInputs:
     """What resolve_inputs() found, and how much to trust it.
 
-    Consumed by coldstart/capacity.py (not owned by this module) to build its
+    Consumed by servedeck/capacity.py (not owned by this module) to build its
     own ModelInputs and raise UNKNOWN_CAPACITY when weights_source=="unknown".
     """
 
@@ -552,7 +552,7 @@ def resolve_inputs(
 
 
 # --------------------------------------------------------------------------- #
-# CLI — `python -m coldstart.registry --list`
+# CLI — `python -m servedeck.registry --list`
 # --------------------------------------------------------------------------- #
 
 
@@ -586,7 +586,7 @@ def _format_listing(entries: list[ModelEntry]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="python -m coldstart.registry")
+    parser = argparse.ArgumentParser(prog="python -m servedeck.registry")
     parser.add_argument("--list", action="store_true", help="list discovered hub models")
     args = parser.parse_args(argv)
 

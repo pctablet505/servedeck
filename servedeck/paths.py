@@ -75,13 +75,13 @@ PTRACE_PATH: Path = Path("/proc/sys/kernel/yama/ptrace_scope")
 # Coldstart's own tree
 # --------------------------------------------------------------------------
 
-# This file lives at <project_root>/coldstart/paths.py.
-COLDSTART_PKG_DIR: Path = Path(__file__).resolve().parent
-PROJECT_ROOT: Path = COLDSTART_PKG_DIR.parent
+# This file lives at <project_root>/servedeck/paths.py.
+SERVEDECK_PKG_DIR: Path = Path(__file__).resolve().parent
+PROJECT_ROOT: Path = SERVEDECK_PKG_DIR.parent
 
 # state/desired.json, state/server.json, state/history.jsonl, state/ack.json,
 # state/measurements.json — SPEC.md §4 / §6. Created on first write; nothing
 # in this module creates it eagerly.
 STATE_DIR: Path = PROJECT_ROOT / "state"
 
-GUI_VENV: Path = PROJECT_ROOT / ".venv-gui"
+GUI_VENV: Path = PROJECT_ROOT / ".venv"

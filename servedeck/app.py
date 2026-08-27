@@ -1,7 +1,7 @@
 """Coldstart — FastAPI application.
 
-Module is named `app` because run.sh and systemd/coldstart.service both import
-`coldstart.app:app`. SPEC.md called it api.py; those two files won the tie
+Module is named `app` because run.sh and systemd/servedeck.service both import
+`servedeck.app:app`. SPEC.md called it api.py; those two files won the tie
 because they are already installed.
 
 Scope of THIS file today: read-only observability + capacity estimation + a
@@ -462,7 +462,7 @@ async def catch_all(path: str, request: Request) -> Any:
                 {
                     "error": {
                         "message": f"Coldstart: upstream {rt.upstream} unreachable ({type(exc).__name__})",
-                        "type": "coldstart_upstream_unavailable",
+                        "type": "servedeck_upstream_unavailable",
                         "code": "unreachable",
                     }
                 },

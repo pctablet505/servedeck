@@ -1,4 +1,4 @@
-"""Tests for coldstart.gateway — SPEC.md §7, corrected by the 2026-08-27
+"""Tests for servedeck.gateway — SPEC.md §7, corrected by the 2026-08-27
 addendum (C2 per-path policy, C7 disconnect propagation, C8 finite hold).
 
 Every test here drives the module against a stubbed supervisor (a plain
@@ -31,7 +31,7 @@ import httpx
 import pytest
 from starlette.requests import Request
 
-from coldstart import gateway
+from servedeck import gateway
 
 # ---------------------------------------------------------------------------
 # Request builder — no ASGI server involved, just a scope + receive callable.
@@ -221,7 +221,7 @@ async def test_desired_stopped_is_immediate_503_never_parks():
         assert resp.headers["retry-after"] == "5"
         body = json.loads(bytes(resp.body))
         assert body["error"]["code"] == "stopped"
-        assert body["error"]["type"] == "coldstart_upstream_unavailable"
+        assert body["error"]["type"] == "servedeck_upstream_unavailable"
         assert transport.calls == 0
         assert runtime.parked_count == 0
     finally:
@@ -326,8 +326,8 @@ async def test_park_timeout_returns_503_restarting_with_eta():
         assert elapsed < 1.0  # bounded near hold_max_s, not left hanging
         body = json.loads(bytes(resp.body))
         assert body["error"]["code"] == "restarting"
-        assert body["error"]["coldstart"]["phase"] == "loading_weights"
-        assert body["error"]["coldstart"]["eta_s"] == 190
+        assert body["error"]["servedeck"]["phase"] == "loading_weights"
+        assert body["error"]["servedeck"]["eta_s"] == 190
         assert "3m10s" in body["error"]["message"]
         assert transport.calls == 0
         assert runtime.parked_count == 0  # slot released even on timeout
@@ -409,7 +409,7 @@ async def test_max_parked_sheds_with_503_and_releases_after():
         assert shed_resp.status_code == 503
         shed_body = json.loads(bytes(shed_resp.body))
         assert shed_body["error"]["code"] == "queue_full"
-        assert shed_body["error"]["coldstart"]["parked"] == 1
+        assert shed_body["error"]["servedeck"]["parked"] == 1
         assert runtime.parked_count == 1  # the shed request never occupied a slot
 
         supervisor.set_actual(gateway.ACTUAL_READY)

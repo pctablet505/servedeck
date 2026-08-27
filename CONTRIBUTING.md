@@ -8,7 +8,7 @@ package and fails on any occurrence. Use `ps -eo comm`, explicit PIDs, or
 `procctl`.
 
 **Never hardcode a path, GPU size, or model name.** Everything
-machine-specific belongs in `coldstart/config.py`.
+machine-specific belongs in `servedeck/config.py`.
 
 **Never run `sudo`.** Where privilege is needed, emit a copyable command for
 the user to run.

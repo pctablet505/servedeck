@@ -21,7 +21,7 @@ Both steps report the real HTTP status and body on failure — never just
 
 This module is import-safe from an API endpoint (`POST /api/smoke`, owned
 by api.py — not this file) via :func:`run_smoke`, and directly runnable:
-    python -m coldstart.smoke [--base-url URL] [--json]
+    python -m servedeck.smoke [--base-url URL] [--json]
 """
 
 from __future__ import annotations
@@ -263,11 +263,11 @@ async def run_smoke(
     timeout_s: float = 120.0,
 ) -> SmokeResult:
     """Run both smoke steps through the gateway at `base_url` (default:
-    $COLDSTART_URL or http://127.0.0.1:8010). Pass `client` to reuse an
+    $SERVEDECK_URL or http://127.0.0.1:8010). Pass `client` to reuse an
     existing httpx.AsyncClient (e.g. a test's MockTransport-backed one,
     or an API endpoint's shared client) — otherwise one is created and
     closed here."""
-    resolved_base_url = (base_url or os.environ.get("COLDSTART_URL") or DEFAULT_BASE_URL).rstrip("/")
+    resolved_base_url = (base_url or os.environ.get("SERVEDECK_URL") or DEFAULT_BASE_URL).rstrip("/")
     started = time.time()
     owns_client = client is None
     if client is None:
@@ -317,11 +317,11 @@ def _format_report(result: SmokeResult) -> str:
 
 
 def _main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="python -m coldstart.smoke")
+    parser = argparse.ArgumentParser(prog="python -m servedeck.smoke")
     parser.add_argument(
         "--base-url",
         default=None,
-        help="Coldstart gateway base URL (default: $COLDSTART_URL or http://127.0.0.1:8010)",
+        help="Coldstart gateway base URL (default: $SERVEDECK_URL or http://127.0.0.1:8010)",
     )
     parser.add_argument("--json", action="store_true", help="emit JSON instead of a human-readable report")
     parser.add_argument("--timeout-s", type=float, default=120.0, help="per-request timeout in seconds")

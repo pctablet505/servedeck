@@ -1,4 +1,4 @@
-"""Tests for coldstart.phases and coldstart.logtail.
+"""Tests for servedeck.phases and servedeck.logtail.
 
 Replays REAL vLLM boot logs captured on disk (never fabricated) to prove the
 phase FSM and classify() match SPEC.md §5 exactly. Fixture paths and the
@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from coldstart import logtail, phases
+from servedeck import logtail, phases
 
 # ---------------------------------------------------------------------------
 # Real fixture logs on disk

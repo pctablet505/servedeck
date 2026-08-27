@@ -1,5 +1,5 @@
-# Coldstart configuration. Copy to `coldstart.toml` and edit.
-# Every value is optional — Coldstart detects what it can.
+# Servedeck configuration. Copy to `servedeck.toml` and edit.
+# Every value is optional — Servedeck detects what it can.
 
 # Where run state is kept (desired state, boot history, measurements).
 # state_dir = "./state"
@@ -14,7 +14,7 @@
 # Raise it if your predictions come out optimistic.
 # overhead_gib = 4.7
 
-# If any of these files exists, Coldstart refuses to start a server —
+# If any of these files exists, Servedeck refuses to start a server —
 # something else (a training run) wants the GPU.
 # training_markers = ["~/run/training_in_progress"]
 
@@ -22,7 +22,7 @@
 # listen_port = 8010
 
 # --- Backends -----------------------------------------------------------
-# A backend is a script you already use to start a model server. Coldstart
+# A backend is a script you already use to start a model server. Servedeck
 # runs it and passes settings through the environment, so your launcher keeps
 # owning the flags.
 
@@ -35,7 +35,7 @@ log_path = "~/serve.log"
 # Models with an architecture no backend claims are listed but not startable.
 architectures = ["Qwen3ForCausalLM", "LlamaForCausalLM", "MistralForCausalLM"]
 
-# Environment variables your launcher reads. Left side is Coldstart's setting
+# Environment variables your launcher reads. Left side is Servedeck's setting
 # name, right side is your variable.
 [backends.vllm.env_map]
 port = "PORT"
@@ -45,6 +45,6 @@ max_num_seqs = "MAX_SEQS"
 served_name = "SERVED_NAME"
 
 # Set if starting this backend needs a terminal (e.g. an interactive sudo
-# prompt). Coldstart will not try to restart it unattended; it reports
+# prompt). Servedeck will not try to restart it unattended; it reports
 # blocked-needs-human instead of looping forever.
 # needs_tty = true

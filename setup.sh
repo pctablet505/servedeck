@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # setup.sh — one-time (idempotent, re-runnable) environment setup for
-# Coldstart. Never touches port 8000/8001, never starts a model server,
+# Servedeck. Never touches port 8000/8001, never starts a model server,
 # never runs sudo (SPEC.md's absolute rules). The only process this script
 # may itself start is `systemctl --user daemon-reload`, which starts
 # nothing — see the systemd section below for why enabling/starting
-# coldstart.service is left as a printed, copyable command rather than run
+# servedeck.service is left as a printed, copyable command rather than run
 # automatically.
 set -euo pipefail
 
@@ -12,7 +12,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$HERE/.venv"
 PYTHON_VERSION="3.13"
 
-echo "== Coldstart setup =="
+echo "== Servedeck setup =="
 echo "project root: $HERE"
 echo
 
@@ -57,7 +57,7 @@ echo "state dir: $HERE/state (desired.json/server.json/history.jsonl/ack.json"
 echo "  are created on first write by supervisor.py/procctl.py, not by this script)"
 
 # --------------------------------------------------------- systemd -------
-UNIT_NAME="coldstart.service"
+UNIT_NAME="servedeck.service"
 USER_UNIT_DIR="$HOME/.config/systemd/user"
 SRC_UNIT="$HERE/systemd/$UNIT_NAME"
 DST_UNIT="$USER_UNIT_DIR/$UNIT_NAME"
@@ -72,10 +72,10 @@ if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/d
     echo "Installed $DST_UNIT and reloaded the user systemd daemon."
     echo "NOT enabling or starting it automatically (see below) — when you're ready:"
     echo
-    echo "    systemctl --user enable --now coldstart.service"
+    echo "    systemctl --user enable --now servedeck.service"
     echo
-    echo "  (then: systemctl --user status coldstart.service"
-    echo "         journalctl --user -u coldstart -f)"
+    echo "  (then: systemctl --user status servedeck.service"
+    echo "         journalctl --user -u servedeck -f)"
 else
     echo "No usable systemd --user manager here; skipping unit install."
     echo "The unit file is still at: $SRC_UNIT"
@@ -91,7 +91,7 @@ fi
 # user deliberately stopped the server" from "the server crashed" — it
 # resurrected a deliberately-stopped unit at least once already (SETUP.md
 # :393, and again live at 20:13:58 on the day this spec's corrections were
-# written). Coldstart's own supervisor.py fixes exactly this defect by
+# written). Servedeck's own supervisor.py fixes exactly this defect by
 # gating auto-restart on a persisted `desired_state` that a Stop click
 # clears *before* signalling (SPEC.md §6, "THE RULE THAT FIXES THE KNOWN
 # WATCHDOG DEFECT"). Running both supervisors at once would let the old,
@@ -112,7 +112,7 @@ if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/d
     watchdog_state="$(systemctl --user is-enabled qwen-vllm-watchdog.timer 2>/dev/null || true)"
     echo "qwen-vllm-watchdog.timer is-enabled: ${watchdog_state:-not-found}"
     if [ "$watchdog_state" = "enabled" ]; then
-        echo "WARNING: it is currently ENABLED. It will fight Coldstart's supervisor"
+        echo "WARNING: it is currently ENABLED. It will fight Servedeck's supervisor"
         echo "  (known defect: it cannot tell a deliberate stop from a crash)."
         echo "  This script will not disable it for you. To do so yourself:"
         echo
@@ -131,7 +131,7 @@ echo
 echo "== SPEC.md §9 shell patches =="
 echo "Not applied by this script (out of scope — those files belong to"
 echo "codex-qwen.sh / serve.sh / qwen-server-run.sh, owned elsewhere in this"
-echo "project, each patch additive and backed up as *.bak-precoldstart)."
+echo "project, each patch additive and backed up as *.bak-preservedeck)."
 echo "Known-applied already, per live inspection: retry values (C1) and the"
 echo "BACKEND!=flashnext systemd gate (§9d)."
 

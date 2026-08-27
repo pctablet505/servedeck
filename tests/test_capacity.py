@@ -1,4 +1,4 @@
-"""Tests for coldstart.capacity — SPEC.md §3.
+"""Tests for servedeck.capacity — SPEC.md §3.
 
 capacity.py is pure (no file I/O, no subprocess, no network), so every test
 here builds ModelInputs / LiveFacts by hand. Numbers asserted against are
@@ -18,7 +18,7 @@ import math
 
 import pytest
 
-from coldstart.capacity import (
+from servedeck.capacity import (
     FLASHNEXT_MIN_UTIL,
     FRAG_MARGIN_GIB,
     GPU_TOTAL_GIB,
@@ -115,15 +115,15 @@ def test_training_markers_are_configurable_not_hardcoded():
     """
     import os
 
-    from coldstart import capacity as cap
-    from coldstart import config
+    from servedeck import capacity as cap
+    from servedeck import config
 
-    os.environ["COLDSTART_TRAINING_MARKERS"] = "/tmp/a-marker:/tmp/b-marker"
+    os.environ["SERVEDECK_TRAINING_MARKERS"] = "/tmp/a-marker:/tmp/b-marker"
     try:
         config.reset()
         assert tuple(cap._cfg_markers()) == ("/tmp/a-marker", "/tmp/b-marker")
     finally:
-        del os.environ["COLDSTART_TRAINING_MARKERS"]
+        del os.environ["SERVEDECK_TRAINING_MARKERS"]
         config.reset()
 
 
@@ -707,7 +707,7 @@ def test_finding_levels_are_only_block_or_warn():
         gpu_responsive=True,
         total_mib=97887,
         used_mib=1000,
-        training_markers=["/tmp/coldstart-test/training_in_progress"],
+        training_markers=["/tmp/servedeck-test/training_in_progress"],
         ptrace_scope=0,
         actual_state="READY",
         codex_max_subagents=8,

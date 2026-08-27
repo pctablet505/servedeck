@@ -5,7 +5,7 @@ and a pass-through proxy. It shells out to your launcher; it never builds a
 model-server command line.
 
 ```
-browser ──► coldstart (127.0.0.1:8010)
+browser ──► servedeck (127.0.0.1:8010)
               ├── web/            static dashboard
               ├── /api/*          state, models, capacity, events
               └── /v1/*           proxied to your model server

@@ -35,7 +35,7 @@ import os
 from dataclasses import dataclass
 from typing import Literal
 
-from coldstart import gpu, paths
+from servedeck import gpu, paths
 
 Level = Literal["block", "warn", "info"]
 

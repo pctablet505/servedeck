@@ -21,7 +21,7 @@ from . import config as _config
 # Constants (SPEC.md §3) — provenance noted inline.
 # ---------------------------------------------------------------------------
 
-# Hardware and safety constants. All come from coldstart.config so a different
+# Hardware and safety constants. All come from servedeck.config so a different
 # card, or a different launcher, needs no code change. They are read at import
 # time; call capacity.refresh_limits() after changing config in a long-lived
 # process (tests do this).
@@ -57,7 +57,7 @@ FLASHNEXT_MIN_UTIL: float = 0.90
 
 def _cfg_markers() -> tuple[str, ...]:
     import os
-    raw = os.environ.get("COLDSTART_TRAINING_MARKERS", "")
+    raw = os.environ.get("SERVEDECK_TRAINING_MARKERS", "")
     return tuple(p for p in raw.split(":") if p)
 
 
@@ -72,7 +72,7 @@ def refresh_limits() -> None:
 
 # A "lock file" convention: if any of these paths exists, something else wants
 # the GPU (a training run, a benchmark) and Coldstart must stand down rather
-# than start a server. Configure via `training_markers` in coldstart.toml.
+# than start a server. Configure via `training_markers` in servedeck.toml.
 # capacity.py stays pure — it never stat()s anything; a caller that is allowed
 # I/O checks existence and reports hits via LiveFacts.training_markers.
 TRAINING_MARKER_PATHS: tuple[str, ...] = tuple(_cfg_markers())
@@ -91,7 +91,7 @@ Trust = Literal["measured", "measured_other_ctx", "estimated", "unknown"]
 class ModelInputs:
     """Everything capacity.compute() needs to know about one model.
 
-    Populated by coldstart/registry.py's resolve_inputs(); capacity.py does
+    Populated by servedeck/registry.py's resolve_inputs(); capacity.py does
     not know how to get these numbers, only what to do with them.
     """
 

@@ -1,9 +1,9 @@
 # Configuration
 
-Coldstart reads settings in this order — first match wins:
+Servedeck reads settings in this order — first match wins:
 
-1. `COLDSTART_*` environment variables
-2. `coldstart.toml` (working directory, or `$COLDSTART_CONFIG`)
+1. `SERVEDECK_*` environment variables
+2. `servedeck.toml` (working directory, or `$SERVEDECK_CONFIG`)
 3. Auto-detection
 4. Defaults
 
@@ -30,12 +30,12 @@ needs_tty = false
 shown but not startable, with the reason.
 
 **`needs_tty = true`** means starting it requires a terminal — an interactive
-`sudo` prompt, for example. Coldstart will not attempt an unattended restart;
+`sudo` prompt, for example. Servedeck will not attempt an unattended restart;
 it reports `blocked-needs-human` instead of looping.
 
 ### Passing settings to your launcher
 
-Coldstart never builds a `vllm serve` command line. It sets environment
+Servedeck never builds a `vllm serve` command line. It sets environment
 variables and runs your script, so your script keeps owning the flags.
 
 ```toml
@@ -47,7 +47,7 @@ max_num_seqs  = "MAX_SEQS"
 served_name   = "SERVED_NAME"
 ```
 
-Left side is Coldstart's setting name; right side is your variable. Your
+Left side is Servedeck's setting name; right side is your variable. Your
 launcher then reads them:
 
 ```bash
@@ -75,7 +75,7 @@ conservative. If yours come out optimistic, raise it.
 Adding it to the requirement makes any utilization above ~0.958 look
 impossible on a card that runs 0.95 fine.
 
-If GPU detection fails, `gpu_total_mib` is 0 and Coldstart refuses to compute
+If GPU detection fails, `gpu_total_mib` is 0 and Servedeck refuses to compute
 capacity rather than guessing.
 
 ---
@@ -95,7 +95,7 @@ model_cache = "~/.cache/huggingface/hub"      # from HF_HUB_CACHE / HF_HOME if u
 training_markers = ["~/run/training_in_progress"]
 ```
 
-If any listed file exists, Coldstart refuses to start a server. Useful when a
+If any listed file exists, Servedeck refuses to start a server. Useful when a
 training job needs the card.
 
 ---
@@ -113,8 +113,8 @@ listen_port = 8010
 
 | Variable | Overrides |
 |---|---|
-| `COLDSTART_CONFIG` | config file location |
-| `COLDSTART_STATE_DIR` | `state_dir` |
-| `COLDSTART_MODEL_CACHE` | `model_cache` |
-| `COLDSTART_GPU_TOTAL_MIB` | `gpu_total_mib` |
-| `COLDSTART_HOST` / `COLDSTART_PORT` | listen address |
+| `SERVEDECK_CONFIG` | config file location |
+| `SERVEDECK_STATE_DIR` | `state_dir` |
+| `SERVEDECK_MODEL_CACHE` | `model_cache` |
+| `SERVEDECK_GPU_TOTAL_MIB` | `gpu_total_mib` |
+| `SERVEDECK_HOST` / `SERVEDECK_PORT` | listen address |
