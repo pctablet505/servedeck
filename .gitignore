@@ -7,4 +7,7 @@ __pycache__/
 # runtime state — machine-specific, never committed
 state/
 coldstart.toml
-web/fonts/
+coldstart/web/fonts/
+dist/
+build/
+*.egg-info/

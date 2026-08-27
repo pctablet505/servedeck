@@ -29,7 +29,7 @@ from . import capacity, config, events, gpu, registry, shellconfig
 from .metrics import MetricsPoller
 
 HERE = Path(__file__).resolve().parent
-WEB = HERE.parent / "web"
+WEB = HERE / "web"   # inside the package, so it ships in the wheel
 def _candidate_logs() -> list[Path]:
     """Backend log files, the one serving our port first.
 
