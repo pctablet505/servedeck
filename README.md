@@ -47,6 +47,7 @@ git clone https://github.com/pctablet505/servedeck && cd servedeck
 cp servedeck.toml.example servedeck.toml
 $EDITOR servedeck.toml        # point it at your launcher
 ./run.sh                      # → http://127.0.0.1:8010
+./stop.sh                     # stop it (or Ctrl-C in the terminal)
 ```
 
 Nothing is installed system-wide. Servedeck binds `127.0.0.1` only, makes no

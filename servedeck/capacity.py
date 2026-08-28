@@ -275,7 +275,10 @@ def compute(
         findings.append(
             Finding(
                 code="UNKNOWN_CAPACITY",
-                level="block",
+                # WARN, not block. Booting is the ONLY way to learn a model's
+                # real weight size, so blocking the launch made the condition
+                # permanent: unknown -> cannot start -> stays unknown.
+                level="warn",
                 title="Weight size unknown — capacity cannot be estimated",
                 detail=(
                     f"{m.repo_id}: weights_source is 'unknown'. The generic "
@@ -326,7 +329,7 @@ def compute(
     if kv_gib_for_tokens > 0 and m.kv_kib_per_token:
         kv_tokens = math.floor(kv_gib_for_tokens * 1048576 / m.kv_kib_per_token)
 
-    if kv_gib > 0 and kv_tokens < ctx:
+    if not weights_unknown and kv_gib > 0 and kv_tokens < ctx:
         fix_action = {"field": "ctx", "value": kv_tokens} if kv_tokens >= 1 else None
         findings.append(
             Finding(

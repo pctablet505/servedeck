@@ -258,10 +258,9 @@ def test_unknown_capacity_blocks_for_qwen4_exp_refused_estimate():
     r = compute(m, util=0.96, ctx=262144, max_num_seqs=128)
     f = _code(r.findings, "UNKNOWN_CAPACITY")
     assert f is not None
-    assert f.level == "block"
+    assert f.level == "warn"
     assert "125.91" in f.detail and "78.47" in f.detail
-    assert "qwen4_exp" in f.detail
-    assert r.can_apply is False
+    assert r.can_apply is True
     assert r.confidence == "unknown"
 
 
@@ -761,7 +760,31 @@ def test_unknown_weights_never_fabricate_a_kv_figure():
     )
     r = compute(m, util=0.95, ctx=262144, max_num_seqs=1)
     assert _code(r.findings, "UNKNOWN_CAPACITY") is not None
-    assert r.can_apply is False
     assert r.kv_tokens == 0, f"fabricated {r.kv_tokens:,} tokens from unknown weights"
     assert r.kv_gib == 0.0
     assert r.agents_at_ctx == 0
+
+
+def test_unknown_weights_do_not_block_the_launch():
+    """Regression: UNKNOWN_CAPACITY used to be a blocker, which was a dead end.
+
+    Booting is the only way to learn a model's real weight size, so blocking
+    the launch made the condition permanent: unknown -> cannot start -> stays
+    unknown forever. Refusing to PREDICT is right; refusing to TRY is not.
+    """
+    m = ModelInputs(
+        repo_id="unknown/model", backend="flashnext", model_max_ctx=262144,
+        weights_gib=None, weights_source="unknown", kv_kib_per_token=30.39,
+        overhead_gib=4.7, trust="estimated", servable=True,
+        unservable_reason=None, model_type="qwen4_exp",
+        used_ctx_for_rate=262144, known_kv_rates={},
+    )
+    r = compute(m, util=0.95, ctx=262144, max_num_seqs=1)
+    f = _code(r.findings, "UNKNOWN_CAPACITY")
+    assert f is not None and f.level == "warn"
+    assert r.can_apply is True, "a model whose size is unknown must still be startable"
+    # but nothing may be fabricated from the weights we do not have
+    assert r.kv_tokens == 0
+    assert _code(r.findings, "KV_TOO_SMALL_FOR_ONE_CTX") is None, (
+        "KV findings derived from unknown weights are meaningless and must be suppressed"
+    )

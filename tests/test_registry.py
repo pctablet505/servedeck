@@ -652,7 +652,7 @@ def test_unknown_weights_source_makes_capacity_raise_unknown_capacity_finding(tm
 
     codes = {f.code for f in result.findings}
     assert "UNKNOWN_CAPACITY" in codes
-    assert result.can_apply is False
+    assert result.can_apply is True
 
 
 # --------------------------------------------------------------------------- #

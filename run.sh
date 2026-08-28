@@ -35,5 +35,14 @@ if [ "${SERVEDECK_RELOAD:-0}" != "0" ]; then
     reload_flag=(--reload --reload-dir "$HERE/servedeck")
 fi
 
-echo "Servedeck starting on http://$HOST:$PORT (Ctrl-C to stop)"
+# A clear message beats uvicorn's "[errno 98] address already in use", which
+# prints AFTER "Application startup complete" and reads like a crash.
+EXISTING="$(ss -H -ltnp "sport = :$PORT" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1 || true)"
+if [ -n "$EXISTING" ]; then
+    echo "Servedeck is already running on http://$HOST:$PORT (pid $EXISTING)." >&2
+    echo "Stop it first:  $HERE/stop.sh" >&2
+    exit 1
+fi
+
+echo "Servedeck starting on http://$HOST:$PORT (Ctrl-C to stop, or ./stop.sh)"
 exec "$VENV/bin/uvicorn" servedeck.app:app --host "$HOST" --port "$PORT" "${reload_flag[@]}" "$@"

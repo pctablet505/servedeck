@@ -418,7 +418,16 @@ function wireControls() {
         log("refused: this configuration cannot start — see the blocker above", "e");
         return;
       }
-      if (!confirm(`Restart with ${m.name} at util ${util.toFixed(2)}, ${fmt(ctx)} context?\n\nThe server will be unavailable for several minutes.`)) return;
+      const unknown = lastEstimate && lastEstimate.confidence === "unknown";
+      const msg = unknown
+        ? `Start ${m.name} at util ${util.toFixed(2)}, ${fmt(ctx)} context?\n\n` +
+          `Its VRAM footprint cannot be predicted for this architecture, so ` +
+          `there is no capacity estimate to check against. Starting it is how ` +
+          `the real figure gets measured — the engine will refuse safely if it ` +
+          `does not fit.\n\nThe server will be unavailable for several minutes.`
+        : `Restart with ${m.name} at util ${util.toFixed(2)}, ${fmt(ctx)} context?\n\n` +
+          `The server will be unavailable for several minutes.`;
+      if (!confirm(msg)) return;
       apply.disabled = true;
       try {
         await post("/api/server/start", {

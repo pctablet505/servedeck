@@ -1,5 +1,17 @@
 # Troubleshooting
 
+## "Address already in use" on start
+
+Something is already on the port. `run.sh` now names it:
+
+```
+Servedeck is already running on http://127.0.0.1:8010 (pid 12345).
+Stop it first:  /path/to/servedeck/stop.sh
+```
+
+Note uvicorn prints its bind error *after* "Application startup complete",
+which reads like a crash. It never got the port.
+
 ## The page loads unstyled
 
 Hard-refresh (`Ctrl+Shift+R`). A stylesheet served once with the wrong
