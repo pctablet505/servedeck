@@ -638,7 +638,15 @@ async def catch_all(path: str, request: Request) -> Any:
         candidate = (WEB / rel).resolve()
         root = WEB.resolve()
         if candidate.is_file() and str(candidate).startswith(str(root)):
-            return FileResponse(candidate)   # FileResponse infers the media type
+            # no-store on the dashboard's own assets. These change whenever the
+            # app is updated, and a browser holding a stale app.js reports bugs
+            # that were already fixed -- with the old error text, which sends
+            # everyone looking in the wrong place. This is a localhost tool;
+            # there is nothing to gain from caching them.
+            return FileResponse(
+                candidate,
+                headers={"Cache-Control": "no-store, must-revalidate"},
+            )   # FileResponse infers the media type
         # A request with a file extension wants a FILE. Returning index.html
         # with content-type text/html for a missing .css/.js is worse than a
         # 404: the browser drops it silently and the page renders unstyled with
@@ -646,7 +654,9 @@ async def catch_all(path: str, request: Request) -> Any:
         if "." in Path(rel).name:
             return JSONResponse({"error": f"not found: {rel}"}, status_code=404)
 
-    return FileResponse(WEB / "index.html")
+    return FileResponse(
+        WEB / "index.html", headers={"Cache-Control": "no-store, must-revalidate"}
+    )
 
 # (no StaticFiles mount: the catch-all above is registered first and would
 # shadow it. Assets are served there, including the /assets/ prefix strip.)
