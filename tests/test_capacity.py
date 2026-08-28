@@ -742,3 +742,26 @@ def test_thin_margin_warns_without_blocking():
     r = compute(FLASHNEXT, util=0.96, ctx=262144, max_num_seqs=1, live=live)
     w = _code(r.findings, "THIN_VRAM_MARGIN")
     assert w is not None and w.level == "warn"
+
+
+def test_unknown_weights_never_fabricate_a_kv_figure():
+    """Regression: unknown weights were substituted with 0.0.
+
+    That made the KV budget absorb the whole card — 2,811,134 tokens for a
+    model whose size nobody knows, displayed next to real models reporting a
+    tenth of that. Blocking the Apply button is not enough; the number itself
+    must not be invented.
+    """
+    m = ModelInputs(
+        repo_id="unknown/model", backend="flashnext", model_max_ctx=262144,
+        weights_gib=None, weights_source="unknown", kv_kib_per_token=30.39,
+        overhead_gib=4.7, trust="estimated", servable=True,
+        unservable_reason=None, model_type="qwen4_exp",
+        used_ctx_for_rate=262144, known_kv_rates={},
+    )
+    r = compute(m, util=0.95, ctx=262144, max_num_seqs=1)
+    assert _code(r.findings, "UNKNOWN_CAPACITY") is not None
+    assert r.can_apply is False
+    assert r.kv_tokens == 0, f"fabricated {r.kv_tokens:,} tokens from unknown weights"
+    assert r.kv_gib == 0.0
+    assert r.agents_at_ctx == 0

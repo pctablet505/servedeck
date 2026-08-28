@@ -110,11 +110,15 @@ agent count is too high. That signal beats any estimate.
 ## Status
 
 **Working:** the dashboard, capacity estimation, live metrics, model discovery,
-and a pass-through proxy.
+start / stop / restart, and a pass-through proxy.
 
-**Not wired yet:** start / stop / restart from the UI. The supervisor and
-gateway modules exist and are tested, but the buttons are disabled rather than
-pretending. Start your server from a terminal for now.
+A server already running when Servedeck starts is deliberately left alone —
+Servedeck does not assume a process it did not start is wanted. Click **Manage
+running server** to adopt it; that is what enables Stop and crash detection
+for it.
+
+**Not wired yet:** the smoke-test button, and the request-holding gateway
+(`gateway.py` exists and is tested, but is not in the request path).
 
 ---
 

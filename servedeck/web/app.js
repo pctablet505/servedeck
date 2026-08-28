@@ -1,4 +1,4 @@
-/* Coldstart frontend.
+/* Servedeck frontend.
  *
  * Ported from the approved design prototype. Two deliberate differences:
  *  1. The prototype's capacity() is GONE. The browser never computes capacity —
@@ -107,19 +107,35 @@ async function doEstimate() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ repo_id: m.repo_id, util, ctx, max_num_seqs: 1 }),
     });
-    const d = await r.json();
-    if (d.error) { showFindings([{ level: "block", title: "Estimate failed", detail: d.error }]); return; }
-    lastEstimate = d;
+    var d = await r.json();
+  } catch (e) {
+    // Only fetch/parse failures belong here. Rendering used to be inside this
+    // try, so a TypeError in the view was reported as a network failure and
+    // sent people looking at a backend that was fine.
+    showFindings([{ level: "block", title: "Backend unreachable", detail: String(e) }]);
+    return;
+  }
+  if (d.error) {
+    showFindings([{ level: "block", title: "Estimate failed", detail: d.error }]);
+    return;
+  }
+  lastEstimate = d;
+  try {
     paintEstimate(d);
   } catch (e) {
-    showFindings([{ level: "block", title: "Backend unreachable", detail: String(e) }]);
+    showFindings([{ level: "block", title: "Display error", detail: String(e) }]);
+    console.error("paintEstimate failed", e, d);
   }
 }
 
 function paintEstimate(d) {
   const set = (id, v) => { const e = $(id); if (e) e.textContent = v; };
   const kv = $("dKv");
-  if (kv) kv.innerHTML = `${d.kv_gib.toFixed(1)}<span style="font-size:13px;font-weight:400"> GiB</span>`;
+  if (kv) {
+    kv.innerHTML = (typeof d.kv_gib === "number")
+      ? `${d.kv_gib.toFixed(1)}<span style="font-size:13px;font-weight:400"> GiB</span>`
+      : "—";
+  }
   set("dKvTok", fmt(d.kv_tokens) + " tokens");
   set("dAgents", d.agents_at_ctx);
   const a = $("dAgents");
@@ -147,9 +163,13 @@ function paintEstimate(d) {
   seg("segK", bar.kv_pct, "KV");
   seg("segO", bar.overhead_pct);
   seg("segF", bar.free_pct);
+  // `(x ?? 0).toFixed` is truthy even when x is null — (0).toFixed is a
+  // function — so the old guard passed and then threw on the real null.
+  // weights_gib IS null for models whose weights cannot be estimated
+  // (host-offload architectures), which is a normal state, not an error.
+  const gib = (v) => (typeof v === "number" ? v.toFixed(1) : "—");
   set("vramTxt",
-    `weights ${(d.weights_gib ?? 0).toFixed ? d.weights_gib.toFixed(1) : "—"} · ` +
-    `KV ${d.kv_gib.toFixed(1)} · budget ${d.budget_gib.toFixed(1)} GiB`);
+    `weights ${gib(d.weights_gib)} · KV ${gib(d.kv_gib)} · budget ${gib(d.budget_gib)} GiB`);
 
   showFindings(d.findings || []);
   paintAgentSizing();
@@ -293,13 +313,49 @@ function paintState(s) {
   }
 
   controlEnabled = !!s.control_enabled;
-  ["apply", "stop", "smoke"].forEach((id) => {
+  const sv = s.supervisor || {};
+  const busy = ["STARTING", "PREFLIGHT", "STOPPING", "DRAINING"].includes(sv.actual_state);
+  const upNow = !!up.up;
+  ["apply", "stop"].forEach((id) => {
     const b = $(id);
-    if (b) {
-      b.disabled = !controlEnabled;
-      if (!controlEnabled) b.title = s.control_note || "not wired yet";
-    }
+    if (!b) return;
+    // Stop only makes sense when something is running; Apply only when the
+    // machine is not mid-transition.
+    b.disabled = !controlEnabled || busy || (id === "stop" && !upNow);
+    b.title = !controlEnabled
+      ? (s.control_note || "supervisor unavailable")
+      : busy ? `busy: ${sv.actual_state}` : "";
   });
+  const smoke = $("smoke");
+  if (smoke) { smoke.disabled = true; smoke.title = "not implemented yet"; }
+
+  // A server running while intent says STOPPED is deliberately untouched.
+  // Offer to adopt it rather than silently leaving Stop inert.
+  const unadopted = upNow && controlEnabled &&
+    (sv.desired_state === "STOPPED" || sv.actual_state === "UNMANAGED");
+  let btn = $("adoptBtn");
+  if (unadopted && !btn) {
+    const bar = document.querySelector(".actions");
+    if (bar) {
+      btn = document.createElement("button");
+      btn.id = "adoptBtn"; btn.className = "btn"; btn.type = "button";
+      btn.textContent = "Manage running server";
+      btn.title = "Bring the already-running server under Servedeck's control";
+      bar.insertBefore(btn, bar.firstChild);
+      wireControls();
+    }
+  } else if (!unadopted && btn) {
+    btn.remove();
+  }
+  const stopBtn = $("stop");
+  if (stopBtn && unadopted) {
+    stopBtn.disabled = true;
+    stopBtn.title = "Not managed yet — click 'Manage running server' first";
+  }
+  if (sv.actual_state && sv.actual_state !== "READY") {
+    const meta = $("sMeta");
+    if (meta && busy) meta.textContent = `${sv.actual_state.toLowerCase()}…`;
+  }
 
   if (MODELS.length && up.model) {
     let servingIdx = -1;
@@ -312,6 +368,65 @@ function paintState(s) {
     // every panel describes a model the user is not using.
     if (servingIdx >= 0 && !userPicked) { sel = servingIdx; estimate(); }
     renderModels();
+  }
+}
+
+/* ------------------------------------------------------------ control --- */
+async function post(path, body) {
+  const r = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+  return d;
+}
+
+function wireControls() {
+  const adopt = $("adoptBtn");
+  if (adopt) {
+    adopt.onclick = async () => {
+      try {
+        const d = await post("/api/server/adopt");
+        log(`adopted the running server (pid ${d.pid})`, "g");
+      } catch (e) { log("adopt failed: " + e.message, "e"); }
+    };
+  }
+
+  const stop = $("stop");
+  if (stop) {
+    stop.onclick = async () => {
+      // Stopping frees the GPU and kills in-flight requests. Confirm, and say
+      // exactly what is running so the click is informed.
+      const running = liveMetrics.running || 0;
+      const what = liveFacts.kv_tokens ? ` (${fmt(liveFacts.kv_tokens)} KV tokens allocated)` : "";
+      const extra = running > 0 ? `\n\n${running} request(s) are in flight and will fail.` : "";
+      if (!confirm(`Stop the model server${what}?${extra}`)) return;
+      stop.disabled = true;
+      try { await post("/api/server/stop"); log("stop requested", "w"); }
+      catch (e) { log("stop failed: " + e.message, "e"); stop.disabled = false; }
+    };
+  }
+
+  const apply = $("apply");
+  if (apply) {
+    apply.onclick = async () => {
+      const m = MODELS[sel];
+      if (!m) return;
+      if (lastEstimate && lastEstimate.can_apply === false) {
+        log("refused: this configuration cannot start — see the blocker above", "e");
+        return;
+      }
+      if (!confirm(`Restart with ${m.name} at util ${util.toFixed(2)}, ${fmt(ctx)} context?\n\nThe server will be unavailable for several minutes.`)) return;
+      apply.disabled = true;
+      try {
+        await post("/api/server/start", {
+          repo_id: m.repo_id, backend: m.backend, util, ctx, max_num_seqs: 1,
+        });
+        log(`applying ${m.name} …`, "g");
+      } catch (e) { log("apply failed: " + e.message, "e"); apply.disabled = false; }
+    };
   }
 }
 
@@ -351,7 +466,8 @@ async function init() {
     try { paintState(await (await fetch("/api/state")).json()); } catch (_) {}
   }, 5000);
 
-  log("connected to Coldstart");
+  wireControls();
+  log("connected");
   matchMedia("(prefers-color-scheme: dark)").addEventListener("change", spark);
 }
 

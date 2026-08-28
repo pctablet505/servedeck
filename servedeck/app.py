@@ -25,7 +25,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from . import capacity, config, events, gpu, registry, shellconfig
+from . import capacity, config, events, gpu, registry, shellconfig, supervisor as _sup
 from .metrics import MetricsPoller
 
 HERE = Path(__file__).resolve().parent
@@ -81,6 +81,24 @@ def _safe_config() -> dict[str, str]:
 
 
 rt = Runtime()
+
+# One supervisor for the process. Created lazily: constructing it touches the
+# state directory, and an import-time failure would take the whole UI down
+# rather than just disabling the controls.
+_supervisor: _sup.Supervisor | None = None
+_supervisor_error: str | None = None
+
+
+def sup() -> _sup.Supervisor | None:
+    global _supervisor, _supervisor_error
+    if _supervisor is None and _supervisor_error is None:
+        try:
+            _supervisor = _sup.Supervisor()
+        except Exception as exc:  # noqa: BLE001
+            _supervisor_error = f"{type(exc).__name__}: {exc}"
+    return _supervisor
+
+
 
 
 # ------------------------------------------------------------- SSE hub ----
@@ -190,6 +208,15 @@ async def _fetch_served_model() -> str | None:
 async def _startup() -> None:
     rt.client = httpx.AsyncClient()
     app.state.poller_task = asyncio.create_task(_poll_loop())
+    # Adopt a server that is already running, so the UI shows READY rather
+    # than STOPPED and a later crash is classified as crash-while-serving.
+    s = sup()
+    if s is not None:
+        try:
+            outcome = await s.reconcile_startup()
+            hub.publish("notice", {"level": "info", "code": "reconciled", "body": outcome})
+        except Exception as exc:  # noqa: BLE001
+            hub.publish("notice", {"level": "warn", "code": "reconcile_failed", "body": str(exc)[:200]})
 
 
 @app.on_event("shutdown")
@@ -355,11 +382,9 @@ def _state() -> dict[str, Any]:
         },
         "gpu": rt.gpu,
         "vllm": rt.metrics,
-        "control_enabled": False,
-        "control_note": (
-            "Start/stop/restart are not wired yet — supervisor.py is not built. "
-            "Use ./codex-qwen.sh or vllm-qwen38next/serve.sh from a terminal."
-        ),
+        "control_enabled": sup() is not None,
+        "control_note": _supervisor_error or "",
+        "supervisor": (sup().snapshot() if sup() is not None else {}),
         "uptime_s": int(time.time() - STARTED_AT),
     }
 
@@ -394,6 +419,122 @@ async def api_estimate(body: dict[str, Any]) -> Any:
         )
     except Exception as exc:  # noqa: BLE001
         return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=400)
+
+
+def _need_sup() -> Any:
+    s = sup()
+    if s is None:
+        return JSONResponse(
+            {"error": _supervisor_error or "supervisor unavailable"}, status_code=503
+        )
+    return s
+
+
+@app.post("/api/server/adopt")
+async def api_adopt(body: dict[str, Any] | None = None) -> Any:
+    """Bring an already-running server under management.
+
+    On startup, a server that is running while desired_state is STOPPED is
+    deliberately left alone -- Servedeck does not assume a process it did not
+    start is wanted. Adopting is the explicit human act that says it is, and
+    it is what makes Stop and crash-detection work for that process.
+    """
+    s = _need_sup()
+    if isinstance(s, JSONResponse):
+        return s
+    port = int((body or {}).get("port") or s.desired.port or rt.port)
+    from . import procctl
+
+    pid = procctl.listener_pid(port)
+    if pid is None:
+        return JSONResponse({"error": f"nothing is listening on port {port}"}, status_code=409)
+    if not procctl.is_attributable(pid):
+        return JSONResponse(
+            {
+                "error": (
+                    f"a server is serving on :{port} but its process (pid {pid}) cannot be "
+                    "attributed, so Servedeck cannot control it. Stop it from the terminal "
+                    "that launched it."
+                )
+            },
+            status_code=409,
+        )
+    d = s.desired
+    d.desired_state = "RUNNING"
+    d.port = port
+    if not d.repo_id:
+        d.repo_id = rt.serving_model
+    if not d.backend:
+        d.backend = _safe_config().get("BACKEND") or "flashnext"
+    _sup.save_desired(d, s.state_dir)
+    s._run_repo_id, s._run_backend = d.repo_id, d.backend
+    s._adopt_ready(pid)
+    hub.publish("state", _state())
+    return JSONResponse({"adopted": True, "pid": pid, "port": port}, status_code=200)
+
+
+@app.post("/api/server/stop")
+async def api_stop() -> Any:
+    s = _need_sup()
+    if isinstance(s, JSONResponse):
+        return s
+    # Returns immediately; progress arrives on /api/events. Stop sets
+    # desired_state=STOPPED BEFORE signalling, so the resulting exit is
+    # recorded as intent and never auto-restarted.
+    asyncio.create_task(_run_and_report(s.stop(), "stop"))
+    return JSONResponse({"accepted": True, "action": "stop"}, status_code=202)
+
+
+@app.post("/api/server/start")
+async def api_start(body: dict[str, Any] | None = None) -> Any:
+    s = _need_sup()
+    if isinstance(s, JSONResponse):
+        return s
+    b = body or {}
+    d = s.desired
+    asyncio.create_task(
+        _run_and_report(
+            s.start(
+                repo_id=b.get("repo_id") or d.repo_id,
+                backend=b.get("backend") or d.backend,
+                served_name=b.get("served_name") or d.served_name,
+                port=int(b.get("port") or d.port or rt.port),
+                util=float(b["util"]) if b.get("util") is not None else d.util,
+                max_model_len=int(b["ctx"]) if b.get("ctx") is not None else d.max_model_len,
+                max_num_seqs=int(b["max_num_seqs"]) if b.get("max_num_seqs") is not None else d.max_num_seqs,
+            ),
+            "start",
+        )
+    )
+    return JSONResponse({"accepted": True, "action": "start"}, status_code=202)
+
+
+@app.post("/api/server/restart")
+async def api_restart(body: dict[str, Any] | None = None) -> Any:
+    s = _need_sup()
+    if isinstance(s, JSONResponse):
+        return s
+    mode = (body or {}).get("mode", "immediate")
+    asyncio.create_task(_run_and_report(s.restart(mode=mode), f"restart:{mode}"))
+    return JSONResponse({"accepted": True, "action": "restart", "mode": mode}, status_code=202)
+
+
+async def _run_and_report(coro: Any, label: str) -> None:
+    """Await a supervisor action, reporting the outcome on the event stream.
+
+    Without this, a failure inside a fire-and-forget task is swallowed and the
+    UI simply never changes state.
+    """
+    try:
+        await coro
+        hub.publish("notice", {"level": "info", "code": label, "body": f"{label} completed"})
+    except Exception as exc:  # noqa: BLE001
+        hub.publish(
+            "notice",
+            {"level": "error", "code": f"{label}_failed", "body": f"{type(exc).__name__}: {exc}"},
+        )
+    finally:
+        hub.publish("state", _state())
 
 
 @app.get("/api/events")

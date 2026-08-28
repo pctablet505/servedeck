@@ -269,6 +269,7 @@ def compute(
         )
 
     # ------------------------------------------------------- weights/budget
+    weights_unknown = False
     weights_gib = m.weights_gib
     if m.weights_source == "unknown" or weights_gib is None:
         findings.append(
@@ -287,12 +288,21 @@ def compute(
             )
         )
         weights_gib = 0.0
+        weights_unknown = True
 
     overhead_gib = m.overhead_gib
     budget_gib = util * GPU_TOTAL_GIB
     kv_gib = budget_gib - weights_gib - overhead_gib
 
-    if kv_gib <= 0:
+    if weights_unknown:
+        # Unknown weights were being substituted with 0.0, so the KV budget
+        # absorbed the entire card and reported millions of tokens -- a bigger
+        # number than any real model, shown as if it meant something.
+        # UNKNOWN_CAPACITY already blocks applying it; the displayed figures
+        # must be blank too, not fabricated.
+        kv_gib = 0.0
+        kv_gib_for_tokens = 0.0
+    elif kv_gib <= 0:
         util_min = _util_min_for(weights_gib, overhead_gib)
         findings.append(
             Finding(
