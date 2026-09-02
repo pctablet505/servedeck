@@ -13,8 +13,8 @@ would be a tautology, so only `servedeck/` is walked below.
 
 It also exercises SPEC.md §2 rules 2/3 end to end against a real (harmless,
 non-vLLM) child process: `launch()` must give the child its own session
-and process group, distinct from Coldstart's own, and `stop()` must refuse
-outright rather than ever signal Coldstart's own process group.
+and process group, distinct from Servedeck's own, and `stop()` must refuse
+outright rather than ever signal Servedeck's own process group.
 """
 
 from __future__ import annotations
@@ -66,7 +66,7 @@ def test_launch_gets_its_own_session_and_process_group(tmp_path, monkeypatch) ->
     try:
         pgid = os.getpgid(handle.pid)
         assert pgid == handle.pid, "launched process must be its own group leader (start_new_session=True)"
-        assert pgid != own_pgid, "launched process must NOT share Coldstart's own process group"
+        assert pgid != own_pgid, "launched process must NOT share Servedeck's own process group"
         assert handle.pgid == pgid
     finally:
         result = procctl.stop(handle, timeout_s=5, escalate=True)
@@ -76,7 +76,7 @@ def test_launch_gets_its_own_session_and_process_group(tmp_path, monkeypatch) ->
 def test_stop_refuses_to_signal_own_process_group(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(paths, "STATE_DIR", tmp_path / "state")
     own_pgid = os.getpgid(0)
-    # A handle that (falsely) claims to BE Coldstart's own process group —
+    # A handle that (falsely) claims to BE Servedeck's own process group —
     # rule 3's guard, exercised directly rather than only trusting that no
     # caller ever constructs one of these by accident.
     fake_handle = procctl.ServerHandle(

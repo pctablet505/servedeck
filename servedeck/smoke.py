@@ -1,4 +1,4 @@
-"""Coldstart smoke test — SPEC.md §8 "SMOKE TEST".
+"""Servedeck smoke test — SPEC.md §8 "SMOKE TEST".
 
 Two requests, run THROUGH the gateway (http://127.0.0.1:8010 by default,
 never directly at :8001/:8000) so this proves the gateway path too, not
@@ -302,7 +302,7 @@ async def run_smoke(
 
 def _format_report(result: SmokeResult) -> str:
     lines = [
-        f"Coldstart smoke test — base_url={result.base_url} model={result.model!r} "
+        f"Servedeck smoke test — base_url={result.base_url} model={result.model!r} "
         f"— {'PASS' if result.ok else 'FAIL'} ({result.finished_at - result.started_at:.1f}s)"
     ]
     for s in result.steps:
@@ -321,7 +321,7 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--base-url",
         default=None,
-        help="Coldstart gateway base URL (default: $SERVEDECK_URL or http://127.0.0.1:8010)",
+        help="Servedeck gateway base URL (default: $SERVEDECK_URL or http://127.0.0.1:8010)",
     )
     parser.add_argument("--json", action="store_true", help="emit JSON instead of a human-readable report")
     parser.add_argument("--timeout-s", type=float, default=120.0, help="per-request timeout in seconds")

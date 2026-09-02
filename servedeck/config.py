@@ -40,7 +40,7 @@ DEFAULT_OVERHEAD_GIB = 4.7
 class Backend:
     """One way of launching a model server.
 
-    Coldstart never builds a ``vllm serve`` command line itself. It runs your
+    Servedeck never builds a ``vllm serve`` command line itself. It runs your
     launcher and passes settings through the environment, so the launcher stays
     the single source of truth for flags.
     """
@@ -48,12 +48,26 @@ class Backend:
     name: str
     launcher: Path
     port: int
-    log_path: Path
+    #: The log this backend is conventionally started into by hand. Used when
+    #: ADOPTING a server Servedeck did not launch, and when reading the boot
+    #: numbers of one. None means "this launcher has no fixed log": Servedeck
+    #: then falls back to the newest log it opened itself, under
+    #: ``state/boot_logs/<name>-*.log``. Naming another backend's log here is
+    #: worse than naming none — the phase machine would classify a different
+    #: model's error lines as this run's failure.
+    log_path: Path | None = None
+    #: True when the launcher redirects its own output into ``log_path``
+    #: (``exec >> "$LOG"``). Then a launch has to tail that file too, because
+    #: the boot output stops arriving on the pipe Servedeck opened. False when
+    #: ``log_path`` is only a hand-launch convention: tailing it during a fresh
+    #: launch would replay a previous boot into the phase machine.
+    writes_own_log: bool = False
     venv: Path | None = None
-    # Environment variable names the launcher reads, so Coldstart can pass
+    # Environment variable names the launcher reads, so Servedeck can pass
     # settings without knowing the flags.
     env_map: dict[str, str] = field(
         default_factory=lambda: {
+            "repo_id": "MODEL",
             "port": "PORT",
             "max_model_len": "MAX_LEN",
             "util": "GPU_UTIL",
@@ -61,10 +75,14 @@ class Backend:
             "served_name": "SERVED_NAME",
         }
     )
+    #: Fixed environment passed to the launcher verbatim on every start —
+    #: tuning knobs that belong to your machine, not to Servedeck. Servedeck
+    #: never interprets these; the launcher owns their meaning.
+    env: dict[str, str] = field(default_factory=dict)
     # Architectures this backend can serve, from config.json's `architectures`.
     architectures: tuple[str, ...] = ()
     # True if starting it needs a terminal (e.g. an interactive sudo prompt),
-    # which makes unattended restart impossible. Coldstart reports
+    # which makes unattended restart impossible. Servedeck reports
     # blocked-needs-human rather than looping.
     needs_tty: bool = False
 
@@ -79,11 +97,11 @@ class Config:
     frag_margin_mib: int = DEFAULT_FRAG_MARGIN_MIB
     listen_host: str = "127.0.0.1"
     listen_port: int = 8010
-    # Optional: a shell script Coldstart shells out to for config writes, so a
-    # CLI and the GUI cannot drift. None = Coldstart owns its own state only.
+    # Optional: a shell script Servedeck shells out to for config writes, so a
+    # CLI and the GUI cannot drift. None = Servedeck owns its own state only.
     shell_config_script: Path | None = None
     #: If any of these paths exists, something else wants the GPU and
-    #: Coldstart stands down instead of starting a server.
+    #: Servedeck stands down instead of starting a server.
     training_markers: tuple[str, ...] = ()
 
     def backend(self, name: str | None) -> Backend | None:
@@ -151,18 +169,27 @@ def _parse_backend(name: str, raw: dict[str, Any]) -> Backend:
         raise ValueError(f"backend '{name}' is missing required key(s): {', '.join(missing)}")
     launcher = Path(str(raw["launcher"])).expanduser()
     port = int(raw["port"])
-    log_path = (
-        Path(str(raw["log_path"])).expanduser()
-        if raw.get("log_path")
-        else launcher.parent / f"{name}.log"
-    )
+    # No invented default: a guessed path (launcher.parent/<name>.log) reads
+    # as a real answer, and an adopted server's boot facts would be parsed out
+    # of a file nothing writes. Absent means absent.
+    log_path = Path(str(raw["log_path"])).expanduser() if raw.get("log_path") else None
     return Backend(
         name=name,
         launcher=launcher,
         port=port,
         log_path=log_path,
+        writes_own_log=bool(raw.get("writes_own_log", False)),
         venv=Path(str(raw["venv"])).expanduser() if raw.get("venv") else None,
-        env_map=dict(raw["env_map"]) if raw.get("env_map") else Backend.__dataclass_fields__["env_map"].default_factory(),  # type: ignore[misc]
+        # `in raw`, not truthiness: an EMPTY [backends.x.env_map] table is a
+        # deliberate "this launcher reads no environment" (it takes its
+        # settings from a file), and falling back to the default map there
+        # would hand it settings it never asked for.
+        env_map=(
+            {str(k): str(v) for k, v in (raw["env_map"] or {}).items()}
+            if "env_map" in raw
+            else Backend.__dataclass_fields__["env_map"].default_factory()  # type: ignore[misc]
+        ),
+        env={str(k): str(v) for k, v in (raw.get("env") or {}).items()},
         architectures=tuple(raw.get("architectures", ())),
         needs_tty=bool(raw.get("needs_tty", False)),
     )
@@ -201,7 +228,9 @@ def load(path: Path | None = None) -> Config:
         listen_host=str(os.environ.get("SERVEDECK_HOST") or raw.get("listen_host", "127.0.0.1")),
         listen_port=int(os.environ.get("SERVEDECK_PORT") or raw.get("listen_port", 8010)),
         shell_config_script=Path(shell_script).expanduser() if shell_script else None,
-        training_markers=tuple(raw.get("training_markers", ())),
+        training_markers=tuple(
+            str(Path(str(m)).expanduser()) for m in raw.get("training_markers", ())
+        ),
     )
 
 

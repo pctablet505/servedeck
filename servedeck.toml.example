@@ -29,22 +29,48 @@
 [backends.vllm]
 launcher = "~/serve.sh"
 port = 8000
+# The venv the server runs out of. Checked before every start (a stale venv
+# path is the single largest boot-failure class), and used to recognise a
+# server you started by hand so Servedeck can adopt and supervise it.
+venv = "~/.venv-vllm"
+
+# Where a HAND-started run of this backend writes its log. Servedeck reads it
+# to recover an adopted server's boot numbers. Leave it out if your launcher
+# has no fixed log — Servedeck then uses the one it opened itself, under
+# state/boot_logs/<backend>-*.log. Never name another backend's log here: the
+# phase machine would file its errors as this backend's failures.
 log_path = "~/serve.log"
+# Set this only if the launcher redirects its OWN output into log_path
+# (`exec >> "$LOG"`). Servedeck then tails that file during a launch too,
+# because the boot output stops arriving on the pipe it opened.
+# writes_own_log = true
 
 # Which architectures (config.json -> architectures[0]) this backend can load.
 # Models with an architecture no backend claims are listed but not startable.
+# This is also how you teach Servedeck a model family it does not know.
 architectures = ["Qwen3ForCausalLM", "LlamaForCausalLM", "MistralForCausalLM"]
-
-# Environment variables your launcher reads. Left side is Servedeck's setting
-# name, right side is your variable.
-[backends.vllm.env_map]
-port = "PORT"
-max_model_len = "MAX_LEN"
-util = "GPU_UTIL"
-max_num_seqs = "MAX_SEQS"
-served_name = "SERVED_NAME"
 
 # Set if starting this backend needs a terminal (e.g. an interactive sudo
 # prompt). Servedeck will not try to restart it unattended; it reports
 # blocked-needs-human instead of looping forever.
 # needs_tty = true
+
+# Environment variables your launcher reads. Left side is Servedeck's setting
+# name, right side is your variable. An EMPTY table means "this launcher reads
+# no environment" (it takes its settings from a file); omitting the table
+# entirely gets the defaults below.
+[backends.vllm.env_map]
+repo_id = "MODEL"
+port = "PORT"
+max_model_len = "MAX_LEN"
+util = "GPU_UTIL"
+max_num_seqs = "MAX_SEQS"
+served_name = "SERVED_NAME"
+kv_dtype = "KV_DTYPE"
+
+# Fixed environment for this backend, passed to the launcher verbatim on every
+# start. This is where machine-specific tuning goes — offload sizing, a KV cap,
+# a feature flag your build understands. Servedeck never interprets these; the
+# launcher owns their meaning.
+# [backends.vllm.env]
+# CPU_OFFLOAD_GB = "104"

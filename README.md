@@ -63,7 +63,6 @@ The minimum is one backend — the launcher you already use:
 [backends.vllm]
 launcher = "~/serve.sh"
 port = 8000
-log_path = "~/serve.log"
 architectures = ["Qwen3ForCausalLM", "LlamaForCausalLM"]
 ```
 
@@ -72,11 +71,15 @@ your script keeps owning the flags:
 
 ```toml
 [backends.vllm.env_map]
+repo_id       = "MODEL"
 port          = "PORT"
 max_model_len = "MAX_LEN"
 util          = "GPU_UTIL"
 max_num_seqs  = "MAX_SEQS"
 ```
+
+Machine-specific tuning your launcher reads — offload sizing, a KV cap — goes
+in `[backends.vllm.env]` and is passed through verbatim.
 
 GPU size and model cache are auto-detected. Full reference:
 **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)**.
@@ -94,6 +97,13 @@ measured from a real boot are labelled **measured**; the rest say **estimated**.
 
 **Live utilization** — KV occupancy, running and queued requests, preemptions,
 average context per request, and prefix cache hit rate.
+
+**Throughput, both halves** — generation *and* prefill tokens per second, from
+the engine's own counters. One number cannot tell a 17-second time-to-first-
+token apart from a slow decode, and on a PCIe-bound decode the two differ by
+~70x. Prefill excludes prefix-cache hits, because a cached token costs no
+prefill compute and counting it makes a cache hit look like a throughput
+record. An idle server reports "—", never "0 tok/s".
 
 **Agent sizing** — two numbers, never one:
 

@@ -92,6 +92,13 @@ h1,h2,h3{margin:0;text-wrap:balance}
   padding:5px 12px;font-size:12px;color:var(--ink-2);box-shadow:var(--shadow)
 }
 .gpuchip .dot{width:7px;height:7px;border-radius:50%;background:var(--ok)}
+.urlchip{
+  font:inherit;font-size:12px;color:var(--ink-2);
+  background:var(--surface);border:1px solid var(--line);border-radius:999px;
+  padding:5px 12px;cursor:pointer;box-shadow:var(--shadow);white-space:nowrap
+}
+.urlchip:hover{border-color:var(--line-strong)}
+.urlchip.copied{border-color:var(--ok);color:var(--ok)}
 
 .vram{margin:14px 0 20px}
 .vram-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px}

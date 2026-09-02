@@ -87,7 +87,7 @@ def test_adopted_server_reports_reached_ready() -> None:
 
     _adopt_ready() left _tracker None, so reached_ready computed False and
     _on_exit took the failed-boot branch — disabling auto-restart for every
-    server that was already running when Coldstart started.
+    server that was already running when Servedeck started.
     """
     t = phases.PhaseTracker()
     assert t.reached_ready is False
@@ -117,3 +117,58 @@ def test_failed_boot_is_never_auto_restarted() -> None:
         reached_ready=t.reached_ready,
     )
     assert f is not None and f.auto_restart is False
+
+
+# --------------------------------------------------------------------------
+# Monitor / adoption regressions
+# --------------------------------------------------------------------------
+def test_adopted_server_monitor_notices_the_process_exiting(tmp_path: Path) -> None:
+    """Regression: _run_monitor died on its first tick for an ADOPTED server.
+
+    _adopt_ready() calls _run_monitor(already_ready=True), which leaves
+    `client` None — but the poll body is guarded on `self._tracker is not
+    None`, which _adopt_ready has just made true. `assert client is not None`
+    therefore fired on iteration 1, the exception was swallowed by the
+    fire-and-forget task, and nothing ever checked liveness again.
+
+    Observed consequence on a live instance: /api/state reported actual_state
+    READY with nothing listening on the port at all.
+    """
+    s, _ = _fake_supervisor(tmp_path)
+    # _fake_supervisor stubs _run_monitor out; this test is about the real one.
+    del s._run_monitor
+    s.desired.backend = "flashnext"
+    s.desired.port = 8001
+    s._tracker = phases.PhaseTracker()
+    s._tracker.mark_adopted_ready()
+    s.actual_state = "READY"
+
+    handle = procctl.ServerHandle(
+        pid=424242, pgid=424242, argv=[], cwd="/tmp", log_path="", started_at=0.0,
+    )
+    alive = [True]
+    s._try_reap = types.MethodType(lambda self, pid: None, s)          # type: ignore[assignment]
+    s._pid_alive = types.MethodType(lambda self, pid: alive[0], s)     # type: ignore[assignment]
+    exits: list = []
+
+    async def fake_on_exit(self, handle, *, reaped_status):  # noqa: ANN001
+        exits.append(reaped_status)
+
+    s._on_exit = types.MethodType(fake_on_exit, s)                     # type: ignore[assignment]
+
+    async def scenario() -> None:
+        task = asyncio.create_task(
+            s._run_monitor(handle, log_paths=[], port=8001, already_ready=True)
+        )
+        for _ in range(200):                 # let a few poll ticks happen
+            await asyncio.sleep(0)
+        alive[0] = False                     # the server dies
+        await asyncio.wait_for(task, timeout=5.0)
+
+    asyncio.run(scenario())
+
+    assert exits == [None], (
+        "the monitor of an adopted server must survive its poll loop and "
+        "report the exit; instead it crashed on tick 1 and the UI sat on a "
+        "stale READY forever"
+    )

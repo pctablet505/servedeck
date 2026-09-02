@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from . import config as _config
+
 # --------------------------------------------------------------------------- #
 # Constants (SPEC §4)
 # --------------------------------------------------------------------------- #
@@ -35,12 +37,36 @@ KNOWN_ARCHS: dict[str, str] = {
     "Qwen4ExpForConditionalGeneration": "flashnext",
 }
 
-#: Reverse of KNOWN_ARCHS. Valid only because the map above is currently 1:1
-#: (each backend has exactly one known architecture). Used by the tier-3 KV-rate
-#: family estimate to classify *historical* observations by architecture even if
-#: their repo has since been deleted from the hub cache (backend survives in the
-#: observation; the architecture does not).
-_REVERSE_KNOWN_ARCHS: dict[str, str] = {backend: arch for arch, backend in KNOWN_ARCHS.items()}
+def arch_backends() -> dict[str, str]:
+    """architectures[0] -> backend, with servedeck.toml layered over the
+    built-in map.
+
+    Declaring `architectures` on a `[backends.<name>]` section is the whole
+    supported way to teach Servedeck a new model family — no code change, and
+    no architecture name belonging to one person's box baked into a public
+    package. KNOWN_ARCHS remains the fallback for an install with no config.
+    """
+    merged = dict(KNOWN_ARCHS)
+    try:
+        backends = _config.get().backends
+    except Exception:  # noqa: BLE001 - an unreadable config must not hide models
+        return merged
+    for b in backends:
+        for arch in b.architectures:
+            merged[arch] = b.name
+    return merged
+
+
+def _reverse_arch_backends() -> dict[str, str]:
+    """Reverse of :func:`arch_backends`. Valid only where the map is 1:1 (each
+    backend has exactly one known architecture). Used by the tier-3 KV-rate
+    family estimate to classify *historical* observations by architecture even
+    if their repo has since been deleted from the hub cache (backend survives
+    in the observation; the architecture does not). A backend declaring several
+    architectures simply has no single reverse answer — last one wins, and the
+    estimate degrades to "no measured observation", never to a wrong family.
+    """
+    return {backend: arch for arch, backend in arch_backends().items()}
 
 GIB = 1024**3
 
@@ -219,14 +245,15 @@ def _build_entry(repo_id: str, hub_dirname: str, snapshot: Path | None) -> Model
     cfg = _parse_config(snapshot)
     config_exists = cfg is not None
     fields = _extract_config_fields(cfg) if cfg is not None else {k: None for k in _CONFIG_FIELD_NAMES}
-    backend = KNOWN_ARCHS.get(fields["architectures0"]) if fields["architectures0"] else None
+    known_archs = arch_backends()
+    backend = known_archs.get(fields["architectures0"]) if fields["architectures0"] else None
 
     reasons: list[str] = []
     if safetensors_gib <= 0:
         reasons.append("0 safetensors")
     if not config_exists:
         reasons.append("no config.json")
-    elif fields["architectures0"] not in KNOWN_ARCHS:
+    elif fields["architectures0"] not in known_archs:
         reasons.append(f"unknown architecture {fields['architectures0']!r}")
 
     servable = not reasons
@@ -401,6 +428,18 @@ def _estimate_weights_gib(
             "weights by ~37% (measured: 125.91 GiB disk vs 78.47 GiB VRAM on "
             "RadixArk/Qwen3.8-Flash-Next-NVFP4)",
         )
+    if model_type == "glm5_next":
+        return (
+            None,
+            "unknown",
+            "safetensors*1.01 estimator refused for model_type='glm5_next': the "
+            "routed experts are host-offloaded via --cpu-offload-gb, so VRAM "
+            "weights are on-disk size MINUS whatever that knob is set to, and "
+            "the knob is a tuning choice rather than a model property (measured: "
+            "181.3 GiB disk, ~79 GiB VRAM at CPU_OFFLOAD_GB=104). Estimating "
+            "from disk size produced 183.11 GiB and a nonsensical negative KV "
+            "budget of -97 GiB",
+        )
     return round(safetensors_gib * 1.01, 4), "estimated", None
 
 
@@ -412,10 +451,11 @@ def _estimate_kv_rate(
     if not architectures0:
         return None, "unknown", "unknown architecture; cannot estimate KV rate by family"
     rates: list[float] = []
+    reverse_archs = _reverse_arch_backends()
     for obs in all_observations:
         if obs.get("trust") != "measured":
             continue
-        arch = _REVERSE_KNOWN_ARCHS.get(obs.get("backend"))
+        arch = reverse_archs.get(obs.get("backend"))
         if arch != architectures0:
             continue
         rate = _kv_rate_of(obs)

@@ -1,4 +1,4 @@
-"""Coldstart GPU introspection — SPEC.md §2's nvidia-smi wrappers and the
+"""Servedeck GPU introspection — SPEC.md §2's nvidia-smi wrappers and the
 Xid classification described there (reusing bin/qwen-server-record-death.sh
 lines 54-69's case statement, read verbatim from that file).
 

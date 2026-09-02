@@ -1,4 +1,4 @@
-"""Coldstart — FastAPI application.
+"""Servedeck — FastAPI application.
 
 Module is named `app` because run.sh and systemd/servedeck.service both import
 `servedeck.app:app`. SPEC.md called it api.py; those two files won the tie
@@ -39,12 +39,21 @@ def _candidate_logs() -> list[Path]:
     cfg = config.get()
     ours = [b for b in cfg.backends if b.port == rt.port]
     others = [b for b in cfg.backends if b.port != rt.port]
-    return [b.log_path for b in (*ours, *others)]
+    # log_path is optional: a launcher with no log management of its own has
+    # no fixed file to name, and None is not a path to try opening.
+    return [b.log_path for b in (*ours, *others) if b.log_path is not None]
 
 UPSTREAM_HOST = "http://localhost"
+#: Context length assumed when a model's config.json declares no
+#: max_position_embeddings. A fallback, never a claim: it exists so the UI has
+#: something to draw, and every real number overrides it.
+DEFAULT_MODEL_MAX_CTX = 262144
+#: A port a listener can actually be on. A hand-edited shell config must not be
+#: able to retarget the whole dashboard at nothing.
+_PORT_RANGE = range(1, 65536)
 STARTED_AT = time.time()
 
-app = FastAPI(title="Coldstart", docs_url=None, redoc_url=None)
+app = FastAPI(title="Servedeck", docs_url=None, redoc_url=None)
 
 
 # ----------------------------------------------------------------- state --
@@ -52,8 +61,7 @@ class Runtime:
     """Process-wide mutable state. One instance, created at startup."""
 
     def __init__(self) -> None:
-        cfg = _safe_config()
-        self.port = int(cfg.get("PORT") or _default_port())
+        self.port = _config_port() or _default_port()
         self.upstream = f"{UPSTREAM_HOST}:{self.port}"
         self.poller = MetricsPoller(self.upstream)
         self.metrics: dict[str, Any] = {"reachable": False}
@@ -65,6 +73,69 @@ class Runtime:
 
     def config(self) -> dict[str, str]:
         return _safe_config()
+
+    def retarget_from_config(self) -> bool:
+        """Follow the shell config's PORT if it has moved. True if it moved.
+
+        The port was read exactly once, at construction. Every start rewrites
+        PORT (supervisor._sync_shell_config), so starting a server on a
+        different port left the metrics poller, the uptime lookup, the
+        running-model probe, the own-VRAM discount and the /v1 proxy all
+        watching the old port for the life of the process — each reporting
+        "not reachable" about a server that was serving perfectly.
+
+        The poller is rebuilt rather than re-pointed: it carries a two-sample
+        throughput baseline belonging to the OLD server, and carrying that
+        across would produce one fabricated rate spanning two processes.
+        """
+        port = _config_port()
+        if port is None or port == self.port:
+            return False
+        self.port = port
+        self.upstream = f"{UPSTREAM_HOST}:{port}"
+        self.poller = MetricsPoller(self.upstream)
+        self.metrics = {"reachable": False}
+        self.serving_model = None
+        return True
+
+
+def _config_port() -> int | None:
+    """The upstream port the shell config names, or None if it names nothing
+    usable. None means "keep what we have", never "fall back to zero"."""
+    try:
+        port = int(_safe_config().get("PORT") or 0)
+    except (TypeError, ValueError):
+        return None
+    return port if port in _PORT_RANGE else None
+
+
+def _training_marker_hits() -> list[str]:
+    """Marker files that exist right now. Empty when none do — and empty when
+    none are configured, which is the same thing to the caller."""
+    hits = []
+    for marker in capacity.TRAINING_MARKER_PATHS:
+        try:
+            if Path(marker).expanduser().exists():
+                hits.append(marker)
+        except OSError:
+            continue
+    return hits
+
+
+def _server_uptime_s() -> int | None:
+    """Uptime of the process actually serving on rt.port, or None.
+
+    procctl is imported here, not at module scope: app.py deliberately keeps
+    that import local (see api_adopt), and referencing it globally silently
+    raised NameError into the except below — which read as "no uptime".
+    """
+    from . import procctl
+
+    try:
+        pid = procctl.listener_pid(rt.port)
+        return procctl.process_uptime_s(pid) if pid else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _default_port() -> int:
@@ -112,6 +183,12 @@ async def _poll_loop() -> None:
     assert rt.client is not None
     while True:
         try:
+            if rt.retarget_from_config():
+                hub.publish(
+                    "notice",
+                    {"level": "info", "code": "retargeted",
+                     "body": f"upstream port changed — now watching {rt.upstream}"},
+                )
             snap = await rt.poller.scrape(rt.client)
             rt.metrics = snap.to_dict()
             rt.upstream_up = snap.reachable
@@ -131,6 +208,14 @@ async def _poll_loop() -> None:
 
             if rt.upstream_up and rt.serving_model is None:
                 rt.serving_model = await _fetch_served_model()
+            if not rt.upstream_up:
+                rt.serving_model = None
+
+            # A server that comes back on its own — started from a terminal
+            # after a blocker was cleared — must be noticed. Without this the
+            # dashboard sits on a stale FAILED while the model serves happily,
+            # and a later crash is misfiled because nothing is tracking it.
+            await _recover_if_server_returned()
 
             hub.publish(
                 "telemetry",
@@ -147,6 +232,107 @@ _KV_RE = re.compile(r"GPU KV cache size:\s*([\d,]+)\s*tokens")
 _KVGIB_RE = re.compile(r"Available KV cache memory:\s*([\d.]+)\s*GiB")
 _CONC_RE = re.compile(r"Maximum concurrency for\s*([\d,]+)\s*tokens per request:\s*([\d.]+)x")
 _WEIGHTS_RE = re.compile(r"Model loading took\s*([\d.]+)\s*GiB")
+_MODEL_RE = re.compile(r"'model_tag':\s*'([^']+)'")
+
+
+def _argv_flag(argv: list[str], flag: str) -> str | None:
+    """The value following `flag` in a command line, or None.
+
+    Space-separated form only — that is how vLLM's own launchers spell their
+    flags. A flag in trailing position has no value and must not read off the
+    end.
+    """
+    for i, a in enumerate(argv):
+        if a == flag and i + 1 < len(argv):
+            return argv[i + 1]
+    return None
+
+
+def _max_model_len_from(argv: list[str]) -> int | None:
+    """--max-model-len as an int, or None if absent or not a length."""
+    raw = _argv_flag(argv, "--max-model-len")
+    try:
+        value = int(raw) if raw is not None else 0
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _listener_argv() -> list[str]:
+    """The command line of whatever is listening on rt.port."""
+    from . import procctl
+
+    pid = procctl.listener_pid(rt.port)
+    if pid is None:
+        return []
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
+    except OSError:
+        return []
+    return [a for a in raw.split("\0") if a]
+
+
+def _running_max_model_len() -> int | None:
+    """The context length the LIVE server is actually serving.
+
+    The serving line's "N ctx" has now been wrong twice from two different
+    stale sources: first the UI's own slider, then supervisor.max_model_len.
+    The second is desired config — what Servedeck WANTS — and for a server it
+    adopted rather than launched, the two need not agree at all. The process's
+    own command line is the only authoritative source, exactly as
+    _running_model_id() already argues for the model name.
+    """
+    return _max_model_len_from(_listener_argv())
+
+
+def _running_model_id() -> str | None:
+    """The model the LIVE process is serving, from its own command line.
+
+    Authoritative, unlike a log file (which can be stale, or belong to a
+    different run) and unlike --served-model-name (which an operator may reuse
+    across different models, leaving two models indistinguishable over the
+    API).
+    """
+    argv = _listener_argv()
+    if not argv:
+        return None
+    for i, a in enumerate(argv):
+        if a == "--model" and i + 1 < len(argv):
+            return argv[i + 1]
+    # positional form: `vllm serve <model>`
+    for i, a in enumerate(argv):
+        if a.endswith("vllm") and i + 2 < len(argv) and argv[i + 1] == "serve":
+            return argv[i + 2]
+    return None
+
+
+def _boot_log_candidates(
+    backend: str | None = None, *, boot_log_dir: Path | None = None
+) -> tuple[Path, ...]:
+    """Logs that could hold the running server's boot numbers, best first.
+
+    Chosen by BACKEND, not by port. The old rule ordered by which backend owns
+    rt.port, which cannot name the log of a backend that declares none — so
+    such a deployment opened some other backend's log first, and that file can
+    be a stale symlink to a months-old boot of a different model carrying a
+    real "GPU KV cache size: N tokens" line. Only _live_boot_facts()'
+    model_tag guard kept that number off the dashboard, and that guard is a
+    backstop, not a selection rule.
+
+    The other backends' logs stay on the list as fallbacks — a server can be
+    adopted after a hand launch into any of them — but behind the one that
+    belongs to the backend we believe is running.
+    """
+    if backend is None:
+        s = sup()
+        backend = (s.desired.backend if s is not None else None) or _safe_config().get("BACKEND")
+    if boot_log_dir is None:
+        s = sup()
+        if s is not None:
+            boot_log_dir = s.state_dir / _sup.BOOT_LOG_DIRNAME
+    primary = tuple(Path(p) for p in _sup._default_log_paths(backend, boot_log_dir=boot_log_dir))
+    rest = tuple(p for p in _candidate_logs() if p not in primary)
+    return primary + rest
 
 
 def _live_boot_facts() -> dict[str, Any]:
@@ -158,15 +344,23 @@ def _live_boot_facts() -> dict[str, Any]:
     total is only ever printed once, at boot.
     """
     facts: dict[str, Any] = {}
-    # Read the LAST match: launcher logs are append-only across restarts, so
+    # Pick the log belonging to the backend actually running on our port, and
+    # read the LAST match: launcher logs are append-only across restarts, so
     # the first match is the oldest boot's numbers.
-    for log in _candidate_logs():
+    want = _running_model_id()
+    for log in _boot_log_candidates():
         try:
             if not log.exists():
                 continue
             text = log.read_text(errors="replace")
         except OSError:
             continue
+        # Reject a log written by a different model: these files are reused
+        # across runs, and a foreground launch may not write to one at all.
+        if want:
+            tags = _MODEL_RE.findall(text)
+            if tags and tags[-1] != want:
+                continue
         kv_all = _KV_RE.findall(text)
         if not kv_all:
             continue
@@ -190,6 +384,35 @@ def _live_boot_facts() -> dict[str, Any]:
         facts["source"] = str(log)
         break
     return facts
+
+
+async def _recover_if_server_returned() -> None:
+    """Adopt a server that reappeared while we were in a terminal state."""
+    s = sup()
+    if s is None or not rt.upstream_up:
+        return
+    if s.actual_state not in ("FAILED", "STOPPED"):
+        return
+    if s.desired.desired_state != "RUNNING":
+        return  # intent says stopped: leave it alone, offer adoption in the UI
+    from . import procctl
+
+    pid = procctl.listener_pid(rt.port)
+    if pid is None or not procctl.is_attributable(pid):
+        return
+    try:
+        s._run_repo_id = s.desired.repo_id or rt.serving_model
+        s._run_backend = s.desired.backend
+        s._adopt_ready(pid)
+        s.last_error = None
+        hub.publish(
+            "notice",
+            {"level": "info", "code": "recovered",
+             "body": f"server returned on :{rt.port} (pid {pid}) — now tracking it"},
+        )
+        hub.publish("state", _state())
+    except Exception as exc:  # noqa: BLE001
+        hub.publish("notice", {"level": "warn", "code": "recover_failed", "body": str(exc)[:200]})
 
 
 async def _fetch_served_model() -> str | None:
@@ -236,6 +459,23 @@ def _model_rows() -> list[dict[str, Any]]:
     for e in registry.discover_models():
         if getattr(e, "skipped", False):
             continue
+        # trust/weights_gib are what the model card's provenance badge and the
+        # serving-model match are built from. The card read both long before
+        # this payload carried either: every model therefore rendered
+        # "estimated" (SPEC.md §3 attaches "~25% optimistic historically" to
+        # that label, so it is a claim, not decoration) and the weights-based
+        # arm of the serving match was dead code.
+        #
+        # Resolved at the model's OWN max context, which is the only ctx that
+        # is a property of the model rather than of the slider — the badge is
+        # a coarse "has this ever been booted and measured", and the exact
+        # per-configuration answer comes from /api/capacity/estimate.
+        ctx_for_trust = e.max_position_embeddings or DEFAULT_MODEL_MAX_CTX
+        try:
+            ri = registry.resolve_inputs(e.repo_id, capacity.UTIL_THIN_MARGIN, ctx_for_trust)
+            trust, weights_gib = ri.trust, ri.weights_gib
+        except Exception:  # noqa: BLE001 - a broken measurements store must not blank the rail
+            trust, weights_gib = "unknown", None
         # Direct attribute access, NOT getattr-with-default: a field rename must
         # raise here, not silently render "262144 ctx / no quant" for every row.
         rows.append(
@@ -247,7 +487,9 @@ def _model_rows() -> list[dict[str, Any]]:
                 "unservable_reason": e.reason,
                 "disk_gib": round(e.safetensors_gib or 0.0, 2),
                 "quant": e.quant_algo or "—",
-                "model_max_ctx": e.max_position_embeddings or 262144,
+                "model_max_ctx": ctx_for_trust,
+                "trust": trust,
+                "weights_gib": weights_gib,
             }
         )
     rows.sort(key=lambda r: (not r["servable"], r["name"]))
@@ -307,7 +549,7 @@ def _estimate(repo_id: str, util: float, ctx: int, seqs: int) -> dict[str, Any]:
     mi = capacity.ModelInputs(
         repo_id=repo_id,
         backend=ri.backend or "inline",
-        model_max_ctx=ri.model_max_ctx or 262144,
+        model_max_ctx=ri.model_max_ctx or DEFAULT_MODEL_MAX_CTX,
         weights_gib=ri.weights_gib,
         weights_source=ri.weights_source,
         kv_kib_per_token=ri.kv_kib_per_token,
@@ -330,6 +572,11 @@ def _estimate(repo_id: str, util: float, ctx: int, seqs: int) -> dict[str, Any]:
         total_mib=g.total_mib if g else None,
         used_mib=g.used_mib if g else None,
         own_mib=own,
+        # capacity.py is pure and never stat()s: somebody allowed I/O has to
+        # do it, and nobody was. The TRAINING_MARKER block was therefore
+        # unreachable — a guard against starting a server on a GPU a training
+        # run is using, that could never fire.
+        training_markers=_training_marker_hits(),
     )
     r = capacity.compute(mi, util=util, ctx=ctx, max_num_seqs=seqs, live=live)
     return {
@@ -370,7 +617,10 @@ def _state() -> dict[str, Any]:
         "upstream": {
             "url": rt.upstream,
             "up": rt.upstream_up,
-            "model": rt.serving_model,
+            "model": rt.serving_model,          # --served-model-name
+            "model_id": _running_model_id(),     # what is REALLY loaded
+            # The running engine's OWN --max-model-len, not desired config.
+            "max_model_len": _running_max_model_len(),
             "port": rt.port,
             # the RUNNING engine's own numbers, not an estimate for some other model
             "live": _live_boot_facts() if rt.upstream_up else {},
@@ -385,7 +635,10 @@ def _state() -> dict[str, Any]:
         "control_enabled": sup() is not None,
         "control_note": _supervisor_error or "",
         "supervisor": (sup().snapshot() if sup() is not None else {}),
+        # Servedeck's own uptime. The UI's "Serving ... up Nm" must NOT use
+        # this: restarting the UI would make a long-running server look fresh.
         "uptime_s": int(time.time() - STARTED_AT),
+        "server_uptime_s": _server_uptime_s(),
     }
 
 
@@ -414,7 +667,7 @@ async def api_estimate(body: dict[str, Any]) -> Any:
         return _estimate(
             repo,
             float(body.get("util", 0.96)),
-            int(body.get("ctx", 262144)),
+            int(body.get("ctx", DEFAULT_MODEL_MAX_CTX)),
             int(body.get("max_num_seqs", 1)),
         )
     except Exception as exc:  # noqa: BLE001
@@ -602,7 +855,7 @@ async def catch_all(path: str, request: Request) -> Any:
             return JSONResponse(
                 {
                     "error": {
-                        "message": f"Coldstart: upstream {rt.upstream} unreachable ({type(exc).__name__})",
+                        "message": f"Servedeck: upstream {rt.upstream} unreachable ({type(exc).__name__})",
                         "type": "servedeck_upstream_unavailable",
                         "code": "unreachable",
                     }

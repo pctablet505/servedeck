@@ -354,10 +354,43 @@ def test_corrupt_config_json_treated_as_missing(tmp_path: Path) -> None:
 
 
 def test_known_archs_map_is_exactly_the_two_documented_entries() -> None:
+    """The built-in map must stay 1:1 — _reverse_arch_backends() depends on it.
+
+    A stray entry here half-wires a backend: the model becomes servable and
+    the UI offers it, while paths, preflight and the launcher know nothing
+    about it. Adding a backend is a config act (`[backends.<name>]`), not an
+    edit to this literal.
+    """
     assert KNOWN_ARCHS == {
         "Qwen3_5ForConditionalGeneration": "inline",
         "Qwen4ExpForConditionalGeneration": "flashnext",
     }
+    assert len(set(KNOWN_ARCHS.values())) == len(KNOWN_ARCHS), "map must stay 1:1"
+
+
+def test_configured_architectures_extend_the_built_in_map(config_path) -> None:
+    """Declaring `architectures` on a backend is the whole supported way to
+    teach Servedeck a new model family.
+
+    It used to require editing KNOWN_ARCHS, i.e. shipping one machine's model
+    lineup inside a public package — and a user who could not edit the source
+    simply saw their model listed as "unknown architecture".
+    """
+    from servedeck import registry
+
+    config_path(
+        '''
+[backends.custom]
+launcher = "/bin/true"
+port = 9500
+architectures = ["SomeNewForConditionalGeneration"]
+'''
+    )
+    got = registry.arch_backends()
+    assert got["SomeNewForConditionalGeneration"] == "custom"
+    # and the built-ins survive, so an install with a config is not a
+    # regression for the backends that never needed one
+    assert got["Qwen4ExpForConditionalGeneration"] == "flashnext"
 
 
 # --------------------------------------------------------------------------- #

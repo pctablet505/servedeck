@@ -1,4 +1,4 @@
-"""Coldstart capacity module — SPEC.md §3.
+"""Servedeck capacity module — SPEC.md §3.
 
 PURE. No file I/O, no subprocess, no network. Every environmental fact that
 requires actually looking at the machine (free VRAM, ptrace_scope, training
@@ -56,22 +56,33 @@ FLASHNEXT_MIN_UTIL: float = 0.90
 
 
 def _cfg_markers() -> tuple[str, ...]:
+    """Marker paths, from $SERVEDECK_TRAINING_MARKERS or servedeck.toml.
+
+    The env var wins so a test (or a one-off run) can override without editing
+    the file. `training_markers` in the config used to be parsed and then
+    never read by anything — config that silently does nothing is worse than
+    no config, because it reads as a guard that is switched on.
+    """
     import os
     raw = os.environ.get("SERVEDECK_TRAINING_MARKERS", "")
-    return tuple(p for p in raw.split(":") if p)
+    if raw:
+        return tuple(p for p in raw.split(":") if p)
+    return tuple(_config.get().training_markers)
 
 
 def refresh_limits() -> None:
     """Re-read hardware limits from config (after config.reset())."""
-    global _cfg, GPU_TOTAL_MIB, GPU_TOTAL_GIB, OVERHEAD_GIB_DEFAULT, VRAM_GUARD_HEADROOM_MIB
+    global _cfg, GPU_TOTAL_MIB, GPU_TOTAL_GIB, OVERHEAD_GIB_DEFAULT
+    global VRAM_GUARD_HEADROOM_MIB, TRAINING_MARKER_PATHS
     _cfg = _config.get()
     GPU_TOTAL_MIB = _cfg.gpu_total_mib
     GPU_TOTAL_GIB = GPU_TOTAL_MIB / 1024
     OVERHEAD_GIB_DEFAULT = _cfg.overhead_gib
     VRAM_GUARD_HEADROOM_MIB = _cfg.frag_margin_mib
+    TRAINING_MARKER_PATHS = tuple(_cfg_markers())
 
 # A "lock file" convention: if any of these paths exists, something else wants
-# the GPU (a training run, a benchmark) and Coldstart must stand down rather
+# the GPU (a training run, a benchmark) and Servedeck must stand down rather
 # than start a server. Configure via `training_markers` in servedeck.toml.
 # capacity.py stays pure — it never stat()s anything; a caller that is allowed
 # I/O checks existence and reports hits via LiveFacts.training_markers.
@@ -96,7 +107,7 @@ class ModelInputs:
     """
 
     repo_id: str
-    backend: str  # "flashnext" | "inline"
+    backend: str  # the servedeck.toml [backends.<name>] this model runs under
     model_max_ctx: int
     weights_gib: float | None = None
     weights_source: WeightsSource = "measured"
@@ -277,17 +288,19 @@ def compute(
                 code="UNKNOWN_CAPACITY",
                 # WARN, not block. Booting is the ONLY way to learn a model's
                 # real weight size, so blocking the launch made the condition
-                # permanent: unknown -> cannot start -> stays unknown.
+                # permanent: unknown -> cannot start -> stays unknown. Refusing
+                # to *predict* is right; refusing to *try* is a dead end.
                 level="warn",
-                title="Weight size unknown — capacity cannot be estimated",
+                title="Capacity unknown until first boot",
                 detail=(
-                    f"{m.repo_id}: weights_source is 'unknown'. The generic "
-                    "safetensors_gib*1.01 estimator is refused for "
-                    "model_type=='qwen4_exp' (on this box it was 37% off for "
-                    "Flash-Next: 125.91 GiB disk vs 78.47 GiB actual VRAM) and "
-                    "no boot measurement exists yet."
+                    f"{m.repo_id}: weight size cannot be predicted for this "
+                    "architecture — layers may be offloaded to host RAM, so "
+                    "on-disk size is not VRAM size (measured 37% off for one "
+                    "such model: 125.91 GiB on disk, 78.47 GiB in VRAM). "
+                    "Starting it is how the real figure gets measured; the "
+                    "engine will refuse safely if it does not fit."
                 ),
-                fix="Boot the model once to obtain a measured weights figure.",
+                fix="Start it once at a utilization you are comfortable with.",
             )
         )
         weights_gib = 0.0
@@ -297,6 +310,8 @@ def compute(
     budget_gib = util * GPU_TOTAL_GIB
     kv_gib = budget_gib - weights_gib - overhead_gib
 
+    # Findings computed from weights we do not have are meaningless. Suppress
+    # them rather than reporting "KV too small" about a number we invented.
     if weights_unknown:
         # Unknown weights were being substituted with 0.0, so the KV budget
         # absorbed the entire card and reported millions of tokens -- a bigger

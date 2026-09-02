@@ -1,4 +1,4 @@
-"""Coldstart log tailing — SPEC.md §5 / §6.
+"""Servedeck log tailing — SPEC.md §5 / §6.
 
 vLLM's boot log for the inline backend lives behind a SYMLINK
 (``local_llm/logs/qwen_server.log``) that ``qwen-server-run.sh`` re-points

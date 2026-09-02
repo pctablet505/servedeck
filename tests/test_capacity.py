@@ -15,6 +15,7 @@ THE ACCEPTANCE TEST IS NON-NEGOTIABLE: both real boots must reproduce to
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import pytest
 
@@ -788,3 +789,29 @@ def test_unknown_weights_do_not_block_the_launch():
     assert _code(r.findings, "KV_TOO_SMALL_FOR_ONE_CTX") is None, (
         "KV findings derived from unknown weights are meaningless and must be suppressed"
     )
+
+
+def test_training_markers_come_from_the_config_file_too(config_path):
+    """`training_markers` in servedeck.toml was parsed into Config and then
+    read by nothing: the only source was $SERVEDECK_TRAINING_MARKERS.
+
+    A configured guard that cannot fire is worse than an absent one — it reads
+    as switched on. `~` is expanded, because a config file is exactly where
+    someone writes `~/run/training_in_progress`.
+    """
+    from servedeck import capacity as cap
+
+    config_path('training_markers = ["~/a-marker", "/tmp/b-marker"]\n')
+    got = tuple(cap._cfg_markers())
+    assert got == (str(Path.home() / "a-marker"), "/tmp/b-marker"), got
+    assert cap.TRAINING_MARKER_PATHS == got, "refresh_limits() must re-read them"
+
+
+def test_env_var_overrides_the_configured_markers(config_path, monkeypatch):
+    """A test or a one-off run must be able to override without editing the
+    file that describes the machine."""
+    from servedeck import capacity as cap
+
+    config_path('training_markers = ["/tmp/from-file"]\n')
+    monkeypatch.setenv("SERVEDECK_TRAINING_MARKERS", "/tmp/x:/tmp/y")
+    assert tuple(cap._cfg_markers()) == ("/tmp/x", "/tmp/y")

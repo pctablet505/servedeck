@@ -1,4 +1,4 @@
-"""Coldstart in-process pub/sub — SPEC.md §8's SSE hub.
+"""Servedeck in-process pub/sub — SPEC.md §8's SSE hub.
 
 One process, no external broker, no persistence beyond a short in-memory
 replay buffer. Every subscriber (one per open `GET /api/events` connection)

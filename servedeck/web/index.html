@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Coldstart</title>
+<title>Servedeck</title>
 <link rel="stylesheet" href="/assets/style.css">
 </head>
 <body>
@@ -11,19 +11,20 @@
 
   <div class="top">
     <div class="brand">
-      <h1>Coldstart</h1>
+      <h1>Servedeck</h1>
       <span class="sub">local model control</span>
     </div>
+    <button type="button" class="urlchip mono" id="serverUrl" title="Codex base URL — click to copy">—</button>
     <div class="gpuchip mono">
       <span class="dot"></span>
-      RTX PRO 6000 Blackwell · <span id="gpuUsed">92,571</span> / 97,887 MiB
+      <span id="gpuName">GPU</span> · <span id="gpuUsed">—</span> / <span id="gpuTotal">—</span> MiB
     </div>
   </div>
 
   <div class="vram">
     <div class="vram-head">
       <span class="lbl">VRAM allocation</span>
-      <span class="val mono" id="vramTxt">weights 78.5 · KV 8.8 · overhead 4.7 · free 3.6 GiB</span>
+      <span class="val mono" id="vramTxt">—</span>
     </div>
     <div class="bar" id="bar">
       <div class="seg weights" id="segW">weights</div>
@@ -43,7 +44,7 @@
 
     <!-- model rail -->
     <div class="panel">
-      <div class="panel-h"><span>Models on disk</span><span class="mono" id="mcount">6</span></div>
+      <div class="panel-h"><span>Models on disk</span><span class="mono" id="mcount">—</span></div>
       <div class="mlist" id="mlist"></div>
     </div>
 
@@ -53,10 +54,10 @@
         <div class="status-row">
           <span class="pill" id="pill"><span class="d"></span><span id="pillTxt">Serving</span></span>
           <div>
-            <div class="status-model" id="sModel">Flash-Next</div>
-            <div class="status-meta mono" id="sMeta">:8001 · 262,144 ctx · 99.3 tok/s · up 12m</div>
+            <div class="status-model" id="sModel">—</div>
+            <div class="status-meta mono" id="sMeta">connecting…</div>
           </div>
-          <span class="queued mono" id="queued"><span id="qN">0</span> agents holding</span>
+          <span class="queued mono" id="queued"><span id="qN">—</span> agents holding</span>
         </div>
 
         <div class="phases" id="phases">
@@ -89,18 +90,18 @@
           <div class="derived">
             <div class="dcell">
               <div class="k">KV budget</div>
-              <div class="n mono" id="dKv">8.8<span style="font-size:13px;font-weight:400"> GiB</span></div>
-              <div class="s mono" id="dKvTok">304,653 tokens</div>
+              <div class="n mono" id="dKv">—</div>
+              <div class="s mono" id="dKvTok">—</div>
             </div>
             <div class="dcell">
-              <div class="k">Parallel agents <span class="tag meas" id="dBadge">measured</span></div>
-              <div class="n mono" id="dAgents">1</div>
-              <div class="s" id="dAgentsS">at 262,144 context</div>
+              <div class="k">Parallel agents <span class="tag est" id="dBadge">—</span></div>
+              <div class="n mono" id="dAgents">—</div>
+              <div class="s" id="dAgentsS">—</div>
             </div>
             <div class="dcell">
               <div class="k">Max single context</div>
-              <div class="n mono" id="dCtx">262,144</div>
-              <div class="s" id="dCtxS">model ceiling reached</div>
+              <div class="n mono" id="dCtx">—</div>
+              <div class="s" id="dCtxS">—</div>
             </div>
           </div>
 
@@ -147,12 +148,12 @@
     <div class="livegrid">
       <div class="lcol">
         <div class="lk">KV blocks in use <span style="text-transform:none;font-weight:400">(in-flight, 0 when idle)</span></div>
-        <div class="lbig mono" id="kvPct">0%</div>
-        <div class="lsub mono" id="kvTok">0 / 304,653 tokens</div>
+        <div class="lbig mono" id="kvPct">—</div>
+        <div class="lsub mono" id="kvTok">—</div>
         <canvas id="spark" width="420" height="42" aria-label="KV cache usage over time"></canvas>
         <div class="lrow">
-          <div><div class="lk">Running</div><div class="n mono" id="mRun">0</div></div>
-          <div><div class="lk">Waiting</div><div class="n mono" id="mWait">0</div></div>
+          <div><div class="lk">Running</div><div class="n mono" id="mRun">—</div></div>
+          <div><div class="lk">Waiting</div><div class="n mono" id="mWait">—</div></div>
           <div><div class="lk">Preemptions</div><div class="n mono" id="mPre">—</div></div>
           <div><div class="lk">Prefix cache</div><div class="n mono" id="hitRate">—</div></div>
         </div>
@@ -160,8 +161,8 @@
 
       <div class="lcol">
         <div class="lk">Average context per request</div>
-        <div class="lbig mono" id="avgCtx">194,532</div>
-        <div class="lsub" id="avgSrc">6 requests · synthetic test traffic</div>
+        <div class="lbig mono" id="avgCtx">—</div>
+        <div class="lsub" id="avgSrc">—</div>
         <div class="winsel" id="winsel"></div>
         <div class="hint">
           vLLM's counters reset on restart. Averages are only worth betting on once
@@ -174,13 +175,13 @@
         <div class="twoup">
           <div class="cap">
             <div class="t">Safe floor</div>
-            <div class="n mono" id="capWorst">1</div>
-            <div class="d">every agent at full 262k</div>
+            <div class="n mono" id="capWorst">—</div>
+            <div class="d" id="capWorstD">—</div>
           </div>
           <div class="cap bet">
             <div class="t">At observed avg</div>
-            <div class="n mono" id="capAvg">1</div>
-            <div class="d" id="capAvgD">at 194,532 avg</div>
+            <div class="n mono" id="capAvg">—</div>
+            <div class="d" id="capAvgD">—</div>
           </div>
         </div>
         <div class="setrow">

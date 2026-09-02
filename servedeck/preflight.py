@@ -1,4 +1,4 @@
-"""Coldstart preflight checks — SPEC.md §3's environmental blockers.
+"""Servedeck preflight checks — SPEC.md §3's environmental blockers.
 
 capacity.py is deliberately pure (no I/O — SPEC.md §3's docstring says so
 explicitly): every environmental fact it reacts to has to be collected by
@@ -15,7 +15,7 @@ detail, fix_command}`` — never raises, and never runs a privileged command
 itself: where a fix needs root (relaxing ``ptrace_scope``), ``fix_command``
 is a copyable string for a human to paste, exactly like capacity.py's own
 ``PTRACE_BLOCKS_PLE``/``PTRACE_LEFT_RELAXED`` findings (SPEC.md absolute
-rule 4 — Coldstart itself never runs ``sudo``).
+rule 4 — Servedeck itself never runs ``sudo``).
 
 Two checks here have no equivalent in capacity.py's finding list at all:
 ``VENV_MISSING`` and ``LAUNCHER_MISSING``. SPEC.md's correction C9 names
@@ -33,9 +33,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
-from servedeck import gpu, paths
+from servedeck import config, gpu, paths
 
 Level = Literal["block", "warn", "info"]
 
@@ -135,7 +136,7 @@ def check_ptrace_scope(backend: str | None, actual_state: str | None = None) -> 
     (serve.sh:53-66) goes through `sudo sysctl`, which silently no-ops
     without an interactive tty (a systemd ExecStart has none) — "it only
     appears to work right now because ptrace_scope happens to be 0 on this
-    boot." This check is what lets Coldstart surface that BEFORE a launch
+    boot." This check is what lets Servedeck surface that BEFORE a launch
     attempt burns 4-10 minutes discovering it the hard way.
     """
     scope = _read_ptrace_scope()
@@ -193,16 +194,35 @@ def check_ptrace_scope(backend: str | None, actual_state: str | None = None) -> 
     return None
 
 
+def _configured(backend: str | None, attr: str) -> Path | None:
+    """A path this backend declares in servedeck.toml, or None.
+
+    Never raises: an unreadable config must degrade to the built-in defaults
+    below, not turn every preflight into a crash.
+    """
+    try:
+        b = config.get().backend(backend)
+    except Exception:  # noqa: BLE001
+        return None
+    value = getattr(b, attr, None) if b is not None else None
+    return Path(value) if value is not None else None
+
+
 def check_venv(backend: str | None) -> PreflightCheck | None:
     """SPEC.md correction C9: "FATAL: vLLM venv not found" at a stale path
     was 12 of 72 recorded exits — the single largest boot-failure class.
-    `backend=None` (not yet chosen) returns None: there is nothing to check."""
-    if backend == BACKEND_FLASHNEXT:
-        venv_dir = paths.VENV_NEXT_DIR
-    elif backend == BACKEND_INLINE:
-        venv_dir = paths.VENV_LLM_DIR
-    else:
-        return None
+    `backend=None` (not yet chosen) returns None: there is nothing to check.
+    The venv comes from servedeck.toml when the backend declares one, so a
+    backend added by configuration gets this check too rather than silently
+    skipping the largest boot-failure class there is."""
+    venv_dir = _configured(backend, "venv")
+    if venv_dir is None:
+        if backend == BACKEND_FLASHNEXT:
+            venv_dir = paths.VENV_NEXT_DIR
+        elif backend == BACKEND_INLINE:
+            venv_dir = paths.VENV_LLM_DIR
+        else:
+            return None
     ok = venv_dir.is_dir() and (venv_dir / "bin" / "python").exists()
     return PreflightCheck(
         id="VENV_MISSING",
@@ -222,13 +242,16 @@ def check_venv(backend: str | None) -> PreflightCheck | None:
 def check_launcher(backend: str | None) -> PreflightCheck | None:
     """The launcher script SPEC.md §1's "delegation, not reimplementation"
     invokes must actually exist and be executable, or a start attempt fails
-    before it can even produce a log to diagnose from."""
-    if backend == BACKEND_FLASHNEXT:
-        script = paths.SERVE_SH
-    elif backend == BACKEND_INLINE:
-        script = paths.SERVER_RUN_SH
-    else:
-        return None
+    before it can even produce a log to diagnose from. The path comes from
+    servedeck.toml when the backend is declared there."""
+    script = _configured(backend, "launcher")
+    if script is None:
+        if backend == BACKEND_FLASHNEXT:
+            script = paths.SERVE_SH
+        elif backend == BACKEND_INLINE:
+            script = paths.SERVER_RUN_SH
+        else:
+            return None
     ok = script.is_file() and os.access(script, os.X_OK)
     return PreflightCheck(
         id="LAUNCHER_MISSING",

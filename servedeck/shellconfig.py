@@ -1,4 +1,4 @@
-"""Coldstart's ONLY writer of local_llm/.config — SPEC.md §1 / §9(c).
+"""Servedeck's ONLY writer of local_llm/.config — SPEC.md §1 / §9(c).
 
 `.config` is never edited directly (that would bypass save_config_kv()'s
 line-preserving semantics and codex-qwen.sh's own validators — see that
@@ -7,12 +7,12 @@ $CONFIG_FILE` clobbered the whole file). Every mutation in this module goes
 through `codex-qwen.sh set-mem|set-subagents|set-config` as a subprocess,
 exactly as a human running that script by hand would.
 
-The one hard rule this module enforces on Coldstart's behalf (SPEC.md §1):
+The one hard rule this module enforces on Servedeck's behalf (SPEC.md §1):
 `set_mem()` in codex-qwen.sh auto-restarts the server as a side effect when
-one is already up. Coldstart's own restart sequence is always
+one is already up. Servedeck's own restart sequence is always
 stop -> write config -> start, owned by supervisor.py — so `set_util()`
 here refuses outright (`ServerRunningError`) rather than ever letting
-codex-qwen.sh's implicit restart race Coldstart's own supervisor loop.
+codex-qwen.sh's implicit restart race Servedeck's own supervisor loop.
 """
 
 from __future__ import annotations
@@ -58,7 +58,7 @@ class ServerRunningError(RuntimeError):
     """`set_util()` was attempted while the inline server answers as up.
 
     codex-qwen.sh's `set-mem` auto-restarts the server as a side effect
-    (SPEC.md §1's hard rule). Coldstart's own restart sequence (stop ->
+    (SPEC.md §1's hard rule). Servedeck's own restart sequence (stop ->
     write config -> start) must own that restart instead — this exception
     is the refusal that keeps the two from racing.
     """
@@ -167,7 +167,7 @@ def set_util(value: float, *, server_up: bool | None = None) -> subprocess.Compl
     if up:
         raise ServerRunningError(
             "set_util() refused: the server currently answers as up. "
-            "Stop it first — Coldstart's restart sequence is always "
+            "Stop it first — Servedeck's restart sequence is always "
             "stop -> write config -> start (SPEC.md §1)."
         )
     return _run_codex_qwen("set-mem", f"{value:.6g}")
@@ -187,7 +187,7 @@ def set_subagents(n: int) -> subprocess.CompletedProcess[str]:
 
 
 def set_key(key: str, value: str) -> subprocess.CompletedProcess[str]:
-    """Persist one Coldstart-integration key via
+    """Persist one Servedeck-integration key via
     `codex-qwen.sh set-config <KEY> <VALUE>` (SPEC.md §9(c)'s allow-listed
     escape hatch — BACKEND, MODEL, PORT, etc.). Never restarts anything;
     codex-qwen.sh's own set_config() says so explicitly and independently

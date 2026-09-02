@@ -1,7 +1,7 @@
-"""Coldstart gateway — SPEC.md §7, corrected by the 2026-08-27 addendum
+"""Servedeck gateway — SPEC.md §7, corrected by the 2026-08-27 addendum
 (C2, C7, C8 specifically).
 
-This module is a transparent reverse proxy from Coldstart's own listener
+This module is a transparent reverse proxy from Servedeck's own listener
 (127.0.0.1:8010, bound by whoever owns app.py/run.sh — not this file) to
 whichever upstream vLLM server is currently configured (127.0.0.1:8001 for
 flashnext, 127.0.0.1:8000 for inline). Two things make it more than a dumb
@@ -287,14 +287,14 @@ def _json_503(body: dict, *, retry_after: int) -> JSONResponse:
 
 
 def _stopped_response() -> JSONResponse:
-    body = _error_body(message="Coldstart: backend is stopped.", code="stopped")
+    body = _error_body(message="Servedeck: backend is stopped.", code="stopped")
     return _json_503(body, retry_after=5)  # SPEC §7: exact value given
 
 
 def _failed_response(supervisor: SupervisorView) -> JSONResponse:
     code = _safe(supervisor.failure_code) or "failed"
     detail = _safe(supervisor.failure_detail)
-    message = f"Coldstart: backend failed to start — {detail or code}"
+    message = f"Servedeck: backend failed to start — {detail or code}"
     body = _error_body(message=message, code=str(code).lower())
     return _json_503(body, retry_after=30)  # UNSPECIFIED IN SPEC
 
@@ -302,7 +302,7 @@ def _failed_response(supervisor: SupervisorView) -> JSONResponse:
 def _shed_response(runtime: GatewayRuntime, supervisor: SupervisorView) -> JSONResponse:
     hold = _safe(supervisor.hold_status)
     message = (
-        f"Coldstart: too many requests waiting for the backend to become "
+        f"Servedeck: too many requests waiting for the backend to become "
         f"ready ({runtime.max_parked} already parked)."
     )
     body = _error_body(
@@ -323,7 +323,7 @@ def _timeout_response(supervisor: SupervisorView, runtime: GatewayRuntime) -> JS
     eta_s = hold.eta_s if hold else None
     attempt = hold.attempt if hold else 0
     eta_str = _format_duration(eta_s) if eta_s is not None else "an unknown time"
-    message = f"Coldstart: backend restarting — phase '{phase_label}', ~{eta_str} remaining"
+    message = f"Servedeck: backend restarting — phase '{phase_label}', ~{eta_str} remaining"
     body = _error_body(
         message=message,
         code="restarting",
@@ -337,7 +337,7 @@ def _timeout_response(supervisor: SupervisorView, runtime: GatewayRuntime) -> JS
 
 
 def _unreachable_response(exc: BaseException) -> JSONResponse:
-    body = _error_body(message=f"Coldstart: upstream unreachable — {exc}", code="upstream_unreachable")
+    body = _error_body(message=f"Servedeck: upstream unreachable — {exc}", code="upstream_unreachable")
     return _json_503(body, retry_after=5)  # UNSPECIFIED IN SPEC
 
 

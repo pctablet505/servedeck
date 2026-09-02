@@ -1,4 +1,4 @@
-"""Coldstart boot/death history — SPEC.md §6 ("append state/history.jsonl
+"""Servedeck boot/death history — SPEC.md §6 ("append state/history.jsonl
 [...] on EVERY exit") and §8's WAIT-TIME UX ("ETA from history: median and
 p90 of total_s and per-phase over prior runs matching (repo_id, backend,
 cold)").
@@ -63,7 +63,7 @@ from servedeck import paths
 # Storage
 # ---------------------------------------------------------------------------
 
-# A single process-wide lock: uvicorn runs Coldstart as one worker (SPEC.md
+# A single process-wide lock: uvicorn runs Servedeck as one worker (SPEC.md
 # §1's process model names no --workers flag, and the systemd unit doesn't
 # either), so this only needs to serialize concurrent async tasks within
 # that one process, not cross-process — but it costs nothing to be safe

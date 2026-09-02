@@ -1,4 +1,4 @@
-"""Coldstart phase detection — SPEC.md §5.
+"""Servedeck phase detection — SPEC.md §5.
 
 Turns a stream of vLLM boot-log lines into an ordered phase state machine
 (:class:`PhaseTracker`) and classifies terminal/near-terminal error lines

@@ -1,6 +1,6 @@
-"""Coldstart supervisor — SPEC.md §6. TOP-PRIORITY MODULE.
+"""Servedeck supervisor — SPEC.md §6. TOP-PRIORITY MODULE.
 
-Owns the desired/actual state machine for the one vLLM server Coldstart
+Owns the desired/actual state machine for the one vLLM server Servedeck
 manages, startup reconciliation, the boot-phase monitor, the
 crash-while-serving vs failed-boot distinction, backoff-based auto-restart
 with a crash-loop ceiling, and death recording. Every other piece of this
@@ -49,7 +49,7 @@ from typing import Any, Awaitable, Callable, Literal, Mapping, Sequence
 
 import httpx
 
-from servedeck import gpu, history, logtail, paths, phases, preflight, procctl, shellconfig
+from servedeck import config, gpu, history, logtail, paths, phases, preflight, procctl, shellconfig
 
 # ---------------------------------------------------------------------------
 # Types & constants — SPEC.md §6
@@ -244,14 +244,14 @@ RestartAction = Literal["none", "restart", "blocked", "suspend"]
 #: SPEC.md correction C3: "for BACKEND=flashnext, auto-restart must resolve
 #: to blocked-needs-human ... NOT a silent retry loop." serve.sh:53-66
 #: relaxes kernel.yama.ptrace_scope via `sudo sysctl`, which silently no-ops
-#: without an interactive tty (a systemd/asyncio-launched Coldstart has
+#: without an interactive tty (a systemd/asyncio-launched Servedeck has
 #: none) — "it only appears to work right now because ptrace_scope happens
 #: to be 0 on this boot." preflight.py's PTRACE_BLOCKS_PLE check already
 #: refuses to *launch* flashnext when ptrace_scope != 0, but C3 asks for
 #: something stronger for the AUTOMATIC-restart path specifically: never
 #: attempt it unattended at all, regardless of ptrace_scope's value at this
 #: exact instant, because "it will break after the next reboot" — the
-#: current 0 is not an invariant Coldstart can lean on for an unattended
+#: current 0 is not an invariant Servedeck can lean on for an unattended
 #: retry. A manual Start (this module's start(), called directly, not via
 #: the backoff scheduler) is NOT gated by this — only the crash-while-
 #: serving auto-restart path is.
@@ -335,15 +335,22 @@ def decide_after_exit(
             "blocked", code="XID_NO_RESTART", reason=xid_note or "GPU fault (Xid) is not a restartable pattern."
         )
 
-    if backend == BACKEND_FLASHNEXT:
+    # `needs_tty` in servedeck.toml, not a backend name: whether a launcher
+    # needs a terminal is a property of that launcher (a `sudo sysctl` that
+    # silently no-ops without a tty — SPEC.md correction C3), and the answer
+    # for the same backend differs from machine to machine. Falls back to the
+    # historical flashnext-only gate when nothing declares the backend, so an
+    # install with no config behaves exactly as before.
+    _b = config.get().backend(backend)
+    if _b.needs_tty if _b is not None else backend == BACKEND_FLASHNEXT:
         return RestartDecision(
             "blocked",
             code=FLASHNEXT_HUMAN_GATE_CODE,
             reason=(
-                "Flash-Next cannot be auto-restarted unattended (SPEC.md correction C3): "
-                "serve.sh relaxes kernel.yama.ptrace_scope via `sudo sysctl`, which silently "
-                "fails without an interactive tty. Start it manually from a terminal once "
-                "ptrace_scope is confirmed 0."
+                f"{backend} cannot be auto-restarted unattended (SPEC.md correction C3): "
+                "its launcher needs an interactive terminal — e.g. serve.sh relaxes "
+                "kernel.yama.ptrace_scope via `sudo sysctl`, which silently fails without "
+                "a tty. Start it manually from a terminal instead."
             ),
         )
 
@@ -386,10 +393,10 @@ def classify_exit(
 ) -> ExitInfo:
     """`reaped_status` is a raw `os.waitpid` status — only available when
     the dead process was genuinely OUR OWN CHILD (procctl.launch() started
-    it, and this same Coldstart process is still alive to reap it).
+    it, and this same Servedeck process is still alive to reap it).
     procctl.py exposes no exit-code API of its own (its ServerHandle drops
     the Popen object once persisted, by design — see its own docstring on
-    surviving a Coldstart restart), so an ADOPTED process (found via a port
+    surviving a Servedeck restart), so an ADOPTED process (found via a port
     probe, not launched by us) can never be reaped here; for those, the
     best available evidence is `stop_result` from our own stop() call, and
     failing that, the honest answer is "unknown" — this never guesses at a
@@ -464,14 +471,40 @@ def _read_metric(text: str, name: str) -> float | None:
 # ---------------------------------------------------------------------------
 
 
-def _default_log_paths(backend: str | None) -> list[Path]:
-    """Where the named backend's launcher writes its log, per config."""
+#: One file per boot, under Servedeck's own state dir. _build_launch() writes
+#: them; _default_log_paths() reads the newest back when adopting.
+BOOT_LOG_DIRNAME = "boot_logs"
+
+
+def _default_log_paths(
+    backend: str | None, *, boot_log_dir: Path | None = None
+) -> list[Path]:
+    """Where the named backend's log is, when we did NOT launch it.
+
+    A launch knows its own log path; this is the adoption case. Returning the
+    WRONG backend's log is worse than returning nothing: phases.classify()
+    would match an error line from another model's run and file it as this
+    run's failure_code. So when a backend declares no `log_path`, fall back
+    to the newest log Servedeck opened for that backend itself, and to an
+    empty list when there is none — a quiet phase machine beats a lying one.
+    """
     b = config.get().backend(backend)
-    return [b.log_path] if b else []
+    if b is not None and b.log_path is not None:
+        return [b.log_path]
+    if not backend:
+        return []
+    d = boot_log_dir if boot_log_dir is not None else paths.STATE_DIR / BOOT_LOG_DIRNAME
+    try:
+        candidates = sorted(
+            d.glob(f"{backend}-*.log"), key=lambda f: f.stat().st_mtime, reverse=True
+        )
+    except OSError:
+        return []
+    return candidates[:1]
 
 
 class Supervisor:
-    """The desired/actual state machine for Coldstart's one managed vLLM
+    """The desired/actual state machine for Servedeck's one managed vLLM
     server. Every process/network side effect is reached through one of a
     small number of injectable callables (`launch_fn`, `stop_fn`,
     `scheduler`, `death_exec_fn`) so the FSM itself — the part SPEC.md §6
@@ -524,7 +557,7 @@ class Supervisor:
     # ----------------------------------------------------------------- #
 
     async def reconcile_startup(self) -> str:
-        """Runs once, when Coldstart itself starts. Returns a short case
+        """Runs once, when Servedeck itself starts. Returns a short case
         name for logging/tests; state is mutated in place."""
         d = self.desired
         port = d.port
@@ -546,7 +579,7 @@ class Supervisor:
 
             # RUNNING + nothing listening -> preflight -> start. If a prior
             # crash-loop suspension is still on record, honor it here too —
-            # otherwise a Coldstart restart would silently resume the exact
+            # otherwise a Servedeck restart would silently resume the exact
             # loop the suspension existed to stop (see acknowledge_and_resume()).
             if d.suspended:
                 self.actual_state = "FAILED"
@@ -601,7 +634,10 @@ class Supervisor:
         self._monitor_task = asyncio.create_task(
             self._run_monitor(
                 handle,
-                log_paths=_default_log_paths(self.desired.backend),
+                log_paths=_default_log_paths(
+                    self.desired.backend,
+                    boot_log_dir=self.state_dir / BOOT_LOG_DIRNAME,
+                ),
                 port=self.desired.port or 0,
                 already_ready=True,
             )
@@ -626,9 +662,17 @@ class Supervisor:
         if self.actual_state in ("READY", "STARTING", "PREFLIGHT", "STOPPING"):
             return  # idempotent: already up or already coming up
 
-        if not repo_id or backend not in (BACKEND_FLASHNEXT, BACKEND_INLINE) or not port:
+        # A backend is startable iff servedeck.toml declares it. The gate used
+        # to be a literal two-name tuple, which silently refused every backend
+        # added by configuration -- the one thing config exists to allow.
+        if not repo_id or not backend or not port or config.get().backend(backend) is None:
             self.actual_state = "FAILED"
-            self.last_error = "no model/backend/port configured — choose a model first."
+            self.last_error = (
+                "no model/backend/port configured — choose a model first."
+                if not (repo_id and backend and port)
+                else f"backend {backend!r} is not declared in servedeck.toml — "
+                "add a [backends.<name>] section naming its launcher."
+            )
             return
 
         d = self.desired
@@ -668,7 +712,8 @@ class Supervisor:
         self._last_stop_result = None
 
         argv, env, cwd, log_paths = self._build_launch(
-            backend=backend, served_name=served_name or repo_id, port=port, util=util,
+            backend=backend, repo_id=repo_id, served_name=served_name or repo_id,
+            port=port, util=util,
             max_model_len=max_model_len, max_num_seqs=max_num_seqs,
         )
         try:
@@ -808,7 +853,7 @@ class Supervisor:
         know nothing is up), so `server_up=False` is trusted directly
         rather than re-probing (shellconfig.py's own docstring names this
         exact case). Keeps local_llm/.config's view of BACKEND/MODEL_REPO/
-        SERVED_NAME/PORT/etc in sync with whichever backend Coldstart is
+        SERVED_NAME/PORT/etc in sync with whichever backend Servedeck is
         actually about to run, for every backend — not just inline —
         because codex-qwen.sh's own status/deaths/base-url logic reads it
         regardless of which backend is live (SPEC.md §9(d)'s use_systemd()
@@ -828,61 +873,61 @@ class Supervisor:
             shellconfig.set_util(util, server_up=False)
 
     def _build_launch(
-        self, *, backend: str, served_name: str, port: int, util: float | None,
-        max_model_len: int | None, max_num_seqs: int | None,
+        self, *, backend: str, repo_id: str, served_name: str, port: int,
+        util: float | None, max_model_len: int | None, max_num_seqs: int | None,
     ) -> tuple[list[str], dict[str, str], str, list[str]]:
         """Returns (argv, env, cwd, log_paths). `log_paths[0]` is what gets
         passed to launch_fn() as the process's own stdout/stderr sink;
-        `log_paths` (plural) is every file the boot monitor should tail —
-        for inline that is TWO files, because qwen-server-run.sh does its
-        own internal `exec ... >> "$RUN_LOG" 2>&1` redirection partway
-        through (see the module-level note in _run_monitor's docstring).
+        `log_paths` (plural) is every file the boot monitor should tail.
+
+        Servedeck never builds a `vllm serve` command line: it runs the
+        launcher named in servedeck.toml and hands it settings through the
+        environment (`env_map`), so the launcher keeps owning the flags. Any
+        machine-specific tuning the launcher also reads goes in that
+        backend's `env` table and is passed through verbatim — deliberately
+        NOT interpreted here, because a knob Servedeck understands is a knob
+        Servedeck can get wrong.
         """
-        boot_log_dir = self.state_dir / "boot_logs"
+        b = config.get().backend(backend)
+        if b is None:                       # start() already gated on this
+            raise ValueError(f"backend {backend!r} is not configured")
+
+        boot_log_dir = self.state_dir / BOOT_LOG_DIRNAME
         boot_log_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        # Servedeck's OWN log, never the launcher's conventional one: that
+        # file may be a read-only fixture, or a previous boot of a different
+        # model, and a fresh launch must not append to or replay either.
+        my_log = str(boot_log_dir / f"{backend}-{stamp}.log")
 
-        if backend == BACKEND_FLASHNEXT:
-            # serve.sh has NO internal log management at all (module-level
-            # docstring in vllm-qwen38next/serve.sh: everything after `&`
-            # inherits fd 1/2 from whoever ran it) — our own launch log
-            # path IS the complete, authoritative boot log. Deliberately a
-            # NEW path under Coldstart's own state dir, never
-            # vllm-qwen38next/serve.log — those are read-only fixtures
-            # tests/test_phases.py replays, and a live launch must never
-            # touch them.
-            my_log = str(boot_log_dir / f"flashnext-{stamp}.log")
-            argv = [str(paths.SERVE_SH)]
-            env = {
-                "PORT": str(port),
-                "MAX_LEN": str(max_model_len or ""),
-                "GPU_UTIL": f"{util:.6g}" if util is not None else "",
-                "MAX_SEQS": str(max_num_seqs or ""),
-                "KV_DTYPE": "auto",
-                "SERVED_NAME": served_name,
-                # SPEC.md correction C9: "Add HF_HUB_OFFLINE=1 to the unit
-                # Environment — verified to remove the DNS class" (17 of 72
-                # recorded exits). procctl.launch() merges this onto (not
-                # over) the current environment, same semantics as the
-                # `env KEY=VAL cmd` prefix SPEC.md §1 describes.
-                "HF_HUB_OFFLINE": "1",
-            }
-            env = {k: v for k, v in env.items() if v != ""}
-            env["HF_HUB_OFFLINE"] = "1"
-            return argv, env, str(paths.VLLM_QWEN38NEXT), [my_log]
+        settings: dict[str, str] = {
+            "repo_id": repo_id,
+            "port": str(port),
+            "max_model_len": str(max_model_len or ""),
+            "util": f"{util:.6g}" if util is not None else "",
+            "max_num_seqs": str(max_num_seqs or ""),
+            "served_name": served_name,
+            "kv_dtype": "auto",
+        }
+        env = {
+            var: settings[key]
+            for key, var in b.env_map.items()
+            if key in settings and settings[key] != ""
+        }
+        env.update(b.env)
+        # SPEC.md correction C9: "Add HF_HUB_OFFLINE=1 to the unit
+        # Environment — verified to remove the DNS class" (17 of 72 recorded
+        # exits). procctl.launch() merges this onto (not over) the current
+        # environment, same semantics as the `env KEY=VAL cmd` prefix
+        # SPEC.md §1 describes.
+        env["HF_HUB_OFFLINE"] = "1"
 
-        # inline
-        my_log = str(boot_log_dir / f"inline-{stamp}.log")
-        argv = [str(paths.SERVER_RUN_SH)]
-        env = {"HF_HUB_OFFLINE": "1"}
-        # my_log first: it captures qwen-server-run.sh's OWN pre-exec guard
-        # messages (training marker / VRAM / missing-venv `note()` calls,
-        # which can exit 69 before the script ever creates $RUN_LOG at
-        # all); QWEN_LOG_FILE (the ln -sfn symlink qwen-server-run.sh
-        # itself rotates on every start — logtail.py's own docstring) is
-        # where the actual vLLM boot log lands once the script's internal
-        # `exec ... >> "$RUN_LOG" 2>&1` takes over.
-        return argv, env, str(paths.LOCAL_LLM), [my_log, str(paths.QWEN_LOG_FILE)]
+        # A launcher that redirects into its own log stops writing to the pipe
+        # we opened partway through the boot, so both files have to be tailed.
+        log_paths = [my_log]
+        if b.writes_own_log and b.log_path is not None:
+            log_paths.append(str(b.log_path))
+        return [str(b.launcher)], env, str(b.launcher.parent), log_paths
 
     # ----------------------------------------------------------------- #
     # Boot / liveness monitor
@@ -920,12 +965,22 @@ class Supervisor:
                         for line in result.lines:
                             self._feed_line(line)
 
-                    assert client is not None
-                    probe_ok = await self._probe_ready(client, port)
-                    event = self._tracker.set_http_probe_ok(probe_ok)
-                    if event is not None:
-                        self._on_reached_ready()
-                        already_ready = True
+                    # An adopted server has no probe client: it answered
+                    # /v1/models before we ever got here, so READY is already
+                    # established and there is nothing for the probe to
+                    # decide. This used to be `assert client is not None`,
+                    # which is reachable for exactly that case — the guard
+                    # above is on `self._tracker`, which _adopt_ready() has
+                    # just set. The assertion fired on tick 1, the
+                    # fire-and-forget task swallowed it, and liveness was
+                    # never polled again: the UI reported READY for a server
+                    # whose port was dead.
+                    if client is not None:
+                        probe_ok = await self._probe_ready(client, port)
+                        event = self._tracker.set_http_probe_ok(probe_ok)
+                        if event is not None:
+                            self._on_reached_ready()
+                            already_ready = True
 
                 await asyncio.sleep(MONITOR_POLL_S)
         finally:

@@ -1,4 +1,4 @@
-"""Coldstart process control — SPEC.md §2, "the self-match trap".
+"""Servedeck process control — SPEC.md §2, "the self-match trap".
 
 SETUP.md:401 recorded a real incident: the pattern-matching lookup tools in
 this family (their names are deliberately never spelled out below — a
@@ -16,17 +16,17 @@ The five rules this module follows instead:
    pattern matching) for "who holds this port".
 2. A launched server gets ``start_new_session=True`` (the ``Popen``
    equivalent of ``setsid``): its pid becomes both its own pgid and its own
-   session id, so it survives Coldstart being restarted and can be
+   session id, so it survives Servedeck being restarted and can be
    signalled as a whole group without touching anything else on the box.
    The resulting handle is recorded (pid, pgid, argv, cwd, log path) and
-   persisted so a restarted Coldstart can find it again.
+   persisted so a restarted Servedeck can find it again.
 3. Stopping a group always signals the *group*
    (``os.killpg``), never a bare pid — vLLM's own EngineCore/Worker
    children are not the process ``stop()`` was handed. SIGTERM first,
    SIGKILL only after a timeout. Before signalling anything we assert the
-   target pgid is neither Coldstart's own process group nor its own pid;
+   target pgid is neither Servedeck's own process group nor its own pid;
    refuse rather than ever signal our own tree.
-4. A server Coldstart did not launch (found by whatever is listening on the
+4. A server Servedeck did not launch (found by whatever is listening on the
    configured port) is only ever "adopted" after cross-checking it really
    looks like a vLLM server living in one of the two known venvs. A port
    that answers with no attributable pid is reported as unmanaged, not
@@ -54,7 +54,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from servedeck import paths
+from servedeck import config, paths
 
 # ---------------------------------------------------------------------------
 # Data
@@ -80,13 +80,13 @@ class VllmProc:
     cwd: str | None
     exe: str | None
     role: str  # "server" | "engine_core" | "worker" | "vllm_internal"
-    venv: str | None  # "next" | "llm" | None (unattributed)
+    venv: str | None  # backend name, or "next"/"llm", or None (unattributed)
     port: int | None  # populated only when role == "server" and it holds a listening socket
 
 
 @dataclass(frozen=True)
 class ServerHandle:
-    """Everything needed to find and stop a server Coldstart launched."""
+    """Everything needed to find and stop a server Servedeck launched."""
 
     pid: int
     pgid: int
@@ -210,7 +210,7 @@ def _classify_role(comm: str) -> str | None:
 
 
 def _detect_venv(cmdline: Sequence[str], cwd: str | None) -> str | None:
-    """Rule 4's "exe/cwd resolving inside .venv-next or .venv-llm".
+    """Rule 4's "exe/cwd resolving inside a known serving venv".
 
     The api-server process's cmdline literally contains the venv's
     ``bin/python``/``bin/vllm`` paths (confirmed live). Its EngineCore /
@@ -221,16 +221,43 @@ def _detect_venv(cmdline: Sequence[str], cwd: str | None) -> str | None:
     root is the correct — not merely a fallback — test for that case.
     """
     joined = " ".join(cmdline)
-    next_dir = str(paths.VENV_NEXT_DIR)
-    next_root = str(paths.VLLM_QWEN38NEXT)
-    llm_dir = str(paths.VENV_LLM_DIR)
-    llm_root = str(paths.LOCAL_LLM)
-
-    if next_dir in joined or (cwd is not None and (cwd == next_root or cwd.startswith(next_root + "/"))):
-        return "next"
-    if llm_dir in joined or (cwd is not None and (cwd == llm_root or cwd.startswith(llm_root + "/"))):
-        return "llm"
+    for label, venv_dir, root in _known_serving_trees():
+        if venv_dir and venv_dir in joined:
+            return label
+        if root and cwd is not None and (cwd == root or cwd.startswith(root + "/")):
+            return label
     return None
+
+
+def _known_serving_trees() -> tuple[tuple[str, str | None, str | None], ...]:
+    """(label, venv dir, project root) for every backend we could attribute.
+
+    Configured backends come first and are the point of the exercise: a
+    backend that is registered everywhere else (registry, capacity, history,
+    supervisor) but missing from THIS check is a server nothing can adopt —
+    so the supervisor can neither stop it nor notice it crashed. Building the
+    list from config means declaring a backend is enough.
+    """
+    out: list[tuple[str, str | None, str | None]] = []
+    try:
+        backends = config.get().backends
+    except Exception:  # noqa: BLE001 - an unreadable config must not break adoption
+        backends = ()
+    for b in backends:
+        out.append(
+            (
+                b.name,
+                str(b.venv) if b.venv else None,
+                str(b.launcher.parent) if b.launcher else None,
+            )
+        )
+    # The two trees this project grew up with, kept as a fallback so an
+    # install with no servedeck.toml behaves exactly as it did before.
+    known = [("next", str(paths.VENV_NEXT_DIR), str(paths.VLLM_QWEN38NEXT)),
+             ("llm", str(paths.VENV_LLM_DIR), str(paths.LOCAL_LLM))]
+    have_roots = {root for _, _, root in out}
+    out.extend(k for k in known if k[2] not in have_roots)
+    return tuple(out)
 
 
 # ---------------------------------------------------------------------------
@@ -479,7 +506,7 @@ def launch(
     prefix SPEC.md §1's delegation commands use, so PATH/HOME/etc. reach
     the launcher script unless this caller explicitly overrides them too.
     stdout+stderr are appended to `log_path` (rule 2: launched detached,
-    with ``start_new_session=True``, so it outlives a Coldstart restart).
+    with ``start_new_session=True``, so it outlives a Servedeck restart).
     """
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -515,7 +542,7 @@ def _pgid_alive(pgid: int) -> bool:
     # `pgid` is always the group leader's own pid here (start_new_session
     # makes pid == pgid == sid at launch time) — so if THIS process is that
     # leader's actual parent (true for anything launch() started, for as
-    # long as this same Coldstart process hasn't restarted since), a
+    # long as this same Servedeck process hasn't restarted since), a
     # reap-free liveness probe is a real bug, not just untidy: a process
     # that already exited sits as a zombie — still a live entry in the
     # process table — until something calls wait() on it. Left unreaped,
@@ -525,7 +552,7 @@ def _pgid_alive(pgid: int) -> bool:
     # Reaping first (non-blocking) makes a natural exit visible
     # immediately. `ChildProcessError` means `pgid` is not (or is no
     # longer) our child — e.g. this handle was re-adopted from a previous
-    # Coldstart process's state/server.json — so fall through to the
+    # Servedeck process's state/server.json — so fall through to the
     # killpg probe, which is the correct check for a pid we didn't fork.
     try:
         # Reap to avoid a zombie leader, but do NOT conclude the group is dead
@@ -550,7 +577,7 @@ def _pgid_alive(pgid: int) -> bool:
 def stop(handle: ServerHandle, timeout_s: float = 60, escalate: bool = True) -> StopResult:
     """SIGTERM the whole process group, escalate to SIGKILL after
     `timeout_s` if `escalate` and it hasn't exited. Rule 3's guard: refuse
-    outright rather than ever signal Coldstart's own process group.
+    outright rather than ever signal Servedeck's own process group.
     """
     pgid = handle.pgid
     own_pgid = os.getpgid(0)
@@ -564,7 +591,7 @@ def stop(handle: ServerHandle, timeout_s: float = 60, escalate: bool = True) -> 
             waited_s=0.0,
             detail=(
                 f"refusing to signal pgid {pgid!r}: non-positive pgid would "
-                "signal Coldstart's own process group (0) or every reachable "
+                "signal Servedeck's own process group (0) or every reachable "
                 "process (-1)"
             ),
         )
@@ -574,7 +601,7 @@ def stop(handle: ServerHandle, timeout_s: float = 60, escalate: bool = True) -> 
             method="refused",
             waited_s=0.0,
             detail=(
-                f"refusing to signal pgid {pgid}: matches Coldstart's own "
+                f"refusing to signal pgid {pgid}: matches Servedeck's own "
                 f"process group ({own_pgid}) or pid ({os.getpid()})"
             ),
         )
@@ -675,6 +702,28 @@ def _main(argv: list[str] | None = None) -> int:
     else:
         print("orphaned VLLM:: processes: none")
     return 0
+
+
+
+def process_uptime_s(pid: int) -> int | None:
+    """Seconds since `pid` started, from /proc/<pid>/stat field 22.
+
+    The UI's "up Nm" previously used Servedeck's OWN uptime, which is a
+    different and misleading number: restarting the UI made a long-running
+    server look freshly started.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            data = fh.read().decode("latin-1")
+        # comm may contain spaces/parens; fields after the final ')' are safe.
+        fields = data[data.rindex(")") + 2 :].split()
+        starttime_ticks = int(fields[19])  # field 22 overall, 0-based here
+        hz = os.sysconf("SC_CLK_TCK")
+        with open("/proc/uptime", "rb") as fh:
+            up = float(fh.read().split()[0])
+        return max(0, int(up - starttime_ticks / hz))
+    except Exception:  # noqa: BLE001 - an unreadable /proc entry means "unknown"
+        return None
 
 
 if __name__ == "__main__":
