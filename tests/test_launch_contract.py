@@ -545,3 +545,151 @@ def test_apply_does_not_advertise_the_new_model_under_the_old_ones_name(
         "the new model would be served under the previous model's name"
     )
     assert recorded.get("repo_id") == "mazinb/Qwen3.8-Flash-Next-Uncensored-NVFP4"
+
+
+# --------------------------------------------------------------------------- #
+# Multimodal: the one launch setting that cannot travel in .config
+# --------------------------------------------------------------------------- #
+# The owner's requirement is "we want images and multimodal to be enabled", and
+# images are controlled by a single vLLM flag, ``--limit-mm-per-prompt``. Every
+# launcher on this box defaulted it to zero images, so a start served text-only
+# with nothing anywhere to say so.
+#
+# It cannot travel the usual way. ``EXTRA_ARGS`` comes out of
+# ``local_llm/.config``, and both readers of that file (``llm``'s own loop and
+# ``shellconfig._KV_LINE_RE``) accept only ``KEY="value"`` with no double quote
+# inside the value -- while vLLM accepts only strict JSON here, i.e. a value
+# that is nothing but double quotes. So the launchers read ``MM_LIMIT_JSON``
+# from the ENVIRONMENT, and a dashboard start has to put it there too.
+#
+# These tests are about THIS BOX, like
+# ``test_the_real_llm_script_exports_nothing_servedeck_drops`` above: the
+# question is whether the dashboard and the CLI start the same server here, and
+# that cannot be asked of a fixture.
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+BOX_CONFIG = REPO_ROOT / "servedeck.toml"
+EXAMPLE_CONFIG = REPO_ROOT / "servedeck.toml.example"
+FLASHNEXT_SERVE_SH = Path("~/Projects/vllm-qwen38next/serve.sh").expanduser()
+
+
+def _serve_sh_mm_default() -> str:
+    """The ``--limit-mm-per-prompt`` value ``serve.sh`` compiles in.
+
+    Read out of the script rather than repeated here, so this file cannot
+    become a second source of truth that quietly goes stale — the exact failure
+    the ``[backends.*.env]`` comment in servedeck.toml warns about. Matches the
+    defaulting line itself (``if [ -z "${MM_LIMIT_JSON:-}" ]; then
+    MM_LIMIT_JSON='...'``), never the several comment lines that also mention
+    the variable.
+    """
+    text = FLASHNEXT_SERVE_SH.read_text()
+    m = re.search(
+        r"""\[ -z "\$\{MM_LIMIT_JSON:-\}" \][^\n]*?MM_LIMIT_JSON='([^']*)'""", text
+    )
+    assert m, "serve.sh no longer defaults MM_LIMIT_JSON — has its shape changed?"
+    return m.group(1)
+
+
+def _box_toml() -> dict:
+    import tomllib
+
+    return tomllib.loads(BOX_CONFIG.read_text())
+
+
+_needs_box = pytest.mark.skipif(
+    not BOX_CONFIG.is_file() or not FLASHNEXT_SERVE_SH.is_file(),
+    reason="this machine has no servedeck.toml / vllm-qwen38next/serve.sh",
+)
+
+
+@_needs_box
+def test_the_launch_contract_names_the_multimodal_limit():
+    """``MM_LIMIT_JSON`` has to be declared, and declared as what the launcher
+    itself defaults to.
+
+    Not an override — a contract made explicit. The value is pinned to
+    ``serve.sh``'s own default so the two can never drift apart silently: if
+    somebody retunes the launcher, this fails rather than the dashboard quietly
+    starting the old configuration.
+    """
+    env = _box_toml()["backends"]["flashnext"].get("env", {})
+    assert "MM_LIMIT_JSON" in env, (
+        "servedeck.toml's flashnext backend does not declare MM_LIMIT_JSON, so a "
+        "dashboard start says nothing about images while the operator's own "
+        "command line does"
+    )
+    assert env["MM_LIMIT_JSON"] == _serve_sh_mm_default()
+
+
+@_needs_box
+def test_a_dashboard_start_and_llm_start_agree_on_the_multimodal_limit(
+    tmp_path, config_path, monkeypatch
+):
+    """End to end through ``_build_launch``, against this box's real config.
+
+    ``llm start`` exports no ``MM_LIMIT_JSON``, so the value ``llm start``
+    produces is the one ``serve.sh`` compiles in. A dashboard start must put
+    the SAME string in the launcher's environment — anything else, including
+    nothing at all, is a second configuration nobody chose.
+    """
+    config_path(BOX_CONFIG.read_text())
+    monkeypatch.setattr(
+        supervisor.shellconfig, "read_config", lambda: {"BACKEND": "flashnext"}
+    )
+    s = _supervisor(tmp_path)
+    _argv, env, _cwd, _logs = _build(s, "flashnext")
+
+    llm_start_value = _serve_sh_mm_default()
+    assert env.get("MM_LIMIT_JSON") == llm_start_value, (
+        f"a dashboard start passes MM_LIMIT_JSON={env.get('MM_LIMIT_JSON')!r}; "
+        f"`llm start` resolves {llm_start_value!r}"
+    )
+    # And it is images-ON, not merely equal: two paths that are both wrong in
+    # the same way match perfectly.
+    assert '"image":0' not in llm_start_value.replace(" ", ""), (
+        "both paths agree, but on IMAGES OFF — the requirement is images enabled"
+    )
+
+
+@_needs_box
+def test_the_multimodal_limit_is_not_handed_to_a_backend_that_ignores_it(
+    tmp_path, config_path, monkeypatch
+):
+    """Over-correction guard.
+
+    ``vllm-glm53/serve-opt.sh`` hardcodes ``--limit-mm-per-prompt`` and reads
+    no environment for it, so declaring ``MM_LIMIT_JSON`` on that backend would
+    advertise a knob that does nothing — a launch contract that lies. GLM's
+    checkpoint does have a vision tower, but turning images on there costs VRAM
+    on the one backend whose usable context is already bounded by free VRAM,
+    which is a measurement on the card, not a config edit.
+    """
+    config_path(BOX_CONFIG.read_text())
+    monkeypatch.setattr(
+        supervisor.shellconfig, "read_config", lambda: {"BACKEND": "glm53"}
+    )
+    s = _supervisor(tmp_path)
+    _argv, env, _cwd, _logs = _build(s, "glm53", port=8002)
+    assert "MM_LIMIT_JSON" not in env, env
+
+
+@pytest.mark.skipif(
+    not EXAMPLE_CONFIG.is_file(), reason="no servedeck.toml.example in this checkout"
+)
+def test_the_shipped_example_documents_the_multimodal_limit():
+    """The example config is the only thing a fresh install reads.
+
+    A launcher setting that (a) changes what the server can do and (b) cannot
+    be expressed in the shell config has to be visible there, or the next
+    machine repeats this bug from scratch.
+    """
+    text = EXAMPLE_CONFIG.read_text()
+    assert "MM_LIMIT_JSON" in text, (
+        "servedeck.toml.example never mentions MM_LIMIT_JSON, so nothing tells a "
+        "new install that images are a launcher setting Servedeck must pass"
+    )
+    assert "limit-mm-per-prompt" in text, (
+        "the example names the variable but not the flag it becomes, which is "
+        "what a reader would search for"
+    )

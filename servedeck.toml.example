@@ -89,6 +89,17 @@ kv_dtype = "KV_DTYPE"
 # launcher owns their meaning.
 # [backends.vllm.env]
 # CPU_OFFLOAD_GB = "104"
+#
+# This table is also where a setting goes that your launcher reads from the
+# environment but that CANNOT travel in `shell_config_script`'s config file.
+# The worked example is multimodal: vLLM's --limit-mm-per-prompt takes strict
+# JSON, i.e. a value made of double quotes, and a KEY="value" shell config
+# cannot express that at all — so a launcher reads it from a variable instead,
+# and a dashboard start has to set the same variable or it quietly boots a
+# server with different capabilities from the one your CLI boots. Declare it
+# here with the value your launcher itself defaults to, so the two agree:
+# [backends.vllm.env]
+# MM_LIMIT_JSON = '{"image":2,"video":0}'
 
 # --- EXTRA_ARGS ---------------------------------------------------------
 # Servedeck exports EXTRA_ARGS to every launcher, whether or not env_map names
