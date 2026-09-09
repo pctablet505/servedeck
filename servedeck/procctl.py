@@ -329,6 +329,19 @@ def _listening_ports_by_pid() -> dict[int, list[int]]:
     return out
 
 
+def backend_of_pid(pid: int) -> str | None:
+    """Which configured backend a running process belongs to, or None.
+
+    From the process itself -- its command line and working directory -- not
+    from a config file recording what somebody last intended to run. Used to
+    label an ADOPTED server: falling back to the shell config's ``BACKEND``
+    header there is how a GLM header got attached to a Qwen process that was
+    serving perfectly (see the qwen-flashnext-live note: both readers trusted
+    a header that disagreed with reality).
+    """
+    return _detect_venv(_read_cmdline_list(pid), _read_cwd(pid))
+
+
 def is_attributable(pid: int) -> bool:
     """SPEC.md §2 rule 4's cross-check, standalone: does this pid look like
     a genuine vLLM api-server process living in one of the two known venvs?
