@@ -243,3 +243,29 @@ def test_adopting_labels_the_process_from_the_process(cache, live, tmp_path, mon
         "process that is actually serving"
     )
     assert s.desired.repo_id == "mazinb/Qwen3.8-Flash-Next-Uncensored-NVFP4"
+
+
+def test_resolving_a_served_name_does_not_rescan_the_cache_every_poll(cache, live, monkeypatch):
+    """/api/state runs on every dashboard poll and every SSE state publish.
+
+    discover_models() walks the whole model cache — a directory listing and a
+    config.json parse per repo — so resolving a served name through it on each
+    call turns a status poll into a filesystem scan several times a second.
+    The name changes only when a server restarts.
+    """
+    calls = {"n": 0}
+
+    def counted(*a, **k):
+        calls["n"] += 1
+        return [_Entry("dealignai/GLM-5.3-Flash-ABLITERATED-NVFP4")]
+
+    monkeypatch.setattr(registry, "discover_models", counted)
+    capp._SERVED_NAME_REPO.clear()
+
+    live["argv"] = []
+    live["names"] = ["GLM-5.3-Flash-ABLITERATED-NVFP4"]
+    live["apply"]()
+
+    for _ in range(20):
+        assert capp._serving_identity()["repo_id"] == "dealignai/GLM-5.3-Flash-ABLITERATED-NVFP4"
+    assert calls["n"] == 1, f"scanned the model cache {calls['n']} times for one name"

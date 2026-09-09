@@ -212,6 +212,7 @@ async def _poll_loop() -> None:
             )
 
             if rt.upstream_up and not rt.serving_models:
+                _SERVED_NAME_REPO.clear()   # a new server may be a new model
                 rt.serving_models = await _fetch_served_models()
                 rt.serving_model = rt.serving_models[0] if rt.serving_models else None
             if not rt.upstream_up:
@@ -438,6 +439,15 @@ async def _fetch_served_models() -> list[str]:
     return []
 
 
+#: Memo for _repo_for_served_name, keyed on the name. discover_models() walks
+#: the whole model cache -- a directory listing and a config.json parse per
+#: repo -- and _state() runs on every dashboard poll and every SSE state
+#: publish. A served name changes only when a server restarts, so resolving it
+#: once per name is the difference between a lookup and a filesystem scan
+#: several times a second.
+_SERVED_NAME_REPO: dict[str, str | None] = {}
+
+
 def _repo_for_served_name(name: str | None) -> str | None:
     """The cached repo a served-model-name refers to, if exactly one does.
 
@@ -446,12 +456,14 @@ def _repo_for_served_name(name: str | None) -> str | None:
     """
     if not name:
         return None
-    hits = [
-        e.repo_id
-        for e in registry.discover_models()
-        if e.repo_id == name or e.repo_id.rsplit("/", 1)[-1] == name
-    ]
-    return hits[0] if len(hits) == 1 else None
+    if name not in _SERVED_NAME_REPO:
+        hits = [
+            e.repo_id
+            for e in registry.discover_models()
+            if e.repo_id == name or e.repo_id.rsplit("/", 1)[-1] == name
+        ]
+        _SERVED_NAME_REPO[name] = hits[0] if len(hits) == 1 else None
+    return _SERVED_NAME_REPO[name]
 
 
 def _serving_identity() -> dict[str, Any]:
