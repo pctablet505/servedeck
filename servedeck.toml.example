@@ -55,12 +55,13 @@ architectures = ["Qwen3ForCausalLM", "LlamaForCausalLM", "MistralForCausalLM"]
 # blocked-needs-human instead of looping forever.
 # needs_tty = true
 
-# Where to run the launcher from. Defaults to the directory the launcher is
-# in, which is right for a serve script sitting at a project root and WRONG
-# for one under bin/ — that launcher resolves its own config, run/ and logs/
-# relative to the project root, and running it one level down makes it write a
-# second, empty state tree. Set this whenever the launcher is not at the root
-# of the tree it belongs to.
+# Where to run the launcher from. Defaults to the directory the launcher is in
+# — the same rule a shell CLI's `cd "$(dirname "$SERVE_SH")"` uses, and right
+# for a serve script sitting at a project root. It is not right for a launcher
+# under bin/: that directory is not the tree the server belongs to, so any
+# relative path the launcher uses resolves one level down. Set this when your
+# launcher cares; a launcher that derives its own root from $BASH_SOURCE does
+# not.
 # cwd = "~/Projects/local_llm"
 
 # Cold-boot ETA envelope [low, high] in seconds, used only until this model

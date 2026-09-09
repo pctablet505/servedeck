@@ -190,10 +190,14 @@ def test_extra_args_is_not_taken_from_another_backends_config(tmp_path, config_p
 def test_cwd_is_the_project_root_not_the_bin_directory(tmp_path, config_path):
     """``llm`` runs the launcher from ``dirname "$SERVE_SH"``, which is the
     project root for a serve script that sits at one — and is NOT the project
-    root for a launcher under ``bin/``. That launcher resolves its own
-    ``.config``, ``run/`` and ``logs/`` relative to the root, so running it
-    from ``bin/`` makes it create a second, empty state tree there and read a
-    config file that does not exist."""
+    root for a launcher under ``bin/``.
+
+    The default still matches the CLI exactly (see the two serve scripts
+    below); what this pins is that a backend CAN declare a different working
+    directory, because for a launcher under ``bin/`` there is no derivable
+    right answer. NOT claimed: that this box's ``qwen-server-run.sh`` needs
+    it — that script derives its own root from ``${BASH_SOURCE[0]}/..`` and is
+    indifferent to cwd. A launcher that uses a relative path is not."""
     trees, _ = _box_config(tmp_path, config_path)
     s = _supervisor(tmp_path)
 

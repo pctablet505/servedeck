@@ -107,8 +107,8 @@
 
 
 Local web GUI managing a vLLM server on one RTX PRO 6000 (97,887 MiB).
-Design prototype (visual/UX reference, NOT logic reference):
-`/tmp/claude-1000/-home-pctablet505-Projects/5b534f7a-126f-4b00-9811-0dfe96e5eacc/scratchpad/design/servedeck.html`
+Design prototype (visual/UX reference, NOT logic reference): a single-file
+HTML mock, kept outside the repository. `servedeck/web/` is what shipped.
 
 ## 0. GROUND TRUTH — measured, do not substitute
 
@@ -127,7 +127,7 @@ tok/s: Flash-Next 99.3 (measured), 27B NVFP4 140.4, AWQ-MTP 173.8, FP8 = null (u
 
 ## 1. ARCHITECTURE
 
-Python 3.13 + FastAPI + uvicorn + httpx in a THIRD venv `/home/pctablet505/Projects/servedeck/.venv-gui`.
+Python 3.13 + FastAPI + uvicorn + httpx in a THIRD venv `~/Projects/servedeck/.venv`.
 NEVER install into `.venv-llm` or `.venv-next` (documented foot-gun: SETUP.md:229 — uv re-resolves and
 downgrades pinned CUDA 13.2.86, reintroducing the PTX blocker).
 
@@ -140,9 +140,9 @@ Servedeck re-adopts on startup from state/server.json + port probe.
 
 ### Delegation, not reimplementation
 Servedeck NEVER builds a `vllm serve` command line. It invokes existing launchers:
-- flashnext: `setsid env PORT= MAX_LEN= GPU_UTIL= MAX_SEQS= KV_DTYPE=auto SERVED_NAME= /home/pctablet505/Projects/vllm-qwen38next/serve.sh`
+- flashnext: `setsid env PORT= MAX_LEN= GPU_UTIL= MAX_SEQS= KV_DTYPE=auto SERVED_NAME= ~/Projects/vllm-qwen38next/serve.sh`
   (serve.sh ALREADY reads PORT/MAX_LEN/GPU_UTIL/MAX_SEQS/KV_DTYPE from env — only SERVED_NAME needs adding)
-- inline: `setsid /home/pctablet505/Projects/local_llm/bin/qwen-server-run.sh` (sources .config)
+- inline: `setsid ~/Projects/local_llm/bin/qwen-server-run.sh` (sources .config)
 
 `.config` is written ONLY by shelling out to `codex-qwen.sh set-mem|set-subagents|set-config`.
 Never edit .config directly (preserves save_config_kv line semantics + validators).

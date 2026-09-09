@@ -1018,9 +1018,11 @@ class Supervisor:
         log_paths = [my_log]
         if b.writes_own_log and b.log_path is not None:
             log_paths.append(str(b.log_path))
-        # run_cwd, not launcher.parent: a launcher under bin/ resolves its own
-        # .config, run/ and logs/ relative to the PROJECT root, and running it
-        # from bin/ makes it create a second, empty state tree there.
+        # run_cwd, not launcher.parent: launcher.parent is the shell CLI's own
+        # rule (`cd "$(dirname "$SERVE_SH")"`) and is right for a serve script
+        # at a project root, but a launcher under bin/ is not at the root of
+        # the tree it belongs to. Backend.cwd lets that be declared; when it is
+        # unset run_cwd IS launcher.parent, so this changes nothing by itself.
         return [str(b.launcher)], env, str(b.run_cwd), log_paths
 
     # ----------------------------------------------------------------- #

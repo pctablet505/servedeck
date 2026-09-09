@@ -42,16 +42,21 @@ Two keys are new in this branch and worth adding:
 
 ```toml
 [backends.inline]
-# The launcher lives under bin/, but resolves its own .config, run/ and logs/
-# relative to the PROJECT root. Without this, Servedeck runs it from bin/ and
-# it creates a second, empty state tree there.
+# The launcher lives under bin/, so the default working directory (the
+# launcher's own directory) is not the tree it belongs to. Precautionary
+# rather than urgent: qwen-server-run.sh derives its root from
+# ${BASH_SOURCE[0]}/.. and uses no relative paths, so this changes nothing
+# today — it makes the launched process's cwd name the tree it came from.
 cwd = "~/Projects/local_llm"
 
 [backends.glm53]
-# Measured 2026-08-29: 330-420 s cold (181 GiB load + Marlin repack + MTP graph
-# capture); the ceiling is generous because the repack is silent for minutes
-# and must not be mistaken for a hang. Used only until this model has boot
-# history of its own.
+# Carried over verbatim from the fork's history.py. Its own comment records a
+# MEASURED 330-420 s cold boot (181 GiB load + Marlin repack + MTP graph
+# capture) while the envelope it shipped is 420-900 -- deliberately pessimistic
+# on both ends, because the repack is silent for minutes and an ETA that
+# expires mid-boot reads as a hang. Kept as it was rather than "corrected" to
+# the measurement: it is an ETA envelope, not a measurement, and it is used
+# only until this model has boot history of its own.
 cold_boot_range_s = [420.0, 900.0]
 ```
 
@@ -107,24 +112,34 @@ this is a stop-then-copy step.
 
 ## 5. Switch the systemd unit
 
+The shipped unit assumes the checkout is at `%h/servedeck`. On this box it is
+at `~/Projects/servedeck`, so the paths have to be rewritten — installing it
+unedited gives `Command /home/<you>/servedeck/.venv/bin/uvicorn is not
+executable: No such file or directory` (which `systemd-analyze verify` will
+also tell you before you install it).
+
 ```bash
 systemctl --user stop    coldstart.service
 systemctl --user disable coldstart.service      # leaves the unit file in place
 
-# Servedeck's unit uses %h/servedeck; adjust WorkingDirectory/ExecStart if the
-# checkout is elsewhere.
-cp ~/Projects/servedeck/systemd/servedeck.service ~/.config/systemd/user/
+sed 's|%h/servedeck|%h/Projects/servedeck|g' \
+    ~/Projects/servedeck/systemd/servedeck.service \
+    > ~/.config/systemd/user/servedeck.service
+systemd-analyze verify --user ~/.config/systemd/user/servedeck.service
 systemctl --user daemon-reload
 systemctl --user enable --now servedeck.service
 systemctl --user status servedeck.service --no-pager
 curl -sf http://127.0.0.1:8010/api/health && echo
 ```
 
-`llm ui` still launches the coldstart tree by path
-(`~/Projects/local_llm/llm`:279-281 hardcodes `$HOME/Projects/coldstart` and
-`.venv-gui`). It is only a convenience opener and the systemd unit makes it
-unnecessary, but if you want it to open Servedeck, that is a one-line change in
-`llm` — a separate edit to a script this branch deliberately does not touch.
+`llm ui` still launches the coldstart tree by path: `cmd_ui` in
+`~/Projects/local_llm/llm` hardcodes `$HOME/Projects/coldstart`, `.venv-gui`
+and `coldstart.app:app`, and the `COLDSTART_PORT="8010"` near the top of that
+file is what `llm status` probes. (Cited by name rather than line number: that
+script is under active edit and the numbers move.) It is only a convenience
+opener and the systemd unit makes it unnecessary, but if you want it to open
+Servedeck, that is a three-line change in `cmd_ui` — a separate edit to a
+script this branch deliberately does not touch.
 
 ## What changes for you
 

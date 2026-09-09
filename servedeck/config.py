@@ -86,11 +86,17 @@ class Backend:
     # blocked-needs-human rather than looping.
     needs_tty: bool = False
     #: Working directory for the launcher. Defaults to the directory the
-    #: launcher lives in, which is right for a serve script at a project root
-    #: and WRONG for one under ``bin/`` — that launcher resolves its own
-    #: config, run/ and logs/ relative to the project root, and running it one
-    #: level down makes it write a second, empty state tree. Set it explicitly
-    #: whenever the launcher is not at the root of the tree it belongs to.
+    #: launcher lives in — which is what the shell CLI on this box does
+    #: (``cd "$(dirname "$SERVE_SH")"``) and is right for a serve script that
+    #: sits at a project root. It is NOT right for a launcher under ``bin/``:
+    #: that directory is not the tree the server belongs to, and any relative
+    #: path the launcher uses resolves one level down from where it means to.
+    #:
+    #: Whether that matters is a property of the launcher, which is why this is
+    #: declared rather than derived. ``local_llm/bin/qwen-server-run.sh``, for
+    #: one, derives its own root from ``${BASH_SOURCE[0]}/..`` and so does not
+    #: care — setting ``cwd`` for it changes nothing today. A launcher that
+    #: does care has nowhere else to say so.
     cwd: Path | None = None
     #: Cold-boot ETA envelope (low, high) in seconds, used only until this
     #: model has produced measured boot history of its own. A model family's
