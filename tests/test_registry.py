@@ -709,7 +709,10 @@ pytestmark_real = pytest.mark.skipif(
 @pytestmark_real
 def test_real_hub_entries_are_internally_consistent() -> None:
     for e in discover_models():
-        assert e.repo_id and "/" in e.repo_id
+        # "org/name", or a legacy single-segment id: the hub still serves
+        # `gpt2` and `bert-base-uncased` under `models--<name>`, and one of
+        # them turning up in a real cache is not a registry defect.
+        assert e.repo_id and not e.repo_id.startswith("/")
         if e.skipped:
             continue
         # Servability must always be explainable: either it is servable, or
@@ -723,13 +726,26 @@ def test_real_hub_entries_are_internally_consistent() -> None:
 
 
 @pytestmark_real
-def test_real_hub_gguf_only_models_are_rejected_with_a_reason() -> None:
-    """A GGUF-only checkpoint has no config.json and cannot be loaded."""
+def test_real_hub_unloadable_models_say_what_is_actually_wrong() -> None:
+    """An entry with no config.json and no safetensors must name its cause.
+
+    This used to assert every such entry was GGUF-only. It is not the only
+    way to get there: a snapshot whose blobs live on an unmounted external
+    drive scans as zero safetensors and an unreadable config.json too, and
+    "0 safetensors, no config.json" reads as a failed download -- sending the
+    operator to re-fetch ~180 GiB that is sitting on a disk they only have to
+    plug back in. Whatever the cause, the reason has to name it.
+    """
     for e in discover_models():
         if e.skipped or e.config_exists or e.safetensors_count:
             continue
         assert not e.servable
-        assert e.reason and "GGUF" in e.reason.upper()
+        assert e.reason, f"{e.repo_id} is unservable with no reason"
+        upper = e.reason.upper()
+        assert "GGUF" in upper or "SYMLINK" in upper, (
+            f"{e.repo_id}: reason {e.reason!r} does not name a cause a human "
+            "can act on"
+        )
 
 
 @pytestmark_real
@@ -748,3 +764,46 @@ def test_weights_estimator_refuses_host_offload_architectures() -> None:
             assert ri.weights_source == "unknown", (
                 f"{e.repo_id}: offload architecture must not be estimated from disk size"
             )
+
+
+def test_a_snapshot_whose_blobs_are_offline_says_so(tmp_path) -> None:
+    """A hub snapshot on this box points its files at blobs on an external
+    drive. Unplug the drive and the scan is byte-for-byte identical to a
+    failed download: zero safetensors, unreadable config.json. Reporting it as
+    "0 safetensors, no config.json" sends the operator to re-fetch ~180 GiB
+    that is sitting on a disk they only have to plug back in.
+    """
+    from servedeck.registry import _scan_snapshot_files
+
+    snap = tmp_path / "snapshots" / "abc"
+    snap.mkdir(parents=True)
+    gone = tmp_path / "not-mounted" / "blob"
+    (snap / "model-00001.safetensors").symlink_to(gone)
+    (snap / "config.json").symlink_to(gone)
+    real = snap / "tokenizer.json"
+    real.write_text("{}")
+
+    gib, st_count, gguf_count, dangling = _scan_snapshot_files(snap)
+    assert (gib, st_count, gguf_count) == (0.0, 0, 0)
+    assert dangling == 2, "unresolved symlinks were counted as ordinary files"
+
+
+def test_a_healthy_snapshot_reports_no_dangling_symlinks(tmp_path) -> None:
+    """The over-correction guard: a normal hub snapshot IS a directory of
+    symlinks into blobs/, and every one of them resolves. Counting those as
+    broken would label every cached model unloadable."""
+    from servedeck.registry import _scan_snapshot_files
+
+    blobs = tmp_path / "blobs"
+    blobs.mkdir()
+    blob = blobs / "deadbeef"
+    blob.write_bytes(b"x" * 4096)
+    snap = tmp_path / "snapshots" / "abc"
+    snap.mkdir(parents=True)
+    (snap / "model-00001.safetensors").symlink_to(blob)
+    (snap / "config.json").symlink_to(blob)
+
+    gib, st_count, gguf_count, dangling = _scan_snapshot_files(snap)
+    assert dangling == 0
+    assert st_count == 1
+    assert gib > 0

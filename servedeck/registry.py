@@ -171,21 +171,32 @@ def _resolve_snapshot(hub_repo_dir: Path) -> Path | None:
     return candidates[0]
 
 
-def _scan_snapshot_files(snapshot: Path) -> tuple[float, int, int]:
-    """(safetensors_gib, safetensors_count, gguf_count) for one snapshot dir.
+def _scan_snapshot_files(snapshot: Path) -> tuple[float, int, int, int]:
+    """(safetensors_gib, safetensors_count, gguf_count, dangling_count).
 
     Sizes follow symlinks (hub snapshot files are symlinks into blobs/); this
     matches ``Path.stat()``'s default (follow_symlinks=True), per SPEC §4.
+
+    ``dangling_count`` is the entries that ARE symlinks and do not resolve.
+    A hub snapshot whose blobs were moved to an external drive that is not
+    mounted looks byte-for-byte like an empty download -- same zero
+    safetensors, same unreadable config.json -- and reporting it as "0
+    safetensors, no config.json" sends the operator to re-download 180 GiB
+    that is already on a disk they only have to plug in.
     """
     total_bytes = 0
     st_count = 0
     gguf_count = 0
+    dangling = 0
     try:
         children = list(snapshot.iterdir())
     except OSError:
-        return 0.0, 0, 0
+        return 0.0, 0, 0, 0
     for p in children:
         name = p.name
+        if p.is_symlink() and not p.exists():
+            dangling += 1
+            continue
         if name.endswith(".safetensors"):
             try:
                 total_bytes += p.stat().st_size
@@ -194,7 +205,7 @@ def _scan_snapshot_files(snapshot: Path) -> tuple[float, int, int]:
             st_count += 1
         elif name.endswith(".gguf"):
             gguf_count += 1
-    return total_bytes / GIB, st_count, gguf_count
+    return total_bytes / GIB, st_count, gguf_count, dangling
 
 
 def _parse_config(snapshot: Path) -> dict[str, Any] | None:
@@ -241,7 +252,7 @@ def _build_entry(repo_id: str, hub_dirname: str, snapshot: Path | None) -> Model
             reason="skipped: no snapshots/ (stub dir)",
         )
 
-    safetensors_gib, st_count, gguf_count = _scan_snapshot_files(snapshot)
+    safetensors_gib, st_count, gguf_count, dangling = _scan_snapshot_files(snapshot)
     cfg = _parse_config(snapshot)
     config_exists = cfg is not None
     fields = _extract_config_fields(cfg) if cfg is not None else {k: None for k in _CONFIG_FIELD_NAMES}
@@ -259,7 +270,15 @@ def _build_entry(repo_id: str, hub_dirname: str, snapshot: Path | None) -> Model
     servable = not reasons
     reason: str | None = None
     if reasons:
-        prefix = "GGUF-only: " if gguf_count > 0 and safetensors_gib <= 0 else ""
+        if gguf_count > 0 and safetensors_gib <= 0:
+            prefix = "GGUF-only: "
+        elif dangling and safetensors_gib <= 0:
+            prefix = (
+                f"{dangling} unresolved symlink(s) — the blobs this snapshot points at "
+                "are on a filesystem that is not mounted: "
+            )
+        else:
+            prefix = ""
         reason = prefix + ", ".join(reasons)
 
     return ModelEntry(
