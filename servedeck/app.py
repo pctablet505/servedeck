@@ -101,6 +101,8 @@ class Runtime:
         self.metrics = {"reachable": False}
         self.serving_model = None
         self.serving_models = []
+        # The cached socket-table answer belongs to the OLD port.
+        _invalidate_listener()
         return True
 
 
@@ -137,7 +139,7 @@ def _server_uptime_s() -> int | None:
     from . import procctl
 
     try:
-        pid = procctl.listener_pid(rt.port)
+        pid = _listener_pid_now()
         return procctl.process_uptime_s(pid) if pid else None
     except Exception:  # noqa: BLE001
         return None
@@ -266,11 +268,55 @@ def _max_model_len_from(argv: list[str]) -> int | None:
     return value if value > 0 else None
 
 
-def _listener_argv() -> list[str]:
-    """The command line of whatever is listening on rt.port."""
+#: (port, monotonic deadline, pid) of the last socket-table lookup.
+_LISTENER_CACHE: tuple[int, float, int | None] | None = None
+
+#: How long one socket-table answer is reused. Deliberately far shorter than
+#: the dashboard's own poll interval, so no two polls ever share an answer:
+#: the point is only that the several questions asked WITHIN one poll — the
+#: running model id, the running max_model_len, the serving identity, the
+#: server's uptime — share the one `ss` between them instead of spawning one
+#: each. A longer window would start hiding a server that just came up.
+_LISTENER_TTL_S = 0.25
+
+
+def _invalidate_listener() -> None:
+    """Forget the cached socket-table answer.
+
+    Called wherever Servedeck itself changes what is listening (a start, a
+    stop, a port move), so the next question re-reads rather than waiting out
+    the TTL.
+    """
+    global _LISTENER_CACHE
+    _LISTENER_CACHE = None
+
+
+def _listener_pid_now() -> int | None:
+    """PID listening on rt.port, from a lookup shared across one poll.
+
+    ``procctl.listener_pid`` shells out to ``ss``: one fork+exec per call, and
+    /api/state asked it five separate times for one listening socket, several
+    times a second, for a fact that cannot change between the questions.
+
+    Keyed on the port, so a repoint (``Runtime.repoint``) can never be
+    answered from the previous port's lookup — that would be the stale-port
+    class of bug this file already carries two fixes for.
+    """
+    global _LISTENER_CACHE
     from . import procctl
 
+    now = time.monotonic()
+    cached = _LISTENER_CACHE
+    if cached is not None and cached[0] == rt.port and now < cached[1]:
+        return cached[2]
     pid = procctl.listener_pid(rt.port)
+    _LISTENER_CACHE = (rt.port, now + _LISTENER_TTL_S, pid)
+    return pid
+
+
+def _listener_argv() -> list[str]:
+    """The command line of whatever is listening on rt.port."""
+    pid = _listener_pid_now()
     if pid is None:
         return []
     try:
@@ -405,7 +451,7 @@ async def _recover_if_server_returned() -> None:
         return  # intent says stopped: leave it alone, offer adoption in the UI
     from . import procctl
 
-    pid = procctl.listener_pid(rt.port)
+    pid = _listener_pid_now()
     if pid is None or not procctl.is_attributable(pid):
         return
     try:
@@ -497,7 +543,7 @@ def _serving_identity() -> dict[str, Any]:
         from . import procctl
 
         try:
-            pid = procctl.listener_pid(rt.port)
+            pid = _listener_pid_now()
             backend = procctl.backend_of_pid(pid) if pid else None
         except Exception:  # noqa: BLE001
             backend = None
@@ -589,9 +635,7 @@ def _own_gpu_mib() -> int:
     processes that are actually part of the server on our upstream port.
     """
     try:
-        from . import procctl
-
-        listener = procctl.listener_pid(rt.port)
+        listener = _listener_pid_now()
     except Exception:  # noqa: BLE001
         listener = None
     if listener is None:

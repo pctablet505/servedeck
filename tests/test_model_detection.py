@@ -269,3 +269,87 @@ def test_resolving_a_served_name_does_not_rescan_the_cache_every_poll(cache, liv
     for _ in range(20):
         assert capp._serving_identity()["repo_id"] == "dealignai/GLM-5.3-Flash-ABLITERATED-NVFP4"
     assert calls["n"] == 1, f"scanned the model cache {calls['n']} times for one name"
+
+
+# --------------------------------------------------------------------------- #
+# What one status poll costs
+# --------------------------------------------------------------------------- #
+
+def _invalidate() -> None:
+    """Drop any cached socket-table answer.
+
+    Tolerates the helper being absent so the count assertion below reports the
+    number of `ss` calls on code that has no cache at all, rather than an
+    AttributeError that says nothing about the cost.
+    """
+    getattr(capp, "_invalidate_listener", lambda: None)()
+
+
+def _count_socket_lookups(monkeypatch):
+    """Replace the socket-table lookup with a counter.
+
+    ``procctl.listener_pid`` shells out to ``ss`` — one fork+exec per call.
+    The counter also stands in for the answer, so nothing downstream needs a
+    real process.
+    """
+    from servedeck import procctl
+
+    calls: list[int] = []
+
+    def _fake(port: int) -> int:
+        calls.append(port)
+        return 424242            # a pid that does not exist: /proc reads fail
+
+    monkeypatch.setattr(procctl, "listener_pid", _fake)
+    return calls
+
+
+@pytest.fixture
+def quiet_state(monkeypatch):
+    """Everything /api/state reads that is not the socket table."""
+    monkeypatch.setattr(capp, "_live_boot_facts", lambda: {})
+    monkeypatch.setattr(capp, "_safe_config", lambda: {})
+    capp.rt.upstream_up = True
+    capp.rt.serving_models = []
+    _invalidate()
+
+
+def test_one_status_poll_makes_one_socket_table_lookup(quiet_state, monkeypatch):
+    """`ss` runs once per poll, not once per question asked of the poll.
+
+    Four separate answers in ``_state()`` are read off the same listening
+    socket: the running model id, the running max_model_len, the serving
+    identity (which wants the pid as well as the argv) and the server's
+    uptime. Each one used to spawn its own ``ss``. The dashboard polls
+    /api/state on a timer and publishes the same payload over SSE, so that is
+    four fork+execs several times a second for one fact that cannot change
+    between them.
+    """
+    calls = _count_socket_lookups(monkeypatch)
+    capp._state()
+    assert len(calls) == 1, (
+        f"one status poll spawned `ss` {len(calls)} times for one listening socket"
+    )
+
+
+def test_the_cached_listener_does_not_outlive_the_port_it_was_read_from(
+    quiet_state, monkeypatch
+):
+    """Over-correction guard: a cache that answers for the WRONG port, or that
+    never expires, makes the dashboard blind to the server it is supposed to
+    be watching. A start rewrites the upstream port; the next lookup must go
+    back to the socket table."""
+    calls = _count_socket_lookups(monkeypatch)
+    original_port = capp.rt.port
+    try:
+        capp._listener_argv()
+        assert len(calls) == 1
+        capp.rt.port = original_port + 1
+        capp._listener_argv()
+        assert calls == [original_port, original_port + 1], calls
+        _invalidate()
+        capp._listener_argv()
+        assert len(calls) == 3, "an explicit invalidation must force a re-read"
+    finally:
+        capp.rt.port = original_port
+        _invalidate()
