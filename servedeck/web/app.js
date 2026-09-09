@@ -34,7 +34,60 @@ function rateTxt(v, digits) {
 function prefillTxt(m) {
   if (typeof m.prefill_tok_s === "number") return rateTxt(m.prefill_tok_s);
   if (typeof m.prefill_tok_s_avg === "number") return "~" + rateTxt(m.prefill_tok_s_avg);
-  return "—";
+  return "n/a";
+}
+
+/* One figure of the throughput strip.
+ *
+ * Returns {value, note}. `value` is never a bare number with no unit and
+ * never an unexplained dash: when there is no reading it is the string "n/a"
+ * and `note` carries the reason the backend gave (idle, counters reset, not
+ * published by this build, backend unreachable). A lone unlabelled number was
+ * the original complaint — you could not tell prefill from decode — and a
+ * lone em dash is the same defect one step further along: it does not say
+ * whether the server is quiet or the metric is missing.
+ *
+ * `live` is the window reading, `life` the lifetime companion. A lifetime
+ * figure is shown with a "~" and says so, so it is never read as "now".
+ */
+function figure(live, life, reason, fmtFn, lifeNote) {
+  if (typeof live === "number" && isFinite(live)) {
+    return { value: fmtFn(live), note: "last 2 s window" };
+  }
+  if (typeof life === "number" && isFinite(life)) {
+    return { value: "~" + fmtFn(life), note: lifeNote + (reason ? " — " + reason : "") };
+  }
+  return { value: "n/a", note: reason || "no reading" };
+}
+
+function secsTxt(v) {
+  if (typeof v !== "number" || !isFinite(v)) return "n/a";
+  return v >= 10 ? v.toFixed(0) + " s" : v >= 1 ? v.toFixed(1) + " s"
+       : Math.round(v * 1000) + " ms";
+}
+
+/* The throughput strip: prefill, decode and TTFT, always all three.
+ *
+ * Rendering only one of them is what the dashboard did, and it made a slow
+ * time-to-first-token indistinguishable from a slow decode — the two differ
+ * by ~70x on this box, so the single number was not merely ambiguous, it was
+ * off by nearly two orders of magnitude depending on which one you assumed.
+ */
+function paintThroughput() {
+  const m = liveMetrics || {};
+  const cells = [
+    ["thPrefill", figure(m.prefill_tok_s, m.prefill_tok_s_avg, m.prefill_reason,
+                         (v) => rateTxt(v), "lifetime, per second of prefill time")],
+    ["thDecode", figure(m.gen_tok_s, m.gen_tok_s_avg, m.gen_reason,
+                        (v) => rateTxt(v, 1), "lifetime, per second of decode time")],
+    ["thTtft", figure(m.ttft_s, m.ttft_s_avg, m.ttft_reason,
+                      secsTxt, "lifetime mean")],
+  ];
+  cells.forEach(([id, f]) => {
+    const n = $(id), sub = $(id + "S");
+    if (n) { n.textContent = f.value; n.className = "n mono" + (f.value === "n/a" ? " na" : ""); }
+    if (sub) sub.textContent = f.note;
+  });
 }
 
 /* Seconds since the SERVING process started -> "3h 12m".
@@ -356,6 +409,7 @@ function paintTelemetry(t) {
     : "backend not reachable");
 
   paintAgentSizing();
+  paintThroughput();
   paintServingMeta();
   spark();
 }
@@ -417,17 +471,30 @@ function paintServingMeta() {
   // Both throughputs, never one: generation tok/s alone cannot tell a 17 s
   // time-to-first-token apart from a slow decode, and the two can differ by
   // ~70x on a PCIe-bound decode.
+  // Every figure is named. "99 tok/s" on its own does not say whether the
+  // server is slow to START answering or slow to KEEP answering, and those
+  // have different fixes.
+  const decode = typeof liveMetrics.gen_tok_s === "number"
+    ? rateTxt(liveMetrics.gen_tok_s, 1)
+    : typeof liveMetrics.gen_tok_s_avg === "number"
+      ? "~" + rateTxt(liveMetrics.gen_tok_s_avg, 1) : "n/a";
+  const ttft = typeof liveMetrics.ttft_s === "number"
+    ? secsTxt(liveMetrics.ttft_s)
+    : typeof liveMetrics.ttft_s_avg === "number"
+      ? "~" + secsTxt(liveMetrics.ttft_s_avg) : "n/a";
   meta.textContent = up.up
     ? `${base} · ${fmt(liveCtx)} ctx` +
-      ` · ${rateTxt(liveMetrics.gen_tok_s, 1)} gen` +
-      ` · ${prefillTxt(liveMetrics)} prefill` +
+      ` · prefill ${prefillTxt(liveMetrics)}` +
+      ` · decode ${decode}` +
+      ` · TTFT ${ttft}` +
       ` · up ${uptimeTxt(s.server_uptime_s)}`
     : `nothing serving on ${base}`;
   meta.title = up.up
-    ? "generation and prefill throughput over the last 2 s poll window, from " +
-      "the engine's own counters. \u2014 means nothing was running in that " +
-      "window; a ~ prefix marks the lifetime prefill average (tokens per " +
-      "second of prefill time), shown when no prefill happened just now."
+    ? "prefill (prompt processing), decode (token generation) and " +
+      "time-to-first-token, from the engine's own counters over the last 2 s " +
+      "poll window. A ~ prefix marks a lifetime average, shown when nothing " +
+      "happened in the window; n/a with a reason is shown when there is no " +
+      "figure at all. The full strip below carries the reasons."
     : "";
 }
 

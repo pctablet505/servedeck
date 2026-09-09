@@ -195,6 +195,29 @@
       </div>
     </div>
 
+    <!-- Prefill, decode and TTFT are three different questions and one number
+         cannot answer them: a 17 s time-to-first-token and a slow decode look
+         identical when only one figure is on screen. All three are always
+         rendered, always labelled, and a figure that is not available says
+         "n/a" plus the reason it is not. -->
+    <div class="thru" id="thru">
+      <div class="tcell">
+        <div class="lk">Prefill <span class="tu">prompt tok/s</span></div>
+        <div class="n mono" id="thPrefill">n/a</div>
+        <div class="s" id="thPrefillS">connecting…</div>
+      </div>
+      <div class="tcell">
+        <div class="lk">Decode <span class="tu">generated tok/s</span></div>
+        <div class="n mono" id="thDecode">n/a</div>
+        <div class="s" id="thDecodeS">connecting…</div>
+      </div>
+      <div class="tcell">
+        <div class="lk">TTFT <span class="tu">time to first token</span></div>
+        <div class="n mono" id="thTtft">n/a</div>
+        <div class="s" id="thTtftS">connecting…</div>
+      </div>
+    </div>
+
     <div class="oversub" id="oversub"></div>
   </div>
 
@@ -204,13 +227,15 @@
   </div>
 
   <div class="foot">
-    <b>Live data.</b> Capacity is computed server-side from measured boot logs — Flash-Next
-    weights 78.47 GiB / KV 30.39 KiB per token / 304,653 tokens; 27B NVFP4 20.75 GiB / 37.99 KiB
-    per token / 627,117 tokens. Models never booted here are marked <span class="tag est">estimated</span>.
+    <b>Live data.</b> Capacity comes from the running engine where it can: the KV size a
+    server reports on <span class="mono">/metrics</span> is labelled
+    <span class="tag meas">measured</span>, and only a model that has never booted here
+    falls back to the per-architecture <span class="tag est">estimated</span> calculator.
+    Figures are never carried over from a different model.
     <br><br>
-    <b>Server control is not wired yet.</b> Start / stop / restart require supervisor.py, which is
-    not built. Use <span class="mono">./codex-qwen.sh</span> or
-    <span class="mono">vllm-qwen38next/serve.sh</span> from a terminal.
+    <b>Stopping and restarting run through Servedeck's supervisor.</b> It shells out to the
+    same launcher scripts a terminal would, so a dashboard launch and a CLI launch build
+    the same server.
   </div>
 </div><script src="/assets/app.js"></script>
 </body>

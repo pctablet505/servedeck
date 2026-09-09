@@ -422,3 +422,59 @@ def test_selecting_a_model_redraws_the_ladder() -> None:
     assert "renderCtx()" in _fn_body("renderModels"), (
         "clicking a model card must redraw the context choices"
     )
+
+
+# --------------------------------------------------------------------------
+# Prefill vs decode vs TTFT (owner report: "confusing whether it is prefill or
+# decode time when only 1 is visible")
+# --------------------------------------------------------------------------
+def test_throughput_strip_renders_all_three_figures_labelled() -> None:
+    """One unlabelled number cannot say whether the server is slow to start
+    answering or slow to keep answering. All three must be on the page, each
+    with a word naming it and a word naming its unit."""
+    for slot, label, unit in (
+        ("thPrefill", "Prefill", "prompt tok/s"),
+        ("thDecode", "Decode", "generated tok/s"),
+        ("thTtft", "TTFT", "time to first token"),
+    ):
+        assert f'id="{slot}"' in INDEX_HTML, f"{slot} missing from the page"
+        assert f'id="{slot}S"' in INDEX_HTML, f"{slot}'s reason line is missing"
+        assert label in INDEX_HTML, f"{slot} is not labelled {label!r}"
+        assert unit in INDEX_HTML, f"{slot} does not name its unit"
+    body = _fn_body("paintThroughput")
+    for slot in ("thPrefill", "thDecode", "thTtft"):
+        assert slot in body, f"paintThroughput never writes {slot}"
+
+
+def test_a_missing_throughput_figure_says_na_with_a_reason() -> None:
+    """A bare em dash is the same defect one step on: it does not distinguish
+    "nothing ran just now" from "this build does not publish that metric"."""
+    body = _fn_body("figure")
+    assert '"n/a"' in body, "figure() must render n/a, not a bare dash"
+    assert "reason" in body, "figure() must carry the backend's reason through"
+    assert "—" not in _fn_body("paintThroughput"), (
+        "the throughput strip must not fall back to an em dash"
+    )
+
+
+def test_serving_line_names_prefill_decode_and_ttft() -> None:
+    line = _serving_line()
+    for word in ("prefill", "decode", "TTFT"):
+        assert word in line, f"the serving line never says {word!r}: {line}"
+    assert "gen`" not in line, (
+        "the serving line abbreviated generation throughput to 'gen', which "
+        "reads as neither prefill nor decode"
+    )
+
+
+def test_the_page_reads_the_reason_fields_the_poller_emits() -> None:
+    """Contract: every *_reason the page renders must be a field
+    MetricsSnapshot.to_dict() actually produces."""
+    emitted = set(metrics.MetricsSnapshot().to_dict())
+    read = {
+        f
+        for f in _reads_of("m", _fn_body("paintThroughput")) | _reads_of("liveMetrics")
+        if f.endswith("_reason")
+    }
+    assert read, "the page reads no reason field at all"
+    assert read <= emitted, f"page reads reasons the poller never emits: {read - emitted}"

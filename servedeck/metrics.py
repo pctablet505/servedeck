@@ -43,6 +43,28 @@ PROMPT_TOK_CACHED_TOTAL = "vllm:prompt_tokens_cached_total"
 # of the lifetime prefill rate.
 PREFILL_TIME_SUM = "vllm:request_prefill_time_seconds_sum"
 PREFILL_TIME_COUNT = "vllm:request_prefill_time_seconds_count"
+#: Time-to-first-token histogram. _sum/_count over the poll window give the
+#: MEAN TTFT of the requests that started producing tokens in that window;
+#: over the lifetime they give the server's average since it booted. Verified
+#: live against http://127.0.0.1:8001/metrics on 2026-09-09 (the exposition
+#: recorded at tests/fixtures/metrics_flashnext_live.txt).
+TTFT_SUM = "vllm:time_to_first_token_seconds_sum"
+TTFT_COUNT = "vllm:time_to_first_token_seconds_count"
+#: Per-request mean time between output tokens. NOTE the `request_` prefix:
+#: this build exposes `vllm:request_time_per_output_token_seconds`, not the
+#: `vllm:time_per_output_token_seconds` name older vLLM used. A guess at the
+#: shorter name silently yields "not exposed" forever.
+TPOT_SUM = "vllm:request_time_per_output_token_seconds_sum"
+TPOT_COUNT = "vllm:request_time_per_output_token_seconds_count"
+#: Seconds spent DECODING, the denominator of the lifetime decode rate. Like
+#: prefill time, it does not decay while the server is idle.
+DECODE_TIME_SUM = "vllm:request_decode_time_seconds_sum"
+DECODE_TIME_COUNT = "vllm:request_decode_time_seconds_count"
+#: The engine's own resolved cache configuration, exposed as one info metric
+#: whose LABELS carry the numbers. `kv_cache_size_tokens` here is the same
+#: figure the boot log prints as "GPU KV cache size: N tokens" — a MEASURED
+#: capacity, read from the running engine, with no estimate in it.
+CACHE_CONFIG = "vllm:cache_config_info"
 SUCCESS_TOTAL = "vllm:request_success_total"
 PREFIX_HITS = "vllm:prefix_cache_hits_total"
 PREFIX_QUERIES = "vllm:prefix_cache_queries_total"
@@ -113,6 +135,35 @@ def _rate(delta: float, dt: float) -> float | None:
     return (delta / dt) if delta > 0 else None
 
 
+#: Why a throughput/latency figure is not a number right now. The UI renders
+#: "n/a" plus one of these, never a bare em dash and never 0: "no traffic in
+#: the window" and "this build does not publish that metric" are different
+#: facts, and only one of them is fixed by sending a request.
+UNREACHABLE = "backend not reachable"
+NO_BASELINE = "no baseline yet — first poll of this server"
+COUNTER_RESET = "counters reset — the server restarted during this window"
+IDLE = "idle — nothing ran in the sampling window"
+NOT_EXPOSED = "not published by this vLLM build"
+
+
+def _label_int(labels: dict[str, str], key: str) -> int | None:
+    """An integer label, or None. vLLM writes the string "None" for unset
+    numeric config, which int() would raise on."""
+    raw = labels.get(key)
+    try:
+        return int(raw) if raw not in (None, "", "None") else None
+    except ValueError:
+        return None
+
+
+def _label_float(labels: dict[str, str], key: str) -> float | None:
+    raw = labels.get(key)
+    try:
+        return float(raw) if raw not in (None, "", "None") else None
+    except ValueError:
+        return None
+
+
 def _by_label(parsed: dict, name: str, key: str, val: str) -> float:
     for labels, v in parsed.get(name, []):
         if labels.get(key) == val:
@@ -148,6 +199,29 @@ class MetricsSnapshot:
     prefill_tok_s_avg: float | None = None
     #: Requests that have finished a prefill (the sample count behind the avg).
     prefill_requests: int = 0
+    #: Lifetime decode throughput: generated tokens per second OF DECODE TIME.
+    #: The windowed gen_tok_s above is unknown whenever nothing is generating;
+    #: this one is the answer to "how fast does this server decode", and it
+    #: survives an idle poll.
+    gen_tok_s_avg: float | None = None
+    #: Mean time-to-first-token of the requests that FINISHED PREFILLING in the
+    #: last window (delta of the histogram sum over the delta of its count).
+    ttft_s: float | None = None
+    #: Same quantity over the server's whole life, so the panel still has a
+    #: TTFT to show when no request started in the last two seconds.
+    ttft_s_avg: float | None = None
+    #: Why each of the four figures above is not a number, when it is not.
+    #: Never None at the same time as its value: exactly one of the pair is
+    #: set, so the UI can always print either a reading or a reason.
+    gen_reason: str | None = None
+    prefill_reason: str | None = None
+    ttft_reason: str | None = None
+    #: The RUNNING engine's own resolved KV capacity, straight off
+    #: vllm:cache_config_info. This is a measurement, not an estimate: it is
+    #: the same number the boot log prints as "GPU KV cache size".
+    kv_cache_size_tokens: int | None = None
+    kv_cache_max_concurrency: float | None = None
+    kv_cache_gpu_util: float | None = None
     requests_succeeded: int = 0
     prefix_hit_rate: float | None = None   # None = no queries yet, NOT 0%
     error: str | None = None
@@ -165,9 +239,20 @@ class MetricsSnapshot:
             "avg_prompt_tokens": round(self.avg_prompt_tokens),
             "prompt_token_count": self.prompt_token_count,
             "gen_tok_s": rate(self.gen_tok_s),
+            "gen_tok_s_avg": rate(self.gen_tok_s_avg),
             "prefill_tok_s": rate(self.prefill_tok_s),
             "prefill_tok_s_avg": rate(self.prefill_tok_s_avg),
             "prefill_requests": self.prefill_requests,
+            # Seconds, not rounded to 1dp: a 0.04 s TTFT is a real reading and
+            # round(_, 1) would print it as 0.0.
+            "ttft_s": None if self.ttft_s is None else round(self.ttft_s, 3),
+            "ttft_s_avg": None if self.ttft_s_avg is None else round(self.ttft_s_avg, 3),
+            "gen_reason": self.gen_reason,
+            "prefill_reason": self.prefill_reason,
+            "ttft_reason": self.ttft_reason,
+            "kv_cache_size_tokens": self.kv_cache_size_tokens,
+            "kv_cache_max_concurrency": self.kv_cache_max_concurrency,
+            "kv_cache_gpu_util": self.kv_cache_gpu_util,
             "requests_succeeded": self.requests_succeeded,
             "prefix_hit_rate": (
                 None if self.prefix_hit_rate is None else round(self.prefix_hit_rate, 4)
@@ -192,9 +277,10 @@ class MetricsPoller:
         self, base_url: str, *, monotonic: Callable[[], float] = time.monotonic
     ) -> None:
         self.base_url = base_url.rstrip("/")
-        # (ts, generation_tokens_total, computed_prompt_tokens). One baseline
-        # for both rates so they can never be measured over different windows.
-        self._prev: tuple[float, float, float] | None = None
+        # (ts, generation_tokens_total, computed_prompt_tokens, ttft_sum,
+        # ttft_count). One baseline for every windowed figure, so the numbers
+        # on the panel can never describe different windows.
+        self._prev: tuple[float, float, float, float, float] | None = None
         # Injectable, and MONOTONIC: time.time() steps on an NTP correction,
         # and a backwards step silently scales every throughput number the UI
         # has ever shown.
@@ -202,12 +288,13 @@ class MetricsPoller:
 
     async def scrape(self, client: httpx.AsyncClient) -> MetricsSnapshot:
         snap = MetricsSnapshot()
+        snap.gen_reason = snap.prefill_reason = snap.ttft_reason = UNREACHABLE
         try:
             r = await client.get(f"{self.base_url}/metrics", timeout=4.0)
             if r.status_code != 200:
                 snap.error = f"HTTP {r.status_code}"
                 self._prev = None
-                return snap
+                return snap  # reasons already say UNREACHABLE
             text = r.text
         except Exception as exc:  # noqa: BLE001 - any transport failure means "down"
             snap.error = type(exc).__name__
@@ -220,6 +307,7 @@ class MetricsPoller:
 
         p = parse_prometheus(text)
         snap.reachable = True
+        snap.gen_reason = snap.prefill_reason = snap.ttft_reason = None
         snap.kv_usage_perc = _first(p, KV_USAGE)
         snap.running = int(_first(p, RUNNING))
         snap.waiting = int(_first(p, WAITING))
@@ -249,17 +337,61 @@ class MetricsPoller:
             0.0, _first(p, PROMPT_TOK_TOTAL) - _first(p, PROMPT_TOK_CACHED_TOTAL)
         )
 
+        # TTFT is a histogram, so the window figure is the mean of the requests
+        # that reached their first token during it: delta(_sum)/delta(_count).
+        # Dividing the lifetime _sum by the lifetime _count instead would print
+        # an average over every request since boot and call it "now".
+        ttft_sum = _first(p, TTFT_SUM)
+        ttft_count = _first(p, TTFT_COUNT)
+        has_ttft = bool(p.get(TTFT_COUNT))
+
         now = self._monotonic()
-        if self._prev is not None:
-            prev_ts, prev_gen, prev_prompt = self._prev
+        if self._prev is None:
+            snap.gen_reason = snap.prefill_reason = snap.ttft_reason = NO_BASELINE
+        else:
+            prev_ts, prev_gen, prev_prompt, prev_ttft_sum, prev_ttft_count = self._prev
             dt = now - prev_ts
             # Counters restart at 0 with the process. A counter that went
             # backwards means "new server", so this window spans two different
             # processes and has no throughput -- which is "unknown", not 0.
-            if dt > 0 and gen_total >= prev_gen and prompt_computed >= prev_prompt:
+            reset = gen_total < prev_gen or prompt_computed < prev_prompt
+            if dt <= 0 or reset:
+                reason = COUNTER_RESET if reset else NO_BASELINE
+                snap.gen_reason = snap.prefill_reason = snap.ttft_reason = reason
+            else:
                 snap.gen_tok_s = _rate(gen_total - prev_gen, dt)
                 snap.prefill_tok_s = _rate(prompt_computed - prev_prompt, dt)
-        self._prev = (now, gen_total, prompt_computed)
+                if snap.gen_tok_s is None:
+                    snap.gen_reason = IDLE
+                if snap.prefill_tok_s is None:
+                    snap.prefill_reason = IDLE
+                if not has_ttft:
+                    snap.ttft_reason = NOT_EXPOSED
+                elif ttft_count > prev_ttft_count:
+                    snap.ttft_s = (ttft_sum - prev_ttft_sum) / (
+                        ttft_count - prev_ttft_count
+                    )
+                else:
+                    snap.ttft_reason = IDLE
+        self._prev = (now, gen_total, prompt_computed, ttft_sum, ttft_count)
+
+        # Lifetime companions. They do not decay while the server is idle, so
+        # the panel always has all three of prefill / decode / TTFT to show —
+        # marked as lifetime rather than silently substituted for the window.
+        if has_ttft and ttft_count > 0:
+            snap.ttft_s_avg = ttft_sum / ttft_count
+        decode_seconds = _first(p, DECODE_TIME_SUM)
+        if decode_seconds > 0 and gen_total > 0:
+            snap.gen_tok_s_avg = gen_total / decode_seconds
+
+        # The engine's own resolved cache configuration. Every number is a
+        # LABEL on a single info metric whose value is always 1.0, so it has to
+        # be read out of the labels, not out of the value.
+        for labels, _v in p.get(CACHE_CONFIG, []):
+            snap.kv_cache_size_tokens = _label_int(labels, "kv_cache_size_tokens")
+            snap.kv_cache_max_concurrency = _label_float(labels, "kv_cache_max_concurrency")
+            snap.kv_cache_gpu_util = _label_float(labels, "gpu_memory_utilization")
+            break
 
         # Lifetime prefill rate. Denominator is seconds spent prefilling, not
         # seconds elapsed, so it stays meaningful while the server sits idle.

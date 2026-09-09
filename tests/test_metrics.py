@@ -11,6 +11,7 @@ be started, stopped or leaned on by a unit test.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -270,3 +271,157 @@ def test_parser_reads_labelled_counters() -> None:
     assert p["vllm:prompt_tokens_total"][0][1] == 7.0
     assert p["vllm:prompt_tokens_total"][0][0]["model_name"] == "glm53-flash"
     assert p["vllm:prompt_tokens_cached_total"][0][1] == 2.0
+
+
+# --------------------------------------------------------------------------
+# Prefill vs decode vs TTFT — the ambiguity the dashboard shipped
+# --------------------------------------------------------------------------
+#
+# The panel showed ONE throughput number. "Confusing whether it is prefill or
+# decode time when only 1 is visible" — and when a figure was missing it
+# rendered a bare em dash, which says neither which figure is missing nor why.
+# These tests pin the three separate figures and the requirement that a
+# missing one always arrives with a reason attached.
+
+_LIVE_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "metrics_flashnext_live.txt"
+
+
+def _live_text() -> str:
+    """The exposition recorded off the running Flash-Next server on :8001,
+    2026-09-09. Recorded rather than invented so the metric NAMES are the ones
+    this build actually publishes — the reason the older short name
+    `vllm:time_per_output_token_seconds` would have read as absent forever."""
+    return _LIVE_FIXTURE.read_text()
+
+
+def _bump(text: str, name: str, delta: float) -> str:
+    """Return `text` with one metric's value increased by `delta`."""
+    out = []
+    hit = 0
+    for line in text.splitlines():
+        if line.startswith(name + "{"):
+            head, _, value = line.rpartition(" ")
+            line = f"{head} {float(value) + delta}"
+            hit += 1
+        out.append(line)
+    assert hit == 1, f"{name} appears {hit} times in the fixture, expected 1"
+    return "\n".join(out) + "\n"
+
+
+def test_ttft_is_read_from_the_metric_name_this_build_publishes() -> None:
+    """TTFT was not scraped at all, so the panel could not show it.
+
+    The window figure is the mean of the requests that reached their first
+    token IN the window: delta(_sum)/delta(_count). Two requests taking 3 s
+    and 5 s must read 4 s, not the server's lifetime average.
+    """
+    first = _live_text()
+    second = _bump(first, metrics.TTFT_SUM, 8.0)
+    second = _bump(second, metrics.TTFT_COUNT, 2.0)
+    snaps = _scrape_all([first, second], [10.0, 12.0])
+
+    assert snaps[1].ttft_s == pytest.approx(4.0)
+    assert snaps[1].ttft_reason is None
+    # And the lifetime average, which does not decay while the server idles.
+    assert snaps[0].ttft_s_avg == pytest.approx(1871.7741420269012 / 552.0)
+
+
+def test_prefill_decode_and_ttft_are_three_separate_readings() -> None:
+    """One number cannot answer "is it slow to start or slow to run".
+
+    Same window, same fixture pair: prefill tok/s, decode tok/s and TTFT must
+    each come out as their own figure.
+    """
+    first = _live_text()
+    second = _bump(first, metrics.PROMPT_TOK_TOTAL, 20_000.0)
+    second = _bump(second, metrics.GEN_TOK_TOTAL, 200.0)
+    second = _bump(second, metrics.TTFT_SUM, 3.0)
+    second = _bump(second, metrics.TTFT_COUNT, 1.0)
+    snaps = _scrape_all([first, second], [0.0, 2.0])
+    s = snaps[1]
+
+    assert s.prefill_tok_s == pytest.approx(10_000.0)
+    assert s.gen_tok_s == pytest.approx(100.0)
+    assert s.ttft_s == pytest.approx(3.0)
+    d = s.to_dict()
+    assert d["prefill_tok_s"] == pytest.approx(10_000.0)
+    assert d["gen_tok_s"] == pytest.approx(100.0)
+    assert d["ttft_s"] == pytest.approx(3.0)
+
+
+def test_every_missing_figure_carries_a_reason_never_a_bare_dash() -> None:
+    """A missing reading must say WHY. "no traffic yet" and "this build does
+    not publish that metric" are different facts and only one of them is fixed
+    by sending a request; both used to render as the same em dash."""
+    text = _live_text()
+    # Two identical scrapes: counters do not move, so the server was idle.
+    snaps = _scrape_all([text, text], [0.0, 2.0])
+
+    first, second = snaps
+    assert first.gen_tok_s is None and first.gen_reason == metrics.NO_BASELINE
+    assert first.prefill_tok_s is None and first.prefill_reason == metrics.NO_BASELINE
+    assert first.ttft_s is None and first.ttft_reason == metrics.NO_BASELINE
+
+    assert second.gen_tok_s is None and second.gen_reason == metrics.IDLE
+    assert second.prefill_tok_s is None and second.prefill_reason == metrics.IDLE
+    assert second.ttft_s is None and second.ttft_reason == metrics.IDLE
+
+    d = second.to_dict()
+    assert d["gen_reason"] == metrics.IDLE and d["ttft_reason"] == metrics.IDLE
+
+
+def test_unreachable_backend_reports_unreachable_not_idle() -> None:
+    snaps = _scrape_all([ConnectionError("refused")], [0.0])
+    s = snaps[0]
+    assert s.reachable is False
+    assert s.gen_reason == metrics.UNREACHABLE
+    assert s.prefill_reason == metrics.UNREACHABLE
+    assert s.ttft_reason == metrics.UNREACHABLE
+
+
+def test_a_build_without_the_ttft_family_says_so() -> None:
+    """Absent family -> "not published by this build", never a fabricated 0."""
+    a = _exposition(prompt_total=10.0, gen_total=5.0)
+    b = _exposition(prompt_total=20.0, gen_total=10.0)
+    snaps = _scrape_all([a, b], [0.0, 1.0])
+    assert snaps[1].ttft_s is None
+    assert snaps[1].ttft_reason == metrics.NOT_EXPOSED
+    assert snaps[1].ttft_s_avg is None
+
+
+def test_lifetime_decode_rate_survives_an_idle_window() -> None:
+    """The window decode rate is unknown whenever nothing is generating, which
+    on an agent workload is most of the time. The lifetime rate — generated
+    tokens per second OF DECODE TIME — is the figure that still answers "how
+    fast does this server decode"."""
+    text = _live_text()
+    snaps = _scrape_all([text, text], [0.0, 2.0])
+    assert snaps[1].gen_tok_s is None                     # idle window
+    assert snaps[1].gen_tok_s_avg == pytest.approx(
+        1_196_208.0 / 9371.17950598198, rel=1e-9
+    )
+    assert snaps[1].to_dict()["gen_tok_s_avg"] == pytest.approx(127.6, abs=0.1)
+
+
+def test_kv_capacity_is_read_from_the_engines_own_cache_config() -> None:
+    """The RUNNING engine publishes its resolved KV size on
+    vllm:cache_config_info. That is a measurement — the same number the boot
+    log prints as "GPU KV cache size: N tokens" — and it must be preferred
+    over any estimate. Servedeck used to be able to read it only by scraping a
+    boot log, which does not exist for a server started by hand."""
+    snaps = _scrape_all([_live_text()], [0.0])
+    s = snaps[0]
+    assert s.kv_cache_size_tokens == 290_925
+    assert s.kv_cache_max_concurrency == pytest.approx(1.1097922848664687)
+    assert s.kv_cache_gpu_util == pytest.approx(0.95)
+    assert s.to_dict()["kv_cache_size_tokens"] == 290_925
+
+
+def test_cache_config_none_labels_do_not_become_zero() -> None:
+    """vLLM writes the string "None" for unset numeric config
+    (kv_cache_memory_bytes="None"). Parsing that as 0 would report a server
+    with no KV cache at all."""
+    line = 'vllm:cache_config_info{kv_cache_size_tokens="None",gpu_memory_utilization="None"} 1.0'
+    snaps = _scrape_all([_exposition() + line + "\n"], [0.0])
+    assert snaps[0].kv_cache_size_tokens is None
+    assert snaps[0].kv_cache_gpu_util is None
