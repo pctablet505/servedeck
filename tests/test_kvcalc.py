@@ -219,3 +219,30 @@ def test_a_measured_observation_still_wins_over_the_calculator() -> None:
     assert ri.kv_source == "measured"
     assert ri.trust == "measured"
     assert ri.kv_kib_per_token == pytest.approx(37.99, abs=0.05)
+
+
+def test_the_estimate_uses_the_flags_this_box_actually_launches_with(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cache-layout flags reach the calculator from the SAME place a
+    launch reads them: the backend's fixed env, then EXTRA_ARGS out of the
+    shell config, guarded on BACKEND so another backend's flags cannot leak
+    in. Without this the panel describes a server nobody starts -- the
+    delivered Flash-Next configuration carries
+    --mamba-ssm-cache-dtype bfloat16, worth 6.9% of its token count."""
+    from servedeck import app as capp
+    from servedeck import supervisor as _sup
+
+    monkeypatch.setattr(
+        _sup,
+        "shell_extra_args",
+        lambda backend: (
+            "--language-model-only --mamba-ssm-cache-dtype bfloat16 --prefix-match-unit 208"
+            if backend == "flashnext"
+            else ""
+        ),
+    )
+    assert capp._cache_flags("flashnext") == (None, "bfloat16")
+    # A different backend must not inherit them.
+    assert capp._cache_flags("inline")[1] is None
+    assert capp._cache_flags(None) == (None, None)

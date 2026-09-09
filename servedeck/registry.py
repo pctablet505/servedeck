@@ -499,6 +499,8 @@ def _estimate_kv_rate(
     *,
     cfg: dict[str, Any] | None = None,
     ctx: int | None = None,
+    kv_cache_dtype: str | None = None,
+    mamba_ssm_dtype: str | None = None,
 ) -> tuple[float | None, KvSource, str | None]:
     """Tier-3 KV rate estimate.
 
@@ -521,7 +523,9 @@ def _estimate_kv_rate(
     """
     if cfg is not None and ctx:
         try:
-            geo = kvcalc.geometry(cfg)
+            geo = kvcalc.geometry(
+                cfg, kv_cache_dtype=kv_cache_dtype, mamba_ssm_dtype=mamba_ssm_dtype
+            )
         except Exception:  # noqa: BLE001 - a malformed config falls through
             geo = None
         if geo is not None and geo.family != "unknown" and geo.attn_bytes_per_token > 0:
@@ -551,6 +555,8 @@ def resolve_inputs(
     *,
     observations: list[dict[str, Any]] | None = None,
     hub_dir: Path | str | None = None,
+    kv_cache_dtype: str | None = None,
+    mamba_ssm_dtype: str | None = None,
 ) -> ResolvedInputs:
     """Three-tier lookup (SPEC §4):
 
@@ -642,7 +648,12 @@ def resolve_inputs(
     weights_gib, weights_source, w_reason = _estimate_weights_gib(safetensors_gib, model_type)
     raw_cfg = load_model_config(repo_id, hub_dir)
     kv_rate, kv_source, kv_reason = _estimate_kv_rate(
-        architectures0, all_observations, cfg=raw_cfg, ctx=ctx
+        architectures0,
+        all_observations,
+        cfg=raw_cfg,
+        ctx=ctx,
+        kv_cache_dtype=kv_cache_dtype,
+        mamba_ssm_dtype=mamba_ssm_dtype,
     )
 
     if weights_source == "unknown":

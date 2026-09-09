@@ -692,7 +692,30 @@ def _own_gpu_mib() -> int:
     return own
 
 
-def _kv_geometry(repo_id: str, ctx: int) -> dict[str, Any] | None:
+def _cache_flags(backend: str | None) -> tuple[str | None, str | None]:
+    """(kv_cache_dtype, mamba_ssm_cache_dtype) this backend would launch with.
+
+    They belong in the estimate because they change the cache LAYOUT, not just
+    its speed: --mamba-ssm-cache-dtype bfloat16 halves the GDN recurrent state
+    and is worth 6.9% of the token count on this box's delivered Flash-Next
+    configuration. Estimating without them describes a server nobody starts.
+
+    Sources, in the order a launch resolves them: the backend's own fixed
+    `env` in servedeck.toml, then EXTRA_ARGS out of the shell config -- which
+    supervisor.shell_extra_args() already guards on BACKEND, so another
+    backend's flags can never be read as this one's.
+    """
+    kv = ssm = None
+    b = config.get().backend(backend) if backend else None
+    if b is not None:
+        kv = b.env.get("KV_DTYPE") or None
+    argv = _sup.shell_extra_args(backend).split()
+    kv = _argv_flag(argv, "--kv-cache-dtype") or kv
+    ssm = _argv_flag(argv, "--mamba-ssm-cache-dtype") or ssm
+    return kv, ssm
+
+
+def _kv_geometry(repo_id: str, ctx: int, backend: str | None = None) -> dict[str, Any] | None:
     """The per-architecture KV breakdown, for the panel's tooltip.
 
     None when the checkpoint's config.json cannot be read locally — never a
@@ -702,16 +725,25 @@ def _kv_geometry(repo_id: str, ctx: int) -> dict[str, Any] | None:
         cfg = registry.load_model_config(repo_id)
         if cfg is None:
             return None
-        return kvcalc.summarise(kvcalc.geometry(cfg), ctx)
+        kv, ssm = _cache_flags(backend)
+        geo = kvcalc.geometry(cfg, kv_cache_dtype=kv, mamba_ssm_dtype=ssm)
+        out = kvcalc.summarise(geo, ctx)
+        out["launch_flags"] = {"kv_cache_dtype": kv, "mamba_ssm_cache_dtype": ssm}
+        return out
     except Exception:  # noqa: BLE001 - a bad config must not blank the panel
         return None
 
 
 def _estimate(repo_id: str, util: float, ctx: int, seqs: int) -> dict[str, Any]:
-    ri = registry.resolve_inputs(repo_id, util, ctx)
     # servable/reason live on ModelEntry, not ResolvedInputs - look them up
     # rather than defaulting servable=True, which made MODEL_UNSERVABLE dead.
+    # The entry also names the backend, which is what decides WHICH launch
+    # flags apply -- so it has to be read before the estimate, not after.
     entry = next((e for e in registry.discover_models() if e.repo_id == repo_id), None)
+    kv_dtype, ssm_dtype = _cache_flags(entry.backend if entry else None)
+    ri = registry.resolve_inputs(
+        repo_id, util, ctx, kv_cache_dtype=kv_dtype, mamba_ssm_dtype=ssm_dtype
+    )
     mi = capacity.ModelInputs(
         repo_id=repo_id,
         backend=ri.backend or "inline",
@@ -766,7 +798,7 @@ def _estimate(repo_id: str, util: float, ctx: int, seqs: int) -> dict[str, Any]:
         # per-architecture calculator). The panel labels them differently and
         # must never present the second as the first.
         "kv_source": ri.kv_source,
-        "kv_geometry": _kv_geometry(repo_id, ctx),
+        "kv_geometry": _kv_geometry(repo_id, ctx, entry.backend if entry else ri.backend),
         "bar": {
             "weights_pct": round(r.bar.weights_pct, 2),
             "kv_pct": round(r.bar.kv_pct, 2),
