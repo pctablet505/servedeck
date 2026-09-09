@@ -25,7 +25,8 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from . import capacity, config, events, gpu, registry, shellconfig, supervisor as _sup
+from . import capacity
+from . import kvcalc, config, events, gpu, registry, shellconfig, supervisor as _sup
 from .metrics import MetricsPoller
 
 HERE = Path(__file__).resolve().parent
@@ -393,11 +394,29 @@ def _live_boot_facts() -> dict[str, Any]:
     """Read the RUNNING server's real KV size from its boot log.
 
     The live 'KV in use' readout must be a fraction of what the running engine
-    actually allocated - NOT of some other model's estimate. vLLM's /metrics
-    exposes kv_cache_usage_perc but not the absolute token total, and that
-    total is only ever printed once, at boot.
+    actually allocated - NOT of some other model's estimate.
+
+    FIRST from /metrics. This build publishes the engine's whole resolved cache
+    configuration on vllm:cache_config_info, whose LABELS carry
+    kv_cache_size_tokens - the same figure the boot log prints once as
+    "GPU KV cache size: N tokens". Reading it there needs no log at all, which
+    matters because a server launched by hand in a terminal writes to no log
+    Servedeck knows about, and the boot log of a PREVIOUS run of another model
+    is the wrong file to fall back to.
+
+    The boot log is still read, for the two things /metrics does not carry:
+    the KV pool in GiB and the weights measurement.
     """
     facts: dict[str, Any] = {}
+    m = rt.metrics or {}
+    if m.get("reachable") and m.get("kv_cache_size_tokens"):
+        facts["kv_tokens"] = int(m["kv_cache_size_tokens"])
+        facts["kv_source"] = "engine"
+        facts["kv_trust"] = "measured"
+        if m.get("kv_cache_max_concurrency"):
+            facts["concurrency_x"] = round(float(m["kv_cache_max_concurrency"]), 3)
+        if m.get("kv_cache_gpu_util"):
+            facts["util_effective"] = float(m["kv_cache_gpu_util"])
     # Pick the log belonging to the backend actually running on our port, and
     # read the LAST match: launcher logs are append-only across restarts, so
     # the first match is the oldest boot's numbers.
@@ -418,14 +437,18 @@ def _live_boot_facts() -> dict[str, Any]:
         kv_all = _KV_RE.findall(text)
         if not kv_all:
             continue
-        facts["kv_tokens"] = int(kv_all[-1].replace(",", ""))
+        # /metrics already answered, and it is the running engine rather than
+        # a file that outlives it. Do not overwrite it with a log line.
+        facts.setdefault("kv_tokens", int(kv_all[-1].replace(",", "")))
+        facts.setdefault("kv_source", "boot log")
+        facts.setdefault("kv_trust", "measured")
         gib_all = _KVGIB_RE.findall(text)
         if gib_all:
             facts["kv_gib"] = float(gib_all[-1])
         conc_all = _CONC_RE.findall(text)
         if conc_all:
             facts["ctx"] = int(conc_all[-1][0].replace(",", ""))
-            facts["concurrency_x"] = float(conc_all[-1][1])
+            facts.setdefault("concurrency_x", float(conc_all[-1][1]))
         w_all = _WEIGHTS_RE.findall(text)
         if w_all:
             facts["weights_gib"] = float(w_all[-1])
@@ -434,7 +457,7 @@ def _live_boot_facts() -> dict[str, Any]:
         # this the UI's slider shows a value the server is not running at.
         if "weights_gib" in facts and "kv_gib" in facts:
             budget = facts["weights_gib"] + facts["kv_gib"] + capacity.OVERHEAD_GIB_DEFAULT
-            facts["util_effective"] = round(budget / capacity.GPU_TOTAL_GIB, 3)
+            facts.setdefault("util_effective", round(budget / capacity.GPU_TOTAL_GIB, 3))
         facts["source"] = str(log)
         break
     return facts
@@ -668,6 +691,21 @@ def _own_gpu_mib() -> int:
     return own
 
 
+def _kv_geometry(repo_id: str, ctx: int) -> dict[str, Any] | None:
+    """The per-architecture KV breakdown, for the panel's tooltip.
+
+    None when the checkpoint's config.json cannot be read locally — never a
+    network fetch, and never a fabricated breakdown.
+    """
+    try:
+        cfg = registry.load_model_config(repo_id)
+        if cfg is None:
+            return None
+        return kvcalc.summarise(kvcalc.geometry(cfg), ctx)
+    except Exception:  # noqa: BLE001 - a bad config must not blank the panel
+        return None
+
+
 def _estimate(repo_id: str, util: float, ctx: int, seqs: int) -> dict[str, Any]:
     ri = registry.resolve_inputs(repo_id, util, ctx)
     # servable/reason live on ModelEntry, not ResolvedInputs - look them up
@@ -714,10 +752,20 @@ def _estimate(repo_id: str, util: float, ctx: int, seqs: int) -> dict[str, Any]:
         "agents_at_ctx": r.agents_at_ctx,
         "effective_parallel": r.effective_parallel,
         "max_single_ctx": r.max_single_ctx,
+        # Bounds for the context control. The UI must not offer a length that
+        # either the model or the KV budget cannot serve.
+        "ctx_max_model": r.ctx_max_model,
+        "ctx_max_fit": r.ctx_max_fit,
+        "agents": seqs,
         "confidence": r.confidence,
         "can_apply": r.can_apply,
         "weights_gib": mi.weights_gib,
         "kv_kib_per_token": mi.kv_kib_per_token,
+        # measured (this repo booted at this context) vs estimated (the
+        # per-architecture calculator). The panel labels them differently and
+        # must never present the second as the first.
+        "kv_source": ri.kv_source,
+        "kv_geometry": _kv_geometry(repo_id, ctx),
         "bar": {
             "weights_pct": round(r.bar.weights_pct, 2),
             "kv_pct": round(r.bar.kv_pct, 2),

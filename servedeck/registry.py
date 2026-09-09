@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from . import config as _config
+from . import kvcalc
 
 # --------------------------------------------------------------------------- #
 # Constants (SPEC §4)
@@ -218,6 +219,23 @@ def _parse_config(snapshot: Path) -> dict[str, Any] | None:
         return None
 
 
+def load_model_config(repo_id: str, hub_dir: Path | str | None = None) -> dict[str, Any] | None:
+    """The raw config.json of one hub repo, or None.
+
+    Read from the LOCAL snapshot only — never fetched. A capacity panel that
+    reaches the network to answer "how big is this model's KV cache" is a
+    panel that blocks on a DNS timeout when the machine is offline, and this
+    machine serves models offline by design (HF_HUB_OFFLINE is exported into
+    every launch).
+    """
+    root = Path(hub_dir) if hub_dir is not None else default_hub_dir()
+    dirname = "models--" + repo_id.replace("/", "--")
+    snapshot = _resolve_snapshot(root / dirname)
+    if snapshot is None:
+        return None
+    return _parse_config(snapshot)
+
+
 def _extract_config_fields(cfg: dict[str, Any]) -> dict[str, Any]:
     """architectures[0], model_type from root; the rest from text_config, falling
     back to root when text_config is absent (SPEC §4)."""
@@ -330,7 +348,20 @@ def discover_models(hub_dir: Path | str | None = None) -> list[ModelEntry]:
 
 
 def default_measurements_path() -> Path:
-    return Path(__file__).resolve().parent.parent / "state" / "measurements.json"
+    """The observation store, inside the CONFIGURED state directory.
+
+    It used to be `<package>/../state/measurements.json` unconditionally,
+    which agrees with `state_dir` only for its default value. Set `state_dir`
+    to anything else — an absolute path, which is what a systemd unit with a
+    StateDirectory= wants — and the supervisor writes boot measurements to one
+    directory while the registry reads capacity out of another. Nothing fails;
+    every model simply reverts to "never booted" forever, because the boots
+    are being recorded where nobody looks.
+    """
+    try:
+        return _config.get().state_dir / "measurements.json"
+    except Exception:  # noqa: BLE001 - an unreadable config must not hide history
+        return Path(__file__).resolve().parent.parent / "state" / "measurements.json"
 
 
 def load_observations(path: Path | str | None = None) -> list[dict[str, Any]]:
@@ -463,10 +494,38 @@ def _estimate_weights_gib(
 
 
 def _estimate_kv_rate(
-    architectures0: str | None, all_observations: list[dict[str, Any]]
+    architectures0: str | None,
+    all_observations: list[dict[str, Any]],
+    *,
+    cfg: dict[str, Any] | None = None,
+    ctx: int | None = None,
 ) -> tuple[float | None, KvSource, str | None]:
-    """Tier-3 KV rate estimate: median kv_kib_per_token of *measured* observations
-    sharing this architecture (SPEC §4)."""
+    """Tier-3 KV rate estimate.
+
+    FIRST from the checkpoint's own config.json, through the per-architecture
+    calculator in ``kvcalc`` — the KV rate is a property of the layer stack
+    (how many attention layers, how many KV heads, what latent rank, what
+    cache dtype), not of the family name.
+
+    The old rule was the MEDIAN measured rate of other models sharing
+    ``architectures[0]``, which is wrong in both directions. It answers with a
+    different model's number when it has one (Qwen3.8-27B has 16 attention
+    layers of 4 KV heads, Flash-Next 12 of 2 — 1.6x apart before any
+    measurement), and answers with nothing at all when it does not. The second
+    case is the one that shipped: GLM-5.3-Flash, measured on this box at
+    375,543 tokens, rendered "0 tokens / capacity unknown" because no other
+    Glm5Next checkpoint had ever been booted here.
+
+    The family median survives as the fallback for a repo whose config.json
+    cannot be read.
+    """
+    if cfg is not None and ctx:
+        try:
+            geo = kvcalc.geometry(cfg)
+        except Exception:  # noqa: BLE001 - a malformed config falls through
+            geo = None
+        if geo is not None and geo.family != "unknown" and geo.attn_bytes_per_token > 0:
+            return round(geo.kib_per_token(ctx), 4), "estimated", None
     if not architectures0:
         return None, "unknown", "unknown architecture; cannot estimate KV rate by family"
     rates: list[float] = []
@@ -581,7 +640,10 @@ def resolve_inputs(
     # Tier 3: estimate.
     safetensors_gib = registry_entry.safetensors_gib if registry_entry else None
     weights_gib, weights_source, w_reason = _estimate_weights_gib(safetensors_gib, model_type)
-    kv_rate, kv_source, kv_reason = _estimate_kv_rate(architectures0, all_observations)
+    raw_cfg = load_model_config(repo_id, hub_dir)
+    kv_rate, kv_source, kv_reason = _estimate_kv_rate(
+        architectures0, all_observations, cfg=raw_cfg, ctx=ctx
+    )
 
     if weights_source == "unknown":
         trust: Trust = "unknown"

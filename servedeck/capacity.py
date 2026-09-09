@@ -150,6 +150,13 @@ class CapacityResult:
     agents_at_ctx: int
     effective_parallel: int
     max_single_ctx: int
+    #: The model's own ceiling (max_position_embeddings), 0 if unknown.
+    ctx_max_model: int
+    #: The largest per-agent context that ACTUALLY FITS: the KV budget divided
+    #: between max_num_seqs agents, capped by the model ceiling. The UI offered
+    #: context lengths off a hardcoded ladder, so a length that cannot be
+    #: served was selectable and the engine refused it minutes into a boot.
+    ctx_max_fit: int
     confidence: str
     bar: CapacityBar
     findings: tuple[Finding, ...]
@@ -236,6 +243,8 @@ def compute(
             agents_at_ctx=0,
             effective_parallel=0,
             max_single_ctx=0,
+            ctx_max_model=m.model_max_ctx,
+            ctx_max_fit=0,
             confidence="unknown",
             bar=empty_bar,
             findings=tuple(findings),
@@ -567,6 +576,14 @@ def compute(
     valid_seqs = isinstance(max_num_seqs, int) and max_num_seqs >= 1
     effective_parallel = min(agents_at_ctx, max_num_seqs) if valid_seqs else 0
 
+    # What the context control may offer. Two independent ceilings, and the
+    # smaller one wins: the model's own max_position_embeddings (asking for
+    # more is refused at boot) and the KV budget shared between the agents the
+    # operator asked for (asking for more boots a server that cannot hold the
+    # agents it was sized for). A hardcoded ladder honoured neither.
+    per_agent_fit = (kv_tokens // max_num_seqs) if valid_seqs and kv_tokens else 0
+    ctx_max_fit = min(m.model_max_ctx, per_agent_fit) if m.model_max_ctx > 0 else per_agent_fit
+
     if valid_seqs and max_num_seqs < agents_at_ctx:
         findings.append(
             Finding(
@@ -620,6 +637,8 @@ def compute(
         agents_at_ctx=agents_at_ctx,
         effective_parallel=effective_parallel,
         max_single_ctx=max_single_ctx,
+        ctx_max_model=m.model_max_ctx,
+        ctx_max_fit=ctx_max_fit,
         confidence=confidence,
         bar=bar,
         findings=tuple(findings),

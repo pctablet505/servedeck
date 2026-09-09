@@ -119,33 +119,75 @@ function trustTag(trust) {
   return '<span class="tag est">estimated</span>';
 }
 
-/* The context lengths offered for the SELECTED model.
+/* The context control.
  *
- * This used to be a literal array, which is wrong in both directions: it
- * offered lengths a small model cannot reach (the engine refuses at boot,
- * minutes later) and hid the top of a large one — GLM-5.3 declares
- * max_position_embeddings 1,048,576 and the list stopped at 262,144, so a
- * quarter of the model was unreachable from the UI. The registry has parsed
- * that ceiling all along; build the ladder from it.
+ * It used to be a fixed ladder of buttons, which is wrong in two directions
+ * at once. It offered lengths the KV budget cannot hold — the engine loads
+ * weights for several minutes and only then refuses — and it stopped at a
+ * hardcoded ceiling, so a model declaring max_position_embeddings 1,048,576
+ * had three quarters of its range unreachable from the page.
  *
- * Powers of two up to the model's own ceiling, with the ceiling itself always
- * last even when it is not a power of two. DEFAULT_MAX_CTX only applies when
- * no model is selected or its config.json declares no ceiling.
+ * The slider's bounds are two real numbers the backend computes:
+ *   ctx_max_model — the checkpoint's own max_position_embeddings
+ *   ctx_max_fit   — (KV tokens the budget buys) / (parallel agents)
+ * and the smaller of the two is the ceiling. Both move when the utilization
+ * slider, the agent count or the selected model moves, so the control is
+ * redrawn on every estimate rather than once at load.
  */
 const MIN_CTX = 8192;
+const CTX_STEP = 4096;
 const DEFAULT_MAX_CTX = 262144;   // mirrors app.DEFAULT_MODEL_MAX_CTX
 
-function ctxChoices() {
-  const ceiling = Number(MODELS[sel]?.model_max_ctx) || DEFAULT_MAX_CTX;
-  const out = [];
-  for (let c = MIN_CTX; c < ceiling; c *= 2) out.push(c);
-  out.push(ceiling);
-  return out;
+function ctxLabel(c) {
+  if (!c) return "—";
+  return c >= 1048576 ? +(c / 1048576).toFixed(2) + "M"
+       : c >= 1024    ? Math.round(c / 1024) + "k"
+       : String(c);
+}
+
+/* Redraw the context slider against the bounds in an estimate.
+ *
+ * `d` is the /api/capacity/estimate payload, or null before the first one has
+ * come back — in which case the only bound known is the selected model's
+ * ceiling, and the fit bound is left blank rather than guessed at.
+ */
+function renderCtx(d) {
+  const el = $("ctx");
+  if (!el) return;
+  const modelMax = Number((d && d.ctx_max_model) || MODELS[sel]?.model_max_ctx) || DEFAULT_MAX_CTX;
+  const fit = d ? Number(d.ctx_max_fit) || 0 : 0;
+  // The ceiling is whichever real limit binds first. A zero fit means the
+  // budget holds nothing at this utilization: keep the model ceiling as the
+  // range so the slider still moves, and let the blocker explain why.
+  const ceiling = Math.max(MIN_CTX, fit > 0 ? Math.min(modelMax, fit) : modelMax);
+  el.min = String(MIN_CTX);
+  el.max = String(ceiling);
+  el.step = String(CTX_STEP);
+  if (ctx > ceiling) ctx = ceiling;
+  if (ctx < MIN_CTX) ctx = MIN_CTX;
+  el.value = String(ctx);
+
+  const set = (id, v) => { const e = $(id); if (e) e.textContent = v; };
+  set("ctxV", fmt(ctx));
+  set("ctxMin", ctxLabel(MIN_CTX));
+  set("ctxMax", ctxLabel(ceiling));
+  // Name which of the two limits is binding, so a ceiling that moves when the
+  // agent count changes is not mistaken for the model's own limit.
+  set("ctxBound", fit > 0 && fit < modelMax
+    ? "KV fits " + ctxLabel(fit)
+    : "model " + ctxLabel(modelMax));
+  const bound = $("ctxBound");
+  if (bound) bound.title = fit > 0 && fit < modelMax
+    ? `the KV budget holds ${fmt(fit)} tokens per agent at this utilization`
+    : `the checkpoint's own max_position_embeddings is ${fmt(modelMax)}`;
+  set("agentsV", agents);
+  set("agentsFit", d && d.agents_at_ctx ? "fits " + d.agents_at_ctx : "—");
 }
 let MODELS = [];
 let sel = 0;
 let util = 0.95;   // overwritten from the running server via /api/state
 let ctx = 262144;
+let agents = 1;   // parallel agents the context is being sized for
 let lastEstimate = null;
 let controlEnabled = false;
 let liveFacts = {};      // the RUNNING engine's own numbers, from /api/state
@@ -202,7 +244,7 @@ function renderModels() {
         sel = i;
         userPicked = true;
         renderModels();
-        renderCtx();   // a different model has a different ceiling
+        renderCtx(null);   // a different model has a different ceiling
         estimate();
       };
     }
@@ -210,32 +252,6 @@ function renderModels() {
   });
   const c = $("mcount");
   if (c) c.textContent = MODELS.length;
-}
-
-function renderCtx() {
-  const B = $("ctxBtns");
-  if (!B) return;
-  const choices = ctxChoices();
-  // Switching to a smaller model must not leave a selection the model cannot
-  // serve: the engine would refuse it at boot, minutes later, with an error
-  // that reads nothing like "you picked too big a number here".
-  if (!choices.includes(ctx)) {
-    ctx = choices.reduce((best, c) => (c <= ctx && c > best ? c : best), choices[0]);
-  }
-  B.innerHTML = "";
-  choices.forEach((c) => {
-    const b = document.createElement("button");
-    b.className = "segbtn";
-    b.type = "button";
-    b.setAttribute("aria-pressed", c === ctx ? "true" : "false");
-    // "1024k" for a 1,048,576-token ceiling reads as a typo. Once the ladder
-    // is derived from the model, million-token contexts are reachable.
-    b.textContent = c >= 1048576 ? +(c / 1048576).toFixed(2) + "M"
-                  : c >= 1024    ? c / 1024 + "k"
-                  : String(c);
-    b.onclick = () => { ctx = c; renderCtx(); estimate(); };
-    B.appendChild(b);
-  });
 }
 
 /* ----------------------------------------------- capacity (server-side) -- */
@@ -254,7 +270,7 @@ async function doEstimate() {
     const r = await fetch("/api/capacity/estimate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ repo_id: m.repo_id, util, ctx, max_num_seqs: 1 }),
+      body: JSON.stringify({ repo_id: m.repo_id, util, ctx, max_num_seqs: agents }),
     });
     var d = await r.json();
   } catch (e) {
@@ -279,13 +295,41 @@ async function doEstimate() {
 
 function paintEstimate(d) {
   const set = (id, v) => { const e = $(id); if (e) e.textContent = v; };
+  // The bounds move with util, agents and model, so redraw them here rather
+  // than once at load.
+  renderCtx(d);
   const kv = $("dKv");
   if (kv) {
     kv.innerHTML = (typeof d.kv_gib === "number")
       ? `${d.kv_gib.toFixed(1)}<span style="font-size:13px;font-weight:400"> GiB</span>`
       : "—";
   }
-  set("dKvTok", fmt(d.kv_tokens) + " tokens");
+  // Measured beats estimated, and the two are never presented alike. When the
+  // model on screen IS the one running, at the context it is running at, the
+  // engine's own resolved KV size is the answer — read off
+  // vllm:cache_config_info, not computed here. Otherwise this is the
+  // per-architecture calculator's estimate and says so.
+  const servingNow = MODELS[sel] && MODELS[sel].serving;
+  const liveCtx = liveFacts.ctx;
+  const measured = servingNow && liveFacts.kv_tokens &&
+                   (!liveCtx || liveCtx === ctx) ? liveFacts.kv_tokens : null;
+  set("dKvTok", measured
+    ? fmt(measured) + " tokens · measured"
+    : fmt(d.kv_tokens) + " tokens · " + (d.kv_source === "measured" ? "measured"
+      : d.kv_source === "measured_other_ctx" ? "measured at another context"
+      : d.kv_source === "estimated" ? "estimated" : "unknown"));
+  const kvTok = $("dKvTok");
+  if (kvTok) {
+    const g = d.kv_geometry;
+    kvTok.title = measured
+      ? "the running engine's own resolved KV size, from /metrics " +
+        "(vllm:cache_config_info)"
+      : g
+        ? `${g.kib_per_token} KiB per token — ${g.family}, from this ` +
+          `checkpoint's config.json (allocator correction ${g.allocator_factor}, ` +
+          `${g.factor_note})`
+        : "";
+  }
   set("dAgents", d.agents_at_ctx);
   const a = $("dAgents");
   if (a) a.classList.toggle("bad", d.agents_at_ctx < 1);
@@ -592,7 +636,7 @@ function paintState(s) {
     }
     // Select what is ACTUALLY running, not whatever sorted first. Otherwise
     // every panel describes a model the user is not using.
-    if (servingIdx >= 0 && !userPicked) { sel = servingIdx; renderCtx(); estimate(); }
+    if (servingIdx >= 0 && !userPicked) { sel = servingIdx; renderCtx(null); estimate(); }
     renderModels();
   }
 }
@@ -657,7 +701,7 @@ function wireControls() {
       apply.disabled = true;
       try {
         await post("/api/server/start", {
-          repo_id: m.repo_id, backend: m.backend, util, ctx, max_num_seqs: 1,
+          repo_id: m.repo_id, backend: m.backend, util, ctx, max_num_seqs: agents,
         });
         log(`applying ${m.name} …`, "g");
       } catch (e) { log("apply failed: " + e.message, "e"); apply.disabled = false; }
@@ -667,7 +711,7 @@ function wireControls() {
 
 /* -------------------------------------------------------------- init ---- */
 async function init() {
-  renderCtx();
+  renderCtx(null);
 
   // The URL every client (Codex) must point at. Served from the same origin
   // as this page, so location.origin IS the gateway origin — no server round-trip.
@@ -703,6 +747,26 @@ async function init() {
     u.oninput = (e) => { util = +e.target.value / 100; estimate(); };
   }
 
+  const cx = $("ctx");
+  if (cx) {
+    cx.oninput = (e) => {
+      ctx = +e.target.value;
+      const v = $("ctxV");
+      if (v) v.textContent = fmt(ctx);   // move the readout with the thumb
+      estimate();
+    };
+  }
+
+  const ag = $("agents");
+  if (ag) {
+    ag.oninput = (e) => {
+      agents = +e.target.value;
+      const v = $("agentsV");
+      if (v) v.textContent = agents;
+      estimate();
+    };
+  }
+
   try {
     const r = await fetch("/api/models");
     const d = await r.json();
@@ -710,9 +774,9 @@ async function init() {
     const i = MODELS.findIndex((m) => m.servable);
     sel = i >= 0 ? i : 0;
     renderModels();
-    // Only now is the selected model's own ceiling known — the ladder drawn
-    // at init() was the DEFAULT_MAX_CTX fallback.
-    renderCtx();
+    // Only now is the selected model's own ceiling known — the range drawn at
+    // init() was the DEFAULT_MAX_CTX fallback.
+    renderCtx(null);
     estimate();
     log(`${MODELS.length} models on disk, ${MODELS.filter((m) => m.servable).length} servable`);
   } catch (e) {

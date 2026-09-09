@@ -82,8 +82,26 @@
         </div>
 
         <div class="field">
-          <div class="flabel"><span class="k">Context per agent</span></div>
-          <div class="segbtns" id="ctxBtns"></div>
+          <div class="flabel">
+            <span class="k">Parallel agents</span>
+            <span class="v mono" id="agentsV">1</span>
+          </div>
+          <input type="range" id="agents" min="1" max="64" value="1" aria-label="Parallel agents">
+          <div class="ticks mono"><span>1</span><span id="agentsFit">—</span><span>64</span></div>
+        </div>
+
+        <div class="field">
+          <div class="flabel">
+            <span class="k">Context per agent</span>
+            <span class="v mono" id="ctxV">—</span>
+          </div>
+          <!-- A slider, not a fixed ladder. Its ceiling is the smaller of two
+               real numbers: the model's own max_position_embeddings, and what
+               the KV budget can hold for the agent count above. The ladder
+               offered lengths this machine cannot serve, and the engine only
+               said so minutes into a boot. -->
+          <input type="range" id="ctx" min="8192" max="262144" step="4096" value="262144" aria-label="Context per agent">
+          <div class="ticks mono"><span id="ctxMin">8k</span><span id="ctxBound">—</span><span id="ctxMax">—</span></div>
         </div>
 
         <div class="field">

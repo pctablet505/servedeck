@@ -380,26 +380,50 @@ def test_serving_line_shows_a_full_url_not_a_bare_port() -> None:
 # --------------------------------------------------------------------------
 # The context ladder comes from the model, not from a literal
 # --------------------------------------------------------------------------
-def test_context_choices_are_built_from_the_selected_models_ceiling() -> None:
+def test_context_control_is_bounded_by_the_model_and_by_what_fits() -> None:
     """`const CTXS = [8192, ... 262144]` was wrong in both directions: it
     offered lengths a small model cannot reach (the engine refuses at boot,
     minutes later) and it capped a large one — a model declaring
     max_position_embeddings 1,048,576 had three quarters of its range
-    unreachable from the UI. The registry has parsed that ceiling all along.
+    unreachable from the UI.
+
+    Deriving the ladder from the model ceiling alone fixed only half of that.
+    A length the CHECKPOINT allows can still be one the KV budget cannot hold
+    for the number of agents asked for, and that failure also arrives minutes
+    into a boot. Both bounds must reach the control.
     """
     assert "const CTXS" not in APP_JS, "the hardcoded context array is back"
-    body = _fn_body("ctxChoices")
-    assert "model_max_ctx" in body, (
-        f"the ladder must be derived from the model's own ceiling: {body}"
+    assert 'id="ctx"' in INDEX_HTML and 'type="range"' in INDEX_HTML, (
+        "context per agent must be a slider over a real range"
+    )
+    assert 'id="ctxBtns"' not in INDEX_HTML, "the fixed ladder of buttons is back"
+    body = _fn_body("renderCtx")
+    assert "ctx_max_model" in body, "the model's own ceiling must bound the slider"
+    assert "ctx_max_fit" in body, "what the KV budget holds must bound the slider"
+    assert "Math.min(modelMax, fit)" in body, (
+        f"the binding limit is the SMALLER of the two bounds: {body}"
     )
     assert "DEFAULT_MAX_CTX" in body, "a model with no declared ceiling needs a fallback"
 
 
-def test_render_ctx_uses_the_derived_choices() -> None:
-    """Deriving the list is pointless if the buttons still come from a
-    literal."""
-    body = _fn_body("renderCtx")
-    assert "ctxChoices()" in body, body
+def test_the_agent_count_is_an_input_not_a_hardcoded_one() -> None:
+    """"Context per agent" is meaningless without an agent count, and the page
+    sent max_num_seqs: 1 on every estimate and every start — so the ceiling it
+    drew was the one-agent ceiling however many agents the operator wanted."""
+    assert 'id="agents"' in INDEX_HTML, "there is no control for the agent count"
+    assert "max_num_seqs: 1" not in APP_JS, (
+        "the agent count is still hardcoded to 1 in a request body"
+    )
+    assert "max_num_seqs: agents" in APP_JS
+
+
+def test_the_bounds_are_redrawn_on_every_estimate() -> None:
+    """Both bounds move with utilization, with the agent count and with the
+    model. A control drawn once at load is the hardcoded ladder again, one
+    render later."""
+    assert "renderCtx(d)" in _fn_body("paintEstimate"), (
+        "the estimate that computes the bounds must redraw the control"
+    )
 
 
 def test_model_max_ctx_is_a_field_api_models_actually_sends() -> None:
@@ -415,13 +439,245 @@ def test_model_max_ctx_is_a_field_api_models_actually_sends() -> None:
     assert isinstance(rows[0]["model_max_ctx"], int) and rows[0]["model_max_ctx"] > 0
 
 
-def test_selecting_a_model_redraws_the_ladder() -> None:
+def test_selecting_a_model_redraws_the_context_control() -> None:
     """A ceiling that is only read once is the hardcoded array again, one
-    render later: picking a different model must re-derive it, or the buttons
-    keep describing the previous model."""
-    assert "renderCtx()" in _fn_body("renderModels"), (
-        "clicking a model card must redraw the context choices"
+    render later: picking a different model must re-derive it, or the control
+    keeps describing the previous model."""
+    assert "renderCtx(" in _fn_body("renderModels"), (
+        "clicking a model card must redraw the context control"
     )
+
+
+# --------------------------------------------------------------------------
+# Structural validity of the page's only script
+# --------------------------------------------------------------------------
+def _scan_js(src: str) -> tuple[list[str], list[tuple[int, str]]]:
+    """Walk web/app.js, skipping comments and string/template bodies.
+
+    Returns (unbalanced-bracket errors, list of (line, kind) for unterminated
+    literals). There is no JavaScript engine installed anywhere on this box —
+    no node, deno, quickjs, and no Python JS binding in .venv-gui — so app.js
+    gets no syntax checking at all before it reaches the browser, where a
+    single unbalanced brace white-screens the entire dashboard. This is the
+    cheap 90%: it catches every failure mode an edit to this file realistically
+    produces.
+
+    Sound only because app.js contains no regex literals (asserted below), so
+    an unquoted `/` is always division.
+
+    Detection power, measured by injecting faults into app.js: 6 of 7 (dropped
+    brace, extra brace, unclosed template, unclosed paren, unterminated
+    string, mismatched bracket type). The miss is a *misplaced* block-comment
+    terminator, which stays balanced by swallowing to the next `*/` -- a real
+    JS parser behaves the same way. Do not read a pass here as "app.js is
+    valid JavaScript"; read it as "app.js will at least parse".
+    """
+    errors: list[str] = []
+    open_at: list[tuple[str, int]] = []
+    pairs = {")": "(", "]": "[", "}": "{"}
+    i, line, n = 0, 1, len(src)
+    # Stack of template-literal depths: entering ${ inside a template pushes a
+    # normal-code context that ends at the matching }.
+    tmpl: list[int] = []
+    while i < n:
+        c = src[i]
+        if c == "\n":
+            line += 1
+            i += 1
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "/":
+            i = src.find("\n", i)
+            if i < 0:
+                break
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "*":
+            end = src.find("*/", i + 2)
+            if end < 0:
+                errors.append(f"unterminated block comment at line {line}")
+                break
+            line += src.count("\n", i, end)
+            i = end + 2
+            continue
+        if c in "'\"":
+            j, quote = i + 1, c
+            while j < n and src[j] != quote:
+                if src[j] == "\\":
+                    j += 1
+                elif src[j] == "\n":
+                    break
+                j += 1
+            if j >= n or src[j] != quote:
+                errors.append(f"unterminated {quote} string at line {line}")
+            i = j + 1
+            continue
+        if c == "`":
+            j = i + 1
+            while j < n:
+                if src[j] == "\\":
+                    j += 2
+                    continue
+                if src[j] == "`":
+                    break
+                if src[j] == "$" and j + 1 < n and src[j + 1] == "{":
+                    tmpl.append(len(open_at))
+                    open_at.append(("{", line))
+                    j += 2
+                    break
+                if src[j] == "\n":
+                    line += 1
+                j += 1
+            if j >= n:
+                errors.append(f"unterminated template literal at line {line}")
+            i = j + 1 if j < n and src[j] == "`" else j
+            continue
+        if c in "([{":
+            open_at.append((c, line))
+        elif c in ")]}":
+            if not open_at:
+                errors.append(f"stray {c!r} at line {line}")
+            elif open_at[-1][0] != pairs[c]:
+                errors.append(
+                    f"{c!r} at line {line} closes {open_at[-1][0]!r} opened at line {open_at[-1][1]}"
+                )
+                open_at.pop()
+            else:
+                open_at.pop()
+                # Leaving a ${...} hands control back to the template body.
+                if tmpl and len(open_at) == tmpl[-1]:
+                    tmpl.pop()
+                    j = i + 1
+                    while j < n:
+                        if src[j] == "\\":
+                            j += 2
+                            continue
+                        if src[j] == "`":
+                            break
+                        if src[j] == "$" and j + 1 < n and src[j + 1] == "{":
+                            tmpl.append(len(open_at))
+                            open_at.append(("{", line))
+                            j += 2
+                            break
+                        if src[j] == "\n":
+                            line += 1
+                        j += 1
+                    i = j + 1 if j < n and src[j] == "`" else j
+                    continue
+        i += 1
+    for ch, ln in open_at:
+        errors.append(f"unclosed {ch!r} opened at line {ln}")
+    return errors, []
+
+
+def test_app_js_has_no_regex_literals() -> None:
+    """Premise of the bracket checker below: an unquoted `/` is division."""
+    assert not re.search(r"(?:match|replace|replaceAll|test|split|exec|search)\(\s*/", APP_JS)
+    assert not re.search(r"=\s*/[^/*\s]", APP_JS)
+
+
+def test_app_js_brackets_and_literals_balance() -> None:
+    """A single unbalanced brace in web/app.js white-screens the dashboard,
+    and nothing else in this project would notice before the browser does."""
+    errors, _ = _scan_js(APP_JS)
+    assert not errors, "web/app.js is not structurally valid:\n  " + "\n  ".join(errors)
+
+
+def test_serving_line_repaints_on_telemetry_not_only_on_state() -> None:
+    """The two throughput figures arrive on the telemetry event (2 s); the
+    rest of the serving line arrives on state (5 s). Painting the line only
+    from paintState() showed readings up to 5 s old and dropped every other
+    sample."""
+    assert "paintServingMeta()" in _fn_body("paintTelemetry")
+    assert "paintServingMeta()" in _fn_body("paintState")
+
+
+def test_serving_line_prefers_the_running_servers_own_context_length() -> None:
+    """`supervisor.max_model_len` is desired config; `upstream.max_model_len`
+    is read out of the serving process's command line. For an adopted server
+    the two can differ, and only the second is a fact."""
+    line = _serving_line()
+    i_live = line.find("up.max_model_len")
+    i_desired = line.find("max_model_len", line.find("supervisor"))
+    assert i_live >= 0, f"serving line ignores the running server's own ctx: {line}"
+    assert i_live < i_desired, (
+        f"the running server's own ctx must be preferred over desired config: {line}"
+    )
+
+
+# --------------------------------------------------------------------------
+# The serving line names a URL, not a port
+# --------------------------------------------------------------------------
+def test_serving_line_shows_a_full_url_not_a_bare_port() -> None:
+    """The serving line is the one place a user goes to find the address to
+    paste into a client. It rendered `:${up.port}` — a bare port, which is not
+    an address: every reader had to reconstruct the scheme and host by hand.
+    """
+    line = _serving_line()
+    assert "http://localhost:${up.port}" in line, (
+        f"the serving line must render a copyable base URL: {line}"
+    )
+    assert "`:${up.port}" not in line, f"bare-port form still present: {line}"
+
+
+# --------------------------------------------------------------------------
+# The context ladder comes from the model, not from a literal
+# --------------------------------------------------------------------------
+def test_context_control_is_bounded_by_the_model_and_by_what_fits() -> None:
+    """`const CTXS = [8192, ... 262144]` was wrong in both directions: it
+    offered lengths a small model cannot reach (the engine refuses at boot,
+    minutes later) and it capped a large one — a model declaring
+    max_position_embeddings 1,048,576 had three quarters of its range
+    unreachable from the UI.
+
+    Deriving the ladder from the model ceiling alone fixed only half of that.
+    A length the CHECKPOINT allows can still be one the KV budget cannot hold
+    for the number of agents asked for, and that failure also arrives minutes
+    into a boot. Both bounds must reach the control.
+    """
+    assert "const CTXS" not in APP_JS, "the hardcoded context array is back"
+    assert 'id="ctx"' in INDEX_HTML and 'type="range"' in INDEX_HTML, (
+        "context per agent must be a slider over a real range"
+    )
+    assert 'id="ctxBtns"' not in INDEX_HTML, "the fixed ladder of buttons is back"
+    body = _fn_body("renderCtx")
+    assert "ctx_max_model" in body, "the model's own ceiling must bound the slider"
+    assert "ctx_max_fit" in body, "what the KV budget holds must bound the slider"
+    assert "Math.min(modelMax, fit)" in body, (
+        f"the binding limit is the SMALLER of the two bounds: {body}"
+    )
+    assert "DEFAULT_MAX_CTX" in body, "a model with no declared ceiling needs a fallback"
+
+
+def test_the_agent_count_is_an_input_not_a_hardcoded_one() -> None:
+    """"Context per agent" is meaningless without an agent count, and the page
+    sent max_num_seqs: 1 on every estimate and every start — so the ceiling it
+    drew was the one-agent ceiling however many agents the operator wanted."""
+    assert 'id="agents"' in INDEX_HTML, "there is no control for the agent count"
+    assert "max_num_seqs: 1" not in APP_JS, (
+        "the agent count is still hardcoded to 1 in a request body"
+    )
+    assert "max_num_seqs: agents" in APP_JS
+
+
+def test_the_bounds_are_redrawn_on_every_estimate() -> None:
+    """Both bounds move with utilization, with the agent count and with the
+    model. A control drawn once at load is the hardcoded ladder again, one
+    render later."""
+    assert "renderCtx(d)" in _fn_body("paintEstimate"), (
+        "the estimate that computes the bounds must redraw the control"
+    )
+
+
+def test_model_max_ctx_is_a_field_api_models_actually_sends() -> None:
+    """The whole ladder now depends on this one field arriving. The class of
+    bug this file exists for is exactly a page reading a key the serialiser
+    never emits."""
+    from servedeck import app
+
+    rows = app._model_rows()
+    if not rows:
+        pytest.skip("no models in the local hub cache — nothing to check against")
+    assert "model_max_ctx" in rows[0]
+    assert isinstance(rows[0]["model_max_ctx"], int) and rows[0]["model_max_ctx"] > 0
 
 
 # --------------------------------------------------------------------------
@@ -478,3 +734,26 @@ def test_the_page_reads_the_reason_fields_the_poller_emits() -> None:
     }
     assert read, "the page reads no reason field at all"
     assert read <= emitted, f"page reads reasons the poller never emits: {read - emitted}"
+
+
+def test_the_kv_budget_says_whether_it_was_measured_or_estimated() -> None:
+    """"Prefer the measured value and label it measured vs estimated." The
+    panel printed a token count with no provenance at all, so a figure the
+    per-architecture calculator produced for a model that has never booted
+    read exactly like one the engine reported."""
+    body = _fn_body("paintEstimate")
+    assert "kv_source" in body, "the KV budget never reads the estimate's provenance"
+    assert "measured" in body and "estimated" in body
+    assert "liveFacts.kv_tokens" in body, (
+        "the running engine's own KV size must win where it applies"
+    )
+
+
+def test_the_estimate_payload_carries_the_fields_the_panel_reads() -> None:
+    """Contract, the same class of bug as the model-row fields: every key
+    paintEstimate reads off the estimate must be one _estimate() emits."""
+    import inspect
+
+    src = inspect.getsource(_app._estimate)
+    for key in ("kv_source", "kv_geometry", "ctx_max_model", "ctx_max_fit", "agents"):
+        assert f'"{key}"' in src, f"_estimate() does not emit {key}"

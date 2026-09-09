@@ -27,6 +27,7 @@ from servedeck.registry import (
     KNOWN_ARCHS,
     ModelEntry,
     append_observation,
+    default_measurements_path,
     discover_models,
     load_observations,
     resolve_inputs,
@@ -613,7 +614,26 @@ def test_tier3_qwen4_exp_refusal_holds_even_with_other_repos_measured(tmp_path: 
     assert r.weights_source == "unknown"
 
 
-def test_tier3_kv_rate_is_median_of_measured_same_architecture(tmp_path: Path) -> None:
+#: A config.json that names an architecture but declares no attention
+#: geometry — the only case in which the family median is still reachable.
+GEOMETRYLESS_CONFIG = {
+    "architectures": ["Qwen3_5ForConditionalGeneration"],
+    "model_type": "qwen3_5",
+    "text_config": {"max_position_embeddings": 262144, "num_hidden_layers": 48},
+}
+
+
+def test_tier3_kv_rate_comes_from_the_layer_stack_not_a_family_median(
+    tmp_path: Path,
+) -> None:
+    """A family median answers with a DIFFERENT model's number.
+
+    KV size is a property of the layer stack — this config has 48 attention
+    layers of 8 KV heads at head_dim 128 in bf16, which is
+    48 * 2 * 8 * 128 * 2 = 196,608 bytes = 192 KiB/token by arithmetic. The two
+    observations below would have made the old rule say 35 KiB/token, a 5.5x
+    error, purely because those models share a family name with this one.
+    """
     _make_repo(
         tmp_path,
         "models--A--NeverBooted",
@@ -621,7 +641,26 @@ def test_tier3_kv_rate_is_median_of_measured_same_architecture(tmp_path: Path) -
         safetensors={"m.safetensors": int(10 * GIB)},
     )
     obs = [
-        # Same architecture (Qwen3_5*), trust="measured" -> counts.
+        _obs("Other/One", "inline", 262144, weights_gib=1.0, kv_gib=10.0, kv_tokens=int(10 * 1048576 / 30)),
+        _obs("Other/Two", "inline", 262144, weights_gib=1.0, kv_gib=10.0, kv_tokens=int(10 * 1048576 / 40)),
+    ]
+    r = resolve_inputs("A/NeverBooted", util=0.5, ctx=262144, observations=obs, hub_dir=tmp_path)
+    assert r.kv_kib_per_token == pytest.approx(192.0, abs=0.5)
+    assert r.kv_source == "estimated"
+
+
+def test_tier3_falls_back_to_the_family_median_when_the_stack_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    """The median is not deleted, only demoted: a config.json that declares an
+    architecture but no attention geometry still gets the family's answer."""
+    _make_repo(
+        tmp_path,
+        "models--A--NeverBooted",
+        config=GEOMETRYLESS_CONFIG,
+        safetensors={"m.safetensors": int(10 * GIB)},
+    )
+    obs = [
         _obs("Other/One", "inline", 262144, weights_gib=1.0, kv_gib=10.0, kv_tokens=int(10 * 1048576 / 30)),
         _obs("Other/Two", "inline", 262144, weights_gib=1.0, kv_gib=10.0, kv_tokens=int(10 * 1048576 / 40)),
     ]
@@ -633,7 +672,7 @@ def test_tier3_kv_rate_ignores_non_measured_trust_observations(tmp_path: Path) -
     _make_repo(
         tmp_path,
         "models--A--NeverBooted",
-        config=INLINE_CONFIG,
+        config=GEOMETRYLESS_CONFIG,
         safetensors={"m.safetensors": int(10 * GIB)},
     )
     estimated_obs = _obs("Other/One", "inline", 262144, weights_gib=1.0, kv_kib_per_token=999.0)
@@ -807,3 +846,23 @@ def test_a_healthy_snapshot_reports_no_dangling_symlinks(tmp_path) -> None:
     assert dangling == 0
     assert st_count == 1
     assert gib > 0
+
+
+def test_the_observation_store_lives_in_the_configured_state_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The registry read `<package>/../state/measurements.json` whatever
+    `state_dir` said. Point state_dir somewhere else — which is what a systemd
+    unit with its own StateDirectory does — and boots are recorded in one
+    place and read from another, so every model reads "never booted" forever
+    while the measurements pile up unseen."""
+    from servedeck import config as _cfg
+
+    store = tmp_path / "elsewhere"
+    monkeypatch.setenv("SERVEDECK_STATE_DIR", str(store))
+    _cfg.reset()
+    try:
+        assert default_measurements_path() == store / "measurements.json"
+    finally:
+        monkeypatch.delenv("SERVEDECK_STATE_DIR", raising=False)
+        _cfg.reset()
