@@ -90,3 +90,42 @@ def config_path(tmp_path: Path):
         return config.get()
 
     return _write
+
+
+# --------------------------------------------------------------------------
+# Guard: a test that permanently rebinds a module entry point
+# --------------------------------------------------------------------------
+_GUARDED = (
+    ("servedeck.preflight", "run_preflight"),
+    ("servedeck.preflight", "blocking_failures"),
+    ("servedeck.registry", "discover_models"),
+)
+
+
+@pytest.fixture(autouse=True)
+def _no_permanent_module_stubs():
+    """Fail the test that leaves a stub behind, not the innocent test after it.
+
+    Two tests replaced ``preflight.run_preflight`` by plain assignment to skip
+    a GPU probe. Assignment is not undone at teardown, so preflight stayed
+    disabled for every test that ran later in the same session -- and the
+    tests that noticed were the ones whose whole subject is a preflight check
+    refusing a start. They failed in a full run and passed in isolation, which
+    reads as flakiness rather than as the pollution it is.
+    """
+    import importlib
+
+    before = {
+        (mod, attr): getattr(importlib.import_module(mod), attr)
+        for mod, attr in _GUARDED
+    }
+    yield
+    leaked = [
+        f"{mod}.{attr}"
+        for (mod, attr), original in before.items()
+        if getattr(importlib.import_module(mod), attr) is not original
+    ]
+    assert not leaked, (
+        "this test replaced " + ", ".join(leaked) + " and did not restore it; "
+        "use monkeypatch.setattr so the next test is not affected"
+    )

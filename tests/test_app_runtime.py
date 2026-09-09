@@ -207,7 +207,7 @@ def test_running_model_id_prefers_the_flag_then_the_positional(monkeypatch) -> N
 # --------------------------------------------------------------------------
 # Starting a backend that only configuration knows about
 # --------------------------------------------------------------------------
-def test_start_accepts_any_configured_backend(config_path, tmp_path) -> None:
+def test_start_accepts_any_configured_backend(config_path, tmp_path, monkeypatch) -> None:
     """Regression: the start gate was `backend not in ("flashnext", "inline")`.
 
     That literal refused every backend added through servedeck.toml — which is
@@ -245,8 +245,12 @@ SOME_LOCAL_KNOB = "7"
         stop_fn=lambda h, **kw: procctl.StopResult(True, "term", 0.0, "faked"),
         history_path=tmp_path / "history.jsonl",
     )
-    preflight.run_preflight = lambda **kw: []           # type: ignore[assignment]
-    preflight.blocking_failures = lambda checks: []     # type: ignore[assignment]
+    # monkeypatch, not assignment: a bare rebind here leaked into every test
+    # that ran after it in the same session, so preflight was silently
+    # disabled for the rest of the suite -- including tests whose entire
+    # subject is a preflight check refusing a start.
+    monkeypatch.setattr(preflight, "run_preflight", lambda **kw: [])
+    monkeypatch.setattr(preflight, "blocking_failures", lambda checks: [])
     s._sync_shell_config = types.MethodType(lambda self, **kw: None, s)           # type: ignore[assignment]
     s._run_monitor = types.MethodType(lambda self, *a, **k: asyncio.sleep(0), s)  # type: ignore[assignment]
 
