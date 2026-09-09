@@ -499,13 +499,30 @@ function paintState(s) {
     if (meta && busy) meta.textContent = `${sv.actual_state.toLowerCase()}…`;
   }
 
-  if (MODELS.length && up.model) {
+  // Which row is serving comes from /api/state's `identity`: the live
+  // process's own --model first, then /v1/models resolved against the cache.
+  // It used to be a served-model-name match with a "weights within 0.5 GiB"
+  // fallback -- an alias an operator reuses across models, plus a heuristic
+  // that cheerfully marks a DIFFERENT model of similar size as the one that
+  // is running. Both were wrong on this box at the same time, and the result
+  // was a dashboard that could not name the model it was serving.
+  const ident = up.identity || {};
+  const names = ident.served_names || (up.model ? [up.model] : []);
+  if (MODELS.length && (ident.repo_id || names.length)) {
     let servingIdx = -1;
     MODELS.forEach((m, i) => {
-      m.serving = (m.repo_id === up.model) || (m.name === up.model) ||
-                  (liveFacts.weights_gib != null && Math.abs((m.weights_gib || -1) - liveFacts.weights_gib) < 0.5);
+      m.serving = ident.repo_id
+        ? m.repo_id === ident.repo_id
+        : names.includes(m.repo_id) || names.includes(m.name);
       if (m.serving) servingIdx = i;
     });
+    if (ident.mismatch) {
+      log(
+        `served-model-name ${names.join(", ")} does not belong to the model ` +
+          `actually loaded (${ident.repo_id}) — it was reused from another run`,
+        "w"
+      );
+    }
     // Select what is ACTUALLY running, not whatever sorted first. Otherwise
     // every panel describes a model the user is not using.
     if (servingIdx >= 0 && !userPicked) { sel = servingIdx; renderCtx(); estimate(); }

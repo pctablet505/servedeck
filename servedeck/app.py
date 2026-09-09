@@ -67,6 +67,10 @@ class Runtime:
         self.metrics: dict[str, Any] = {"reachable": False}
         self.gpu: dict[str, Any] = {}
         self.serving_model: str | None = None
+        #: Every id /v1/models advertises on the live port. A vLLM server can
+        #: advertise several aliases for one loaded model, and taking data[0]
+        #: alone made an alias that happened to sort first the whole answer.
+        self.serving_models: list[str] = []
         self.upstream_up = False
         self.client: httpx.AsyncClient | None = None
         self._models_cache: list[dict[str, Any]] | None = None
@@ -96,6 +100,7 @@ class Runtime:
         self.poller = MetricsPoller(self.upstream)
         self.metrics = {"reachable": False}
         self.serving_model = None
+        self.serving_models = []
         return True
 
 
@@ -206,10 +211,12 @@ async def _poll_loop() -> None:
                 else {}
             )
 
-            if rt.upstream_up and rt.serving_model is None:
-                rt.serving_model = await _fetch_served_model()
+            if rt.upstream_up and not rt.serving_models:
+                rt.serving_models = await _fetch_served_models()
+                rt.serving_model = rt.serving_models[0] if rt.serving_models else None
             if not rt.upstream_up:
                 rt.serving_model = None
+                rt.serving_models = []
 
             # A server that comes back on its own — started from a terminal
             # after a blocker was cleared — must be noticed. Without this the
@@ -415,16 +422,80 @@ async def _recover_if_server_returned() -> None:
         hub.publish("notice", {"level": "warn", "code": "recover_failed", "body": str(exc)[:200]})
 
 
-async def _fetch_served_model() -> str | None:
+async def _fetch_served_models() -> list[str]:
+    """Every model id the live server advertises on ``/v1/models``.
+
+    This is the ONLY authority for what the server calls itself. It is not the
+    authority for what the server actually loaded -- see _serving_identity().
+    """
     try:
         r = await rt.client.get(f"{rt.upstream}/v1/models", timeout=3.0)  # type: ignore[union-attr]
         if r.status_code == 200:
             data = r.json().get("data") or []
-            if data:
-                return data[0].get("id")
+            return [str(d.get("id")) for d in data if d.get("id")]
     except Exception:  # noqa: BLE001
         pass
-    return None
+    return []
+
+
+def _repo_for_served_name(name: str | None) -> str | None:
+    """The cached repo a served-model-name refers to, if exactly one does.
+
+    Exact match on the repo id or on its final path segment, and only when the
+    match is unique -- a name that fits two cached repos identifies neither.
+    """
+    if not name:
+        return None
+    hits = [
+        e.repo_id
+        for e in registry.discover_models()
+        if e.repo_id == name or e.repo_id.rsplit("/", 1)[-1] == name
+    ]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _serving_identity() -> dict[str, Any]:
+    """Which model is REALLY serving on rt.port, and how we know.
+
+    Sources, in decreasing order of trust:
+
+    1. the live process's own ``--model`` argument -- what vLLM was actually
+       told to load, read from ``/proc/<pid>/cmdline``;
+    2. ``/v1/models`` on the live port, resolved against the model cache --
+       what the server calls itself;
+    3. nothing, and then we say nothing.
+
+    The shell config header is deliberately NOT a source. ``BACKEND`` /
+    ``MODEL_REPO`` record what somebody last INTENDED; on this box that header
+    said GLM while Qwen was serving, and every reader that trusted it was
+    wrong together. ``mismatch`` is true when 1 and 2 disagree -- the
+    ``--served-model-name`` was reused from another model, which is exactly
+    when a name-matching UI shows the wrong row (or no row at all).
+    """
+    from_process = _running_model_id()
+    served_names = list(rt.serving_models)
+    from_name = next(
+        (r for r in (_repo_for_served_name(n) for n in served_names) if r), None
+    )
+    repo_id = from_process or from_name
+    source = "process" if from_process else ("served_name" if from_name else "unknown")
+    pid = None
+    backend = None
+    if rt.upstream_up:
+        from . import procctl
+
+        try:
+            pid = procctl.listener_pid(rt.port)
+            backend = procctl.backend_of_pid(pid) if pid else None
+        except Exception:  # noqa: BLE001
+            backend = None
+    return {
+        "repo_id": repo_id,
+        "source": source,
+        "backend": backend,
+        "served_names": served_names,
+        "mismatch": bool(from_process and from_name and from_process != from_name),
+    }
 
 
 @app.on_event("startup")
@@ -619,6 +690,9 @@ def _state() -> dict[str, Any]:
             "up": rt.upstream_up,
             "model": rt.serving_model,          # --served-model-name
             "model_id": _running_model_id(),     # what is REALLY loaded
+            # Which model is serving, and how we know -- never the config
+            # header. The UI matches its model list on this.
+            "identity": _serving_identity(),
             # The running engine's OWN --max-model-len, not desired config.
             "max_model_len": _running_max_model_len(),
             "port": rt.port,
@@ -715,10 +789,20 @@ async def api_adopt(body: dict[str, Any] | None = None) -> Any:
     d = s.desired
     d.desired_state = "RUNNING"
     d.port = port
-    if not d.repo_id:
+    ident = _serving_identity()
+    # Adopt what is RUNNING, not what a header says was intended. `d.repo_id`
+    # was filled from the served-model-name (an alias an operator reuses) and
+    # `d.backend` from the shell config's BACKEND -- the exact header that
+    # said GLM while Qwen was serving. Both now come from the live process,
+    # and only fall back when the process cannot be read at all.
+    if ident["repo_id"]:
+        d.repo_id = ident["repo_id"]
+    elif not d.repo_id:
         d.repo_id = rt.serving_model
-    if not d.backend:
-        d.backend = _safe_config().get("BACKEND") or "flashnext"
+    if ident["backend"]:
+        d.backend = ident["backend"]
+    elif not d.backend:
+        d.backend = _safe_config().get("BACKEND") or None
     _sup.save_desired(d, s.state_dir)
     s._run_repo_id, s._run_backend = d.repo_id, d.backend
     s._adopt_ready(pid)
@@ -745,13 +829,23 @@ async def api_start(body: dict[str, Any] | None = None) -> Any:
         return s
     b = body or {}
     d = s.desired
+    repo_id = b.get("repo_id") or d.repo_id
+    backend = b.get("backend") or d.backend
+    # Port and served name come from the backend/model being started, not from
+    # whatever the PREVIOUS run left in desired.json -- see the two resolvers'
+    # docstrings. Falling through to d.port/d.served_name is what launched one
+    # backend on another's port under the other's model name.
+    port = _sup.resolve_port(backend, d, explicit=b.get("port"), fallback=rt.port)
+    served_name = _sup.resolve_served_name(
+        backend, repo_id, d, explicit=b.get("served_name")
+    )
     asyncio.create_task(
         _run_and_report(
             s.start(
-                repo_id=b.get("repo_id") or d.repo_id,
-                backend=b.get("backend") or d.backend,
-                served_name=b.get("served_name") or d.served_name,
-                port=int(b.get("port") or d.port or rt.port),
+                repo_id=repo_id,
+                backend=backend,
+                served_name=served_name,
+                port=int(port or rt.port),
                 util=float(b["util"]) if b.get("util") is not None else d.util,
                 max_model_len=int(b["ctx"]) if b.get("ctx") is not None else d.max_model_len,
                 max_num_seqs=int(b["max_num_seqs"]) if b.get("max_num_seqs") is not None else d.max_num_seqs,
