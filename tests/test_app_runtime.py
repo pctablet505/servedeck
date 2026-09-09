@@ -346,3 +346,61 @@ needs_tty = {str(declared_tty).lower()}
         now=1000.0,
     )
     assert (decision.code == _sup.FLASHNEXT_HUMAN_GATE_CODE) is expected_block, decision
+
+
+# --------------------------------------------------------------------------
+# Where the MEASURED KV size comes from
+# --------------------------------------------------------------------------
+def test_live_kv_size_prefers_the_running_engine_over_a_boot_log(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A boot log outlives the server that wrote it, and a hand-launched
+    server writes to no log Servedeck knows about at all. The engine publishes
+    its own resolved capacity on vllm:cache_config_info, so read it there and
+    let the log fill in only what /metrics does not carry."""
+    from servedeck import metrics
+
+    stale = tmp_path / "old.log"
+    stale.write_text(
+        "GPU KV cache size: 111,111 tokens, "
+        "Maximum concurrency for 262,144 tokens per request: 0.42x\n"
+        "Available KV cache memory: 3.21 GiB\n"
+        "Model loading took 78.47 GiB memory and 90.6 seconds\n"
+    )
+    monkeypatch.setattr(capp, "_boot_log_candidates", lambda *a, **k: (stale,))
+    monkeypatch.setattr(capp, "_running_model_id", lambda: None)
+
+    live = (Path(__file__).parent / "fixtures" / "metrics_flashnext_live.txt").read_text()
+    snap = metrics.MetricsSnapshot()
+    parsed = metrics.parse_prometheus(live)
+    labels = parsed[metrics.CACHE_CONFIG][0][0]
+    snap.reachable = True
+    snap.kv_cache_size_tokens = int(labels["kv_cache_size_tokens"])
+    snap.kv_cache_max_concurrency = float(labels["kv_cache_max_concurrency"])
+    snap.kv_cache_gpu_util = float(labels["gpu_memory_utilization"])
+    monkeypatch.setattr(capp.rt, "metrics", snap.to_dict())
+
+    facts = capp._live_boot_facts()
+    assert facts["kv_tokens"] == 290_925, "the stale log's 111,111 won"
+    assert facts["kv_source"] == "engine"
+    assert facts["kv_trust"] == "measured"
+    assert facts["util_effective"] == pytest.approx(0.95)
+    # And the log still supplies what /metrics does not carry.
+    assert facts["kv_gib"] == pytest.approx(3.21)
+    assert facts["weights_gib"] == pytest.approx(78.47)
+
+
+def test_live_kv_size_falls_back_to_the_boot_log(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An older vLLM that does not publish cache_config_info must still get
+    its measured KV size out of the log."""
+    log = tmp_path / "boot.log"
+    log.write_text("GPU KV cache size: 272,062 tokens\n")
+    monkeypatch.setattr(capp, "_boot_log_candidates", lambda *a, **k: (log,))
+    monkeypatch.setattr(capp, "_running_model_id", lambda: None)
+    monkeypatch.setattr(capp.rt, "metrics", {"reachable": True})
+
+    facts = capp._live_boot_facts()
+    assert facts["kv_tokens"] == 272_062
+    assert facts["kv_source"] == "boot log"

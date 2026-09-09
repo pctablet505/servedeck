@@ -425,3 +425,15 @@ def test_cache_config_none_labels_do_not_become_zero() -> None:
     snaps = _scrape_all([_exposition() + line + "\n"], [0.0])
     assert snaps[0].kv_cache_size_tokens is None
     assert snaps[0].kv_cache_gpu_util is None
+
+
+def test_the_prescrape_placeholder_has_the_same_shape_as_a_snapshot() -> None:
+    """The dashboard publishes a placeholder before its first scrape. A bare
+    {"reachable": False} carries none of the reason fields, so the one state
+    that most needs explaining — nothing has been scraped yet — rendered as
+    the unexplained blank the reasons exist to replace."""
+    placeholder = metrics.unreachable_snapshot()
+    assert set(placeholder) == set(metrics.MetricsSnapshot().to_dict())
+    assert placeholder["reachable"] is False
+    for key in ("gen_reason", "prefill_reason", "ttft_reason"):
+        assert placeholder[key] == metrics.UNREACHABLE

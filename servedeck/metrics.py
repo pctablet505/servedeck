@@ -261,6 +261,19 @@ class MetricsSnapshot:
         }
 
 
+def unreachable_snapshot() -> dict[str, Any]:
+    """The payload to publish before the first scrape, and after a repoint.
+
+    A bare ``{"reachable": False}`` is not the same shape as a real snapshot:
+    the page reads a reason beside every missing figure and would find none,
+    so the very state that most needs explaining ("nothing has been scraped
+    yet") rendered as the unexplained blank the reasons exist to replace.
+    """
+    snap = MetricsSnapshot()
+    snap.gen_reason = snap.prefill_reason = snap.ttft_reason = UNREACHABLE
+    return snap.to_dict()
+
+
 class MetricsPoller:
     """Scrapes /metrics and derives generation and prefill throughput.
 

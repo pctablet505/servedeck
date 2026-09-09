@@ -27,6 +27,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from . import capacity
 from . import kvcalc, config, events, gpu, registry, shellconfig, supervisor as _sup
+from . import metrics as _metrics_mod
 from .metrics import MetricsPoller
 
 HERE = Path(__file__).resolve().parent
@@ -65,7 +66,7 @@ class Runtime:
         self.port = _config_port() or _default_port()
         self.upstream = f"{UPSTREAM_HOST}:{self.port}"
         self.poller = MetricsPoller(self.upstream)
-        self.metrics: dict[str, Any] = {"reachable": False}
+        self.metrics: dict[str, Any] = _metrics_mod.unreachable_snapshot()
         self.gpu: dict[str, Any] = {}
         self.serving_model: str | None = None
         #: Every id /v1/models advertises on the live port. A vLLM server can
@@ -99,7 +100,7 @@ class Runtime:
         self.port = port
         self.upstream = f"{UPSTREAM_HOST}:{port}"
         self.poller = MetricsPoller(self.upstream)
-        self.metrics = {"reachable": False}
+        self.metrics = _metrics_mod.unreachable_snapshot()
         self.serving_model = None
         self.serving_models = []
         # The cached socket-table answer belongs to the OLD port.
