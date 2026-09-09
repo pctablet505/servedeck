@@ -134,7 +134,7 @@ downgrades pinned CUDA 13.2.86, reintroducing the PTX blocker).
 Deps pinned: fastapi==0.136.3, uvicorn==0.52.4, httpx==0.28.* (wheels already in uv cache).
 Runtime is network-free: 127.0.0.1 only, no CDN, no external fonts.
 
-Process model: uvicorn on 127.0.0.1:8010 serves GUI + /api/* + gateway proxy to upstream vLLM (8001 flashnext / 8000 inline).
+Process model: uvicorn on 127.0.0.1:8010 serves GUI + /api/* + gateway proxy to upstream vLLM (the active backend's `port` from servedeck.toml).
 vLLM launched with `start_new_session=True` so it gets its OWN session+PGID and survives Servedeck restarting.
 Servedeck re-adopts on startup from state/server.json + port probe.
 
@@ -349,7 +349,7 @@ CONFIG IS NEVER MUTATED ON A LIVE SERVER.
 
 ## 7. GATEWAY (servedeck/gateway.py)
 
-Codex targets http://127.0.0.1:8010/v1. Upstream stays 8001/8000. Bind 127.0.0.1 only.
+Codex targets http://127.0.0.1:8010/v1. Upstream is the active backend's configured `port`. Bind 127.0.0.1 only.
 Proxy prefixes: /v1/*, /health, /ping, /metrics, /tokenize, /detokenize, /invocations, /generative_scoring.
 
 NO SSE keep-alive trick, NO fake-200. Never write a byte until an upstream response exists.

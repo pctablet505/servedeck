@@ -61,9 +61,13 @@
         </div>
 
         <div class="phases" id="phases">
+          <!-- The ETA string was a literal. history.py computes a real one
+               per model from measured boots and says when it is falling back
+               to a calibration figure instead; until that is painted here,
+               the slot stays empty rather than asserting a number. -->
           <div class="eta">
-            <span>Elapsed <span class="el mono" id="elapsed">0:00</span></span>
-            <span id="etaTxt">typically 4m10s warm · 9m50s cold</span>
+            <span>Elapsed <span class="el mono" id="elapsed">—</span></span>
+            <span id="etaTxt"></span>
           </div>
           <div class="ptrack" id="ptrack"></div>
           <div class="plabels" id="plabels"></div>
@@ -128,26 +132,37 @@
         </div>
       </div>
 
+      <!-- The failure banner is styled display:none and nothing ever adds the
+           .on class, so it has never appeared; its two buttons had no
+           handlers either. Kept as the markup the phase machine will paint
+           into, with both buttons disabled so neither can be clicked into
+           silence if the banner is ever shown before they are wired. -->
       <div class="banner" id="banner">
         <b id="banTitle"></b>
         <span id="banBody"></span>
         <div class="act">
-          <button type="button" id="banRetry">Retry now</button>
-          <button type="button" id="banDismiss">Dismiss</button>
+          <button type="button" id="banRetry" disabled title="not wired yet — retry is not exposed over the API">Retry now</button>
+          <button type="button" id="banDismiss" disabled title="not wired yet — the banner has no painter">Dismiss</button>
         </div>
       </div>
 
-      <div class="pref">
-        <span class="chk ok"><span class="m">✓</span> GPU free</span>
-        <span class="chk ok"><span class="m">✓</span> weights cached</span>
-        <span class="chk warn"><span class="m">!</span> ptrace_scope 0 — will re-harden</span>
-        <span class="chk ok"><span class="m">✓</span> disk 412 GiB</span>
-      </div>
+      <!-- Live preflight, painted from the estimate's own findings. This was
+           four static spans claiming the GPU was free, the weights cached,
+           ptrace_scope relaxed and several hundred GiB of disk left. None of
+           the four was ever computed, all four were on screen whenever the
+           backend was unreachable and the rest of the page was empty, and
+           nothing in this codebase has ever measured free disk. -->
+      <div class="pref" id="pref"></div>
 
       <div class="actions">
+        <!-- Both of these were enabled, one of them checked by default, and
+             neither was read by anything. A ticked "Auto-restart on crash" is
+             not a cosmetic problem: it tells the operator a recovery
+             behaviour is armed when nothing arms it. Disabled with the reason
+             until the supervisor exposes them, the same way Smoke test is. -->
         <div class="toggles">
-          <label class="tog"><input type="checkbox" id="autoR" checked> Auto-restart on crash</label>
-          <label class="tog"><input type="checkbox" id="notify"> Notify when ready</label>
+          <label class="tog"><input type="checkbox" id="autoR" disabled title="not wired yet — the supervisor's restart policy is not exposed over the API"> Auto-restart on crash</label>
+          <label class="tog"><input type="checkbox" id="notify" disabled title="not wired yet — Servedeck sends no notifications"> Notify when ready</label>
         </div>
         <button class="btn pri" id="apply" disabled>Apply &amp; restart</button>
         <button class="btn" id="smoke">Smoke test</button>
@@ -181,7 +196,6 @@
         <div class="lk">Average context per request</div>
         <div class="lbig mono" id="avgCtx">—</div>
         <div class="lsub" id="avgSrc">—</div>
-        <div class="winsel" id="winsel"></div>
         <div class="hint">
           vLLM's counters reset on restart. Averages are only worth betting on once
           they reflect your real agent workload, not a benchmark.
@@ -202,13 +216,16 @@
             <div class="d" id="capAvgD">—</div>
           </div>
         </div>
+        <!-- The button wrote nothing: there is no endpoint behind it, and the
+             hint under it described a write that never happened. -->
         <div class="setrow">
-          <input type="number" id="subN" min="1" max="64" value="64" aria-label="Max concurrent Codex subagents">
-          <button class="btn" id="subApply">Set subagents</button>
+          <input type="number" id="subN" min="1" max="64" disabled title="not wired yet — Servedeck has no endpoint that writes the Codex subagent cap" aria-label="Max concurrent Codex subagents">
+          <button class="btn" id="subApply" disabled title="not wired yet — Servedeck has no endpoint that writes the Codex subagent cap">Set subagents</button>
         </div>
         <div class="hint">
-          Writes <span class="mono">max_concurrent_threads_per_session</span>. Applies to the
-          next Codex launch, not a running session.
+          Servedeck does not write <span class="mono">max_concurrent_threads_per_session</span>
+          yet. Set it in your Codex config; the figures on the left say how many
+          the GPU can actually serve at once.
         </div>
       </div>
     </div>

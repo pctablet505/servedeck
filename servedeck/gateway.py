@@ -3,9 +3,9 @@
 
 This module is a transparent reverse proxy from Servedeck's own listener
 (127.0.0.1:8010, bound by whoever owns app.py/run.sh — not this file) to
-whichever upstream vLLM server is currently configured (127.0.0.1:8001 for
-flashnext, 127.0.0.1:8000 for inline). Two things make it more than a dumb
-proxy:
+whichever upstream vLLM server is currently configured — the `port` of the
+active `[backends.<name>]` in servedeck.toml, never a port named here. Two
+things make it more than a dumb proxy:
 
 1. Two endpoints — POST /v1/chat/completions and POST /v1/responses — may
    be *held* ("parked") for up to ``hold_max_s`` while the backend is

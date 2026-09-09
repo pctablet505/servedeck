@@ -757,3 +757,53 @@ def test_the_estimate_payload_carries_the_fields_the_panel_reads() -> None:
     src = inspect.getsource(_app._estimate)
     for key in ("kv_source", "kv_geometry", "ctx_max_model", "ctx_max_fit", "agents"):
         assert f'"{key}"' in src, f"_estimate() does not emit {key}"
+
+
+# --------------------------------------------------------------------------
+# Controls that lie
+# --------------------------------------------------------------------------
+def test_no_enabled_control_is_unwired() -> None:
+    """A control the page never reads is a claim the page cannot keep.
+
+    "Auto-restart on crash" shipped enabled AND checked, and nothing anywhere
+    read it: the operator was told a recovery behaviour was armed by a
+    checkbox no code consults. "Set subagents" shipped enabled next to a hint
+    saying it writes max_concurrent_threads_per_session, with no endpoint
+    behind it. An unimplemented control must be disabled with a reason, the
+    way Smoke test already was.
+    """
+    dead = []
+    for m in re.finditer(r"<(button|input|select)\b([^>]*)>", INDEX_HTML):
+        attrs = m.group(2)
+        idm = re.search(r'id="([A-Za-z0-9_]+)"', attrs)
+        if not idm:
+            continue
+        elem_id = idm.group(1)
+        if elem_id in APP_JS:
+            continue          # painted or handled by the page's own script
+        assert "disabled" in attrs, f"#{elem_id} is enabled and nothing reads it"
+        assert "title=" in attrs, f"#{elem_id} is disabled with no reason on it"
+    assert not dead, f"enabled controls nothing reads: {dead}"
+
+
+def test_the_preflight_strip_is_computed_not_written_into_the_page() -> None:
+    """Four static spans — "GPU free", "weights cached", "ptrace_scope 0",
+    "disk 412 GiB" — were on screen whatever the machine was doing, including
+    when the backend was unreachable and the rest of the page was empty. No
+    code has ever measured free disk."""
+    markup = re.sub(r"<!--.*?-->", "", INDEX_HTML, flags=re.S)
+    assert "disk 412 GiB" not in markup
+    assert 'id="pref"' in INDEX_HTML
+    body = _fn_body("paintPreflight")
+    assert "findings" in body, "the strip must be built from real findings"
+    assert "paintPreflight" in _fn_body("paintEstimate")
+
+
+def test_the_boot_eta_is_not_a_literal_string() -> None:
+    """"typically 4m10s warm · 9m50s cold" was hardcoded markup. history.py
+    computes a real per-model ETA and marks when it is falling back to a
+    calibration figure; until that is painted, the slot must be empty rather
+    than assert a number."""
+    m = re.search(r'id="etaTxt"[^>]*>([^<]*)<', INDEX_HTML)
+    assert m, "could not find #etaTxt"
+    assert not re.search(r"\d", m.group(1)), f"fabricated ETA: {m.group(1)!r}"

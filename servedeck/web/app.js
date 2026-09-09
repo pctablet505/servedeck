@@ -293,6 +293,41 @@ async function doEstimate() {
   }
 }
 
+/* The preflight strip: what would stop this configuration starting.
+ *
+ * It used to be four hardcoded spans that were on screen no matter what the
+ * machine was doing, including one ("disk 412 GiB") that nothing has ever
+ * measured. Every entry here is a finding capacity.compute() actually
+ * produced for the configuration on screen.
+ */
+function paintPreflight(d) {
+  const el = $("pref");
+  if (!el) return;
+  el.innerHTML = "";
+  const findings = (d && d.findings) || [];
+  const add = (cls, mark, text, title) => {
+    const s = document.createElement("span");
+    s.className = "chk " + cls;
+    const m = document.createElement("span");
+    m.className = "m";
+    m.textContent = mark;
+    s.appendChild(m);
+    s.appendChild(document.createTextNode(" " + text));
+    if (title) s.title = title;
+    el.appendChild(s);
+  };
+  if (!findings.length) {
+    add("ok", "\u2713", "no blockers for this configuration");
+    return;
+  }
+  findings.forEach((f) => {
+    add(f.level === "block" ? "warn" : "ok",
+        f.level === "block" ? "!" : "\u2713",
+        f.title,
+        (f.detail || "") + (f.fix ? "  Fix: " + f.fix : ""));
+  });
+}
+
 function paintEstimate(d) {
   const set = (id, v) => { const e = $(id); if (e) e.textContent = v; };
   // The bounds move with util, agents and model, so redraw them here rather
@@ -352,6 +387,7 @@ function paintEstimate(d) {
     e.style.width = (pct || 0) + "%";
     if (label !== undefined) e.textContent = (pct > 10 ? label : "");
   };
+  paintPreflight(d);
   seg("segW", bar.weights_pct, "weights");
   seg("segK", bar.kv_pct, "KV");
   seg("segO", bar.overhead_pct);
@@ -439,6 +475,13 @@ function paintTelemetry(t) {
     ? fmt(Math.round((kvp || 0) * liveTotal)) + " / " + fmt(liveTotal) + " tokens"
     : "—");
   set("mRun", reachable ? liveMetrics.running : "—");
+  // The header chip said "— agents holding" forever. The engine knows how
+  // many requests are in flight; say that, and only show the chip when there
+  // are any.
+  const q = document.querySelector(".queued");
+  const running = reachable ? (liveMetrics.running || 0) : 0;
+  set("qN", running);
+  if (q) q.className = "queued mono" + (running > 0 ? " on" : "");
   set("mWait", reachable ? liveMetrics.waiting : "—");
   set("mPre", reachable ? liveMetrics.preemptions : "—");
 
