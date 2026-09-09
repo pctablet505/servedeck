@@ -55,6 +55,20 @@ architectures = ["Qwen3ForCausalLM", "LlamaForCausalLM", "MistralForCausalLM"]
 # blocked-needs-human instead of looping forever.
 # needs_tty = true
 
+# Where to run the launcher from. Defaults to the directory the launcher is
+# in, which is right for a serve script sitting at a project root and WRONG
+# for one under bin/ — that launcher resolves its own config, run/ and logs/
+# relative to the project root, and running it one level down makes it write a
+# second, empty state tree. Set this whenever the launcher is not at the root
+# of the tree it belongs to.
+# cwd = "~/Projects/local_llm"
+
+# Cold-boot ETA envelope [low, high] in seconds, used only until this model
+# has produced boot history of its own. How long a checkpoint takes to load is
+# a fact about one machine — 181 GiB of weights plus a Marlin repack behaves
+# nothing like a 40 GiB model — so there is no useful default.
+# cold_boot_range_s = [420.0, 900.0]
+
 # Environment variables your launcher reads. Left side is Servedeck's setting
 # name, right side is your variable. An EMPTY table means "this launcher reads
 # no environment" (it takes its settings from a file); omitting the table
@@ -74,3 +88,14 @@ kv_dtype = "KV_DTYPE"
 # launcher owns their meaning.
 # [backends.vllm.env]
 # CPU_OFFLOAD_GB = "104"
+
+# --- EXTRA_ARGS ---------------------------------------------------------
+# Servedeck exports EXTRA_ARGS to every launcher, whether or not env_map names
+# it: it is the conventional verbatim passthrough slot, and a launcher that
+# does not read it ignores it. The value comes from `shell_config_script`'s
+# config file, and ONLY when that file's BACKEND matches the backend being
+# started — that file describes one backend at a time, and handing one
+# launcher another's flags is worse than handing it none.
+#
+# To pin extra arguments per backend regardless of the shell config, set them
+# in that backend's [env] table instead; it is applied last and wins.
