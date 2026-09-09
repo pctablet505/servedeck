@@ -85,6 +85,23 @@ class Backend:
     # which makes unattended restart impossible. Servedeck reports
     # blocked-needs-human rather than looping.
     needs_tty: bool = False
+    #: Working directory for the launcher. Defaults to the directory the
+    #: launcher lives in, which is right for a serve script at a project root
+    #: and WRONG for one under ``bin/`` — that launcher resolves its own
+    #: config, run/ and logs/ relative to the project root, and running it one
+    #: level down makes it write a second, empty state tree. Set it explicitly
+    #: whenever the launcher is not at the root of the tree it belongs to.
+    cwd: Path | None = None
+    #: Cold-boot ETA envelope (low, high) in seconds, used only until this
+    #: model has produced measured boot history of its own. A model family's
+    #: cold boot is a fact about a checkpoint on one machine, so it is
+    #: configuration, not a constant in the package.
+    cold_boot_range_s: tuple[float, float] | None = None
+
+    @property
+    def run_cwd(self) -> Path:
+        """Where to run the launcher from."""
+        return self.cwd if self.cwd is not None else self.launcher.parent
 
 
 @dataclass(frozen=True)
@@ -192,6 +209,12 @@ def _parse_backend(name: str, raw: dict[str, Any]) -> Backend:
         env={str(k): str(v) for k, v in (raw.get("env") or {}).items()},
         architectures=tuple(raw.get("architectures", ())),
         needs_tty=bool(raw.get("needs_tty", False)),
+        cwd=Path(str(raw["cwd"])).expanduser() if raw.get("cwd") else None,
+        cold_boot_range_s=(
+            (float(raw["cold_boot_range_s"][0]), float(raw["cold_boot_range_s"][1]))
+            if raw.get("cold_boot_range_s")
+            else None
+        ),
     )
 
 

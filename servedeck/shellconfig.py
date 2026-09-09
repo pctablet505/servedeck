@@ -46,6 +46,12 @@ ALLOWED_SET_KEYS: frozenset[str] = frozenset(
         "MAX_MODEL_LEN",
         "MAX_NUM_SEQS",
         "SERVEDECK_URL",
+        # The name the shell side actually uses. codex-qwen.sh's own
+        # CONFIG_ALLOWED_KEYS still spells this COLDSTART_URL, and .config on
+        # this box carries COLDSTART_URL="": renaming it here alone meant
+        # Servedeck read a key that never exists, and set_key("SERVEDECK_URL")
+        # would be re-rejected by codex-qwen.sh's own allow list anyway.
+        "COLDSTART_URL",
         "USE_COLDSTART",
     }
 )
@@ -104,9 +110,13 @@ def _base_url(cfg: Mapping[str, str]) -> str:
     completely normal and must fall back to the same default the shell
     script itself would use, not an arbitrary one.
     """
-    servedeck_url = cfg.get("SERVEDECK_URL", "").strip()
-    if servedeck_url:
-        return servedeck_url.rstrip("/") + "/v1"
+    # Either spelling: SERVEDECK_URL is what this project calls it, and
+    # COLDSTART_URL is what the shell script still writes. Preferring the new
+    # name while still honouring the old one is the only way both readers of
+    # one file agree during the rename.
+    gateway_url = (cfg.get("SERVEDECK_URL", "") or cfg.get("COLDSTART_URL", "")).strip()
+    if gateway_url:
+        return gateway_url.rstrip("/") + "/v1"
     port = cfg.get("PORT", "").strip() or "8001"
     return f"http://localhost:{port}/v1"
 

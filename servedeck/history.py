@@ -59,6 +59,8 @@ from typing import Any
 
 from servedeck import paths
 
+from . import config as _config
+
 # ---------------------------------------------------------------------------
 # Storage
 # ---------------------------------------------------------------------------
@@ -198,6 +200,27 @@ SPEC_COLD_BOOT_RANGE_S: dict[str, tuple[float, float]] = {
 }
 
 
+def cold_boot_range_s(backend: str | None) -> tuple[float, float] | None:
+    """The cold-boot envelope for a backend with no measured history yet.
+
+    ``cold_boot_range_s`` in servedeck.toml wins over the built-in map. How
+    long a checkpoint takes to load is a fact about one machine (181 GiB of
+    weights plus a Marlin repack behaves nothing like a 40 GiB model), so it
+    belongs in configuration -- the fold-in dropped a measured 420-900 s
+    envelope for one backend because it lived in the package as a literal and
+    the package is public.
+    """
+    if not backend:
+        return None
+    try:
+        b = _config.get().backend(backend)
+    except Exception:  # noqa: BLE001 - an unreadable config falls back
+        b = None
+    if b is not None and b.cold_boot_range_s is not None:
+        return b.cold_boot_range_s
+    return SPEC_COLD_BOOT_RANGE_S.get(backend)
+
+
 @dataclass(frozen=True)
 class EtaStats:
     """What supervisor.py / the API layer needs to render SPEC.md §8's
@@ -243,7 +266,7 @@ def _phase_stat(records: list[dict[str, Any]], stat_fn) -> dict[str, float]:
 
 def _spec_calibration(repo_id: str, backend: str, cold: bool) -> EtaStats:
     if cold:
-        rng = SPEC_COLD_BOOT_RANGE_S.get(backend)
+        rng = cold_boot_range_s(backend)
         if rng is not None:
             lo, hi = rng
             return EtaStats(
