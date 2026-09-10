@@ -365,7 +365,7 @@ max_parked=64 -> beyond that immediate 503 + Retry-After.
 
 Error body (OpenAI-compatible):
  {"error":{"message":"Servedeck: backend restarting — phase 'Loading weights', ~3m10s remaining",
-  "type":"coldstart_upstream_unavailable","code":"restarting",
+  "type":"servedeck_upstream_unavailable","code":"restarting",
   "servedeck":{"phase":"loading_weights","eta_s":190,"parked":3,"attempt":1}}}
 
 REPLAY SAFETY — THE ONE HARD RULE: once ANY upstream byte has been forwarded, NEVER retry internally.
@@ -464,7 +464,17 @@ Failures must show the actual HTTP status AND body.
 6. Servedeck NEVER runs sudo. ptrace is a copyable manual one-liner.
 7. Estimates for never-booted models are upper bounds (~25% optimistic historically on this box).
 
-## 9. SHELL PATCHES (backup each as .bak-precoldstart first; all additive and guarded)
+## 9. SHELL PATCHES (backup each as .bak-preservedeck first; all additive and guarded)
+
+> **The `COLDSTART_*` key names below are DEPRECATED, and are left spelled that
+> way on purpose.** They are the contract with `codex-qwen.sh` and
+> `~/Projects/local_llm/.config`, which are outside this repository and have
+> not been renamed — `.config` still carries `COLDSTART_URL=""` and
+> `CONFIG_ALLOWED_KEYS` still lists `COLDSTART_URL USE_COLDSTART`. Rewriting
+> them here would make this section describe a shell script that does not
+> exist. Servedeck reads both spellings and prefers `SERVEDECK_URL` /
+> `USE_SERVEDECK` (servedeck/legacy.py); docs/MIGRATION.md lists exactly what
+> the owner of those files has to change before the old names can go.
 
 codex-qwen.sh:
  a. recompute_derived() { BASE_URL="${COLDSTART_URL:+$COLDSTART_URL/v1}";

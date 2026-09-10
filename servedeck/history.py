@@ -60,6 +60,7 @@ from typing import Any
 from servedeck import paths
 
 from . import config as _config
+from . import legacy
 
 # ---------------------------------------------------------------------------
 # Storage
@@ -73,8 +74,24 @@ from . import config as _config
 _WRITE_LOCK = threading.Lock()
 
 
+HISTORY_FILENAME = "history.jsonl"
+
+
 def default_history_path() -> Path:
-    return paths.STATE_DIR / "history.jsonl"
+    """``history.jsonl`` inside the CONFIGURED state directory.
+
+    This used to be ``paths.STATE_DIR`` unconditionally — the directory next
+    to the package — which agrees with ``state_dir`` only at its default
+    value. A systemd unit with a ``StateDirectory=``, or any ``state_dir``
+    setting at all, then had the supervisor appending boots to one file while
+    registry.py read measurements out of another. Nothing failed; the boot-ETA
+    statistics simply stayed empty forever. registry.default_measurements_path()
+    already resolved this way, and the two must agree.
+    """
+    try:
+        return _config.get().state_dir / HISTORY_FILENAME
+    except Exception:  # noqa: BLE001 - an unreadable config must not hide history
+        return paths.STATE_DIR / HISTORY_FILENAME
 
 
 def now_iso() -> str:
@@ -100,14 +117,32 @@ def load_all(path: Path | str | None = None) -> list[dict[str, Any]]:
     """Read every record. Missing file -> []. A malformed trailing line
     (e.g. a write that was interrupted mid-flush) is skipped, not fatal —
     every earlier line still parses and is returned; never raises."""
-    p = Path(path) if path is not None else default_history_path()
+    if path is not None:
+        # An explicit path means "read exactly this file" -- see the same
+        # guard in registry.load_observations().
+        return _read_history_file(Path(path))
+    p = default_history_path()
+    # Boots recorded by the pre-rename `coldstart` tree come FIRST: they are
+    # older, and these records are chronological. Merged rather than used as a
+    # fallback -- "read the old file only when the new one is missing" would
+    # make every historic boot vanish the moment this tree recorded its first
+    # one. De-duplicated on content so that copying the old file across (which
+    # docs/MIGRATION.md suggests) does not count each boot twice.
+    records: list[dict[str, Any]] = legacy.merge_jsonl(p, HISTORY_FILENAME)
+    records.extend(_read_history_file(p))
+    return legacy.dedupe(records)
+
+
+def _read_history_file(p: Path) -> list[dict[str, Any]]:
+    """One JSONL file's records. Missing file -> []; a torn trailing line is
+    skipped rather than fatal; never raises."""
     if not p.is_file():
         return []
-    records: list[dict[str, Any]] = []
     try:
         text = p.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return []
+    out: list[dict[str, Any]] = []
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -117,8 +152,8 @@ def load_all(path: Path | str | None = None) -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             continue
         if isinstance(obj, dict):
-            records.append(obj)
-    return records
+            out.append(obj)
+    return out
 
 
 def query(

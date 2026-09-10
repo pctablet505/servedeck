@@ -4,6 +4,15 @@
 # Where run state is kept (desired state, boot history, measurements).
 # state_dir = "./state"
 
+# A PRE-RENAME state directory to read alongside state_dir, merged oldest
+# first and de-duplicated on record content. Servedeck was forked as
+# `coldstart`, and on a box where that fork was the thing actually running,
+# this is where the boot history and the KV measurements are. Read-only:
+# Servedeck never writes inside it, because the fork may still be running.
+# Set the SERVEDECK_LEGACY_STATE_DIR environment variable to "" to turn the
+# compatibility read off. Defaults to ~/Projects/coldstart/state.
+# (environment only, for now: SERVEDECK_LEGACY_STATE_DIR)
+
 # Hugging Face model cache. Detected from HF_HUB_CACHE / HF_HOME if unset.
 # model_cache = "~/.cache/huggingface/hub"
 

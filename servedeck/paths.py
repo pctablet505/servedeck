@@ -84,4 +84,21 @@ PROJECT_ROOT: Path = SERVEDECK_PKG_DIR.parent
 # in this module creates it eagerly.
 STATE_DIR: Path = PROJECT_ROOT / "state"
 
+# --------------------------------------------------------------------------
+# Pre-rename tree (DEPRECATED)
+# --------------------------------------------------------------------------
+
+# Servedeck was forked as `coldstart`, and that fork is what has been serving
+# :8010 on this box — so it, not this tree, is where the boot history and the
+# KV measurements were actually accumulated. Renaming the project without
+# reading this directory would not lose the file, but it would lose the
+# HISTORY: every model would silently revert to "never booted", the boot-ETA
+# statistics would restart from zero, and nothing would report an error.
+#
+# READ-ONLY, always. Nothing in Servedeck may write inside this tree: the
+# coldstart dashboard may still be running out of it, and a writer would be
+# corrupting the state of a live process. See legacy.py.
+LEGACY_COLDSTART_ROOT: Path = HOME / "Projects" / "coldstart"
+LEGACY_COLDSTART_STATE_DIR: Path = LEGACY_COLDSTART_ROOT / "state"
+
 GUI_VENV: Path = PROJECT_ROOT / ".venv"

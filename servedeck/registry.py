@@ -27,6 +27,7 @@ from typing import Any, Literal
 from . import config as _config
 from . import disksize
 from . import kvcalc
+from . import legacy as _legacy
 
 # --------------------------------------------------------------------------- #
 # Constants (SPEC §4)
@@ -439,6 +440,9 @@ def discover_models(hub_dir: Path | str | None = None) -> list[ModelEntry]:
 # --------------------------------------------------------------------------- #
 
 
+MEASUREMENTS_FILENAME = "measurements.json"
+
+
 def default_measurements_path() -> Path:
     """The observation store, inside the CONFIGURED state directory.
 
@@ -451,14 +455,30 @@ def default_measurements_path() -> Path:
     are being recorded where nobody looks.
     """
     try:
-        return _config.get().state_dir / "measurements.json"
+        return _config.get().state_dir / MEASUREMENTS_FILENAME
     except Exception:  # noqa: BLE001 - an unreadable config must not hide history
-        return Path(__file__).resolve().parent.parent / "state" / "measurements.json"
+        return Path(__file__).resolve().parent.parent / "state" / MEASUREMENTS_FILENAME
 
 
 def load_observations(path: Path | str | None = None) -> list[dict[str, Any]]:
     """Read the observation list. Missing/empty/corrupt file -> []; never raises."""
-    p = Path(path) if path is not None else default_measurements_path()
+    if path is not None:
+        # An explicit path means "read exactly this file". Merging the legacy
+        # store into it would make every caller that names a file -- tests
+        # included -- read something off this machine that it never asked for.
+        return _load_observation_file(Path(path))
+    p = default_measurements_path()
+    # Observations measured by the pre-rename `coldstart` tree come first --
+    # see legacy.py. Without this, renaming the project makes every model that
+    # HAS been booted and measured report "estimated" again, which is the one
+    # thing this store exists to stop.
+    data: list[dict[str, Any]] = list(_legacy.merge_json_list(p, MEASUREMENTS_FILENAME))
+    data.extend(_load_observation_file(p))
+    return _legacy.dedupe(data)
+
+
+def _load_observation_file(p: Path) -> list[dict[str, Any]]:
+    """One observations file. Missing/empty/corrupt -> []; never raises."""
     if not p.is_file():
         return []
     try:
@@ -468,12 +488,12 @@ def load_observations(path: Path | str | None = None) -> list[dict[str, Any]]:
     if not raw.strip():
         return []
     try:
-        data = json.loads(raw)
+        parsed = json.loads(raw)
     except json.JSONDecodeError:
         return []
-    if not isinstance(data, list):
+    if not isinstance(parsed, list):
         return []
-    return data
+    return parsed
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:

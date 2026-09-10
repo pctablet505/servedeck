@@ -61,6 +61,14 @@ def _isolated_config(tmp_path_factory: pytest.TempPathFactory):
     path.write_text(_TOML)
     previous = os.environ.get("SERVEDECK_CONFIG")
     os.environ["SERVEDECK_CONFIG"] = str(path)
+    # Same reason, for the pre-rename state directory: legacy.legacy_state_dir()
+    # defaults to ~/Projects/coldstart/state, which exists on the maintainer's
+    # box and nowhere else. Left on, every test that reads the default history
+    # or measurements store would silently merge one machine's real boot
+    # records into its fixture. "" turns the compatibility read off; the tests
+    # that are ABOUT it set the variable themselves.
+    previous_legacy = os.environ.get("SERVEDECK_LEGACY_STATE_DIR")
+    os.environ["SERVEDECK_LEGACY_STATE_DIR"] = ""
     config.reset()
     capacity.refresh_limits()
     try:
@@ -70,6 +78,10 @@ def _isolated_config(tmp_path_factory: pytest.TempPathFactory):
             os.environ.pop("SERVEDECK_CONFIG", None)
         else:
             os.environ["SERVEDECK_CONFIG"] = previous
+        if previous_legacy is None:
+            os.environ.pop("SERVEDECK_LEGACY_STATE_DIR", None)
+        else:
+            os.environ["SERVEDECK_LEGACY_STATE_DIR"] = previous_legacy
         config.reset()
         capacity.refresh_limits()
 

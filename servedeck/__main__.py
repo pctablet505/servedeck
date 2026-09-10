@@ -19,7 +19,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         import uvicorn
     except ImportError:
-        print("uvicorn is not installed. Try: pip install 'servedeck-llm[server]'", file=sys.stderr)
+        print("uvicorn is not installed. Try: pip install servedeck", file=sys.stderr)
         return 1
 
     if not cfg.backends:

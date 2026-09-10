@@ -26,6 +26,47 @@ is untouched and still serving. The owner performs the switch.
 
 Both bind `127.0.0.1:8010`, so **only one can run at a time**.
 
+---
+
+## 0. The `coldstart` -> `servedeck` rename
+
+The rename is complete inside this repository: module, package, class,
+function and variable names, config keys, environment variables, the console
+entry point, the systemd unit, the log and state paths, the gateway's error
+`type`, the docs and the UI strings. Three things are DELIBERATELY still
+spelled the old way, because the outside world has not been renamed with them.
+
+### The deprecated aliases Servedeck still reads
+
+| Old name | New name | Why the old one survives |
+|---|---|---|
+| `COLDSTART_URL` (in `.config`) | `SERVEDECK_URL` | `~/Projects/local_llm/.config` carries `COLDSTART_URL=""` and `codex-qwen.sh`'s `CONFIG_ALLOWED_KEYS` still lists it. Dropping it would make Servedeck read a key that does not exist and fall back to `http://localhost:$PORT/v1` — pointing Codex at the model server and around the gateway, with nothing reporting an error. |
+| `USE_COLDSTART` (in `.config`) | `USE_SERVEDECK` | Same file, same allow list. |
+| `COLDSTART_*` env vars | `SERVEDECK_*` env vars | A shell that exported the old prefix keeps working: `COLDSTART_PORT`, `COLDSTART_STATE_DIR`, `COLDSTART_CONFIG` and friends are read as their `SERVEDECK_*` equivalents. |
+
+The new name **wins whenever both are set**, so a `.config` mid-migration is
+never ambiguous. Every alias lives in one module, `servedeck/legacy.py`, so
+that removing compatibility later is one file to read and one grep to trust;
+`tests/test_rename.py` pins each of them.
+
+### The pre-rename state directory is read, never written
+
+`~/Projects/coldstart/state/` holds **47 boot records and 7 KV measurements**
+— every boot this box has actually recorded, because the coldstart fork is
+what has been serving `:8010`. Servedeck reads that directory alongside its
+own `state_dir` and merges the two, oldest tree first, de-duplicated on
+record content.
+
+* It is **read-only**. Nothing in Servedeck writes inside `~/Projects/coldstart`
+  — the fork may still be running out of it, and a second writer would be
+  corrupting a live process's state. Rollback is therefore always clean.
+* "Read the old file only when the new one is missing" was rejected: the first
+  boot recorded after the cutover would make every earlier one disappear.
+* Set `SERVEDECK_LEGACY_STATE_DIR=""` to turn the compatibility read off on a
+  machine that never ran the fork. Point it elsewhere to read a different
+  directory.
+
+
 ## 1. Check the config describes this box
 
 `~/Projects/servedeck/servedeck.toml` already exists and is gitignored. Confirm
@@ -94,21 +135,32 @@ Open http://127.0.0.1:8010 and check three things that were broken before:
 If anything looks wrong, Ctrl-C and go to Rollback. Nothing has been changed
 that a restart of coldstart does not undo.
 
-## 4. Carry the run history over
+## 4. The run history carries over by itself
 
-Servedeck's `state_dir` in `servedeck.toml` is `./state`, which already holds
-the fork's `measurements.json` and `history.jsonl`. If you want the newest
-coldstart history instead (it has kept running since), copy it before the
-first Servedeck start — never during one:
+Since the rename, Servedeck reads `~/Projects/coldstart/state/` and merges it
+with its own `state_dir` (see §0). Nothing has to be copied, and a first start
+no longer has to be timed around a copy.
+
+Copying the files anyway is still safe — the merge de-duplicates on record
+content, so a boot present in both directories is counted once:
 
 ```bash
 cp ~/Projects/coldstart/state/history.jsonl     ~/Projects/servedeck/state/
 cp ~/Projects/coldstart/state/measurements.json ~/Projects/servedeck/state/
 ```
 
-Losing these is not fatal: capacity predictions fall back to estimates and
-re-learn on the next boot. Losing them silently mid-run is worse, which is why
-this is a stop-then-copy step.
+Verify the history is visible before switching the service over:
+
+```bash
+cd ~/Projects/servedeck
+.venv/bin/python -c "from servedeck import history, registry; \
+print(len(history.load_all()), 'boots,', len(registry.load_observations()), 'measurements')"
+```
+
+That must print a non-zero count. Zero means the compatibility read is off
+(`SERVEDECK_LEGACY_STATE_DIR` set to empty) or `state_dir` points somewhere
+unexpected — capacity predictions would silently revert to estimates, which is
+a degradation nothing else reports.
 
 ## 5. Switch the systemd unit
 
@@ -141,6 +193,40 @@ opener and the systemd unit makes it unnecessary, but if you want it to open
 Servedeck, that is a three-line change in `cmd_ui` — a separate edit to a
 script this branch deliberately does not touch.
 
+## What the owner must change outside this repo
+
+None of these files is touched by this branch — another workstream owns them,
+and Servedeck keeps working as they are, on the deprecated aliases. This is the
+list for whoever retires those aliases.
+
+**`~/Projects/local_llm/.config`** (2 occurrences)
+
+* line 15 — comment: "`COLDSTART_URL` is empty; Coldstart is optional…"
+* line 16 — `COLDSTART_URL=""` -> `SERVEDECK_URL=""`
+
+**`~/Projects/local_llm/codex-qwen.sh`** (16 occurrences)
+
+* line 810 — `CONFIG_ALLOWED_KEYS="… COLDSTART_URL USE_COLDSTART"`; this is the
+  allow list that rejects a `SERVEDECK_URL` write today, so it has to change
+  first or nothing else can.
+* lines 163-164, 177 — the `COLDSTART_URL` / `USE_COLDSTART` defaults and
+  `recompute_derived()`'s `BASE_URL`
+* lines 450-459, 677-680 — the delegate-to-the-dashboard branches in
+  `start_server()` / `stop_server()`
+* lines 68, 152, 156, 166, 446-447, 667 — comments naming the same keys
+
+**`~/Projects/local_llm/llm`** (8 occurrences) — this one is not an alias;
+it launches the OLD TREE by path and will keep doing so until it is edited:
+
+* line 24 — `COLDSTART_PORT="8010"`
+* line 603 — `coldstart.app:app` out of `$HOME/Projects/coldstart` with
+  `.venv-gui`, logging to `$LOG_DIR/coldstart.log`
+* lines 545-547, 584, 600, 606-607 — `llm status` / `llm up` probes of that port
+
+Until line 603 is changed, `llm ui` starts the coldstart fork on `:8010`, which
+will collide with a running Servedeck (`PORT_IN_USE`, refused up front) rather
+than replace it.
+
 ## What changes for you
 
 * **The model name in the header is the model that is running.** It is read
@@ -169,7 +255,11 @@ systemctl --user enable  --now coldstart.service
 curl -sf http://127.0.0.1:8010/api/health && echo
 ```
 
-The coldstart tree is unmodified by this migration, including its `state/`.
+The coldstart tree is unmodified by this migration, including its `state/`:
+Servedeck reads that directory and never writes to it, so a rollback finds
+the fork's own history exactly as it left it. Boots recorded by Servedeck in
+the meantime stay in Servedeck's `state_dir` and are not visible to the fork —
+that gap is the only thing a rollback loses.
 
 ## After the cutover
 
@@ -178,3 +268,18 @@ its own `state/` and its `.venv-gui`, and it is not under version control, so
 deleting it is not reversible. Recommendation: **keep it, stopped and
 disabled, until Servedeck has served for a week and a cold boot has been
 measured through it**; then delete. Do not delete on the day of the cutover.
+
+**Before deleting it, copy its `state/` across.** Servedeck reads that
+directory live (§0); deleting the tree takes 47 boot records and 7 KV
+measurements with it, and the loss is silent — every model simply reverts to
+"estimated". The copy is de-duplicated, so it is safe to run at any time:
+
+```bash
+cp ~/Projects/coldstart/state/history.jsonl     ~/Projects/servedeck/state/
+cp ~/Projects/coldstart/state/measurements.json ~/Projects/servedeck/state/
+export SERVEDECK_LEGACY_STATE_DIR=""   # then the tree is genuinely unreferenced
+```
+
+Retiring the deprecated `COLDSTART_*` aliases is a separate, later step, and
+it is gated on the three files listed under "What the owner must change
+outside this repo" — not on deleting the tree.

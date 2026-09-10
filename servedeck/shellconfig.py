@@ -23,6 +23,7 @@ import urllib.error
 import urllib.request
 from typing import Mapping
 
+from servedeck import legacy
 from servedeck import paths
 
 # codex-qwen.sh's save_config_kv() always emits exactly `KEY="value"\n`
@@ -46,14 +47,17 @@ ALLOWED_SET_KEYS: frozenset[str] = frozenset(
         "MAX_MODEL_LEN",
         "MAX_NUM_SEQS",
         "SERVEDECK_URL",
-        # The name the shell side actually uses. codex-qwen.sh's own
-        # CONFIG_ALLOWED_KEYS still spells this COLDSTART_URL, and .config on
-        # this box carries COLDSTART_URL="": renaming it here alone meant
-        # Servedeck read a key that never exists, and set_key("SERVEDECK_URL")
-        # would be re-rejected by codex-qwen.sh's own allow list anyway.
-        "COLDSTART_URL",
-        "USE_COLDSTART",
+        "USE_SERVEDECK",
     }
+    # DEPRECATED ALIASES. The shell side has not been renamed: codex-qwen.sh's
+    # own CONFIG_ALLOWED_KEYS still spells these COLDSTART_*, and .config on
+    # this box carries COLDSTART_URL="". Dropping them here would mean
+    # Servedeck reads a key that never exists, and set_key("SERVEDECK_URL")
+    # would be re-rejected by codex-qwen.sh's own allow list anyway. Both
+    # files are owned by another workstream -- see docs/MIGRATION.md for what
+    # has to change there before these can go. legacy.DEPRECATED_KEYS is the
+    # one list; spelling them out again here is how they drift.
+    | frozenset(legacy.DEPRECATED_KEYS)
 )
 
 _PROBE_TIMEOUT_S = 2.0
@@ -111,10 +115,10 @@ def _base_url(cfg: Mapping[str, str]) -> str:
     script itself would use, not an arbitrary one.
     """
     # Either spelling: SERVEDECK_URL is what this project calls it, and
-    # COLDSTART_URL is what the shell script still writes. Preferring the new
-    # name while still honouring the old one is the only way both readers of
-    # one file agree during the rename.
-    gateway_url = (cfg.get("SERVEDECK_URL", "") or cfg.get("COLDSTART_URL", "")).strip()
+    # COLDSTART_URL is the DEPRECATED alias the shell script still writes.
+    # Preferring the new name while still honouring the old one is the only
+    # way both readers of one file agree during the rename.
+    gateway_url = legacy.preferred(cfg, "SERVEDECK_URL")
     if gateway_url:
         return gateway_url.rstrip("/") + "/v1"
     port = cfg.get("PORT", "").strip() or "8001"
