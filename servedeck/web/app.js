@@ -9,6 +9,14 @@
 const $ = (id) => document.getElementById(id);
 const fmt = (n) => (n == null ? "—" : Number(n).toLocaleString("en-US"));
 
+/* Write text into an element by id, if it exists.
+ *
+ * Every painter needs this and four of them used to define their own identical
+ * copy. Hoisted once: the null guard is the whole content, and a per-function
+ * copy is one more place for the guard to be forgotten.
+ */
+function set(id, v) { const e = $(id); if (e) e.textContent = v; }
+
 /* Bytes -> a string that carries its own unit.
  *
  * Binary (1024), because everything else on this page is: df, free,
@@ -98,18 +106,6 @@ function lifeTxt(v, fmtFn, basis, n) {
   if (typeof v !== "number" || !isFinite(v)) return "lifetime n/a";
   const count = (typeof n === "number" && n > 0) ? " over " + fmt(n) + " requests" : "";
   return "lifetime " + fmtFn(v) + " " + basis + count;
-}
-
-/* One figure for the one-line serving summary.
- *
- * The window reading or the word "idle" — never a lifetime average wearing a
- * "~", and never a bare em dash. The strip below is where a stale value, its
- * age and its reason belong; this line only has room to say whether the
- * figure is live.
- */
-function segFigure(live, state, fmtFn) {
-  if (typeof live === "number" && isFinite(live)) return fmtFn(live);
-  return state === "idle" ? "idle" : "n/a";
 }
 
 /* The throughput strip: prefill, decode and TTFT, always all three, and for
@@ -223,12 +219,51 @@ function ctxLabel(c) {
        : String(c);
 }
 
+/* The highest context the slider can actually rest on.
+ *
+ * A range input's thumb only stops at min + k*step, so a ceiling that is not on
+ * the grid is unreachable and the thumb parks one step below it — while the
+ * readout beside the slider shows the unsnapped ceiling. The control then
+ * disagrees with its own value, which is the exact defect this page has tests
+ * for everywhere else. Snapping down (never up) keeps the thumb, the readout and
+ * the value POSTed to /api/server/start identical, and never exceeds the bound
+ * the ceiling came from.
+ */
+function ctxTop(ceiling) {
+  const steps = Math.floor((ceiling - MIN_CTX) / CTX_STEP);
+  return MIN_CTX + Math.max(0, steps) * CTX_STEP;
+}
+
 /* Redraw the context slider against the bounds in an estimate.
  *
  * `d` is the /api/capacity/estimate payload, or null before the first one has
  * come back — in which case the only bound known is the selected model's
  * ceiling, and the fit bound is left blank rather than guessed at.
  */
+/* What the agents field's constraint line says, and how loud it is.
+ *
+ * Painted beside the field rather than only in the live panel because it is a
+ * limit ON that field, and a limit nobody can see while typing into the box is
+ * not a limit: the field read "16" next to "KV fits 1" with nothing connecting
+ * the two. Pure so the test engine can execute the comparison — the contradiction
+ * is the whole content, and a grep assertion passes unchanged when `fitN <
+ * agents` is flipped to `fitN > agents`.
+ */
+function agentsFitNote(fitN, want, ctxLen) {
+  if (!fitN) {
+    return {text: "—", overfit: false,
+            title: "the KV budget for this configuration is not known yet"};
+  }
+  const over = fitN < want;
+  return {
+    text: "KV fits " + fitN,
+    overfit: over,
+    title: `at ${fmt(ctxLen)} context the KV budget holds ${fitN} agent`
+      + `${fitN === 1 ? "" : "s"} — the field above asks for ${want}`
+      + (over ? " and is over budget" : ""),
+  };
+}
+
 function renderCtx(d) {
   const el = $("ctx");
   if (!el) return;
@@ -238,19 +273,26 @@ function renderCtx(d) {
   // budget holds nothing at this utilization: keep the model ceiling as the
   // range so the slider still moves, and let the blocker explain why.
   const ceiling = Math.max(MIN_CTX, fit > 0 ? Math.min(modelMax, fit) : modelMax);
+  // The ceiling is snapped DOWN onto the step grid, and the reason is a lie the
+  // slider otherwise tells: a range input's thumb can only rest on
+  // min + k*step, so with min 8192 / step 4096 a max of 19,100 leaves the thumb
+  // at 16,384 while the readout beside it says 19,100 -- the control and its own
+  // value disagreeing, which is the defect class this page is full of tests for.
+  // Snapping keeps thumb, readout and the value sent to the backend identical.
+  // It never raises the ceiling, so the KV budget is still respected.
+  const top = ctxTop(ceiling);
   el.min = String(MIN_CTX);
-  el.max = String(ceiling);
+  el.max = String(top);
   el.step = String(CTX_STEP);
-  if (ctx > ceiling) ctx = ceiling;
+  if (ctx > top) ctx = top;
   if (ctx < MIN_CTX) ctx = MIN_CTX;
   el.value = String(ctx);
 
-  const set = (id, v) => { const e = $(id); if (e) e.textContent = v; };
   set("ctxV", fmt(ctx));
-  set("ctxMin", ctxLabel(MIN_CTX));
-  set("ctxMax", ctxLabel(ceiling));
   // Name which of the two limits is binding, so a ceiling that moves when the
-  // agent count changes is not mistaken for the model's own limit.
+  // agent count changes is not mistaken for the model's own limit. The range
+  // itself is in the slider's title; the tick row that used to spell it out
+  // cost a line per field.
   set("ctxBound", fit > 0 && fit < modelMax
     ? "KV fits " + ctxLabel(fit)
     : "model " + ctxLabel(modelMax));
@@ -258,8 +300,19 @@ function renderCtx(d) {
   if (bound) bound.title = fit > 0 && fit < modelMax
     ? `the KV budget holds ${fmt(fit)} tokens per agent at this utilization`
     : `the checkpoint's own max_position_embeddings is ${fmt(modelMax)}`;
-  set("agentsV", agents);
-  set("agentsFit", d && d.agents_at_ctx ? "fits " + d.agents_at_ctx : "—");
+  const cx = $("ctx");
+  if (cx) cx.title = `${ctxLabel(MIN_CTX)} to ${ctxLabel(ceiling)} — ${
+    fit > 0 && fit < modelMax ? "limited by the KV budget" : "limited by the model"
+  }`;
+  // The agents field's own constraint. Painted here rather than only in the
+  // live panel because it is a limit ON that field; see agentsFitNote().
+  const fitNote = agentsFitNote(d && d.agents_at_ctx, agents, ctx);
+  const af = $("agentsFit");
+  if (af) {
+    af.classList.toggle("overfit", fitNote.overfit);
+    af.title = fitNote.title;
+  }
+  set("agentsFit", fitNote.text);
 }
 let MODELS = [];
 let sel = 0;
@@ -293,15 +346,65 @@ function log(msg, cls) {
 }
 
 /* -------------------------------------------------------- model rail ---- */
+
+/* The rail is repainted on every state event — every five seconds — and used to
+ * tear down and rebuild all its cards each time. That stole the keyboard focus
+ * from whatever card the operator was arrowing through and reset the list's
+ * scroll position mid-scroll, so reaching the eighth model meant scrolling to it
+ * again every five seconds.
+ *
+ * So the cards are rebuilt only when the SET changes (a model appears, vanishes,
+ * becomes servable, or changes size); selection and the serving tag are updated
+ * in place otherwise. The signature is deliberately not just MODELS.length,
+ * which would miss a model becoming servable.
+ */
+let railSig = "";
+
+/* What a rebuild of the rail is keyed on, and what its header says.
+
+   Both are separate from renderModels() so they can be EXECUTED by the test
+   engine: the decision "did the set change" is the whole fix, and a canvas-
+   free pure function is assertable while a DOM teardown is not.
+
+   The signature is deliberately not MODELS.length, which would miss a model
+   becoming servable, nor repo_id alone, which would miss a model changing size
+   or gaining its blobs. */
+function railSigOf(models) {
+  return (models || []).map((m) => `${m.repo_id}|${m.servable ? 1 : 0}|${m.disk_bytes}`).join(";");
+}
+
+/* "N models" alone hid the number that actually matters: how many of them this
+ * machine can serve at all. Say both. */
+function railCountOf(models) {
+  const n = (models || []).length;
+  const servable = (models || []).filter((m) => m.servable).length;
+  return `${servable}/${n} servable`;
+}
+
 function renderModels() {
   const L = $("mlist");
   if (!L) return;
+  const c = $("mcount");
+  if (c) c.textContent = railCountOf(MODELS);
+  const sig = railSigOf(MODELS);
+  if (sig === railSig) { updateRailSelection(); return; }
+  railSig = sig;
+  // Which card had focus, and how far the list was scrolled, are restored after
+  // the rebuild. Focus is tracked by repo_id rather than index, because a model
+  // appearing earlier in the list would otherwise move the focus to a different
+  // model under the operator's keyboard.
+  const focused = L.querySelector ? L.querySelector(":focus") : null;
+  const focusRepo = focused && focused.dataset ? focused.dataset.repo : null;
+  const scrollTop = L.scrollTop;
   L.innerHTML = "";
   MODELS.forEach((m, i) => {
     const b = document.createElement("button");
     b.className = "mcard";
     b.type = "button";
     b.setAttribute("aria-pressed", i === sel ? "true" : "false");
+    // The rail is a list of choices, not a list of unrelated buttons.
+    b.setAttribute("role", "option");
+    b.dataset.repo = m.repo_id || "";
     const tags = [];
     tags.push(`<span class="tag">${m.quant || "—"}</span>`);
     if (m.serving) tags.push('<span class="tag live">serving</span>');
@@ -315,9 +418,14 @@ function renderModels() {
     b.querySelector(".note").textContent =
       m.unservable_reason || `${m.backend || "?"} · ${fmt(m.model_max_ctx)} ctx`;
     if (!m.servable) {
-      b.disabled = true;
-      b.style.opacity = ".5";
-      b.style.cursor = "not-allowed";
+      // aria-disabled, NOT the disabled attribute. A disabled button is skipped
+      // by Tab entirely, so an operator who cannot serve a model also cannot
+      // reach the card to read why -- and the reason lives on the card's own
+      // note line, which is only readable if the card can be focused. The
+      // click handler is simply not attached below, and .mcard[aria-disabled]
+      // in the stylesheet carries the dimmed look the attribute used to set.
+      b.setAttribute("aria-disabled", "true");
+      b.title = m.unservable_reason || "this model cannot be served here";
     } else {
       b.onclick = () => {
         sel = i;
@@ -329,8 +437,24 @@ function renderModels() {
     }
     L.appendChild(b);
   });
-  const c = $("mcount");
-  if (c) c.textContent = MODELS.length;
+  L.scrollTop = scrollTop;
+  if (focusRepo && L.querySelector) {
+    const back = L.querySelector(`[data-repo="${focusRepo}"]`);
+    if (back && back.focus) back.focus();
+  }
+}
+
+/* Selection and the serving tag without a rebuild. Both change on every state
+ * event; neither is a reason to throw away the operator's focus. */
+function updateRailSelection() {
+  const L = $("mlist");
+  if (!L || !L.children) return;
+  MODELS.forEach((m, i) => {
+    const b = L.children[i];
+    if (!b) return;
+    b.setAttribute("aria-selected", i === sel ? "true" : "false");
+    b.setAttribute("aria-pressed", i === sel ? "true" : "false");
+  });
 }
 
 /* ----------------------------------------------- capacity (server-side) -- */
@@ -401,15 +525,43 @@ function paintPreflight(d) {
     return;
   }
   findings.forEach((f) => {
-    add(f.level === "block" ? "warn" : "ok",
-        f.level === "block" ? "!" : "\u2713",
-        f.title,
+    // A warning is not a pass. This used to colour every non-blocking finding
+    // green with a tick, so "KV budget is tight at this context" and "no
+    // blockers" were indistinguishable — the strip read all-green on a
+    // configuration that was about to preempt.
+    const cls = f.level === "block" ? "crit" : f.level === "warn" ? "warn" : "ok";
+    const mark = f.level === "block" ? "\u2715" : f.level === "warn" ? "!" : "\u2713";
+    add(cls, mark, f.title,
         (f.detail || "") + (f.fix ? "  Fix: " + f.fix : ""));
   });
 }
 
+/* The provenance badge's label and explanation, from the estimate's confidence
+ * code.
+ *
+ * The badge is read as prose, so it must not print the enum: the page showed
+ * "measured_other_ctx" verbatim, and "unknown" is the wrong word for a capacity
+ * figure (nothing is unknown about the model — its footprint is what cannot be
+ * predicted). Pure so the mapping is executed by the tests rather than grepped.
+ */
+function badgeOf(confidence) {
+  if (confidence === "measured_other_ctx") {
+    return {text: "measured*", meas: true,
+            title: "measured on this machine, but at a different context length"};
+  }
+  if (confidence === "measured") {
+    return {text: "measured", meas: true,
+            title: "this model has been booted here at this context length"};
+  }
+  if (confidence === "unknown") {
+    return {text: "unpredictable", meas: false,
+            title: "this architecture's VRAM footprint cannot be predicted from its files"};
+  }
+  return {text: confidence || "estimated", meas: false,
+          title: "from the per-architecture calculator, not from a boot here"};
+}
+
 function paintEstimate(d) {
-  const set = (id, v) => { const e = $(id); if (e) e.textContent = v; };
   // The bounds move with util, agents and model, so redraw them here rather
   // than once at load.
   renderCtx(d);
@@ -445,19 +597,18 @@ function paintEstimate(d) {
           `${g.factor_note})`
         : "";
   }
-  set("dAgents", d.agents_at_ctx);
-  const a = $("dAgents");
-  if (a) a.classList.toggle("bad", d.agents_at_ctx < 1);
-  set("dAgentsS", "at " + fmt(ctx) + " context");
-  set("dCtx", fmt(d.max_single_ctx));
-  set("dCtxS", d.max_single_ctx >= (MODELS[sel].model_max_ctx || 262144)
-    ? "model ceiling reached" : "below the model's " + fmt(MODELS[sel].model_max_ctx));
-
+  // d.agents_at_ctx — how many agents the KV budget holds at this context — is
+  // not painted here. It is painted on the agents control itself, where the
+  // number is a constraint on a field rather than a fourth readout; see
+  // renderCtx()'s agentsFit. Painting it in both places was the defect: the
+  // derived cell restated the input above it, and the badge over it claimed the
+  // division had been measured.
   const badge = $("dBadge");
   if (badge) {
-    const meas = d.confidence && d.confidence.startsWith("measured");
-    badge.textContent = d.confidence || "estimated";
-    badge.className = "tag " + (meas ? "meas" : "est");
+    const b = badgeOf(d.confidence);
+    badge.textContent = b.text;
+    badge.title = b.title;
+    badge.className = "tag " + (b.meas ? "meas" : "est");
   }
 
   const bar = d.bar || {};
@@ -508,14 +659,55 @@ function showFindings(findings) {
 let hist = [];
 let liveMetrics = {};
 
+/* Size a canvas's bitmap to its CSS box x devicePixelRatio and return the
+ * drawing size in CSS pixels.
+ *
+ * Both canvases shipped a hardcoded width/height attribute (420x42, 440x96)
+ * while CSS stretched them to the column's width, so every figure was
+ * stretched by an unknown factor and text came out blurry — on a 2x display,
+ * permanently soft. Painting in device pixels and scaling the context back
+ * means the painters below keep working in CSS-pixel coordinates and come out
+ * sharp at any DPI.
+ *
+ * width/height are only assigned when they actually change: writing to
+ * canvas.width clears the bitmap, which would blank the plot on every repaint.
+ */
+function fitCanvas(c) {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.round((c.clientWidth || c.width) * dpr));
+  const h = Math.max(1, Math.round((c.clientHeight || c.height) * dpr));
+  if (c.width !== w) c.width = w;
+  if (c.height !== h) c.height = h;
+  const x = c.getContext("2d");
+  x.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { W: w / dpr, H: h / dpr };
+}
+
+/* The palette a canvas painter needs, read from the stylesheet.
+ *
+ * The colours are CSS custom properties so the plots follow the theme — a
+ * hardcoded hex would be invisible in one of the two modes. Each name carries
+ * its own fallback because getComputedStyle returns "" for a property the
+ * stylesheet does not define, and an empty strokeStyle is silently ignored by
+ * the canvas rather than reported.
+ */
+function palette(names) {
+  const cs = getComputedStyle(document.documentElement);
+  const out = {};
+  names.forEach(([k, fallback]) => {
+    out[k] = (cs.getPropertyValue("--" + k) || "").trim() || fallback;
+  });
+  return out;
+}
+
 function spark() {
   const c = $("spark");
   if (!c || !c.getContext) return;
   const x = c.getContext("2d");
-  const cs = getComputedStyle(document.documentElement);
-  const acc = cs.getPropertyValue("--accent").trim() || "#0E7C7B";
-  const ln = cs.getPropertyValue("--line").trim() || "#ccc";
-  const w = c.width, h = c.height;
+  const size = fitCanvas(c);
+  const col = palette([["accent", "#0E7C7B"], ["line", "#ccc"]]);
+  const acc = col.accent, ln = col.line;
+  const w = size.W, h = size.H;
   x.clearRect(0, 0, w, h);
   x.strokeStyle = ln; x.lineWidth = 1;
   [0.25, 0.5, 0.75].forEach((g) => { x.beginPath(); x.moveTo(0, h * g); x.lineTo(w, h * g); x.stroke(); });
@@ -528,11 +720,205 @@ function spark() {
   x.globalAlpha = 0.13; x.fillStyle = acc; x.fill(); x.globalAlpha = 1;
 }
 
+/* The request-size histogram: the last 100 finished requests, drawn in vLLM's
+ * own buckets, with the percentiles marked where they fall.
+ *
+ * WHY A PICTURE INSTEAD OF FOUR NUMBERS
+ * The window's observations are bucket-bounded, so every percentile it can
+ * report is an interval — "45,314–49,216". Printed as text, four of those in a
+ * row, they read as noise and the one number that is a decision input (the p90,
+ * which the agent count is divided by) has to be labelled to death to be found.
+ * Drawn, the same data answers the two questions that actually get asked:
+ *   - WHERE is the mass?  The bars, on a linear token axis.
+ *   - HOW COARSE is it?   A bar's WIDTH is the range it covers. A 30,000-token
+ *     bar with nothing beside it says "nothing here is known finer than 30k"
+ *     without a sentence saying so. That is the honesty the provenance
+ *     paragraph used to carry in prose, and it is the reason the paragraph is
+ *     gone rather than merely shortened.
+ *
+ * The x axis is LINEAR, not log. A log axis would draw every bucket a similar
+ * width and quietly destroy the one thing the picture is for.
+ *
+ * A percentile is an interval, so it is drawn as one: a band from lo to hi,
+ * with the marker line at hi — the bound the recommendation is sized on, which
+ * is the conservative end. An exact percentile draws as the line alone.
+ */
+/* Which bars to draw, and which requests to draw behind them.
+
+   Split out of reqHist() so the SELECTION is testable in the JS engine the
+   rendering tests already use: a canvas painter cannot be asserted on in
+   duktape (no getContext), but this decision can, and it is the decision the
+   owner's "this can have more granularity" is about. The rule it encodes:
+
+     exact observations exist  -> draw the fine bins; the interval-only
+                                  requests go behind them as an underlay.
+     nothing is exact          -> fall back to the engine's own buckets.
+
+   The two are never merged into one bar: a request known only to
+   (20000, 50000] placed in a single 5k bin would be drawn at a position no
+   measurement supports.
+*/
+function histData(w) {
+  const fine = (w && w.fine) || {};
+  const bins = fine.bins || [];
+  const intervals = fine.intervals || [];
+  const buckets = (w && w.buckets) || [];
+  return bins.length
+    ? { bars: bins, underlay: intervals }
+    : { bars: buckets, underlay: [] };
+}
+
+// Which label row each percentile marker's caption goes on, so two close
+// percentiles stack instead of overprinting. A label may only sit where the
+// previous caption on that row has cleared it, so take the first row whose
+// last label is at least `gap` px to the left; if every row is still crowded,
+// double up on the last one — overlapping beats running off the canvas.
+function markRows(xs, gap, rows) {
+  const last = [];
+  return xs.map((cx) => {
+    let r = rows - 1;
+    for (let i = 0; i < rows; i++) {
+      if (last[i] === undefined || cx - last[i] >= gap) { r = i; break; }
+    }
+    last[r] = cx;
+    return r;
+  });
+}
+
+function reqHist(w) {
+  const c = $("reqHist");
+  if (!c || !c.getContext) return;
+  const x = c.getContext("2d");
+  const col = palette([["accent", "#0E7C7B"], ["line", "#ccc"], ["muted", "#888"]]);
+  const acc = col.accent, line = col.line, muted = col.muted;
+  const size = fitCanvas(c);
+  const W = size.W, H = size.H;
+  const padT = 20, padB = 15;
+  const plotH = H - padT - padB;
+  x.clearRect(0, 0, W, H);
+
+  // The fine histogram when the window has exact observations to fill it, and
+  // the engine's own coarse buckets otherwise. Most observations here are exact
+  // (a poll that catches one finished request gets its token count exactly), so
+  // the fine bins carry real precision the three fat engine bars would hide;
+  // the requests that are only known to a bucket interval are drawn behind them
+  // as a translucent "somewhere in this range" band, never merged into a bar
+  // that would place them more precisely than they were measured.
+  const sel = histData(w);
+  const bins = sel.bars;
+  const intervals = sel.underlay;
+
+  // The axis is drawn whatever the data is, so an empty window still shows
+  // where the readings would land rather than a blank box.
+  x.strokeStyle = line; x.lineWidth = 1;
+  x.beginPath(); x.moveTo(0, H - padB + 0.5); x.lineTo(W, H - padB + 0.5); x.stroke();
+  if (!bins.length) return;
+
+  // Right edge of the axis: the widest thing the window actually knows about,
+  // so no bar or marker is clipped and no empty space is invented.
+  const hiOf = (v) => (v == null ? 0 : v);
+  let xmax = 0;
+  const grow = (b) => { xmax = Math.max(xmax, hiOf(b.hi) || b.lo); };
+  bins.forEach(grow);
+  intervals.forEach(grow);
+  [w.p50, w.p90, w.p99, w.max].forEach((p) => {
+    if (p) xmax = Math.max(xmax, hiOf(p.hi) || hiOf(p.lo));
+  });
+  if (!(xmax > 0)) return;
+  const px = (v) => Math.max(0, Math.min(W, (v / xmax) * W));
+
+  // Tick labels, at a round step that yields four to six of them.
+  const STEPS = [500, 1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000];
+  let step = STEPS[STEPS.length - 1];
+  for (let i = 0; i < STEPS.length; i++) {
+    if (xmax / STEPS[i] <= 6) { step = STEPS[i]; break; }
+  }
+  x.font = '9px "IBM Plex Mono",monospace';
+  x.fillStyle = muted; x.textBaseline = "top";
+  for (let v = step; v <= xmax; v += step) {
+    const tx = px(v);
+    const lab = v >= 1000 ? Math.round(v / 1000) + "k" : String(v);
+    x.fillText(lab, Math.min(tx + 2, W - x.measureText(lab).width - 1), H - padB + 3);
+  }
+
+  // One shared height scale across the exact bars and the interval underlay,
+  // so a tall underlay band and a tall exact bar mean the same count.
+  const maxn = bins.concat(intervals).reduce((m, b) => Math.max(m, b.n), 0);
+  const barH = (n) => (maxn ? Math.max(1, (n / maxn) * plotH) : 0);
+
+  // The count scale. Without it a bar is only relatively tall — you can see
+  // one bin is twice another but not whether that "another" is 2 requests or
+  // 200. One faint gridline at the peak, labelled with the count it is, is
+  // enough to read every bar against; drawing a full y axis would crowd a
+  // 96px-tall plot for no extra information.
+  if (maxn > 0) {
+    const gy = H - padB - plotH;
+    x.strokeStyle = line; x.lineWidth = 1; x.setLineDash([2, 3]);
+    x.beginPath(); x.moveTo(0, gy + 0.5); x.lineTo(W, gy + 0.5); x.stroke();
+    x.setLineDash([]);
+    x.fillStyle = muted; x.textBaseline = "bottom";
+    x.fillText(String(maxn), 1, gy - 1);
+    x.textBaseline = "alphabetic";
+  }
+
+  // One bar-drawing routine, called twice. The interval underlay and the exact
+  // bars are the same rectangle computation at two opacities; they were two
+  // copy-pasted loops, which is two places for the "+Inf bucket runs to the
+  // axis end" rule to drift apart. The underlay is drawn first so the exact
+  // bars sit in front of it.
+  const drawBars = (list, alpha) => {
+    x.globalAlpha = alpha; x.fillStyle = acc;
+    list.forEach((b) => {
+      const x0 = px(b.lo);
+      // An unbounded +Inf bucket has no right edge; it runs to the axis end.
+      const x1 = b.hi == null ? W : px(b.hi);
+      const bh = barH(b.n);
+      x.fillRect(x0, H - padB - bh, Math.max(1, x1 - x0 - 1), bh);
+    });
+    x.globalAlpha = 1;
+  };
+  drawBars(intervals, 0.18);
+  // The bars themselves: the fine bins when the window has exact
+  // observations, the engine's own buckets when it has none.
+  drawBars(bins, 0.5);
+
+  // The percentile markers. p90 is the accent because it is the input to the
+  // recommendation; the others are context and are drawn quieter. Labels
+  // stagger into two rows so two close percentiles cannot overprint.
+  const marks = [
+    { k: "p50", p: w.p50, c: muted },
+    { k: "p90", p: w.p90, c: acc },
+    { k: "p99", p: w.p99, c: muted },
+  ].filter((m) => m.p);
+  const markX = marks.map((m) => px(hiOf(m.p.hi) || hiOf(m.p.lo)));
+  const rows = markRows(markX, 26, 2);
+  // The captions live in the 20px band above the plot, two rows of 10px. The
+  // baseline has to be stated: the count gridline above leaves it "alphabetic",
+  // which anchors glyphs ABOVE the y coordinate and pushes a row-0 caption
+  // half off the top of the canvas — the labels were drawn and invisible.
+  x.textBaseline = "top";
+  marks.forEach((m, i) => {
+    const hi = hiOf(m.p.hi) || hiOf(m.p.lo);
+    const cx = markX[i];
+    if (!m.p.exact && m.p.lo != null && hiOf(m.p.lo) < hi) {
+      x.globalAlpha = 0.16; x.fillStyle = m.c;
+      x.fillRect(px(m.p.lo), padT, Math.max(1, cx - px(m.p.lo)), plotH);
+      x.globalAlpha = 1;
+    }
+    x.setLineDash([3, 2]); x.strokeStyle = m.c; x.lineWidth = 1;
+    x.beginPath(); x.moveTo(cx + 0.5, padT); x.lineTo(cx + 0.5, H - padB); x.stroke();
+    x.setLineDash([]);
+    x.fillStyle = m.c;
+    const lab = m.k;
+    x.fillText(lab, Math.min(cx + 3, W - x.measureText(lab).width - 1), 1 + rows[i] * 10);
+  });
+  x.textBaseline = "alphabetic";
+}
+
 function paintTelemetry(t) {
   liveMetrics = t.vllm || {};
   if (t.sizing) liveSizing = t.sizing;
   const g = t.gpu || {};
-  const set = (id, v) => { const e = $(id); if (e) e.textContent = v; };
 
   // The card's identity and size come from nvidia-smi, not from the markup.
   // index.html used to name one specific GPU and one specific total, which is
@@ -588,9 +974,35 @@ function paintTelemetry(t) {
  * live here: it has to reproduce a measured concurrency table, and a copy of
  * it in the page would be a second, untested implementation. This function
  * only formats.
+ *
+ * The distribution is DRAWN rather than listed. This column used to print
+ * p50/p90/p99/max as four interval strings, a sample-count line, a
+ * generated-token line and a provenance paragraph — six lines of text whose
+ * combined content is "the data is coarse, here is roughly where the tail
+ * sits". reqHist() says the same thing in one picture, and says the
+ * coarseness better, because a bar's width IS the range of sizes it covers.
  */
+/* The window's own honesty line: how many requests were observed out of how
+ * many it wants, over how long a span, and how many are exact rather than
+ * bucket-bounded. "n of 100" is said explicitly whenever the window is partial
+ * -- never padded.
+ *
+ * The span is a DURATION and gets the duration formatter. A raw "1182s" made
+ * the reader do arithmetic to learn the window is 20 minutes of traffic, which
+ * is the number that decides whether the picture is current at all.
+ *
+ * Pure so the test engine can execute it: the whole content of this line is
+ * its formatting, and a grep for `durTxt` passes even when the arguments are
+ * swapped or the exact-count condition is inverted.
+ */
+function winSpan(w) {
+  if (!w || !w.n) return `0/${(w && w.capacity) || 100} requests observed`;
+  const age = w.age_s == null ? "" : ` · ${durTxt(w.age_s)}`;
+  const ex = w.exact_n < w.n ? ` · ${w.exact_n} exact` : "";
+  return `${w.n}/${w.capacity} requests${age}${ex}`;
+}
+
 function paintRequestStats() {
-  const set = (id, v) => { const e = $(id); if (e) e.textContent = v; };
   const sz = liveSizing || {};
   const w = sz.window || {};
   const rec = sz.recommended;
@@ -605,27 +1017,22 @@ function paintRequestStats() {
     return fmt(p.lo) + "–" + fmt(p.hi);
   };
 
+  // The one figure that is a decision input rather than a description: the
+  // p90 is what the recommendation below is divided by. p50/p99/max are on
+  // the plot instead of here.
   set("pctP90", pct(w.p90));
-  set("pctP50", pct(w.p50));
-  set("pctP99", pct(w.p99));
-  set("pctMax", pct(w.max));
 
-  // The window's own honesty line: how many requests, out of how many it wants,
-  // how old, and how many are exact rather than bucket-bounded. "n of 100" is
-  // said explicitly whenever the window is partial -- never padded.
-  if (w.n) {
-    const age = w.age_s == null ? "" : ` · spans ${Math.round(w.age_s)}s`;
-    const exact = ` · ${w.exact_n} exact, ${w.n - w.exact_n} bucket-bounded`;
-    set("winMeta", `${w.n} of ${w.capacity} requests${age}${exact}`);
-  } else {
-    set("winMeta", `0 of ${w.capacity || 100} requests observed`);
-  }
-  const g = sz.gen_window || {};
-  set("genMeta", g.n && g.p90 ? `generated tokens p90 ${pct(g.p90)}` : "");
-  set("statsProv", sz.provenance || "—");
+  // The window's own honesty line, as short as it can be; see winSpan().
+  set("winMeta", winSpan(w));
+  reqHist(w);
 
   if (rec) {
     set("recN", rec.n);
+    const ur = $("useRec");
+    if (ur) {
+      ur.disabled = false;
+      ur.title = `write ${rec.n} into the Parallel agents field`;
+    }
     set("recBasis", `${rec.basis} = ${fmt(rec.prompt_tokens)} prompt tokens`);
     // The arithmetic, in full. pool / cost gives the raw fit; the headroom
     // factor keeps the last admitted sequence off the preemption edge; the
@@ -646,6 +1053,8 @@ function paintRequestStats() {
     set("recBasis", sz.reason || "—");
     set("recMath", "");
     set("recP99", "");
+    const ur = $("useRec");
+    if (ur) { ur.disabled = true; ur.title = sz.reason || "nothing recommended yet"; }
   }
   set("recCal", sz.calibration_note || "—");
 
@@ -677,6 +1086,25 @@ function paintRequestStats() {
 
 /* ------------------------------------------------------------- state ---- */
 
+/* The supervisor's transition, in the operator's words, or "" when it is not
+ * mid-transition.
+ *
+ * Pure, and the single owner of the state list, for two reasons. (1) The list
+ * used to be written twice -- once to disable the buttons, once to paint a
+ * note -- so the two could disagree about what counts as busy. (2) The note
+ * used to be painted by paintState() straight into #sMeta, which
+ * paintTelemetry() repaints every two seconds while state arrives every five:
+ * "starting…" was on screen for one frame in three and the rest of the time
+ * the line claimed the server was already serving. Whatever owns a slot must
+ * be the only thing that writes it, so the phase is rendered inside
+ * paintServingMeta() and this is the decision it renders from.
+ */
+const BUSY_PHASES = {STARTING: "starting", PREFLIGHT: "preflight", STOPPING: "stopping", DRAINING: "draining"};
+
+function busyPhase(sv) {
+  return BUSY_PHASES[(sv || {}).actual_state] || "";
+}
+
 /* The serving line.
  *
  * Split out of paintState() because its two throughput figures come from the
@@ -688,6 +1116,16 @@ function paintServingMeta() {
   const meta = $("sMeta");
   if (!meta || !lastState) return;
   const s = lastState, up = s.upstream || {};
+  // A transition is its own answer, and it is painted HERE rather than by
+  // paintState(): telemetry repaints this element every 2 s, so a note written
+  // by the 5 s state painter was overwritten before it could be read.
+  const phase = busyPhase(s.supervisor);
+  if (phase) {
+    meta.textContent = `${phase}…`;
+    meta.title = `the supervisor is in ${s.supervisor.actual_state}; ` +
+      "the figures below are the last ones the previous server produced";
+    return;
+  }
   // The SERVING line reports what the server ACTUALLY serves, never the
   // planner's inputs. ctx sources, most authoritative first: the running
   // process's own --max-model-len; then desired config, which is what
@@ -712,17 +1150,14 @@ function paintServingMeta() {
   // the OTHER figure still showed a number. That is what made it look as
   // though prefill and generate were swapping places.
   //
-  // Every figure here also appears in the strip below with its reason and its
-  // lifetime companion; this line is the summary, never the only copy.
+  // Identity only. The three throughput figures used to be here too, as bare
+  // numbers with no reason for an absent one and no age for a stale one, while
+  // the strip below carried the same three done properly. Two renderings of one
+  // figure is two chances for them to disagree, so the strip is their only home
+  // and this line keeps the three facts only it carries.
   const segs = [
     ["", base],
     ["context", fmt(liveCtx) + " tokens"],
-    ["prefill", segFigure(liveMetrics.prefill_tok_s, liveMetrics.prefill_state,
-                          (v) => rateTxt(v))],
-    ["decode", segFigure(liveMetrics.gen_tok_s, liveMetrics.gen_state,
-                         (v) => rateTxt(v, 1))],
-    ["time to first token", segFigure(liveMetrics.ttft_s, liveMetrics.ttft_state,
-                                      secsTxt)],
     ["up", uptimeTxt(s.server_uptime_s)],
   ];
   meta.textContent = "";
@@ -750,13 +1185,153 @@ function paintServingMeta() {
     });
   }
   meta.title = up.up
-    ? "prefill (prompt processing), decode (token generation) and " +
-      "time-to-first-token, from the engine's own counters over the last 2 s " +
-      "poll window. 'idle' means nothing of that kind ran in the window — it " +
-      "is not a zero and it is not the other figure. The strip below carries " +
-      "each figure's reason and its lifetime companion, whose denominator is " +
-      "prefill/decode seconds rather than wall clock."
+    ? "the address a client points at, the context the running engine accepts, " +
+      "and how long it has been up. Throughput is NOT here: the strip below " +
+      "carries prefill, decode and time-to-first-token with their reasons and " +
+      "lifetime companions."
     : "";
+}
+
+/* A duration for the boot bar: "48 s", "3m 12s", "1h 04m".
+ *
+ * uptimeTxt() is the serving line's formatter and floors to whole minutes,
+ * which is right for "up 3h 12m" and useless for a boot that is 48 seconds in
+ * and moving every tick. The boot bar needs the seconds to visibly advance or
+ * it reads as frozen.
+ */
+function durTxt(sec) {
+  if (typeof sec !== "number" || !isFinite(sec) || sec < 0) return "—";
+  const s = Math.round(sec);
+  if (s < 60) return s + " s";
+  const p2 = (n) => (n < 10 ? "0" + n : String(n));
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${p2(s % 60)}s`;
+  return `${Math.floor(m / 60)}h ${p2(m % 60)}m`;
+}
+
+/* Is a boot in progress? Only then is the bar drawn: once the server is READY
+ * the phase history is a post-mortem, not progress, and a dead widget above the
+ * controls every time the page opens is worse than no widget. */
+function bootActive(b) {
+  return !!(b && b.phase && !b.reached_ready);
+}
+
+/* The ETA line, with its provenance. history.py decides whether the figure is a
+ * median of this model's measured boots or SPEC.md's calibration fallback, and
+ * the note says which — an ETA that is a guess must never read like a
+ * measurement, and being past the estimate must be said rather than hidden. */
+function bootNote(b) {
+  if (typeof b.eta_s !== "number") return b.eta_note || "no boot estimate for this model yet";
+  const past = typeof b.elapsed_s === "number" && b.elapsed_s > b.eta_s;
+  const bits = [past
+    ? `past the ${durTxt(b.eta_s)} estimate already`
+    : `typically ${durTxt(b.eta_s)} (${b.cold ? "cold" : "warm"} boot)`];
+  if (typeof b.eta_p90_s === "number") bits.push(`p90 ${durTxt(b.eta_p90_s)}`);
+  bits.push(b.eta_source === "history" ? "from this model's measured boots"
+                                       : "from calibration figures");
+  return bits.join(" · ");
+}
+
+/* The boot-progress bar.
+ *
+ * The markup for this shipped with the prototype and has never had a painter:
+ * a multi-minute boot sat on "Elapsed —" with an empty track while the
+ * supervisor was publishing the phase, the per-phase times and a real ETA the
+ * whole time. This paints all of it from s.boot (app._boot_payload).
+ *
+ * The bar is drawn ONLY while a boot is in progress. Once the server is READY
+ * the phase history is a post-mortem, not a progress bar, and leaving it up
+ * would put a dead widget above the controls every time the page is opened.
+ */
+const PHASE_LABELS = {
+  init: "init",
+  loading_weights: "weights",
+  compiling: "compile",
+  kv_cache: "KV cache",
+  cuda_graphs: "graphs",
+  http_start: "HTTP",
+  ready: "ready",
+};
+
+function paintBoot(b) {
+  const wrap = $("phases");
+  if (!wrap) return;
+  const order = b.phases || [];
+  const booting = bootActive(b);
+  wrap.className = "phases" + (booting ? " on" : "");
+  if (!booting) return;
+
+  const el = $("elapsed");
+  if (el) el.textContent = durTxt(b.elapsed_s);
+
+  const idx = order.indexOf(b.phase);
+  const times = b.phase_times || {};
+  const track = $("ptrack"), labels = $("plabels");
+  if (track && labels) {
+    if (track.childNodes.length !== order.length) {
+      track.textContent = "";
+      labels.textContent = "";
+      order.forEach((p) => {
+        const step = document.createElement("div");
+        step.className = "pstep";
+        const fill = document.createElement("div");
+        fill.className = "fill";
+        step.appendChild(fill);
+        track.appendChild(step);
+        const lab = document.createElement("span");
+        lab.textContent = PHASE_LABELS[p] || p;
+        labels.appendChild(lab);
+      });
+    }
+    // A phase that has been seen is done; the current one pulses; unseen ones
+    // stay empty. The per-phase times are what prove a phase actually ran
+    // rather than the index merely being ahead of it.
+    order.forEach((p, i) => {
+      const done = times[p] != null && i < idx;
+      const act = i === idx;
+      track.children[i].className = "pstep" + (done ? " done" : act ? " act" : "");
+      labels.children[i].className = done ? "done" : act ? "act" : "";
+    });
+  }
+
+  const note = $("pnote");
+  if (note) {
+    note.textContent = bootNote(b);
+    note.style.display = "block";
+  }
+}
+
+/* The unsaved-changes marker.
+ *
+ * It shipped as markup with a .on class in CSS and nothing ever added the
+ * class, so "unsaved changes" was permanently invisible. It means: the controls
+ * on screen differ from what the running server was started with.
+ */
+/* Which controls differ from the running server, as human-readable bits.
+ *
+ * Pure so the test engine can execute it: the marker's whole value is the
+ * comparison, and "has anything been clicked" is the wrong question — moving a
+ * slider back to the running value must clear it, and a server adopted at util
+ * 0.90 must mark the page's default 0.95 as changed with no click at all. */
+function dirtyBits(facts, sizing, want) {
+  const bits = [];
+  if (facts.util_effective && Math.abs(facts.util_effective - want.util) > 0.002) {
+    bits.push(`util ${want.util.toFixed(2)}`);
+  }
+  if (facts.ctx && facts.ctx !== want.ctx) bits.push(`${fmt(want.ctx)} ctx`);
+  if (sizing.max_num_seqs && sizing.max_num_seqs !== want.agents) {
+    bits.push(`${want.agents} agent${want.agents === 1 ? "" : "s"}`);
+  }
+  return bits;
+}
+
+function paintDirty(upIsUp) {
+  const d = $("dirty");
+  if (!d) return;
+  if (!upIsUp) { d.classList.remove("on"); d.textContent = "unsaved changes"; return; }
+  const diff = dirtyBits(liveFacts || {}, liveSizing || {}, { util: util, ctx: ctx, agents: agents });
+  d.classList.toggle("on", diff.length > 0);
+  d.textContent = diff.length ? `unsaved: ${diff.join(", ")}` : "unsaved changes";
 }
 
 function paintState(s) {
@@ -766,18 +1341,41 @@ function paintState(s) {
   // /api/state carries the same sizing block as the telemetry event, so the
   // panel is populated on first paint rather than staying blank for up to 2 s.
   if (s.sizing) { liveSizing = s.sizing; paintRequestStats(); }
-  // Show the utilization the server is ACTUALLY running at, not a hardcoded
-  // default, until the user moves the slider themselves.
+  paintBoot(s.boot || {});
+  // Show the configuration the server is ACTUALLY running at, not the page's
+  // defaults, until the operator touches a control. Both of these used to be
+  // one-directional: util was read back but the agent count never was, so the
+  // "Parallel agents" field showed 1 against a server running 8, and the
+  // recommendation column below it disagreed with the input above it.
   if (!userPicked && liveFacts.util_effective && Math.abs(liveFacts.util_effective - util) > 0.002) {
     util = liveFacts.util_effective;
     const u = $("util");
     if (u) u.value = String(Math.round(util * 100));
     estimate();
   }
+  // The running engine's --max-num-seqs, read back into the field that sets
+  // it. liveSizing.max_num_seqs is that value (app._sizing_payload reads it off
+  // the live process), so the input and the recommendation can never disagree.
+  const runSeqs = liveSizing.max_num_seqs;
+  if (!userPicked && runSeqs && runSeqs !== agents) {
+    agents = runSeqs;
+    const a = $("agents");
+    if (a) a.value = String(agents);
+    estimate();
+  }
+  paintDirty(!!up.up);
+  const sv = s.supervisor || {};
+  const phase = busyPhase(sv);
   const pill = $("pill"), pillTxt = $("pillTxt");
   if (pill && pillTxt) {
-    pill.className = "pill" + (up.up ? "" : " off");
-    pillTxt.textContent = up.up ? "Serving" : "Not reachable";
+    // `.pill.busy` shipped in the stylesheet with no painter, exactly like
+    // #dirty. During a boot the upstream is down, so the pill read
+    // "Not reachable" in grey while the operator had just pressed the button
+    // that started it -- the page describing a boot in progress as a fault.
+    pill.className = "pill" + (phase ? " busy" : up.up ? "" : " off");
+    pillTxt.textContent = phase
+      ? phase + "\u2026"
+      : up.up ? "Serving" : "Not reachable";
   }
   const sm = $("sModel");
   if (sm) sm.textContent = up.model || "—";
@@ -786,8 +1384,7 @@ function paintState(s) {
   paintServingMeta();
 
   controlEnabled = !!s.control_enabled;
-  const sv = s.supervisor || {};
-  const busy = ["STARTING", "PREFLIGHT", "STOPPING", "DRAINING"].includes(sv.actual_state);
+  const busy = !!phase;
   const upNow = !!up.up;
   ["apply", "stop"].forEach((id) => {
     const b = $(id);
@@ -824,10 +1421,6 @@ function paintState(s) {
   if (stopBtn && unadopted) {
     stopBtn.disabled = true;
     stopBtn.title = "Not managed yet — click 'Manage running server' first";
-  }
-  if (sv.actual_state && sv.actual_state !== "READY") {
-    const meta = $("sMeta");
-    if (meta && busy) meta.textContent = `${sv.actual_state.toLowerCase()}…`;
   }
 
   // Which row is serving comes from /api/state's `identity`: the live
@@ -964,12 +1557,18 @@ async function init() {
   const u = $("util");
   if (u) {
     u.value = String(Math.round(util * 100));
-    u.oninput = (e) => { util = +e.target.value / 100; estimate(); };
+    u.oninput = (e) => { userPicked = true; util = +e.target.value / 100; estimate(); };
   }
 
   const cx = $("ctx");
   if (cx) {
     cx.oninput = (e) => {
+      // Touching a control is the operator speaking. Without this flag the
+      // next state event overwrites the value the operator just set with the
+      // one the running server was started with, which is how a moved slider
+      // sprang back and how the Apply confirmation could quote a util the
+      // operator had already changed.
+      userPicked = true;
       ctx = +e.target.value;
       const v = $("ctxV");
       if (v) v.textContent = fmt(ctx);   // move the readout with the thumb
@@ -980,10 +1579,39 @@ async function init() {
   const ag = $("agents");
   if (ag) {
     ag.oninput = (e) => {
-      agents = +e.target.value;
-      const v = $("agentsV");
-      if (v) v.textContent = agents;
+      // A number input, not a slider: the value is the whole point and a thumb
+      // cannot be aimed at 7. An empty or out-of-range box must not send
+      // max_num_seqs: NaN to the backend.
+      const n = Math.round(+e.target.value);
+      agents = isFinite(n) ? Math.min(64, Math.max(1, n)) : 1;
+      // Echo the clamped value back into the box. Typing 99 left the box
+      // reading 99 while `agents` -- the number POSTed as max_num_seqs -- held
+      // 64, so the control displayed a value the page was not using. An empty
+      // box is left alone: that is someone mid-edit, not an out-of-range
+      // entry, and the request falls back to 1 without rewriting their text.
+      if (e.target.value !== "" && e.target.value !== String(agents)) {
+        e.target.value = String(agents);
+      }
+      userPicked = true;
       estimate();
+    };
+  }
+
+  // The recommendation is computed from measured request sizes and lives in
+  // the live panel; this writes it into the field it constrains. It is a
+  // suggestion the operator confirms by clicking, never an automatic write:
+  // paintState deliberately does not move `agents` on its own.
+  const useRec = $("useRec");
+  if (useRec) {
+    useRec.onclick = () => {
+      const rec = (liveSizing || {}).recommended;
+      if (!rec || !isFinite(rec.n)) return;
+      agents = Math.min(64, Math.max(1, Math.round(rec.n)));
+      const a = $("agents");
+      if (a) a.value = String(agents);
+      userPicked = true;
+      estimate();
+      log(`agent count set to the recommendation: ${agents}`, "g");
     };
   }
 
@@ -1017,15 +1645,64 @@ async function init() {
     const n = JSON.parse(ev.data);
     log(n.body || n.code, n.level === "warn" ? "w" : "e");
   });
-  es.onerror = () => log("event stream dropped — reconnecting", "w");
+  // The page used to ALSO poll /api/state every 5 s on top of this stream,
+  // which already pushes a state event on that same interval. Two sources for
+  // one readout means whichever paint lands last wins, and the poll's
+  // `catch (_) {}` meant the duplicate could fail forever without a trace.
+  // EventSource reconnects by itself; what it cannot do is refresh the disk
+  // scan, which is what the interval above is for. The drop is reported once
+  // per outage rather than once per reconnect attempt.
+  let streamDown = false;
+  es.onerror = () => {
+    if (streamDown) return;
+    streamDown = true;
+    log("event stream dropped — reconnecting", "w");
+  };
+  es.onopen = () => { streamDown = false; };
 
-  setInterval(async () => {
-    try { paintState(await (await fetch("/api/state")).json()); } catch (_) {}
-  }, 5000);
+  // The log drawer. Collapsed by default because it is the least read thing on
+  // the page and it used to hold 190px of it permanently. The button says how
+  // many lines are waiting, so opening it is an informed click, and the count
+  // keeps updating while folded — an error arriving is visible as a number
+  // changing even when the stream itself is hidden.
+  const fold = $("logFold");
+  if (fold) {
+    const panel = $("logPanel");
+    const count = () => {
+      const L = $("log");
+      const n = L && L.children ? L.children.length : 0;
+      fold.textContent = (panel && panel.classList.contains("folded") ? "show " : "hide ") + n;
+    };
+    fold.onclick = () => {
+      const folded = panel.classList.toggle("folded");
+      fold.setAttribute("aria-expanded", folded ? "false" : "true");
+      count();
+      if (!folded) { const L = $("log"); if (L) L.scrollTop = L.scrollHeight; }
+    };
+    // log() appends without asking the drawer, so the count is refreshed on a
+    // short tick of its own rather than by instrumenting every call site.
+    count();
+    setInterval(count, 2000);
+  }
 
   wireControls();
   log("connected");
-  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", spark);
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+    spark();
+    reqHist((liveSizing || {}).window || {});
+  });
+  // The canvases are sized to their CSS box (fitCanvas), so a width change —
+  // a resize, or the drawer opening — invalidates the bitmap. Repaint rather
+  // than leave a stretched old drawing behind. Debounced: resize fires per
+  // pixel of drag, and each repaint re-reads the CSS custom properties.
+  let rsTimer = null;
+  window.addEventListener("resize", () => {
+    clearTimeout(rsTimer);
+    rsTimer = setTimeout(() => {
+      spark();
+      reqHist((liveSizing || {}).window || {});
+    }, 120);
+  });
 }
 
 init();

@@ -11,3 +11,7 @@ servedeck/web/fonts/
 dist/
 build/
 *.egg-info/
+
+# Runtime log from `run.sh` / the systemd unit. Regenerated on every boot of the
+# dashboard, 300 kB+ within an hour, and carries local paths and model names.
+servedeck.log

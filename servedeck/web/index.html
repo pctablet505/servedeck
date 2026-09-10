@@ -50,7 +50,7 @@
            one is statvfs on the filesystem holding the hub cache, refreshed
            every 15 s so a large deletion is visible without a reload. -->
       <div class="dfline mono"><span id="dhub">—</span><span id="dfree">—</span></div>
-      <div class="mlist" id="mlist"></div>
+      <div class="mlist" id="mlist" role="listbox" aria-label="Models in the local hub cache"></div>
     </div>
 
     <!-- main -->
@@ -59,10 +59,57 @@
         <div class="status-row">
           <span class="pill" id="pill"><span class="d"></span><span id="pillTxt">Serving</span></span>
           <div>
-            <div class="status-model" id="sModel">—</div>
+            <div class="status-model" id="sModel">—</div>            <!-- Identity only: address, context, uptime. The three throughput
+                 figures that used to be here are the strip below, which shows
+                 each one with its reason and its lifetime companion instead of
+                 a bare number -- and a figure shown twice is a figure that can
+                 disagree with itself. -->
             <div class="status-meta smeta mono" id="sMeta">connecting…</div>
           </div>
-          <span class="queued mono" id="queued"><span id="qN">—</span> agents holding</span>
+          <span class="queued mono" id="queued" role="status"><span id="qN">—</span> in flight</span>
+        </div>
+
+        <!-- Prefill, decode and TTFT are three different questions and one number
+             cannot answer them: a 17 s time-to-first-token and a slow decode look
+             identical when only one figure is on screen.
+
+             Every cell has the SAME three lines at all times, and no line is ever
+             empty or borrowed by another cell:
+               .n  the current window reading, or "idle" when nothing ran
+               .s  what that line is (window, or the last value and its age)
+               .l  the lifetime companion, which never decays and never moves up
+                   into .n -- the two are different quantities (the window figure
+                   is aggregate, per second of WALL clock; the lifetime figure is
+                   per second of PREFILL/DECODE time) and the panel used to swap
+                   one for the other marked only by a "~".
+             Units are on the label AND on the number, so a figure read on its own
+             still carries one.
+
+             This strip used to sit at the bottom of the live panel while a
+             summary of the same three figures sat up here. The summary lost:
+             it had no reason for an absent figure, no age for a stale one, and
+             no lifetime companion -- so "prefill idle" next to a decode number
+             was the whole story. The strip is the better rendering, so it moved
+             up and the summary shrank to the facts only it carries. -->
+        <div class="thru" id="thru">
+          <div class="tcell">
+            <div class="lk">Prefill <span class="tu">prompt tokens/second</span></div>
+            <div class="n mono" id="thPrefill">n/a</div>
+            <div class="s" id="thPrefillS">—</div>
+            <div class="l" id="thPrefillL">—</div>
+          </div>
+          <div class="tcell">
+            <div class="lk">Decode <span class="tu">generated tokens/second</span></div>
+            <div class="n mono" id="thDecode">n/a</div>
+            <div class="s" id="thDecodeS">—</div>
+            <div class="l" id="thDecodeL">—</div>
+          </div>
+          <div class="tcell">
+            <div class="lk" title="from vllm:time_to_first_token_seconds, which is measured from request ARRIVAL — a request queued behind others carries that wait in its TTFT">Time to first token <span class="tu">seconds, mean · includes queue wait</span></div>
+            <div class="n mono" id="thTtft">n/a</div>
+            <div class="s" id="thTtftS">—</div>
+            <div class="l" id="thTtftL">—</div>
+          </div>
         </div>
 
         <div class="phases" id="phases">
@@ -80,74 +127,63 @@
         </div>
       </div>
 
+      <!-- One line per control. Each field used to be three (label, a
+           full-width slider, a tick row), which made the allocator taller than
+           the panels it feeds. The tick rows carried the range, which now rides
+           in each control's title, and the agent count, which was a slider over
+           1..64 -- a thumb that cannot be aimed at a number, and the number is
+           the whole point of the field. -->
       <div class="alloc">
-        <div class="field">
-          <div class="flabel">
-            <span class="k">GPU memory utilization</span>
-            <span class="v mono" id="utilV">0.96</span>
-          </div>
-          <input type="range" id="util" min="40" max="98" value="96" aria-label="GPU memory utilization">
-          <div class="ticks mono"><span>0.40</span><span>0.70</span><span>0.98</span></div>
+        <div class="field frow">
+          <span class="k">GPU utilization</span>
+          <input type="range" id="util" min="40" max="98" value="96" title="0.40 to 0.98 — the share of the card vLLM may reserve" aria-label="GPU memory utilization" aria-describedby="utilV">
+          <span class="v mono" id="utilV">0.96</span>
         </div>
 
-        <div class="field">
-          <div class="flabel">
-            <span class="k">Parallel agents</span>
-            <span class="v mono" id="agentsV">1</span>
-          </div>
-          <input type="range" id="agents" min="1" max="64" value="1" aria-label="Parallel agents">
-          <div class="ticks mono"><span>1</span><span id="agentsFit">—</span><span>64</span></div>
+        <div class="field frow">
+          <span class="k">Parallel agents</span>
+          <input type="number" id="agents" class="num" min="1" max="64" value="1" title="--max-num-seqs: the scheduler's ceiling on concurrent sequences" aria-label="Parallel agents" aria-describedby="agentsFit">
+          <span class="s mono" id="agentsFit">—</span>
+          <!-- The recommendation lives in the live panel below the fold, as
+               evidence (it is measured off the last 100 requests). This button
+               closes the loop without moving that evidence: it writes the
+               recommended count into the field above. It was a manual scroll-
+               up-and-type before, which is the round trip the owner's "badly
+               organised" complaint is about. -->
+          <button type="button" class="btn tiny" id="useRec" disabled title="nothing recommended yet">Use recommended</button>
         </div>
 
-        <div class="field">
-          <div class="flabel">
-            <span class="k">Context per agent</span>
-            <span class="v mono" id="ctxV">—</span>
-          </div>
+        <div class="field frow">
+          <span class="k">Context / agent</span>
           <!-- A slider, not a fixed ladder. Its ceiling is the smaller of two
                real numbers: the model's own max_position_embeddings, and what
                the KV budget can hold for the agent count above. The ladder
                offered lengths this machine cannot serve, and the engine only
                said so minutes into a boot. -->
-          <input type="range" id="ctx" min="8192" max="262144" step="4096" value="262144" aria-label="Context per agent">
-          <div class="ticks mono"><span id="ctxMin">8k</span><span id="ctxBound">—</span><span id="ctxMax">—</span></div>
+          <input type="range" id="ctx" min="8192" max="262144" step="4096" value="262144" aria-label="Context per agent" aria-describedby="ctxV ctxBound">
+          <span class="v mono" id="ctxV">—</span>
+          <span class="s mono" id="ctxBound">—</span>
         </div>
 
         <div class="field">
-          <div class="derived">
+          <!-- One derived figure, not three. The other two cells were echoes:
+               "Parallel agents" here restated the input of the same name (a
+               division the badge wrongly called "measured"), and "Max single
+               context" restated the context slider's own ceiling. The KV budget
+               is the one figure here that is not a mirror of a control, and it
+               is the one the measured/estimated badge actually describes — the
+               engine's resolved KV size is a measurement, the calculator's is
+               not — so the badge moved onto it. -->
+          <div class="derived one">
             <div class="dcell">
-              <div class="k">KV budget</div>
+              <div class="k">KV budget <span class="tag" id="dBadge">—</span></div>
               <div class="n mono" id="dKv">—</div>
               <div class="s mono" id="dKvTok">—</div>
             </div>
-            <div class="dcell">
-              <div class="k">Parallel agents <span class="tag est" id="dBadge">—</span></div>
-              <div class="n mono" id="dAgents">—</div>
-              <div class="s" id="dAgentsS">—</div>
-            </div>
-            <div class="dcell">
-              <div class="k">Max single context</div>
-              <div class="n mono" id="dCtx">—</div>
-              <div class="s" id="dCtxS">—</div>
-            </div>
           </div>
 
-          <div class="alert crit" id="alertC"><b>⚠</b><span id="alertCT"></span></div>
-          <div class="alert warn" id="alertW"><b>!</b><span id="alertWT"></span></div>
-        </div>
-      </div>
-
-      <!-- The failure banner is styled display:none and nothing ever adds the
-           .on class, so it has never appeared; its two buttons had no
-           handlers either. Kept as the markup the phase machine will paint
-           into, with both buttons disabled so neither can be clicked into
-           silence if the banner is ever shown before they are wired. -->
-      <div class="banner" id="banner">
-        <b id="banTitle"></b>
-        <span id="banBody"></span>
-        <div class="act">
-          <button type="button" id="banRetry" disabled title="not wired yet — retry is not exposed over the API">Retry now</button>
-          <button type="button" id="banDismiss" disabled title="not wired yet — the banner has no painter">Dismiss</button>
+          <div class="alert crit" id="alertC" role="alert"><b>⚠</b><span id="alertCT"></span></div>
+          <div class="alert warn" id="alertW" role="alert"><b>!</b><span id="alertWT"></span></div>
         </div>
       </div>
 
@@ -161,20 +197,15 @@
            whether this configuration can start. -->
       <div class="pref" id="pref"></div>
 
+      <!-- The action bar sits directly under the controls it applies and the
+           preflight that gates them. It used to sit below a dead banner and a
+           row of disabled checkboxes, so the primary action was visually
+           detached from the three fields that decide it. -->
       <div class="actions">
-        <!-- Both of these were enabled, one of them checked by default, and
-             neither was read by anything. A ticked "Auto-restart on crash" is
-             not a cosmetic problem: it tells the operator a recovery
-             behaviour is armed when nothing arms it. Disabled with the reason
-             until the supervisor exposes them, the same way Smoke test is. -->
-        <div class="toggles">
-          <label class="tog"><input type="checkbox" id="autoR" disabled title="not wired yet — the supervisor's restart policy is not exposed over the API"> Auto-restart on crash</label>
-          <label class="tog"><input type="checkbox" id="notify" disabled title="not wired yet — Servedeck sends no notifications"> Notify when ready</label>
-        </div>
         <button class="btn pri" id="apply" disabled>Apply &amp; restart</button>
         <button class="btn" id="smoke">Smoke test</button>
         <button class="btn" id="stop">Stop</button>
-        <span class="dirty" id="dirty">unsaved changes</span>
+        <span class="dirty" id="dirty" role="status">unsaved changes</span>
       </div>
     </div>
   </div>
@@ -191,11 +222,15 @@
         <div class="lbig mono" id="kvPct">—</div>
         <div class="lsub mono" id="kvTok">—</div>
         <canvas id="spark" width="420" height="42" aria-label="KV cache usage over time"></canvas>
+        <!-- Each counter names its own time base. Running/Waiting are
+             instantaneous; Preemptions and Prefix cache are lifetime counters
+             that never reset, and drawing them in one row at one size made a
+             593-since-boot preemption read identically to "preempting now". -->
         <div class="lrow">
-          <div><div class="lk">Running</div><div class="n mono" id="mRun">—</div></div>
-          <div><div class="lk">Waiting</div><div class="n mono" id="mWait">—</div></div>
-          <div><div class="lk">Preemptions</div><div class="n mono" id="mPre">—</div></div>
-          <div><div class="lk">Prefix cache</div><div class="n mono" id="hitRate">—</div></div>
+          <div><div class="lk">Running <span class="tb">now</span></div><div class="n mono" id="mRun">—</div></div>
+          <div><div class="lk">Waiting <span class="tb">now</span></div><div class="n mono" id="mWait">—</div></div>
+          <div><div class="lk">Preemptions <span class="tb">since boot</span></div><div class="n mono" id="mPre">—</div></div>
+          <div><div class="lk">Prefix cache <span class="tb">lifetime</span></div><div class="n mono" id="hitRate">—</div></div>
         </div>
       </div>
 
@@ -204,23 +239,21 @@
            question people actually ask it ("how many agents?") because sizing
            is set by the TAIL -- a p90 that does not fit is a preemption -- and
            a mean has no tail. Replaced by the distribution over a rolling
-           window of the last 100 finished requests. -->
+           window of the last 100 finished requests.
+
+           The distribution is DRAWN, not described. The bars are vLLM's own
+           buckets, so the quantisation is visible in the picture -- a wide bar
+           with nothing beside it says "we cannot tell you more than this" --
+           and the percentiles are marked at the place they fall. The sentences
+           that explained all of that are gone: the column used to carry four
+           percentile intervals, a sample-count line, a generated-token line
+           and a provenance paragraph, and each restated what the bars show. -->
       <div class="lcol">
-        <div class="lk">Request size <span style="text-transform:none;font-weight:400">(last 100 requests)</span></div>
+        <div class="lk">Request size <span style="text-transform:none;font-weight:400">(prompt tokens, last 100)</span></div>
         <div class="lbig mono" id="pctP90">—</div>
-        <div class="lsub">p90 prompt tokens — what the agent count is sized on</div>
-        <div class="lrow">
-          <div><div class="lk">p50</div><div class="n mono" id="pctP50">—</div></div>
-          <div><div class="lk">p99</div><div class="n mono" id="pctP99">—</div></div>
-          <div><div class="lk">max</div><div class="n mono" id="pctMax">—</div></div>
-        </div>
+        <div class="lsub">p90 — the agent count is sized on this</div>
+        <canvas id="reqHist" width="440" height="96" aria-label="Prompt-token counts over the last 100 finished requests. Exact requests are drawn in fine bins; requests known only to a vLLM bucket are drawn as a translucent band over that bucket's range. Median, p90 and p99 are marked."></canvas>
         <div class="lsub mono" id="winMeta">—</div>
-        <div class="lsub mono" id="genMeta">—</div>
-        <!-- Provenance, never omitted: these percentiles are bucket-quantised
-             and cover only what Servedeck watched. #statsProv is filled from
-             reqstats.PROVENANCE so the page cannot drift from the module that
-             computes the estimate. -->
-        <div class="hint" id="statsProv">—</div>
       </div>
 
       <div class="lcol">
@@ -232,62 +265,30 @@
         <div class="lsub mono" id="recMath">—</div>
         <div class="lsub" id="recP99">—</div>
         <div class="hint" id="recCal">—</div>
-        <!-- The button wrote nothing: there is no endpoint behind it, and the
-             hint under it described a write that never happened. -->
-        <div class="setrow">
-          <input type="number" id="subN" min="1" max="64" disabled title="not wired yet — Servedeck has no endpoint that writes the Codex subagent cap" aria-label="Max concurrent Codex subagents">
-          <button class="btn" id="subApply" disabled title="not wired yet — Servedeck has no endpoint that writes the Codex subagent cap">Set subagents</button>
-        </div>
-        <div class="hint">
-          Servedeck does not write <span class="mono">max_concurrent_threads_per_session</span>
-          yet. Set it in your Codex config; the figures on the left say how many
-          the GPU can actually serve at once.
-        </div>
-      </div>
-    </div>
-
-    <!-- Prefill, decode and TTFT are three different questions and one number
-         cannot answer them: a 17 s time-to-first-token and a slow decode look
-         identical when only one figure is on screen.
-
-         Every cell has the SAME three lines at all times, and no line is ever
-         empty or borrowed by another cell:
-           .n  the current window reading, or "idle" when nothing ran
-           .s  what that line is (window, or the last value and its age)
-           .l  the lifetime companion, which never decays and never moves up
-               into .n -- the two are different quantities (the window figure
-               is aggregate, per second of WALL clock; the lifetime figure is
-               per second of PREFILL/DECODE time) and the panel used to swap
-               one for the other marked only by a "~".
-         Units are on the label AND on the number, so a figure read on its own
-         still carries one. -->
-    <div class="thru" id="thru">
-      <div class="tcell">
-        <div class="lk">Prefill <span class="tu">prompt tokens/second</span></div>
-        <div class="n mono" id="thPrefill">n/a</div>
-        <div class="s" id="thPrefillS">connecting…</div>
-        <div class="l" id="thPrefillL">lifetime —</div>
-      </div>
-      <div class="tcell">
-        <div class="lk">Decode <span class="tu">generated tokens/second</span></div>
-        <div class="n mono" id="thDecode">n/a</div>
-        <div class="s" id="thDecodeS">connecting…</div>
-        <div class="l" id="thDecodeL">lifetime —</div>
-      </div>
-      <div class="tcell">
-        <div class="lk" title="from vllm:time_to_first_token_seconds, which is measured from request ARRIVAL — a request queued behind others carries that wait in its TTFT">Time to first token <span class="tu">seconds, mean · includes queue wait</span></div>
-        <div class="n mono" id="thTtft">n/a</div>
-        <div class="s" id="thTtftS">connecting…</div>
-        <div class="l" id="thTtftL">lifetime —</div>
+        <!-- The disabled "Set subagents" input, its button and a two-line hint
+             about max_concurrent_threads_per_session were deleted: Servedeck has
+             no endpoint that writes that value, so the whole control was a claim
+             it could not keep. The "Use recommended" button beside the agents
+             field is the action that DOES exist. -->
       </div>
     </div>
 
     <div class="oversub" id="oversub"></div>
   </div>
 
-  <div class="panel log">
-    <div class="panel-h"><span>Server log</span><span class="mono" style="font-size:10px">serve.log</span></div>
-    <div class="logbody mono" id="log"></div>
+  <div class="panel log folded" id="logPanel">
+    <div class="panel-h">
+      <span>Server log</span>
+      <span style="display:flex;align-items:center;gap:8px">
+        <span class="mono" style="font-size:10px">serve.log</span>
+        <!-- The log used to hold 190px of the page permanently to display a
+             stream nobody was reading while they were reading something else.
+             Collapsed by default; the count says whether opening it is worth
+             the click. -->
+        <button type="button" class="fold" id="logFold" aria-expanded="false" aria-controls="log">show</button>
+      </span>
+    </div>
+    <div class="logbody mono" id="log" aria-live="polite"></div>
   </div>
 
   <div class="foot">

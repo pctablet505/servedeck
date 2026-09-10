@@ -189,6 +189,16 @@ def sup() -> _sup.Supervisor | None:
     return _supervisor
 
 
+def _snap() -> dict[str, Any]:
+    """The supervisor's snapshot, or {} when there is no supervisor at all.
+
+    The guard belongs here rather than at each of the two call sites that build
+    a payload: `sup().snapshot() if sup() is not None else {}` calls sup() twice,
+    and a third copy written as `sup() and sup().snapshot()` would return None
+    rather than {} and put a null where the page expects an object.
+    """
+    s = sup()
+    return s.snapshot() if s is not None else {}
 
 
 # ------------------------------------------------------------- SSE hub ----
@@ -430,6 +440,54 @@ def _boot_log_candidates(
     return primary + rest
 
 
+def _boot_payload() -> dict[str, Any]:
+    """Boot progress for the phase bar: the ordered phase list, the per-phase
+    times the supervisor recorded, the elapsed clock, and the ETA.
+
+    The page has drawn none of this since the prototype — #phases/#elapsed
+    shipped markup with no painter, so a multi-minute boot sat on "Elapsed —"
+    with an empty track. The supervisor already tracks the phase and its
+    per-phase times; the only thing computed here is the ETA, which needs the
+    boot history and must stay attributed when it falls back to SPEC.md's
+    calibration figures (history.eta_for handles that; this only forwards it).
+
+    The history read happens ONLY while a boot is in progress. In the steady
+    state — server up, nothing booting — the bar is not drawn, so the 5 s
+    state poll must not open history.jsonl twice for a bar nobody sees.
+    """
+    from . import history, phases
+
+    snap = _snap()
+    out: dict[str, Any] = {
+        "phases": [p.value for p in phases.PHASE_ORDER],
+        "phase": snap.get("phase"),
+        "phase_times": snap.get("phase_times") or {},
+        "elapsed_s": snap.get("run_elapsed_s"),
+        "reached_ready": bool(snap.get("reached_ready")),
+        "eta_s": None,
+        "eta_p90_s": None,
+        "eta_source": None,
+        "eta_note": None,
+        "cold": None,
+    }
+    repo_id = snap.get("repo_id") or rt.serving_model
+    booting = out["phase"] is not None and not out["reached_ready"]
+    if not booting or not repo_id:
+        return out
+    backend = snap.get("backend") or rt.config().get("BACKEND") or ""
+    try:
+        cold = not history.has_prior_success(repo_id, backend)
+        eta = history.eta_for(repo_id, backend, cold=cold)
+    except Exception:  # noqa: BLE001 - an unreadable history must not blank the bar
+        return out
+    out["cold"] = cold
+    out["eta_s"] = eta.median_total_s
+    out["eta_p90_s"] = eta.p90_total_s
+    out["eta_source"] = eta.source
+    out["eta_note"] = eta.note
+    return out
+
+
 def _sizing_payload() -> dict[str, Any]:
     """The parallelism panel's whole payload: window stats + the recommendation.
 
@@ -448,7 +506,6 @@ def _sizing_payload() -> dict[str, Any]:
     out: dict[str, Any] = {
         "window": window,
         "gen_window": m.get("gen_stats") or dict(reqstats.EMPTY_STATS),
-        "provenance": reqstats.PROVENANCE,
         "calibration_note": parallelism.calibration_note(rt.serving_model),
         "running": m.get("running") if m.get("reachable") else None,
         "preemptions": m.get("preemptions") if m.get("reachable") else None,
@@ -1003,9 +1060,10 @@ def _state() -> dict[str, Any]:
         "gpu": rt.gpu,
         "vllm": rt.metrics,
         "sizing": _sizing_payload(),
+        "boot": _boot_payload(),
         "control_enabled": sup() is not None,
         "control_note": _supervisor_error or "",
-        "supervisor": (sup().snapshot() if sup() is not None else {}),
+        "supervisor": _snap(),
         # Servedeck's own uptime. The UI's "Serving ... up Nm" must NOT use
         # this: restarting the UI would make a long-running server look fresh.
         "uptime_s": int(time.time() - STARTED_AT),
