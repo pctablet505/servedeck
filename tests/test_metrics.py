@@ -437,3 +437,158 @@ def test_the_prescrape_placeholder_has_the_same_shape_as_a_snapshot() -> None:
     assert placeholder["reachable"] is False
     for key in ("gen_reason", "prefill_reason", "ttft_reason"):
         assert placeholder[key] == metrics.UNREACHABLE
+
+
+# --------------------------------------------------------------------------
+# The rolling request-size window (reqstats), fed from the histograms
+# --------------------------------------------------------------------------
+_FIXTURE = Path(__file__).parent / "fixtures" / "metrics_hist_live.txt"
+
+#: The real bucket edges, in the order vLLM emits them.
+_EDGES = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000,
+          10000, 20000, 50000, 100000, 200000, "+Inf"]
+
+
+def _hist_exposition(cum: list[int], *, hist_sum: float, count: float) -> str:
+    """A /metrics page carrying only the prompt-token histogram, in the exact
+    shape the live server publishes it (checked against
+    tests/fixtures/metrics_hist_live.txt)."""
+    m = 'engine="0",model_name="qwen38-flash-next"'
+    lines = [
+        f'vllm:request_prompt_tokens_bucket{{{m},le="{e}"}} {float(c)}'
+        for e, c in zip(_EDGES, cum)
+    ]
+    lines += [
+        f"vllm:request_prompt_tokens_count{{{m}}} {count}",
+        f"vllm:request_prompt_tokens_sum{{{m}}} {hist_sum}",
+        f"vllm:num_requests_running{{{m}}} 0",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def test_the_live_fixture_carries_the_histogram_the_window_needs() -> None:
+    """Guards against a vLLM rename. The whole window is reconstructed from
+    request_prompt_tokens_bucket; if that family disappears, the panel must be
+    known to be dead rather than quietly showing an empty window forever."""
+    parsed = metrics.parse_prometheus(_FIXTURE.read_text())
+    buckets = metrics._buckets(parsed, metrics.PROMPT_TOK_BUCKET)
+    assert len(buckets) == 18, "bucket edge count changed"
+    assert buckets[-1][0] == float("inf"), "no +Inf bucket"
+    # Cumulative and monotone, as a Prometheus histogram must be.
+    values = [v for _le, v in sorted(buckets)]
+    assert values == sorted(values)
+
+
+def test_the_first_scrape_does_not_backfill_the_lifetime_histogram() -> None:
+    """A dashboard restart must show an EMPTY window, not 1,717 requests it
+    never watched. The panel's sample count is what was observed."""
+    snaps = _scrape_all([_FIXTURE.read_text()], [100.0])
+    assert snaps[0].prompt_stats["n"] == 0
+    assert snaps[0].prompt_stats["partial"] is True
+
+
+def test_requests_finishing_between_two_scrapes_enter_the_window() -> None:
+    """Three requests land in (20000, 50000] between polls. The window holds
+    three interval-valued observations, and the p90 is that interval."""
+    base = [0] * 18
+    after = [0] * 14 + [3, 3, 3, 3]   # cumulative: 3 in the (20000, 50000] bucket
+    snaps = _scrape_all(
+        [
+            _hist_exposition(base, hist_sum=0.0, count=0.0),
+            _hist_exposition(after, hist_sum=99_000.0, count=3.0),
+        ],
+        [100.0, 102.0],
+    )
+    st = snaps[1].prompt_stats
+    assert st["n"] == 3
+    assert st["p90"] == {"lo": 20001, "hi": 50000, "exact": False}
+
+
+def test_one_request_between_scrapes_is_recorded_exactly() -> None:
+    """delta(_count) == 1 makes delta(_sum) that request's exact prompt size.
+    At a 2 s poll this is the common case for agent traffic, and it is what
+    keeps the percentiles off the bucket edges."""
+    base = [0] * 18
+    after = [0] * 14 + [1, 1, 1, 1]
+    snaps = _scrape_all(
+        [
+            _hist_exposition(base, hist_sum=0.0, count=0.0),
+            _hist_exposition(after, hist_sum=31_234.0, count=1.0),
+        ],
+        [100.0, 102.0],
+    )
+    st = snaps[1].prompt_stats
+    assert (st["n"], st["exact_n"]) == (1, 1)
+    assert st["p90"] == {"lo": 31234, "hi": 31234, "exact": True}
+
+
+def test_an_engine_restart_empties_the_window() -> None:
+    """Counters reset with the process. Requests served by the OLD engine --
+    possibly a different model with a different KV cost -- must not size the
+    new one."""
+    base = [0] * 18
+    after = [0] * 14 + [5, 5, 5, 5]
+    snaps = _scrape_all(
+        [
+            _hist_exposition(base, hist_sum=0.0, count=0.0),
+            _hist_exposition(after, hist_sum=150_000.0, count=5.0),
+            _hist_exposition([0] * 18, hist_sum=0.0, count=0.0),
+        ],
+        [100.0, 102.0, 104.0],
+    )
+    assert snaps[1].prompt_stats["n"] == 5
+    assert snaps[2].prompt_stats["n"] == 0
+
+
+def test_a_failed_scrape_does_not_backfill_the_outage() -> None:
+    """The requests served while /metrics was unreachable are real, but nothing
+    observed them. Stamping a whole outage's worth of them with the instant of
+    the next successful scrape would make the window claim to span 2 s when it
+    spans ten minutes."""
+    base = [0] * 18
+    after_5 = [0] * 14 + [5, 5, 5, 5]
+    after_405 = [0] * 14 + [405, 405, 405, 405]
+    snaps = _scrape_all(
+        [
+            _hist_exposition(base, hist_sum=0.0, count=0.0),
+            _hist_exposition(after_5, hist_sum=150_000.0, count=5.0),
+            (503, ""),
+            _hist_exposition(after_405, hist_sum=1.2e7, count=405.0),
+        ],
+        [100.0, 102.0, 104.0, 700.0],
+    )
+    assert snaps[1].prompt_stats["n"] == 5
+    assert snaps[3].prompt_stats["n"] == 5, "outage traffic was back-filled"
+
+
+def test_the_open_ended_bucket_is_bounded_by_the_engines_max_model_len() -> None:
+    """A request cannot exceed --max-model-len, so that is a real ceiling for
+    the +Inf bucket. Without it the p90 is infinite and the recommendation has
+    nothing to divide by."""
+    base = [0] * 18
+    after = [0] * 17 + [2]
+    ticks = iter([100.0, 102.0])
+    poller = metrics.MetricsPoller("http://127.0.0.1:8002", monotonic=lambda: next(ticks))
+    poller.ceiling_tokens = 262_144
+    client = _FakeClient(
+        [
+            _hist_exposition(base, hist_sum=0.0, count=0.0),
+            _hist_exposition(after, hist_sum=500_000.0, count=2.0),
+        ]
+    )
+
+    async def run() -> list[metrics.MetricsSnapshot]:
+        return [await poller.scrape(client), await poller.scrape(client)]  # type: ignore[arg-type]
+
+    snaps = asyncio.run(run())
+    assert snaps[1].prompt_stats["p90"]["hi"] == 262_144
+
+
+def test_a_build_without_the_histogram_reports_an_empty_window_not_a_crash() -> None:
+    """vLLM renames families between versions. A missing histogram means the
+    panel has no data, which must render as "0 of 100 observed" -- never as a
+    traceback in the poll loop, which would take the whole dashboard's
+    telemetry down."""
+    snaps = _scrape_all([_exposition(), _exposition()], [100.0, 102.0])
+    assert snaps[1].prompt_stats["n"] == 0
+    assert snaps[1].prompt_stats["p90"] is None

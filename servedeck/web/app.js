@@ -191,6 +191,7 @@ let agents = 1;   // parallel agents the context is being sized for
 let lastEstimate = null;
 let controlEnabled = false;
 let liveFacts = {};      // the RUNNING engine's own numbers, from /api/state
+let liveSizing = {};     // request-size window + parallelism recommendation
 let lastState = null;    // last /api/state payload, so telemetry can repaint
 let userPicked = false;  // once the user picks a model, stop auto-selecting
 
@@ -401,7 +402,6 @@ function paintEstimate(d) {
     `weights ${gib(d.weights_gib)} · KV ${gib(d.kv_gib)} · budget ${gib(d.budget_gib)} GiB`);
 
   showFindings(d.findings || []);
-  paintAgentSizing();
 }
 
 function showFindings(findings) {
@@ -446,6 +446,7 @@ function spark() {
 
 function paintTelemetry(t) {
   liveMetrics = t.vllm || {};
+  if (t.sizing) liveSizing = t.sizing;
   const g = t.gpu || {};
   const set = (id, v) => { const e = $(id); if (e) e.textContent = v; };
 
@@ -490,41 +491,101 @@ function paintTelemetry(t) {
   const p = $("mPre");
   if (p) p.className = "n mono" + (reachable && liveMetrics.preemptions > 8 ? " bad" : "");
 
-  set("avgCtx", reachable && liveMetrics.avg_prompt_tokens ? fmt(liveMetrics.avg_prompt_tokens) : "—");
-  set("avgSrc", reachable
-    ? `${liveMetrics.prompt_token_count || 0} requests since server start`
-    : "backend not reachable");
-
-  paintAgentSizing();
+  paintRequestStats();
   paintThroughput();
   paintServingMeta();
   spark();
 }
 
-function paintAgentSizing() {
-  if (!lastEstimate) return;
+/* Request-size distribution and the parallelism recommendation.
+ *
+ * Every number here is computed in Python (app._sizing_payload ->
+ * parallelism.recommend) and arrives whole. The formula deliberately does NOT
+ * live here: it has to reproduce a measured concurrency table, and a copy of
+ * it in the page would be a second, untested implementation. This function
+ * only formats.
+ */
+function paintRequestStats() {
   const set = (id, v) => { const e = $(id); if (e) e.textContent = v; };
-  set("capWorst", lastEstimate.agents_at_ctx);
-  set("capWorstD", "every agent at full " + fmt(ctx));
-  const avg = liveMetrics.avg_prompt_tokens;
-  // prefer the running engine's real KV total; fall back to the estimate for
-  // the selected model when nothing is serving
-  const total = liveFacts.kv_tokens || lastEstimate.kv_tokens;
-  if (avg && avg > 0) {
-    set("capAvg", Math.floor(total / avg));
-    set("capAvgD", "at " + fmt(avg) + " avg");
+  const sz = liveSizing || {};
+  const w = sz.window || {};
+  const rec = sz.recommended;
+
+  // A percentile over bucket-bounded observations IS an interval. Render it as
+  // one -- "20,001–50,000", not a midpoint nothing measured. Only when every
+  // observation at that rank was exact does it collapse to a single number.
+  const pct = (p) => {
+    if (!p) return "—";
+    if (p.hi == null) return "> " + fmt(p.lo);
+    if (p.exact || p.lo === p.hi) return fmt(p.hi);
+    return fmt(p.lo) + "–" + fmt(p.hi);
+  };
+
+  set("pctP90", pct(w.p90));
+  set("pctP50", pct(w.p50));
+  set("pctP99", pct(w.p99));
+  set("pctMax", pct(w.max));
+
+  // The window's own honesty line: how many requests, out of how many it wants,
+  // how old, and how many are exact rather than bucket-bounded. "n of 100" is
+  // said explicitly whenever the window is partial -- never padded.
+  if (w.n) {
+    const age = w.age_s == null ? "" : ` · spans ${Math.round(w.age_s)}s`;
+    const exact = ` · ${w.exact_n} exact, ${w.n - w.exact_n} bucket-bounded`;
+    set("winMeta", `${w.n} of ${w.capacity} requests${age}${exact}`);
   } else {
-    set("capAvg", "—");
-    set("capAvgD", "no traffic measured yet");
+    set("winMeta", `0 of ${w.capacity || 100} requests observed`);
   }
+  const g = sz.gen_window || {};
+  set("genMeta", g.n && g.p90 ? `generated tokens p90 ${pct(g.p90)}` : "");
+  set("statsProv", sz.provenance || "—");
+
+  if (rec) {
+    set("recN", rec.n);
+    set("recBasis", `${rec.basis} = ${fmt(rec.prompt_tokens)} prompt tokens`);
+    // The arithmetic, in full. pool / cost gives the raw fit; the headroom
+    // factor keeps the last admitted sequence off the preemption edge; the
+    // clamp is max_num_seqs, which the scheduler enforces whatever the KV says.
+    const clamp = rec.clamped
+      ? ` → clamped to --max-num-seqs ${rec.max_num_seqs}`
+      : (rec.max_num_seqs ? ` (--max-num-seqs ${rec.max_num_seqs})` : "");
+    set("recMath",
+      `${fmt(rec.pool_tokens)} KV ÷ ${fmt(rec.cost_tokens)} per request `
+      + `= ${rec.fit_n} × ${rec.headroom} headroom = ${rec.n_before_clamp}${clamp}`);
+    const alt = sz.at_p99;
+    const where = rec.extrapolated
+      ? " · cost extrapolated beyond the measured range"
+      : (rec.segment ? ` · cost interpolated between ${fmt(rec.segment[0])} and ${fmt(rec.segment[1])} tok` : "");
+    set("recP99", (alt ? `at p99 (${fmt(alt.prompt_tokens)} tok) it would be ${alt.n}` : "") + where);
+  } else {
+    set("recN", "—");
+    set("recBasis", sz.reason || "—");
+    set("recMath", "");
+    set("recP99", "");
+  }
+  set("recCal", sz.calibration_note || "—");
+
+  // The warning. Live concurrency above the recommendation is the condition;
+  // num_preemptions_total is the CONFIRMATION, because preemption is what
+  // over-subscription actually does -- vLLM evicts a sequence's KV and
+  // recomputes it, so work already paid for is thrown away.
   const os = $("oversub");
   if (!os) return;
-  if (liveMetrics.waiting_capacity > 0) {
+  const pre = liveMetrics.preemptions;
+  if (rec && sz.over_subscribed) {
+    os.className = "oversub on";
+    os.innerHTML = `<b>Over-subscribed: ${sz.running} requests in flight, `
+      + `${rec.n} recommended</b> at a p90 of ${fmt(rec.prompt_tokens)} prompt tokens. `
+      + (pre ? `${pre} preemptions since this server started — that is vLLM `
+             + `evicting and recomputing KV, i.e. work already paid for being thrown away.`
+             : `No preemptions yet; <span class="mono">vllm:num_preemptions_total</span> `
+             + `climbing is what confirms it.`);
+  } else if (liveMetrics.waiting_capacity > 0) {
     os.className = "oversub on";
     os.innerHTML = `<b>KV-bound right now.</b> ${liveMetrics.waiting_capacity} request(s) waiting on capacity. Reduce agents, lower per-agent context, or raise utilization.`;
-  } else if (liveMetrics.preemptions > 8) {
+  } else if (pre > 8) {
     os.className = "oversub on";
-    os.innerHTML = `<b>${liveMetrics.preemptions} preemptions since restart.</b> vLLM is evicting and recomputing KV — real work is being thrown away. This is the empirical signal that the agent count is too high.`;
+    os.innerHTML = `<b>${pre} preemptions since restart.</b> vLLM is evicting and recomputing KV — real work is being thrown away. This is the empirical signal that the agent count is too high.`;
   } else {
     os.className = "oversub";
   }
@@ -589,6 +650,9 @@ function paintState(s) {
   lastState = s;
   const up = s.upstream || {};
   liveFacts = up.live || {};
+  // /api/state carries the same sizing block as the telemetry event, so the
+  // panel is populated on first paint rather than staying blank for up to 2 s.
+  if (s.sizing) { liveSizing = s.sizing; paintRequestStats(); }
   // Show the utilization the server is ACTUALLY running at, not a hardcoded
   // default, until the user moves the slider themselves.
   if (!userPicked && liveFacts.util_effective && Math.abs(liveFacts.util_effective - util) > 0.002) {

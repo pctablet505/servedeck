@@ -28,6 +28,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from . import capacity
 from . import kvcalc, config, events, gpu, registry, shellconfig, supervisor as _sup
 from . import metrics as _metrics_mod
+from . import parallelism, reqstats
 from .metrics import MetricsPoller
 
 HERE = Path(__file__).resolve().parent
@@ -198,6 +199,11 @@ async def _poll_loop() -> None:
                     {"level": "info", "code": "retargeted",
                      "body": f"upstream port changed — now watching {rt.upstream}"},
                 )
+            # A request cannot exceed the engine's own --max-model-len, so
+            # that is the ceiling for the histogram's open-ended +Inf bucket.
+            # Set every poll rather than once: a restart at a different
+            # context length must not keep the old ceiling.
+            rt.poller.ceiling_tokens = _running_max_model_len()
             snap = await rt.poller.scrape(rt.client)
             rt.metrics = snap.to_dict()
             rt.upstream_up = snap.reachable
@@ -231,7 +237,12 @@ async def _poll_loop() -> None:
 
             hub.publish(
                 "telemetry",
-                {"gpu": rt.gpu, "vllm": rt.metrics, "uptime_s": int(time.time() - STARTED_AT)},
+                {
+                    "gpu": rt.gpu,
+                    "vllm": rt.metrics,
+                    "sizing": _sizing_payload(),
+                    "uptime_s": int(time.time() - STARTED_AT),
+                },
             )
         except asyncio.CancelledError:
             raise
@@ -341,6 +352,25 @@ def _running_max_model_len() -> int | None:
     return _max_model_len_from(_listener_argv())
 
 
+def _running_max_num_seqs() -> int | None:
+    """``--max-num-seqs`` of the LIVE server, from its own command line.
+
+    The hard ceiling on parallelism: however much KV is free, the scheduler
+    will not run more sequences than this concurrently, so a recommendation
+    above it is a recommendation to build a queue. Read from the process for
+    the same reason as --max-model-len -- servedeck.toml says what Servedeck
+    would launch, which for an adopted server need not be what is running.
+    vLLM's /metrics does not publish it (cache_config_info carries the cache
+    settings only), so the command line is the only live source.
+    """
+    raw = _argv_flag(_listener_argv(), "--max-num-seqs")
+    try:
+        value = int(raw) if raw is not None else 0
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
 def _running_model_id() -> str | None:
     """The model the LIVE process is serving, from its own command line.
 
@@ -389,6 +419,81 @@ def _boot_log_candidates(
     primary = tuple(Path(p) for p in _sup._default_log_paths(backend, boot_log_dir=boot_log_dir))
     rest = tuple(p for p in _candidate_logs() if p not in primary)
     return primary + rest
+
+
+def _sizing_payload() -> dict[str, Any]:
+    """The parallelism panel's whole payload: window stats + the recommendation.
+
+    Computed in Python, not in the page, for one reason: the formula has to be
+    testable. ``tests/test_parallelism.py`` reproduces the measured
+    concurrency table against :func:`parallelism.recommend`; a copy of the same
+    arithmetic living in app.js would be a second, untested implementation that
+    silently disagrees.
+
+    Everything here degrades to a stated REASON rather than to a number. "We do
+    not know yet" and "8 agents" must never look alike on a panel whose whole
+    job is to tell you how hard to push the GPU.
+    """
+    m = rt.metrics or {}
+    window = m.get("prompt_stats") or dict(reqstats.EMPTY_STATS)
+    out: dict[str, Any] = {
+        "window": window,
+        "gen_window": m.get("gen_stats") or dict(reqstats.EMPTY_STATS),
+        "provenance": reqstats.PROVENANCE,
+        "calibration_note": parallelism.calibration_note(rt.serving_model),
+        "running": m.get("running") if m.get("reachable") else None,
+        "preemptions": m.get("preemptions") if m.get("reachable") else None,
+        "max_num_seqs": _running_max_num_seqs(),
+        "recommended": None,
+        "at_p99": None,
+        "over_subscribed": False,
+        "reason": None,
+    }
+    if not m.get("reachable"):
+        out["reason"] = "backend not reachable"
+        return out
+    pool = m.get("kv_cache_size_tokens")
+    if not pool:
+        # The pool must be the RUNNING engine's own kv_cache_size_tokens.
+        # Falling back to the 280,813 the cost curve was calibrated on would
+        # produce a confident recommendation for a server launched at a
+        # different --gpu-memory-utilization, which is how you over-subscribe.
+        out["reason"] = "engine has not published its KV pool size yet"
+        return out
+    p90 = (window.get("p90") or {}).get("hi")
+    if not p90:
+        out["reason"] = (
+            f"no requests observed yet — {window.get('n', 0)} of "
+            f"{window.get('capacity', reqstats.WINDOW_SIZE)} in the window"
+        )
+        return out
+
+    seqs = out["max_num_seqs"]
+    n = window.get("n", 0)
+    rec = parallelism.recommend(
+        pool_tokens=int(pool),
+        prompt_tokens=float(p90),
+        max_num_seqs=seqs,
+        basis=f"p90 of the last {n} request{'' if n == 1 else 's'}",
+    )
+    out["recommended"] = rec.to_dict()
+
+    p99 = (window.get("p99") or {}).get("hi")
+    if p99:
+        out["at_p99"] = parallelism.recommend(
+            pool_tokens=int(pool),
+            prompt_tokens=float(p99),
+            max_num_seqs=seqs,
+            basis=f"p99 of the last {n} request{'' if n == 1 else 's'}",
+        ).to_dict()
+
+    # The warning. Live concurrency above the recommendation is the condition;
+    # num_preemptions_total is the confirmation, because preemption is what
+    # over-subscription actually DOES -- vLLM evicts a sequence's KV and
+    # recomputes it, so work already paid for is thrown away.
+    running = m.get("running") or 0
+    out["over_subscribed"] = bool(running > rec.n)
+    return out
 
 
 def _live_boot_facts() -> dict[str, Any]:
@@ -843,6 +948,7 @@ def _state() -> dict[str, Any]:
         },
         "gpu": rt.gpu,
         "vllm": rt.metrics,
+        "sizing": _sizing_payload(),
         "control_enabled": sup() is not None,
         "control_note": _supervisor_error or "",
         "supervisor": (sup().snapshot() if sup() is not None else {}),

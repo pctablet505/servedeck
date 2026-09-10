@@ -22,6 +22,8 @@ from typing import Any
 
 import httpx
 
+from .reqstats import EMPTY_STATS, RequestWindow
+
 # --- metric names, verified live -----------------------------------------
 KV_USAGE = "vllm:kv_cache_usage_perc"
 RUNNING = "vllm:num_requests_running"
@@ -30,6 +32,19 @@ WAITING_BY_REASON = "vllm:num_requests_waiting_by_reason"
 PREEMPTIONS = "vllm:num_preemptions_total"
 PROMPT_TOK_SUM = "vllm:request_prompt_tokens_sum"
 PROMPT_TOK_COUNT = "vllm:request_prompt_tokens_count"
+#: Per-request PROMPT SIZE, as a cumulative histogram: one series per `le`
+#: bucket edge. This is the only per-request size information vLLM publishes --
+#: there is no per-request feed -- and reqstats.RequestWindow turns successive
+#: scrapes of it into a rolling window of the last 100 finished requests. The
+#: `_sum`/`_count` pair above is a LIFETIME mean and answers a different, much
+#: less useful question; see reqstats' module docstring.
+PROMPT_TOK_BUCKET = "vllm:request_prompt_tokens_bucket"
+#: The same, for generated tokens. Reported beside the prompt percentiles but
+#: NOT folded into the KV cost model: parallelism.KV_COST_ANCHORS were measured
+#: at admission, and adding generation on top of them would double-count.
+GEN_TOK_BUCKET = "vllm:request_generation_tokens_bucket"
+GEN_TOK_SUM = "vllm:request_generation_tokens_sum"
+GEN_TOK_COUNT = "vllm:request_generation_tokens_count"
 GEN_TOK_TOTAL = "vllm:generation_tokens_total"
 PROMPT_TOK_TOTAL = "vllm:prompt_tokens_total"
 # Prompt tokens served straight out of the prefix cache. They are INCLUDED in
@@ -164,6 +179,27 @@ def _label_float(labels: dict[str, str], key: str) -> float | None:
         return None
 
 
+def _buckets(parsed: dict, name: str) -> list[tuple[float, float]]:
+    """(le, cumulative count) pairs for a histogram family.
+
+    ``le="+Inf"`` becomes ``math.inf`` so the caller can sort the edges
+    numerically; float("+Inf") already parses it, but the label is quoted and
+    reaching it via float() on the *label* rather than the value is the point.
+    A family this build does not publish yields [], which the window treats as
+    "nothing to observe" rather than as an empty histogram.
+    """
+    out: list[tuple[float, float]] = []
+    for labels, value in parsed.get(name, []):
+        raw = labels.get("le")
+        if raw is None:
+            continue
+        try:
+            out.append((float(raw), value))
+        except ValueError:
+            continue
+    return out
+
+
 def _by_label(parsed: dict, name: str, key: str, val: str) -> float:
     for labels, v in parsed.get(name, []):
         if labels.get(key) == val:
@@ -179,8 +215,19 @@ class MetricsSnapshot:
     waiting: int = 0
     waiting_capacity: int = 0
     preemptions: int = 0
+    #: LIFETIME mean prompt size (sum/count since the engine booted). Kept
+    #: because the serving line still reports it as a lifetime figure, but it
+    #: is NOT what the sizing panel reads: one 250k request skews it for the
+    #: rest of the process's life, and a mean has no tail to size against.
     avg_prompt_tokens: float = 0.0
     prompt_token_count: int = 0
+    #: p50/p90/p99/max over the last 100 FINISHED requests, reconstructed from
+    #: the prompt-token histogram (reqstats). Bucket-quantised, and only
+    #: covering requests that finished while this poller was running -- both
+    #: facts travel in the payload (`exact_n`, `n`, `partial`) so the page can
+    #: state them.
+    prompt_stats: dict[str, Any] = field(default_factory=lambda: dict(EMPTY_STATS))
+    gen_stats: dict[str, Any] = field(default_factory=lambda: dict(EMPTY_STATS))
     # None means "not known right now", and is NOT interchangeable with 0.0.
     # An idle server has no throughput; rendering that as "0 tok/s" reads as
     # "the machine got slow", which is the opposite of the truth. The UI shows
@@ -238,6 +285,8 @@ class MetricsSnapshot:
             "preemptions": self.preemptions,
             "avg_prompt_tokens": round(self.avg_prompt_tokens),
             "prompt_token_count": self.prompt_token_count,
+            "prompt_stats": self.prompt_stats,
+            "gen_stats": self.gen_stats,
             "gen_tok_s": rate(self.gen_tok_s),
             "gen_tok_s_avg": rate(self.gen_tok_s_avg),
             "prefill_tok_s": rate(self.prefill_tok_s),
@@ -294,6 +343,18 @@ class MetricsPoller:
         # ttft_count). One baseline for every windowed figure, so the numbers
         # on the panel can never describe different windows.
         self._prev: tuple[float, float, float, float, float] | None = None
+        # Rolling windows over the last 100 finished requests. They live on
+        # the POLLER, not the snapshot: a snapshot is one scrape, and the
+        # window's whole value is that it spans many of them. Rebuilding the
+        # poller (Runtime.repoint) therefore drops the window, which is
+        # correct -- a different upstream is a different workload.
+        self.prompt_window = RequestWindow()
+        self.gen_window = RequestWindow()
+        #: Upper bound for the histogram's open-ended +Inf bucket. Set by
+        #: app.py from the running process's --max-model-len, because a
+        #: request cannot exceed it. None leaves that bucket unbounded, and
+        #: the page prints "> 200,000" rather than inventing a ceiling.
+        self.ceiling_tokens: int | None = None
         # Injectable, and MONOTONIC: time.time() steps on an NTP correction,
         # and a backwards step silently scales every throughput number the UI
         # has ever shown.
@@ -307,6 +368,8 @@ class MetricsPoller:
             if r.status_code != 200:
                 snap.error = f"HTTP {r.status_code}"
                 self._prev = None
+                self.prompt_window.drop_baseline()
+                self.gen_window.drop_baseline()
                 return snap  # reasons already say UNREACHABLE
             text = r.text
         except Exception as exc:  # noqa: BLE001 - any transport failure means "down"
@@ -316,6 +379,8 @@ class MetricsPoller:
             # so a backend that was down for ten minutes came back reporting a
             # plausible-looking throughput averaged over its own downtime.
             self._prev = None
+            self.prompt_window.drop_baseline()
+            self.gen_window.drop_baseline()
             return snap
 
         p = parse_prometheus(text)
@@ -331,6 +396,29 @@ class MetricsPoller:
         count = _first(p, PROMPT_TOK_COUNT)
         snap.prompt_token_count = int(count)
         snap.avg_prompt_tokens = (total / count) if count else 0.0
+
+        # Feed the rolling windows the delta of this scrape's histograms. Done
+        # BEFORE the counter-reset check below on purpose: the window does its
+        # own reset detection over the bucket vector, which catches a restart
+        # the token counters alone can miss (a server that restarts between two
+        # polls and serves nothing in between leaves gen_total at 0 both times).
+        prompt_buckets = _buckets(p, PROMPT_TOK_BUCKET)
+        if prompt_buckets:
+            self.prompt_window.observe(
+                prompt_buckets,
+                hist_sum=total,
+                hist_count=count,
+                ceiling=self.ceiling_tokens,
+            )
+        gen_buckets = _buckets(p, GEN_TOK_BUCKET)
+        if gen_buckets:
+            self.gen_window.observe(
+                gen_buckets,
+                hist_sum=_first(p, GEN_TOK_SUM),
+                hist_count=_first(p, GEN_TOK_COUNT),
+            )
+        snap.prompt_stats = self.prompt_window.stats().to_dict()
+        snap.gen_stats = self.gen_window.stats().to_dict()
 
         snap.requests_succeeded = int(sum(v for _, v in p.get(SUCCESS_TOTAL, [])))
 

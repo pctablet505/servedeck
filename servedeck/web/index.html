@@ -192,30 +192,39 @@
         </div>
       </div>
 
+      <!-- Was "Average context per request": one lifetime mean, sum/count over
+           every request since the engine booted. It could not answer the
+           question people actually ask it ("how many agents?") because sizing
+           is set by the TAIL -- a p90 that does not fit is a preemption -- and
+           a mean has no tail. Replaced by the distribution over a rolling
+           window of the last 100 finished requests. -->
       <div class="lcol">
-        <div class="lk">Average context per request</div>
-        <div class="lbig mono" id="avgCtx">—</div>
-        <div class="lsub" id="avgSrc">—</div>
-        <div class="hint">
-          vLLM's counters reset on restart. Averages are only worth betting on once
-          they reflect your real agent workload, not a benchmark.
+        <div class="lk">Request size <span style="text-transform:none;font-weight:400">(last 100 requests)</span></div>
+        <div class="lbig mono" id="pctP90">—</div>
+        <div class="lsub">p90 prompt tokens — what the agent count is sized on</div>
+        <div class="lrow">
+          <div><div class="lk">p50</div><div class="n mono" id="pctP50">—</div></div>
+          <div><div class="lk">p99</div><div class="n mono" id="pctP99">—</div></div>
+          <div><div class="lk">max</div><div class="n mono" id="pctMax">—</div></div>
         </div>
+        <div class="lsub mono" id="winMeta">—</div>
+        <div class="lsub mono" id="genMeta">—</div>
+        <!-- Provenance, never omitted: these percentiles are bucket-quantised
+             and cover only what Servedeck watched. #statsProv is filled from
+             reqstats.PROVENANCE so the page cannot drift from the module that
+             computes the estimate. -->
+        <div class="hint" id="statsProv">—</div>
       </div>
 
       <div class="lcol">
-        <div class="lk">How many agents fit</div>
-        <div class="twoup">
-          <div class="cap">
-            <div class="t">Safe floor</div>
-            <div class="n mono" id="capWorst">—</div>
-            <div class="d" id="capWorstD">—</div>
-          </div>
-          <div class="cap bet">
-            <div class="t">At observed avg</div>
-            <div class="n mono" id="capAvg">—</div>
-            <div class="d" id="capAvgD">—</div>
-          </div>
-        </div>
+        <div class="lk">Run this many agents in parallel</div>
+        <div class="lbig mono" id="recN">—</div>
+        <div class="lsub" id="recBasis">—</div>
+        <!-- The arithmetic, on screen, so the number can be checked rather
+             than trusted. -->
+        <div class="lsub mono" id="recMath">—</div>
+        <div class="lsub" id="recP99">—</div>
+        <div class="hint" id="recCal">—</div>
         <!-- The button wrote nothing: there is no endpoint behind it, and the
              hint under it described a write that never happened. -->
         <div class="setrow">
