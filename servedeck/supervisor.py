@@ -1417,4 +1417,19 @@ class Supervisor:
             "reached_ready": bool(self._tracker and self._tracker.reached_ready),
             "next_restart_at": self._next_restart_at,
             "unmanaged_pid": self._unmanaged_pid,
+            # The boot-progress bar and its elapsed clock. The page had the
+            # markup for both (#phases, #elapsed) since the prototype and
+            # nothing ever painted them, so a multi-minute boot showed
+            # "Elapsed —" with no track. These two fields are the whole
+            # contract the painter needs: which phase we are in, when each
+            # phase was first seen, and when the run began.
+            "phase_times": dict(self._phase_times),
+            # Elapsed seconds, not a timestamp: the page must not diff its own
+            # clock against the supervisor's, and an ISO string parsed in JS is
+            # how a timezone bug gets into an "Elapsed" readout.
+            "run_elapsed_s": (
+                round(now - self._run_started_at, 1)
+                if self._run_started_at is not None
+                else None
+            ),
         }

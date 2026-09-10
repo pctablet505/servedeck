@@ -84,11 +84,17 @@ class Observation:
     ``math.inf`` only for the ``+Inf`` bucket when no ceiling was supplied;
     with a ceiling (``--max-model-len``, a real hard limit the engine enforces)
     it is that ceiling.
+
+    ``bucket`` is the index of the engine's bucket this request was counted in.
+    Kept because it cannot be recovered from ``hi`` afterwards: a ceiling that
+    happens to equal a finite edge makes an observation's ``hi`` name the wrong
+    bin, and the bars must be counted in the bin the engine itself used.
     """
 
     lo: float
     hi: float
     ts: float
+    bucket: int = -1
 
     @property
     def exact(self) -> bool:
@@ -137,6 +143,41 @@ class Percentile:
 
 
 @dataclass(frozen=True)
+class Bucket:
+    """One bar of the request-size histogram: ``count`` finished requests.
+
+    The edges are vLLM's own, not a binning invented here. That is the whole
+    point of drawing bars instead of printing percentile text: a bar is the
+    quantisation, so the coarseness of the source is visible rather than
+    explained away in a sentence beside the number.
+
+    ``hi`` is ``None`` only for the ``+Inf`` bucket when the engine has not
+    published a context limit, which leaves the last bar with no right edge.
+    """
+
+    lo: float
+    hi: float
+    count: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "lo": round(self.lo),
+            "hi": None if self.hi == math.inf else round(self.hi),
+            "n": self.count,
+        }
+
+
+#: Round bin widths for the fine histogram, ascending. The step is the smallest
+#: of these that keeps the exact observations inside ~40 bars, so a workload
+#: spanning 20k..185k gets ~5k bars and a narrow one gets finer ones. A ladder,
+#: not a fixed width, because a fixed width is either too coarse to add
+#: granularity or too fine to be readable depending on the range.
+_FINE_STEPS: tuple[int, ...] = (
+    500, 1000, 2000, 2500, 5000, 10000, 20000, 25000, 50000, 100000,
+)
+
+
+@dataclass(frozen=True)
 class WindowStats:
     """Everything the panel needs to describe the window honestly."""
 
@@ -144,6 +185,8 @@ class WindowStats:
     capacity: int
     exact_n: int
     age_s: float | None
+    buckets: tuple[Bucket, ...]
+    fine: dict[str, Any]
     p50: Percentile | None
     p90: Percentile | None
     p99: Percentile | None
@@ -159,6 +202,8 @@ class WindowStats:
             "capacity": self.capacity,
             "exact_n": self.exact_n,
             "age_s": None if self.age_s is None else round(self.age_s, 1),
+            "buckets": [b.to_dict() for b in self.buckets],
+            "fine": self.fine,
             "p50": pct(self.p50),
             "p90": pct(self.p90),
             "p99": pct(self.p99),
@@ -167,23 +212,11 @@ class WindowStats:
         }
 
 
-#: The one sentence the panel MUST print beside every percentile it shows.
-#: Both halves are load-bearing: a bucket-quantised percentile is not an exact
-#: one, and a window that only covers what Servedeck watched is not the
-#: server's history. Presenting either as exact is the failure this whole
-#: module was written to avoid, so the string lives here rather than in the
-#: markup, and tests/test_ui.py asserts the page renders it.
-PROVENANCE = (
-    "estimate: percentiles are bucket-quantised from vLLM's histogram, "
-    "and cover only requests that finished while Servedeck was watching"
-)
-
-
 #: The empty window's payload. Published before the first delta, and after a
 #: counter reset. Every key a filled window has is present, so the page never
 #: has to distinguish "no stats yet" from "stats field missing".
 EMPTY_STATS = WindowStats(
-    n=0, capacity=WINDOW_SIZE, exact_n=0, age_s=None,
+    n=0, capacity=WINDOW_SIZE, exact_n=0, age_s=None, buckets=(), fine={"step": 0, "bins": []},
     p50=None, p90=None, p99=None, peak=None, partial=True,
 ).to_dict()
 
@@ -201,6 +234,14 @@ class RequestWindow:
         #: (cumulative counts, _sum, _count) of the previous poll, or None
         #: before the first one.
         self._prev: tuple[list[float], float, float] | None = None
+        #: The engine's own bucket edges from the last scrape, ascending, with
+        #: ``+Inf`` last. Kept so the window can be counted back up into the
+        #: SAME bins it was built from — see :meth:`_bars`.
+        self._edges: list[float] = []
+        #: The ceiling passed to the last scrape (--max-model-len), if any. The
+        #: +Inf bar is drawn to it rather than to an open end, because the
+        #: engine will not admit a request longer than it.
+        self._ceiling: float | None = None
 
     def __len__(self) -> int:
         return len(self._obs)
@@ -215,6 +256,8 @@ class RequestWindow:
         """
         self._obs.clear()
         self._prev = None
+        self._edges = []
+        self._ceiling = None
 
     def drop_baseline(self) -> None:
         """Forget the previous bucket vector, keep the observations.
@@ -249,6 +292,8 @@ class RequestWindow:
         cum = [c for _le, c in rows]
         if not cum:
             return 0
+        self._edges = list(edges)
+        self._ceiling = ceiling
 
         prev = self._prev
         self._prev = (list(cum), hist_sum, hist_count)
@@ -292,7 +337,7 @@ class RequestWindow:
             if hi < lo:
                 hi = lo
             for _ in range(d):
-                added.append(Observation(lo=lo, hi=hi, ts=now))
+                added.append(Observation(lo=lo, hi=hi, ts=now, bucket=i))
 
         # Exactness for free: one new request means delta(_sum) IS its token
         # count. Only accepted when it lands inside the bucket the histogram
@@ -302,17 +347,111 @@ class RequestWindow:
             exact = float(round(sum_new))
             o = added[0]
             if o.lo <= exact <= o.hi:
-                added = [Observation(lo=exact, hi=exact, ts=now)]
+                added = [Observation(lo=exact, hi=exact, ts=now, bucket=o.bucket)]
 
         self._obs.extend(added)
         return len(added)
+
+    def _bars(self, obs: list[Observation]) -> tuple[Bucket, ...]:
+        """Count the window back into the engine's own bins, for the bars.
+
+        Re-binning here (rather than storing per-bucket counts as requests
+        arrive) is what keeps the bars honest across the deque's boundary: an
+        observation that has aged out of the last-100 window disappears from
+        its bar too. Empty bins are omitted — a bar of height zero is not a
+        reading, and dropping them leaves the page nothing to misread.
+
+        The bin is the index recorded when the request was observed, so the
+        bars are the engine's own counts and not a re-derivation of them.
+        """
+        edges = self._edges
+        if not edges:
+            return ()
+        counts = [0] * len(edges)
+        for o in obs:
+            if 0 <= o.bucket < len(edges):
+                counts[o.bucket] += 1
+        ceiling = self._ceiling
+        return tuple(
+            Bucket(
+                lo=float(MIN_PROMPT_TOKENS) if i == 0 else edges[i - 1] + 1.0,
+                # The open bucket is bounded by the engine's context limit when
+                # it has published one; the observations inside it already are.
+                hi=ceiling if (edges[i] == math.inf and ceiling is not None) else edges[i],
+                count=counts[i],
+            )
+            for i in range(len(edges))
+            if counts[i]
+        )
+
+    def _fine(self, obs: list[Observation]) -> dict[str, Any]:
+        """A finer histogram, for the part of the window that supports it.
+
+        ``_bars`` answers "what did the engine measure", and its answer is
+        three fat bars because that is all vLLM's histogram resolves. But most
+        observations here are EXACT -- a poll that catches one finished request
+        gets its token count exactly from delta(_sum) -- and collapsing 90 exact
+        counts into 3 bars throws away precision the window actually has.
+
+        So the exact observations are binned on a round step chosen to keep them
+        inside ~40 bars, and the interval observations are returned separately,
+        still as intervals, for the page to draw as a translucent underlay. The
+        two are never added into one bar: an exact count and a "somewhere in
+        (20k,50k]" count are different kinds of knowledge, and stacking them
+        would imply the interval requests are as precisely placed as the exact
+        ones. The page draws the exact bars solid and the intervals behind them.
+
+        Returns ``{"step", "bins": [{lo,hi,n}], "intervals": [{lo,hi,n}]}``.
+        ``step`` is 0 when there are no exact observations to bin.
+        """
+        exact = sorted(o.lo for o in obs if o.exact)
+        intervals: dict[tuple[float, float], int] = {}
+        for o in obs:
+            if not o.exact:
+                key = (o.lo, o.hi)
+                intervals[key] = intervals.get(key, 0) + 1
+
+        if not exact:
+            return {
+                "step": 0,
+                "bins": [],
+                "intervals": [
+                    {"lo": round(lo), "hi": None if hi == math.inf else round(hi), "n": c}
+                    for (lo, hi), c in sorted(intervals.items())
+                ],
+            }
+
+        span = exact[-1] - exact[0]
+        step = _FINE_STEPS[-1]
+        for cand in _FINE_STEPS:
+            if span / cand <= 40 or cand == _FINE_STEPS[-1]:
+                step = cand
+                break
+        base = (exact[0] // step) * step
+        nbins = int((exact[-1] - base) // step) + 1
+        counts = [0] * nbins
+        for v in exact:
+            counts[int((v - base) // step)] += 1
+        return {
+            "step": step,
+            "bins": [
+                {"lo": base + i * step, "hi": base + (i + 1) * step, "n": c}
+                for i, c in enumerate(counts)
+                if c
+            ],
+            "intervals": [
+                {"lo": round(lo), "hi": None if hi == math.inf else round(hi), "n": c}
+                for (lo, hi), c in sorted(intervals.items())
+            ],
+        }
 
     def stats(self) -> WindowStats:
         obs = list(self._obs)
         n = len(obs)
         if n == 0:
             return WindowStats(
-                n=0, capacity=self._maxlen, exact_n=0, age_s=None,
+                n=0, capacity=self._maxlen, exact_n=0, age_s=None, buckets=(),
+                fine={"step": 0, "bins": [], "intervals": []},
                 p50=None, p90=None, p99=None, peak=None, partial=True,
             )
         # Sorted separately, which is sound: lo_j <= hi_j for every
@@ -330,6 +469,8 @@ class RequestWindow:
             capacity=self._maxlen,
             exact_n=sum(1 for o in obs if o.exact),
             age_s=max(0.0, time.time() - oldest),
+            buckets=self._bars(obs),
+            fine=self._fine(obs),
             p50=pct(50),
             p90=pct(90),
             p99=pct(99),

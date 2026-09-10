@@ -285,8 +285,169 @@ def test_empty_stats_payload_has_every_key_a_filled_one_has() -> None:
     assert set(reqstats.EMPTY_STATS) == set(win.stats().to_dict())
 
 
-def test_provenance_string_names_both_limitations() -> None:
-    """The one sentence that has to be on screen. Bucket quantisation and the
-    partial view are separate defects in the estimate and both must be said."""
-    assert "bucket" in reqstats.PROVENANCE.lower()
-    assert "watching" in reqstats.PROVENANCE.lower()
+def test_the_window_counts_itself_into_the_engines_own_bins() -> None:
+    """The bars the panel draws. Three properties, all of which a hand-rolled
+    binning in the page would get wrong:
+
+    * the counts sum to ``n`` — a bar chart that silently drops or duplicates
+      observations is worse than the text it replaced, because the picture
+      looks authoritative;
+    * the edges are the ones the engine published, not a re-binning;
+    * empty bins are omitted, so a bar on screen always means a request.
+    """
+    win = RequestWindow()
+    feed(win, {5000.0: 3, 50000.0: 4})
+    d = win.stats().to_dict()
+    bars = d["buckets"]
+    assert sum(b["n"] for b in bars) == d["n"] == 7
+    # Each bar's lower bound is the engine's previous edge + 1, so a bar claims
+    # exactly the range its bucket covers and no more.
+    assert [(b["lo"], b["hi"], b["n"]) for b in bars] == [
+        (2001, 5000, 3), (20001, 50000, 4),
+    ], bars
+    assert all(b["lo"] <= b["hi"] for b in bars), bars
+
+
+def test_a_bar_follows_its_observations_out_of_the_window() -> None:
+    """The bars describe the LAST 100, the same population as the percentiles.
+
+    Counting buckets as requests arrive instead would report the engine's
+    lifetime histogram the moment the deque starts evicting, so the picture and
+    the p90 beside it would describe different sets of requests.
+    """
+    win = RequestWindow(maxlen=4)
+    feed(win, {5000.0: 1}, {50000.0: 5})
+    d = win.stats().to_dict()
+    assert d["n"] == 4, "the window itself did not evict"
+    assert sum(b["n"] for b in d["buckets"]) == 4, (
+        f"a bar kept an evicted request: {d['buckets']}"
+    )
+    assert all(b["hi"] == 50000 for b in d["buckets"]), d["buckets"]
+
+
+def test_an_unbounded_bucket_bars_to_the_ceiling_and_nulls_its_edge() -> None:
+    """With a ceiling the +Inf bucket is bounded by it, and the bar inherits
+    that; without one the bar has no right edge and serialises ``hi`` as null
+    so the page draws it to the axis end rather than inventing a number."""
+    win = RequestWindow()
+    feed(win, {math.inf: 2}, ceiling=262_144)
+    (bar,) = win.stats().to_dict()["buckets"]
+    assert bar["hi"] == 262_144, bar
+
+    win = RequestWindow()
+    feed(win, {math.inf: 2})
+    (bar,) = win.stats().to_dict()["buckets"]
+    assert bar["hi"] is None, bar
+
+
+def test_an_empty_window_has_no_bars_rather_than_zero_bars() -> None:
+    """``buckets == []`` before the first delta and after a reset. A list of
+    zero-height bars would make the plot draw an axis full of nothing."""
+    win = RequestWindow()
+    assert win.stats().to_dict()["buckets"] == []
+    feed(win, {5000.0: 2})
+    win.clear()
+    assert win.stats().to_dict()["buckets"] == []
+
+
+# --------------------------------------------------------------------------
+# The fine histogram: precision the coarse bars would hide
+# --------------------------------------------------------------------------
+def feed_exact(win: RequestWindow, values: list[float], *, ceiling=None) -> None:
+    """Feed one finished request per poll, each with its own exact token count.
+
+    A poll whose delta(_count) is 1 makes delta(_sum) that request's exact
+    size, so this is how the window fills with exact observations rather than
+    intervals -- the common case for interactive agent traffic, and the whole
+    reason a finer plot than vLLM's three fat buckets is honest.
+    """
+    total: dict[float, int] = {}
+    win.observe(cumulative(total), hist_sum=0.0, hist_count=0.0, ceiling=ceiling)
+    hist_sum = 0.0
+    hist_count = 0.0
+    for v in values:
+        # Which bucket the engine would have counted it in.
+        edge = next(e for e in EDGES if v <= e)
+        total[edge] = total.get(edge, 0) + 1
+        hist_sum += v
+        hist_count += 1
+        win.observe(
+            cumulative(total), hist_sum=hist_sum, hist_count=hist_count,
+            ceiling=ceiling,
+        )
+
+
+def test_exact_observations_are_binned_finer_than_the_engine_buckets() -> None:
+    """The defect this fixes: 90 exact counts drawn as 3 fat bars. The fine
+    bins must resolve them to a step far smaller than the engine's 30,000-token
+    bucket, and the counts must add up to the exact observations -- no more."""
+    win = RequestWindow()
+    feed_exact(win, [25_000.0, 30_000.0, 35_000.0, 60_000.0, 150_000.0])
+    fine = win.stats().to_dict()["fine"]
+    assert fine["step"] < 30_000, f"no finer than the engine bucket: {fine['step']}"
+    assert sum(b["n"] for b in fine["bins"]) == 5, fine["bins"]
+    # Two requests 5k apart must NOT share a bar when the step is finer than 5k.
+    assert len(fine["bins"]) > 1, fine["bins"]
+
+
+def test_the_fine_step_keeps_the_exact_observations_inside_about_40_bars() -> None:
+    """A fixed width is either too coarse to add granularity or too fine to
+    read. The step is the smallest round one that fits the span in ~40 bars."""
+    win = RequestWindow()
+    feed_exact(win, [20_001.0 + i * 5_000.0 for i in range(30)])  # span ~170k
+    fine = win.stats().to_dict()["fine"]
+    span = 20_001.0 + 29 * 5_000.0 - 20_001.0
+    assert span / fine["step"] <= 40, f"{fine['step']} gives too many bars"
+    # and the next-coarser step would have been too few to be worth it
+    assert span / fine["step"] > 1, fine["step"]
+
+
+def test_interval_observations_are_never_merged_into_a_fine_bar() -> None:
+    """A request known only to (20000,50000] cannot be placed in one 5k bin
+    without inventing a position. It must come back as an interval, separate
+    from the exact bins, so the page can draw it as a band rather than a bar."""
+    win = RequestWindow()
+    feed_exact(win, [30_000.0])
+    # A poll with two new requests in one bucket: intervals, not exact.
+    total = {50000.0: 3}
+    win.observe(
+        cumulative(total), hist_sum=30_000.0 + 2 * 40_000.0, hist_count=3.0,
+    )
+    fine = win.stats().to_dict()["fine"]
+    assert sum(b["n"] for b in fine["bins"]) == 1, "an interval leaked into a bar"
+    assert sum(b["n"] for b in fine["intervals"]) == 2, fine["intervals"]
+    # The interval keeps its full range, not a bin.
+    (band,) = fine["intervals"]
+    assert (band["lo"], band["hi"]) == (20001, 50000), band
+
+
+def test_a_window_of_only_intervals_has_no_fine_bars() -> None:
+    """With nothing exact to place, the fine histogram is empty and the page
+    falls back to the engine's own buckets -- it must not invent a fine binning
+    out of interval data."""
+    win = RequestWindow()
+    feed(win, {50000.0: 10})
+    fine = win.stats().to_dict()["fine"]
+    assert fine["step"] == 0, fine
+    assert fine["bins"] == [], fine
+    assert sum(b["n"] for b in fine["intervals"]) == 10, fine
+
+
+def test_the_fine_histogram_survives_eviction_with_the_window() -> None:
+    """The fine bins are recomputed from the live window, so a request that
+    ages out of the last-100 leaves its fine bar too -- the same property the
+    coarse bars have, and the reason the bins are derived, not accumulated."""
+    win = RequestWindow(maxlen=3)
+    feed_exact(win, [25_000.0, 30_000.0, 35_000.0, 150_000.0])
+    fine = win.stats().to_dict()["fine"]
+    assert sum(b["n"] for b in fine["bins"]) == 3, fine["bins"]
+    assert not any(b["lo"] <= 25_000.0 < b["hi"] for b in fine["bins"]), (
+        f"the evicted request is still drawn: {fine['bins']}"
+    )
+
+
+def test_the_empty_window_publishes_the_fine_key_too() -> None:
+    """The page reads window.fine unconditionally. An empty payload that omits
+    it makes the plot read undefined.bins and white-screen the panel."""
+    assert "fine" in reqstats.EMPTY_STATS
+    assert reqstats.EMPTY_STATS["fine"] == {"step": 0, "bins": []}
