@@ -2149,3 +2149,26 @@ def test_the_serving_line_says_nothing_extra_when_there_is_no_resolution() -> No
         dom["sMeta"]["text"]
     )
     assert dom["sMeta"]["title"] == "", dom["sMeta"]["title"]
+
+
+# ---------------------------------------------------------------------------
+# Phase-1 sweep, F3: the button labelled "Apply & restart" never restarted
+# ---------------------------------------------------------------------------
+def test_apply_reaches_the_endpoint_that_actually_relaunches() -> None:
+    """The Apply handler posted only to /api/server/start.
+
+    supervisor.start() returns at its first statement when the server is
+    READY, so applying a new context length to a running server changed
+    nothing while the page logged a success — and POST /api/server/restart,
+    the only endpoint that relaunches, appeared nowhere in the page's source
+    at all. Driven on the live 27B 2026-09-10: 202 accepted, pid unchanged,
+    .config unchanged, cmdline unchanged.
+    """
+    wire = _fn_body("wireControls")
+    apply_handler = wire[wire.index('$("apply")'):]
+    assert "/api/server/restart" in apply_handler, (
+        "the Apply button cannot reach the only endpoint that relaunches; "
+        "every config change it posts at a running server is a silent no-op"
+    )
+    # ... and starting a stopped server must still go through start.
+    assert "/api/server/start" in apply_handler

@@ -1546,8 +1546,19 @@ function wireControls() {
           `The server will be unavailable for several minutes.`;
       if (!confirm(msg)) return;
       apply.disabled = true;
+      // "Apply & restart" means RESTART when something is already serving.
+      // /api/server/start is idempotent on the supervisor's side -- it returns
+      // early when the server is READY -- so posting a new context length at a
+      // running server returned 202 "accepted" and changed nothing at all:
+      // same pid, same cmdline, same .config, and a success in the log.
+      // /api/server/restart is the only endpoint that relaunches, and it
+      // carries the same settings body.
+      const sv = (lastState && lastState.supervisor) || {};
+      const upNow = !!(lastState && lastState.upstream && lastState.upstream.up);
+      const path = (upNow || sv.actual_state === "READY")
+        ? "/api/server/restart" : "/api/server/start";
       try {
-        await post("/api/server/start", {
+        await post(path, {
           repo_id: m.repo_id, backend: m.backend, util, ctx, max_num_seqs: agents,
         });
         log(`applying ${m.name} …`, "g");

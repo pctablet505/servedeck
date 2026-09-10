@@ -972,13 +972,39 @@ class Supervisor:
         loop = asyncio.get_running_loop()
         self._last_stop_result = await loop.run_in_executor(None, self._stop_fn, handle)
 
-    async def restart(self, *, mode: str = "immediate") -> None:
+    async def restart(
+        self,
+        *,
+        mode: str = "immediate",
+        repo_id: str | None = None,
+        backend: str | None = None,
+        served_name: str | None = None,
+        port: int | None = None,
+        util: float | None = None,
+        max_model_len: int | None = None,
+        max_num_seqs: int | None = None,
+    ) -> None:
+        """Stop, then start again — optionally at NEW settings.
+
+        The settings arguments are what makes the dashboard's "Apply &
+        restart" possible at all. start() is idempotent by design (it returns
+        immediately when the server is READY), so a config change POSTed at a
+        running server did nothing at all while the page reported success.
+        Anything left None keeps the value the current desired state carries.
+        """
         if mode == "blue_green":
             raise NotImplementedError(
                 "blue-green execution is a v1 non-goal (SPEC.md §10); use mode='immediate' or 'drain'."
             )
         if mode not in ("immediate", "drain"):
             raise ValueError(f"unknown restart mode {mode!r}")
+
+        # Refuse an impossible configuration BEFORE stopping anything: a
+        # server the operator is happily using must not be taken down for a
+        # start we already know we will reject.
+        rejected = _reject_settings(util=util, max_model_len=max_model_len, max_num_seqs=max_num_seqs)
+        if rejected is not None:
+            raise ValueError(rejected)
 
         d = self.desired
         if mode == "drain" and d.port:
@@ -1004,8 +1030,13 @@ class Supervisor:
         # before start()'s preflight runs.
         await asyncio.sleep(0.2)
         await self.start(
-            repo_id=d.repo_id, backend=d.backend, served_name=d.served_name, port=d.port,
-            util=d.util, max_model_len=d.max_model_len, max_num_seqs=d.max_num_seqs,
+            repo_id=repo_id if repo_id is not None else d.repo_id,
+            backend=backend if backend is not None else d.backend,
+            served_name=served_name if served_name is not None else d.served_name,
+            port=port if port is not None else d.port,
+            util=util if util is not None else d.util,
+            max_model_len=max_model_len if max_model_len is not None else d.max_model_len,
+            max_num_seqs=max_num_seqs if max_num_seqs is not None else d.max_num_seqs,
         )
 
     async def _drain(self, port: int, timeout_s: float = 120.0) -> None:

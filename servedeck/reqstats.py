@@ -221,6 +221,22 @@ EMPTY_STATS = WindowStats(
 ).to_dict()
 
 
+def _went_backwards(
+    cum: Sequence[float], hist_sum: float, previous: tuple[list[float], float, float]
+) -> bool:
+    """Do these cumulative counters describe a DIFFERENT process than
+    `previous` did? A Prometheus counter only ever goes up within one process,
+    so any decrease -- or a change in the bucket layout -- means the engine
+    restarted.
+    """
+    prev_cum, prev_sum, _prev_count = previous
+    return (
+        len(prev_cum) != len(cum)
+        or any(c < p for c, p in zip(cum, prev_cum))
+        or hist_sum < prev_sum
+    )
+
+
 class RequestWindow:
     """Rolling window of the last ``maxlen`` finished requests.
 
@@ -234,6 +250,13 @@ class RequestWindow:
         #: (cumulative counts, _sum, _count) of the previous poll, or None
         #: before the first one.
         self._prev: tuple[list[float], float, float] | None = None
+        #: The last cumulative vector we ever saw, kept even across
+        #: drop_baseline(). Without it a restart was invisible: the failed
+        #: scrapes an engine restart causes drop the baseline, so the new
+        #: engine's first scrape took the "first scrape is a baseline only"
+        #: path and the backwards-counter check below never ran -- leaving the
+        #: dead process's requests in the window for good.
+        self._last_seen: tuple[list[float], float, float] | None = None
         #: The engine's own bucket edges from the last scrape, ascending, with
         #: ``+Inf`` last. Kept so the window can be counted back up into the
         #: SAME bins it was built from — see :meth:`_bars`.
@@ -256,6 +279,7 @@ class RequestWindow:
         """
         self._obs.clear()
         self._prev = None
+        self._last_seen = None
         self._edges = []
         self._ceiling = None
 
@@ -296,25 +320,31 @@ class RequestWindow:
         self._ceiling = ceiling
 
         prev = self._prev
+        last_seen = self._last_seen
         self._prev = (list(cum), hist_sum, hist_count)
+        self._last_seen = self._prev
         if prev is None:
             # First scrape is a baseline only. Counting the whole lifetime
             # histogram here would fill the "last 100 requests" window with
             # requests from before the dashboard was even running.
+            #
+            # But "no baseline" is also what a restart looks like from here:
+            # the scrapes that fail while the engine is down drop the
+            # baseline, so this path is where a NEW process's counters arrive.
+            # Compare against the last vector we ever saw, not just the last
+            # one we could difference -- otherwise the window goes on
+            # reporting requests served by a process that no longer exists.
+            if last_seen is not None and _went_backwards(cum, hist_sum, last_seen):
+                self._obs.clear()
             return 0
 
-        prev_cum, prev_sum, _prev_count = prev
-        if (
-            len(prev_cum) != len(cum)
-            or any(c < p for c, p in zip(cum, prev_cum))
-            or hist_sum < prev_sum
-        ):
+        if _went_backwards(cum, hist_sum, prev):
             # Counters went backwards: new engine process. Everything already
             # in the window belongs to the old one.
             self._obs.clear()
-            self._prev = (list(cum), hist_sum, hist_count)
             return 0
 
+        prev_cum, prev_sum, _prev_count = prev
         total_new = int(round(cum[-1] - prev_cum[-1]))
         if total_new <= 0:
             return 0

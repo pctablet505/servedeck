@@ -367,11 +367,52 @@ async def _poll_loop() -> None:
                     "uptime_s": int(time.time() - STARTED_AT),
                 },
             )
+            _publish_state_if_changed()
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - the poller must never die
             hub.publish("notice", {"level": "warn", "code": "poll_error", "body": str(exc)[:200]})
         await asyncio.sleep(2.0)
+
+
+#: Signature of the last `state` event published by the poll loop, so an
+#: idle box does not re-broadcast an unchanged payload every 2 s.
+_LAST_STATE_SIG: tuple[Any, ...] | None = None
+
+
+def _publish_state_if_changed() -> None:
+    """Publish a `state` event when the state a human can see has moved.
+
+    The page paints the phase strip, the elapsed clock and the boot ETA only
+    from `state` (app.js: paintState -> paintBoot), and the 5 s /api/state poll
+    was deliberately removed in favour of this stream. The poll loop published
+    only `telemetry`, so across two real boots the browser received three
+    `state` events -- all three published by a control POST returning, at the
+    instant phase was still null. The boot panel therefore never rendered at
+    all: bootActive() needs a phase, and by the time one existed nothing was
+    publishing.
+
+    While a boot is in progress every poll publishes, because the elapsed
+    counter is part of the payload and a counter that only moves on a state
+    CHANGE does not count.
+    """
+    global _LAST_STATE_SIG
+    snap = _snap()
+    booting = snap.get("phase") is not None and not snap.get("reached_ready")
+    sig = (
+        snap.get("actual_state"),
+        snap.get("desired_state"),
+        snap.get("phase"),
+        bool(snap.get("reached_ready")),
+        snap.get("last_error"),
+        snap.get("unmanaged_pid"),
+        rt.upstream_up,
+        rt.upstream,
+        rt.serving_model,
+    )
+    if booting or sig != _LAST_STATE_SIG:
+        _LAST_STATE_SIG = sig
+        hub.publish("state", _state())
 
 
 _KV_RE = re.compile(r"GPU KV cache size:\s*([\d,]+)\s*tokens")
@@ -1436,6 +1477,23 @@ async def api_start(body: dict[str, Any] | None = None) -> Any:
         return s
     b = body or {}
     d = s.desired
+    # supervisor.start() is idempotent: it returns at its first statement when
+    # the server is READY or mid-transition. Reporting that as 202 accepted is
+    # how the dashboard's "Apply & restart" came to change nothing at all while
+    # the page logged a success. Say so instead, and name the endpoint that
+    # does work.
+    busy = getattr(s, "actual_state", "STOPPED")
+    if busy in ("READY", "STARTING", "PREFLIGHT", "STOPPING", "DRAINING"):
+        return JSONResponse(
+            {
+                "error": (
+                    f"the server is {busy}; a start would be ignored. "
+                    "POST /api/server/restart to apply new settings, or stop it first."
+                ),
+                "actual_state": busy,
+            },
+            status_code=409,
+        )
     repo_id = b.get("repo_id") or d.repo_id
     backend = b.get("backend") or d.backend
     # Port and served name come from the backend/model being started, not from
@@ -1468,8 +1526,29 @@ async def api_restart(body: dict[str, Any] | None = None) -> Any:
     s = _need_sup()
     if isinstance(s, JSONResponse):
         return s
-    mode = (body or {}).get("mode", "immediate")
-    asyncio.create_task(_run_and_report(s.restart(mode=mode), f"restart:{mode}"))
+    b = body or {}
+    mode = b.get("mode", "immediate")
+    # The same body the Apply button sends to /api/server/start, honoured here
+    # too: this is the only endpoint that actually relaunches, so it is the
+    # only one that can change ctx / max_num_seqs / util on a running server.
+    # Port and served name are re-derived from the backend being started, for
+    # the same reason api_start does it -- never inherited from the previous run.
+    d = s.desired
+    backend = b.get("backend") or d.backend
+    repo_id = b.get("repo_id") or d.repo_id
+    settings: dict[str, Any] = {"repo_id": repo_id, "backend": backend}
+    if b.get("backend") or b.get("port") is not None:
+        settings["port"] = int(_sup.resolve_port(backend, d, explicit=b.get("port"), fallback=rt.port) or rt.port)
+        settings["served_name"] = _sup.resolve_served_name(
+            backend, repo_id, d, explicit=b.get("served_name")
+        )
+    if b.get("util") is not None:
+        settings["util"] = float(b["util"])
+    if b.get("ctx") is not None:
+        settings["max_model_len"] = int(b["ctx"])
+    if b.get("max_num_seqs") is not None:
+        settings["max_num_seqs"] = int(b["max_num_seqs"])
+    asyncio.create_task(_run_and_report(s.restart(mode=mode, **settings), f"restart:{mode}"))
     return JSONResponse({"accepted": True, "action": "restart", "mode": mode}, status_code=202)
 
 
@@ -1481,14 +1560,42 @@ async def _run_and_report(coro: Any, label: str) -> None:
     """
     try:
         await coro
-        hub.publish("notice", {"level": "info", "code": label, "body": f"{label} completed"})
     except Exception as exc:  # noqa: BLE001
         hub.publish(
             "notice",
             {"level": "error", "code": f"{label}_failed", "body": f"{type(exc).__name__}: {exc}"},
         )
+    else:
+        # The outcome is the supervisor's state afterwards, not the mere fact
+        # that the coroutine returned. Every control action used to report
+        # '<action> completed' at level info -- including a start PORT_IN_USE
+        # had just refused, a start that did nothing because the server was
+        # already up, and the loser of two concurrent starts. An action that
+        # failed must not read like one that worked.
+        hub.publish("notice", _outcome_notice(label))
     finally:
         hub.publish("state", _state())
+
+
+#: Supervisor states in which an action is still in flight -- "start
+#: completed" then means "the boot is under way", not "the server is up".
+_IN_FLIGHT_STATES = ("PREFLIGHT", "STARTING", "STOPPING", "DRAINING")
+
+
+def _outcome_notice(label: str) -> dict[str, Any]:
+    """The notice for an action that returned, derived from what it achieved."""
+    s = sup()
+    state = getattr(s, "actual_state", None)
+    error = getattr(s, "last_error", None)
+    if state == "FAILED":
+        return {"level": "error", "code": f"{label}_failed",
+                "body": f"{label} failed: {error or 'no reason recorded'}"}
+    if state == "UNMANAGED":
+        return {"level": "warn", "code": f"{label}_unmanaged",
+                "body": error or f"{label}: a server is running that Servedeck does not manage"}
+    if state in _IN_FLIGHT_STATES:
+        return {"level": "info", "code": label, "body": f"{label} accepted — {state.lower()}"}
+    return {"level": "info", "code": label, "body": f"{label} completed"}
 
 
 @app.get("/api/events")
