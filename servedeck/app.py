@@ -26,6 +26,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from . import capacity
+from . import disksize
 from . import kvcalc, config, events, gpu, registry, shellconfig, supervisor as _sup
 from . import metrics as _metrics_mod
 from . import parallelism, reqstats
@@ -77,6 +78,14 @@ class Runtime:
         self.upstream_up = False
         self.client: httpx.AsyncClient | None = None
         self._models_cache: list[dict[str, Any]] | None = None
+        #: When the model scan was taken. The cache used to have no expiry at
+        #: all: scanned once on the first /api/models and then served for the
+        #: life of the process. On the day a 95.37 GiB BF16 PLE table was
+        #: deleted and a 47.68 GiB FP8 one installed, the panel went on
+        #: reporting the pre-deletion sizes for hours -- the whole reason the
+        #: displayed disk figure "looked wrong". A whole-hub scan is ~25 ms
+        #: warm, so there is nothing to protect with a permanent cache.
+        self._models_cache_at: float = 0.0
 
     def config(self) -> dict[str, str]:
         return _safe_config()
@@ -710,8 +719,15 @@ async def _shutdown() -> None:
 
 
 # ------------------------------------------------------------- helpers ----
-def _model_rows() -> list[dict[str, Any]]:
-    if rt._models_cache is not None:
+#: Seconds a model scan stays fresh. Short enough that a deletion shows up
+#: while the operator is still looking at the screen, long enough that the
+#: 2 s telemetry tick does not re-walk the hub cache on every poll.
+MODELS_CACHE_TTL_S = 5.0
+
+
+def _model_rows(*, now: float | None = None) -> list[dict[str, Any]]:
+    t = time.monotonic() if now is None else now
+    if rt._models_cache is not None and (t - rt._models_cache_at) < MODELS_CACHE_TTL_S:
         return rt._models_cache
     rows: list[dict[str, Any]] = []
     for e in registry.discover_models():
@@ -743,7 +759,12 @@ def _model_rows() -> list[dict[str, Any]]:
                 "backend": e.backend,
                 "servable": e.servable,
                 "unservable_reason": e.reason,
-                "disk_gib": round(e.safetensors_gib or 0.0, 2),
+                # Bytes, not a pre-rounded GiB float: the unit belongs to the
+                # formatter. Shipping "disk_gib" and rendering it beside the
+                # letters "GB" is how a 125.99 GiB model came to be displayed
+                # as 125.91 GB -- a 7.4% error that reads as a rounding slip.
+                "disk_bytes": e.disk_bytes,
+                "disk_local_bytes": e.disk_local_bytes,
                 "quant": e.quant_algo or "—",
                 "model_max_ctx": ctx_for_trust,
                 "trust": trust,
@@ -752,7 +773,40 @@ def _model_rows() -> list[dict[str, Any]]:
         )
     rows.sort(key=lambda r: (not r["servable"], r["name"]))
     rt._models_cache = rows
+    rt._models_cache_at = t
     return rows
+
+
+def _disk_payload() -> dict[str, Any]:
+    """Filesystem free/used from statvfs, plus what the hub cache costs.
+
+    The filesystem half never comes from a directory walk. A walk sees only
+    what it can read, so it under-reports "used" by every tree the server
+    cannot enter, and it cannot see free space at all. ``statvfs`` is the
+    kernel's own answer and is what ``df`` prints.
+
+    ``hub_bytes`` versus ``hub_local_bytes``: blobs reached through symlinks
+    to another mount are real bytes but sit on another filesystem, so they
+    must not be subtracted from the ``df`` figure shown beside them.
+    """
+    hub = registry.default_hub_dir()
+    fs = disksize.filesystem_usage(hub if hub.exists() else Path("/"))
+    rows = _model_rows()
+    hub_bytes = sum(r["disk_bytes"] for r in rows)
+    hub_local = sum(r["disk_local_bytes"] for r in rows)
+    return {
+        "path": fs.path,
+        "total_bytes": fs.total_bytes,
+        "used_bytes": fs.used_bytes,
+        "avail_bytes": fs.avail_bytes,
+        "used_pct": round(fs.used_pct, 1),
+        "hub_bytes": hub_bytes,
+        "hub_local_bytes": hub_local,
+        "hub_foreign_bytes": hub_bytes - hub_local,
+        # Named so no consumer has to guess. Everything above is bytes; the
+        # UI divides by 1024 and says GiB.
+        "unit": "bytes",
+    }
 
 
 def _own_gpu_mib() -> int:
@@ -972,7 +1026,12 @@ async def api_state() -> dict[str, Any]:
 
 @app.get("/api/models")
 async def api_models() -> dict[str, Any]:
-    return {"models": _model_rows(), "serving": rt.serving_model}
+    return {"models": _model_rows(), "serving": rt.serving_model, "disk": _disk_payload()}
+
+
+@app.get("/api/disk")
+async def api_disk() -> dict[str, Any]:
+    return _disk_payload()
 
 
 @app.post("/api/capacity/estimate")

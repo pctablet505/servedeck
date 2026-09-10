@@ -1095,3 +1095,79 @@ def test_the_lifetime_average_is_no_longer_the_sizing_input() -> None:
     )
     assert "avg_prompt_tokens" not in _fn_body("paintTelemetry")
     assert 'id="avgCtx"' not in INDEX_HTML
+
+
+# --------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# Disk sizes: the number and its unit must be produced together
+# --------------------------------------------------------------------------- #
+
+
+def test_no_size_is_rendered_next_to_a_hardcoded_unit() -> None:
+    """The defect, stated as a source-level rule.
+
+    The model card was literally ``${m.disk_gib || "—"} GB``: a value computed
+    in GiB (bytes/1024**3) printed beside the letters "GB". 125.99 GiB was
+    displayed as "125.91 GB" — 7.4% low, small enough to read as rounding.
+    A template that interpolates a number and then types its unit can always
+    drift; bytesTxt() returns both together, so nothing may hardcode one.
+    """
+    # The rule: a unit literal may appear only where a formatter is DEFINED
+    # (bytesTxt, gib), never in a render template. A formatter returns its
+    # number and its unit as one string, so the two cannot drift apart; a
+    # template that types the unit itself can drift, and did.
+    offenders = [
+        line.strip()
+        for line in APP_JS.splitlines()
+        if re.search(r"\$\{[^}]*\}\s*(?:GB|GiB|MB|MiB|TB|TiB)\b", line)
+        and "=>" not in line
+        and not line.strip().startswith("//")
+    ]
+    assert not offenders, (
+        "a render template interpolates a size next to a hardcoded unit, which "
+        f"is exactly how GiB came to be labelled GB: {offenders}"
+    )
+    assert "disk_gib" not in APP_JS, (
+        "disk_gib was a pre-divided GiB float; the payload now carries bytes so "
+        "the unit is chosen at the point of formatting"
+    )
+
+
+def test_the_page_formats_sizes_through_one_binary_formatter() -> None:
+    """bytesTxt is binary (1024) and says so. If it ever became decimal, every
+    figure on the page would drift 7.4% from the df it sits beside."""
+    assert "function bytesTxt" in APP_JS
+    body = _fn_body("bytesTxt")
+    assert "1024" in body and "1000" not in body, (
+        "bytesTxt must be binary — the page's other sources (df, free, "
+        "nvidia-smi, vLLM's logs) all are"
+    )
+    # The unit table itself is binary-named; a decimal name here would mean a
+    # decimal number was being printed under a binary label or vice versa.
+    assert re.search(r'BYTE_UNITS\s*=\s*\[[^\]]*"GiB"', APP_JS)
+    assert not re.search(r'BYTE_UNITS\s*=\s*\[[^\]]*"GB"', APP_JS)
+
+
+def test_the_disk_line_reads_only_fields_api_disk_emits() -> None:
+    """Same contract as the model rows: every property the disk line reads has
+    to exist in the payload that paints it."""
+    from servedeck import app
+
+    payload = app._disk_payload()
+    read = _reads_of("d", _fn_body("paintDisk"))
+    missing = read - set(payload)
+    assert not missing, (
+        f"web/app.js reads disk field(s) /api/disk never sends: {sorted(missing)}"
+    )
+
+
+def test_the_free_disk_figure_is_measured_not_markup() -> None:
+    """The page once carried a static "412 GiB" disk span that nothing
+    computed. The placeholder must be an em-dash the painter overwrites, never
+    a plausible-looking number."""
+    m = re.search(r'id="dfree"[^>]*>([^<]*)<', INDEX_HTML)
+    assert m, 'the model rail has no #dfree element for the disk figure'
+    assert not re.search(r"\d", m.group(1)), (
+        f"#dfree ships a hardcoded reading: {m.group(1)!r}"
+    )
+    assert "paintDisk" in APP_JS, "nothing paints the disk figure"
