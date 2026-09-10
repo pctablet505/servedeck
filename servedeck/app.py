@@ -255,7 +255,18 @@ def _server_uptime_s() -> int | None:
 
     try:
         pid = _listener_pid_now()
-        return procctl.process_uptime_s(pid) if pid else None
+        if not pid:
+            return None
+        # Whose uptime is this? The pid holding the port is not necessarily a
+        # model server: with the shell config (or, before the ordering fix in
+        # supervisor.start(), a refused start) naming someone else's port, this
+        # reported 105,114 s of an unrelated always-on service as the model
+        # server's uptime while no model was running at all. procctl's own rule
+        # 4 -- a port that answers with no attributable pid is UNMANAGED, not
+        # guessed at -- applies to every figure taken off that pid.
+        if not procctl.is_attributable(pid):
+            return None
+        return procctl.process_uptime_s(pid)
     except Exception:  # noqa: BLE001
         return None
 

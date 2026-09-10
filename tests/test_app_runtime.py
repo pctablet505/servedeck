@@ -923,3 +923,29 @@ def test_a_boot_publishes_state_events_not_only_telemetry(monkeypatch) -> None:
         "a boot in progress produced only telemetry events; the phase strip, "
         "the elapsed counter and the ETA are painted from `state` alone"
     )
+
+
+def test_an_unrelated_listeners_uptime_is_not_reported_as_the_models(monkeypatch) -> None:
+    """F5, the half that survives the ordering fix.
+
+    server_uptime_s is the uptime of whatever pid holds the port — with no
+    check that the pid is a vLLM server at all. On 2026-09-10 that put
+    ats-optimizer's 105,114 s (29.2 h) on the dashboard as the model server's
+    uptime while the 27B was not running. desired.json is no longer written
+    before preflight, so that particular route is closed, but the shell
+    config's PORT can name someone else's port just as easily.
+    """
+    from servedeck import procctl
+
+    monkeypatch.setattr(capp, "_listener_pid_now", lambda: 2922)
+    monkeypatch.setattr(procctl, "process_uptime_s", lambda pid: 105114)
+
+    monkeypatch.setattr(procctl, "is_attributable", lambda pid: False)
+    assert capp._server_uptime_s() is None, (
+        "an unrelated service's uptime is being reported as the model server's"
+    )
+
+    # Over-correction guard: a listener that IS a vLLM api-server still
+    # reports its uptime — this must not blank the figure for every server.
+    monkeypatch.setattr(procctl, "is_attributable", lambda pid: True)
+    assert capp._server_uptime_s() == 105114
