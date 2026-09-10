@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-from servedeck import kvcalc, registry
+from servedeck import kvcalc, paths, registry
 
 GIB = 1 << 30
 HUB = Path.home() / ".cache" / "huggingface" / "hub"
@@ -180,8 +180,15 @@ def test_a_config_with_no_attention_geometry_refuses_rather_than_guesses() -> No
 # Integration: the defect the owner reported, end to end
 # --------------------------------------------------------------------------
 def _observations() -> list[dict]:
-    """The real observation store the running dashboard uses."""
-    p = Path.home() / "Projects" / "coldstart" / "state" / "measurements.json"
+    """The real observation store the running dashboard uses.
+
+    That is the PRE-RENAME tree: the coldstart fork is what has been serving
+    :8010, so its state directory is where the measurements actually are.
+    Spelled through paths.LEGACY_COLDSTART_STATE_DIR rather than as a literal,
+    so this fixture follows the one constant the package resolves it by --
+    a second copy of the path is how the two silently stop agreeing.
+    """
+    p = paths.LEGACY_COLDSTART_STATE_DIR / registry.MEASUREMENTS_FILENAME
     if not p.is_file():
         pytest.skip("no observation store on this machine")
     return json.loads(p.read_text())
