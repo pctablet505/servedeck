@@ -22,42 +22,13 @@ function rateTxt(v, digits) {
   return (digits ? v.toFixed(digits) : fmt(Math.round(v))) + " tok/s";
 }
 
-/* Prefill throughput for the serving line.
- *
- * Prefill is bursty: at --max-num-seqs 1 a 10k-token prompt prefills for
- * ~10-17 s and then nothing prefills for minutes, so the windowed rate is
- * genuinely unknown most of the time. Fall back to the lifetime figure —
- * computed prompt tokens per second OF PREFILL TIME, which does not decay
- * while the server sits idle — and mark it "~" so a live reading and a
- * lifetime average are never mistaken for each other.
- */
-function prefillTxt(m) {
-  if (typeof m.prefill_tok_s === "number") return rateTxt(m.prefill_tok_s);
-  if (typeof m.prefill_tok_s_avg === "number") return "~" + rateTxt(m.prefill_tok_s_avg);
-  return "n/a";
-}
-
-/* One figure of the throughput strip.
- *
- * Returns {value, note}. `value` is never a bare number with no unit and
- * never an unexplained dash: when there is no reading it is the string "n/a"
- * and `note` carries the reason the backend gave (idle, counters reset, not
- * published by this build, backend unreachable). A lone unlabelled number was
- * the original complaint — you could not tell prefill from decode — and a
- * lone em dash is the same defect one step further along: it does not say
- * whether the server is quiet or the metric is missing.
- *
- * `live` is the window reading, `life` the lifetime companion. A lifetime
- * figure is shown with a "~" and says so, so it is never read as "now".
- */
-function figure(live, life, reason, fmtFn, lifeNote) {
-  if (typeof live === "number" && isFinite(live)) {
-    return { value: fmtFn(live), note: "last 2 s window" };
-  }
-  if (typeof life === "number" && isFinite(life)) {
-    return { value: "~" + fmtFn(life), note: lifeNote + (reason ? " — " + reason : "") };
-  }
-  return { value: "n/a", note: reason || "no reading" };
+/* How long ago, in words. Whole seconds/minutes: this is the age of a
+ * reading, not a reading. */
+function agoTxt(sec) {
+  if (typeof sec !== "number" || !isFinite(sec) || sec < 0) return "";
+  if (sec < 60) return Math.round(sec) + " s ago";
+  const m = Math.round(sec / 60);
+  return m < 60 ? m + " min ago" : Math.round(m / 60) + " h ago";
 }
 
 function secsTxt(v) {
@@ -66,27 +37,95 @@ function secsTxt(v) {
        : Math.round(v * 1000) + " ms";
 }
 
-/* The throughput strip: prefill, decode and TTFT, always all three.
+/* The WINDOW line of one throughput cell: {value, note}.
  *
- * Rendering only one of them is what the dashboard did, and it made a slow
- * time-to-first-token indistinguishable from a slow decode — the two differ
- * by ~70x on this box, so the single number was not merely ambiguous, it was
- * off by nearly two orders of magnitude depending on which one you assumed.
+ * The rule this function exists to enforce: a cell's window line shows the
+ * window figure or says why it cannot, and it NEVER falls back to a different
+ * quantity. The panel used to substitute a lifetime average here behind a "~",
+ * so a cell read "3,013 tok/s" whether that was a rate measured over the last
+ * two seconds or an average over three thousand requests. Those differ by
+ * 2.4x for decode on this box (measured: window 249.0 tok/s vs lifetime
+ * 104.4 tok/s) — same font, same slot, no way to tell.
+ *
+ * When there is no window reading, the value is "idle" (or "n/a") and the note
+ * carries the LAST window reading and its age. That is a fact about this
+ * figure, so the cell is never blank and never looks as though its neighbour
+ * has taken it over.
+ */
+function windowFigure(live, last, ageS, state, reason, fmtFn) {
+  if (typeof live === "number" && isFinite(live)) {
+    return { value: fmtFn(live), na: false, note: "now · last 2 s window" };
+  }
+  // Switch on the CODE, never on the English. metrics.REASON_CODE is the
+  // table; test_ui.py checks the codes named here are all in it.
+  const head = (state === "idle") ? "idle" : "n/a";
+  let note = reason || "no reading";
+  if (typeof last === "number" && isFinite(last)) {
+    const ago = agoTxt(ageS);
+    note = note + " · last " + fmtFn(last) + (ago ? ", " + ago : "");
+  }
+  return { value: head, na: true, note: note };
+}
+
+/* The LIFETIME line of one throughput cell.
+ *
+ * Always rendered, in its own line, in its own smaller type, and always
+ * naming its denominator — because it is not the same quantity as the line
+ * above it. "per second of prefill time" is what makes 3,013 tok/s and
+ * 249 tok/s both true at once.
+ */
+function lifeTxt(v, fmtFn, basis, n) {
+  if (typeof v !== "number" || !isFinite(v)) return "lifetime n/a";
+  const count = (typeof n === "number" && n > 0) ? " over " + fmt(n) + " requests" : "";
+  return "lifetime " + fmtFn(v) + " " + basis + count;
+}
+
+/* One figure for the one-line serving summary.
+ *
+ * The window reading or the word "idle" — never a lifetime average wearing a
+ * "~", and never a bare em dash. The strip below is where a stale value, its
+ * age and its reason belong; this line only has room to say whether the
+ * figure is live.
+ */
+function segFigure(live, state, fmtFn) {
+  if (typeof live === "number" && isFinite(live)) return fmtFn(live);
+  return state === "idle" ? "idle" : "n/a";
+}
+
+/* The throughput strip: prefill, decode and TTFT, always all three, and for
+ * each of them a window figure and a lifetime figure, always both.
+ *
+ * Rendering one number where the other had been is the defect this replaces.
+ * Owner: "when one is not displayed, the prefill speed shows, when it is not
+ * running, while generate shows when generating". Both causes are gone: no
+ * cell can go blank (an idle window prints its last value and an age) and no
+ * cell can borrow another cell's quantity.
  */
 function paintThroughput() {
   const m = liveMetrics || {};
+  const rate0 = (v) => rateTxt(v);
+  const rate1 = (v) => rateTxt(v, 1);
   const cells = [
-    ["thPrefill", figure(m.prefill_tok_s, m.prefill_tok_s_avg, m.prefill_reason,
-                         (v) => rateTxt(v), "lifetime, per second of prefill time")],
-    ["thDecode", figure(m.gen_tok_s, m.gen_tok_s_avg, m.gen_reason,
-                        (v) => rateTxt(v, 1), "lifetime, per second of decode time")],
-    ["thTtft", figure(m.ttft_s, m.ttft_s_avg, m.ttft_reason,
-                      secsTxt, "lifetime mean")],
+    ["thPrefill",
+     windowFigure(m.prefill_tok_s, m.prefill_tok_s_last, m.prefill_last_age_s,
+                  m.prefill_state, m.prefill_reason, rate0),
+     lifeTxt(m.prefill_tok_s_avg, rate0, "per second of prefill time",
+             m.prefill_requests)],
+    ["thDecode",
+     windowFigure(m.gen_tok_s, m.gen_tok_s_last, m.gen_last_age_s,
+                  m.gen_state, m.gen_reason, rate1),
+     lifeTxt(m.gen_tok_s_avg, rate1, "per second of decode time")],
+    ["thTtft",
+     windowFigure(m.ttft_s, m.ttft_s_last, m.ttft_last_age_s,
+                  m.ttft_state, m.ttft_reason, secsTxt),
+     lifeTxt(m.ttft_s_avg, secsTxt, "mean", m.ttft_requests)],
   ];
-  cells.forEach(([id, f]) => {
-    const n = $(id), sub = $(id + "S");
-    if (n) { n.textContent = f.value; n.className = "n mono" + (f.value === "n/a" ? " na" : ""); }
+  cells.forEach(function (row) {
+    const id = row[0], f = row[1], life = row[2];
+    const n = $(id), sub = $(id + "S"), lifeEl = $(id + "L");
+    if (n) { n.textContent = f.value; n.className = "n mono" + (f.na ? " na" : ""); }
     if (sub) sub.textContent = f.note;
+    if (lifeEl) lifeEl.textContent = life;
   });
 }
 
@@ -555,33 +594,62 @@ function paintServingMeta() {
   // client, and a bare port is not pasteable — they had to reconstruct the
   // scheme and host by hand every time.
   const base = up.port ? `http://localhost:${up.port}` : "—";
-  // Both throughputs, never one: generation tok/s alone cannot tell a 17 s
-  // time-to-first-token apart from a slow decode, and the two can differ by
-  // ~70x on a PCIe-bound decode.
-  // Every figure is named. "99 tok/s" on its own does not say whether the
-  // server is slow to START answering or slow to KEEP answering, and those
-  // have different fixes.
-  const decode = typeof liveMetrics.gen_tok_s === "number"
-    ? rateTxt(liveMetrics.gen_tok_s, 1)
-    : typeof liveMetrics.gen_tok_s_avg === "number"
-      ? "~" + rateTxt(liveMetrics.gen_tok_s_avg, 1) : "n/a";
-  const ttft = typeof liveMetrics.ttft_s === "number"
-    ? secsTxt(liveMetrics.ttft_s)
-    : typeof liveMetrics.ttft_s_avg === "number"
-      ? "~" + secsTxt(liveMetrics.ttft_s_avg) : "n/a";
-  meta.textContent = up.up
-    ? `${base} · ${fmt(liveCtx)} ctx` +
-      ` · prefill ${prefillTxt(liveMetrics)}` +
-      ` · decode ${decode}` +
-      ` · TTFT ${ttft}` +
-      ` · up ${uptimeTxt(s.server_uptime_s)}`
-    : `nothing serving on ${base}`;
+  // One segment per figure, each an element of its own, each LABEL FIRST.
+  //
+  // Two defects fixed here. (1) The whole line was one text node, so it
+  // wrapped wherever it happened to fit — including between a number and its
+  // unit, and between a number and the word saying which number it was. Each
+  // segment is now white-space:nowrap and the line breaks only between them.
+  // (2) The label trailed the number ("249.0 tok/s gen"), so you read the
+  // figure before learning what it measured, and when a figure was missing
+  // the line read "— gen": an em dash with no unit and no explanation, while
+  // the OTHER figure still showed a number. That is what made it look as
+  // though prefill and generate were swapping places.
+  //
+  // Every figure here also appears in the strip below with its reason and its
+  // lifetime companion; this line is the summary, never the only copy.
+  const segs = [
+    ["", base],
+    ["context", fmt(liveCtx) + " tokens"],
+    ["prefill", segFigure(liveMetrics.prefill_tok_s, liveMetrics.prefill_state,
+                          (v) => rateTxt(v))],
+    ["decode", segFigure(liveMetrics.gen_tok_s, liveMetrics.gen_state,
+                         (v) => rateTxt(v, 1))],
+    ["time to first token", segFigure(liveMetrics.ttft_s, liveMetrics.ttft_state,
+                                      secsTxt)],
+    ["up", uptimeTxt(s.server_uptime_s)],
+  ];
+  meta.textContent = "";
+  if (!up.up) {
+    meta.textContent = `nothing serving on ${base}`;
+  } else {
+    segs.forEach((seg, i) => {
+      if (i > 0) {
+        const sep = document.createElement("span");
+        sep.className = "sep";
+        sep.textContent = "·";
+        meta.appendChild(sep);
+      }
+      // createElement + textContent, not innerHTML: a served model name is
+      // upstream data and must never be parsed as markup.
+      const el = document.createElement("span");
+      el.className = "seg";
+      if (seg[0]) {
+        const b = document.createElement("b");
+        b.textContent = seg[0] + " ";
+        el.appendChild(b);
+      }
+      el.appendChild(document.createTextNode(seg[1]));
+      meta.appendChild(el);
+    });
+  }
   meta.title = up.up
     ? "prefill (prompt processing), decode (token generation) and " +
       "time-to-first-token, from the engine's own counters over the last 2 s " +
-      "poll window. A ~ prefix marks a lifetime average, shown when nothing " +
-      "happened in the window; n/a with a reason is shown when there is no " +
-      "figure at all. The full strip below carries the reasons."
+      "poll window. 'idle' means nothing of that kind ran in the window — it " +
+      "is not a zero and it is not the other figure. The strip below carries " +
+      "each figure's reason and its lifetime companion, whose denominator is " +
+      "prefill/decode seconds rather than wall clock."
     : "";
 }
 

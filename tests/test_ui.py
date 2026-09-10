@@ -16,6 +16,7 @@ whole content is the ABSENCE of an expression.
 
 from __future__ import annotations
 
+import json
 import re
 
 import pytest
@@ -452,38 +453,61 @@ def test_model_max_ctx_is_a_field_api_models_actually_sends() -> None:
 # Prefill vs decode vs TTFT (owner report: "confusing whether it is prefill or
 # decode time when only 1 is visible")
 # --------------------------------------------------------------------------
-def test_throughput_strip_renders_all_three_figures_labelled() -> None:
+def test_throughput_strip_gives_every_figure_a_name_and_a_unit() -> None:
     """One unlabelled number cannot say whether the server is slow to start
-    answering or slow to keep answering. All three must be on the page, each
-    with a word naming it and a word naming its unit."""
+    answering or slow to keep answering. Each cell names the figure, spells
+    the unit out in full, and has all three of its lines in the markup -- the
+    window reading, what that reading is, and the lifetime companion -- so no
+    line can be missing at render time and no cell can go blank."""
     for slot, label, unit in (
-        ("thPrefill", "Prefill", "prompt tok/s"),
-        ("thDecode", "Decode", "generated tok/s"),
-        ("thTtft", "TTFT", "time to first token"),
+        ("thPrefill", "Prefill", "prompt tokens/second"),
+        ("thDecode", "Decode", "generated tokens/second"),
+        ("thTtft", "Time to first token", "seconds, mean"),
     ):
-        assert f'id="{slot}"' in INDEX_HTML, f"{slot} missing from the page"
-        assert f'id="{slot}S"' in INDEX_HTML, f"{slot}'s reason line is missing"
+        for suffix, what in (("", "figure"), ("S", "state line"), ("L", "lifetime line")):
+            assert f'id="{slot}{suffix}"' in INDEX_HTML, f"{slot}'s {what} is missing"
         assert label in INDEX_HTML, f"{slot} is not labelled {label!r}"
-        assert unit in INDEX_HTML, f"{slot} does not name its unit"
+        assert unit in INDEX_HTML, f"{slot} does not spell out its unit"
     body = _fn_body("paintThroughput")
     for slot in ("thPrefill", "thDecode", "thTtft"):
         assert slot in body, f"paintThroughput never writes {slot}"
 
 
-def test_a_missing_throughput_figure_says_na_with_a_reason() -> None:
-    """A bare em dash is the same defect one step on: it does not distinguish
-    "nothing ran just now" from "this build does not publish that metric"."""
-    body = _fn_body("figure")
-    assert '"n/a"' in body, "figure() must render n/a, not a bare dash"
-    assert "reason" in body, "figure() must carry the backend's reason through"
+def test_a_missing_throughput_figure_says_why_and_keeps_its_last_value() -> None:
+    """A bare em dash is the same defect one step on: it distinguishes neither
+    "nothing ran just now" from "this build does not publish that metric", nor
+    either of them from "the other figure took this slot"."""
+    body = _fn_body("windowFigure")
+    assert '"n/a"' in body, "windowFigure() must render n/a, not a bare dash"
+    assert '"idle"' in body, "an idle window is a different fact from a missing metric"
+    assert "reason" in body, "windowFigure() must carry the backend's reason through"
+    assert "last" in body, "an idle figure must keep the last reading it had"
+    assert "agoTxt" in body, "a stale reading without its age reads as current"
     assert "—" not in _fn_body("paintThroughput"), (
         "the throughput strip must not fall back to an em dash"
     )
 
 
-def test_serving_line_names_prefill_decode_and_ttft() -> None:
+def test_the_window_figure_cannot_be_filled_in_from_the_lifetime_average() -> None:
+    """The substitution, pinned in the source as well as in the render: the
+    function that draws the window line is not given the lifetime value at
+    all, so it cannot print it however it is later edited."""
+    import inspect
+
+    sig = re.search(r"function windowFigure\(([^)]*)\)", APP_JS)
+    assert sig, "web/app.js must define windowFigure()"
+    params = [p.strip() for p in sig.group(1).split(",")]
+    assert not any("avg" in p or "life" in p for p in params), (
+        f"windowFigure() takes a lifetime figure: {params}"
+    )
+    body = _fn_body("windowFigure")
+    assert "_avg" not in body, body
+    del inspect
+
+
+def test_serving_line_names_prefill_decode_and_time_to_first_token() -> None:
     line = _serving_line()
-    for word in ("prefill", "decode", "TTFT"):
+    for word in ("prefill", "decode", "time to first token"):
         assert word in line, f"the serving line never says {word!r}: {line}"
     assert "gen`" not in line, (
         "the serving line abbreviated generation throughput to 'gen', which "
@@ -575,3 +599,340 @@ def test_the_boot_eta_is_not_a_literal_string() -> None:
     m = re.search(r'id="etaTxt"[^>]*>([^<]*)<', INDEX_HTML)
     assert m, "could not find #etaTxt"
     assert not re.search(r"\d", m.group(1)), f"fabricated ETA: {m.group(1)!r}"
+
+
+# --------------------------------------------------------------------------
+# Rendering tests: the real app.js functions, run in a real JS engine
+# --------------------------------------------------------------------------
+#
+# Everything above this line is a CONTRACT test -- it reads the source as
+# text. That catches a field name that does not exist and misses everything
+# about what the page actually puts on screen, which is precisely where the
+# defect the owner reported lived: "when one is not displayed, the prefill
+# speed shows, when it is not running, while generate shows when generating".
+# No substring assertion can see that.
+#
+# So these tests EXECUTE web/app.js's rendering functions against a small DOM
+# shim, with payloads produced by the real MetricsPoller, and assert on the
+# text that lands in each element. duktape (via dukpy) is ES5.1 plus the ES6
+# app.js actually uses (const/let, arrow functions, template literals).
+
+_DOM_SHIM = """
+/* duktape implements toLocaleString() but ignores the locale, so fmt() would
+   return "1240" where a browser returns "1,240" -- and the grouping is part of
+   what the tests are checking. Give the engine the browser's behaviour. */
+Number.prototype.toLocaleString = function () {
+  var neg = this < 0, n = Math.abs(this), i = Math.floor(n), frac = n - i;
+  var out = "", str = String(i);
+  while (str.length > 3) { out = "," + str.slice(-3) + out; str = str.slice(0, -3); }
+  out = str + out;
+  if (frac > 0) out += String(Math.round(frac * 1000) / 1000).slice(1);
+  return (neg ? "-" : "") + out;
+};
+function El(tag) {
+  this.tagName = tag || "div";
+  this._text = "";
+  this.className = "";
+  this.title = "";
+  this.childNodes = [];
+}
+Object.defineProperty(El.prototype, "textContent", {
+  get: function () {
+    if (this.childNodes.length === 0) return this._text;
+    var out = "";
+    for (var i = 0; i < this.childNodes.length; i++) out += this.childNodes[i].textContent;
+    return out;
+  },
+  set: function (v) { this.childNodes = []; this._text = String(v); }
+});
+El.prototype.appendChild = function (c) { this._text = ""; this.childNodes.push(c); return c; };
+var __els = {};
+var document = {
+  getElementById: function (id) { return __els[id] || null; },
+  createElement: function (tag) { return new El(tag); },
+  createTextNode: function (t) { var n = new El("#text"); n._text = String(t); return n; },
+  querySelector: function () { return null; }
+};
+var liveMetrics = {};
+var lastState = null;
+var ctx = 262144;
+function __mk(ids) { for (var i = 0; i < ids.length; i++) __els[ids[i]] = new El("div"); }
+function __dump(ids) {
+  var out = {};
+  for (var i = 0; i < ids.length; i++) {
+    var e = __els[ids[i]];
+    out[ids[i]] = e ? { text: e.textContent, cls: e.className, title: e.title } : null;
+  }
+  return JSON.stringify(out);
+}
+"""
+
+#: The functions under test, lifted verbatim out of web/app.js.
+_RENDER_FNS = (
+    "agoTxt", "secsTxt", "rateTxt", "windowFigure", "lifeTxt", "segFigure",
+    "uptimeTxt", "paintThroughput", "paintServingMeta",
+)
+
+
+def _const_line(name: str) -> str:
+    """A top-level `const name = ...;` line, verbatim."""
+    i = APP_JS.index(f"const {name} = ")
+    return APP_JS[i : APP_JS.index("\n", i)]
+
+
+def _element_ids() -> list[str]:
+    return sorted(set(re.findall(r'id="([A-Za-z0-9_]+)"', INDEX_HTML)))
+
+
+def _render(payload: dict, state: dict | None = None) -> dict:
+    """Paint the throughput strip (and, with `state`, the serving line) from a
+    real /api telemetry payload and return every element's rendered text."""
+    dukpy = pytest.importorskip(
+        "dukpy", reason="pip install -e '.[dev]' brings in the JS engine"
+    )
+    ids = _element_ids()
+    src = [
+        _DOM_SHIM,
+        _const_line("$"),
+        _const_line("fmt"),
+        *[_fn_body(n) for n in _RENDER_FNS],
+        f"__mk({json.dumps(ids)});",
+        f"liveMetrics = {json.dumps(payload)};",
+        f"lastState = {json.dumps(state)};",
+        "paintThroughput();",
+        "if (lastState) paintServingMeta();",
+        f"__dump({json.dumps(ids)});",
+    ]
+    return json.loads(dukpy.evaljs("\n".join(src)))
+
+
+def _payload(**kw) -> dict:
+    """A telemetry payload the poller could really have produced."""
+    snap = metrics.MetricsSnapshot(reachable=True)
+    for k, v in kw.items():
+        setattr(snap, k, v)
+    return snap.to_dict()
+
+
+_SERVING = {
+    "upstream": {"up": True, "port": 8001, "max_model_len": 262144},
+    "server_uptime_s": 11520,
+}
+
+_CELLS = ("thPrefill", "thDecode", "thTtft")
+
+
+def test_both_figures_render_at_once_in_every_server_state() -> None:
+    """The defect, stated as a test: no state of the server may leave prefill
+    or decode without a figure of its own.
+
+    Before the fix an idle window put NOTHING in the cell (or, worse, quietly
+    substituted the lifetime average), so the two numbers appeared to take
+    turns. Every state below must produce a non-empty, distinct reading for
+    both -- and the labels are static markup, so they are present regardless.
+    """
+    states = {
+        "both busy": _payload(
+            prefill_tok_s=1240.0, gen_tok_s=249.0, ttft_s=1.85,
+            prefill_tok_s_avg=3013.3, gen_tok_s_avg=104.4, ttft_s_avg=8.62,
+        ),
+        "decoding, no prefill": _payload(
+            gen_tok_s=249.0, prefill_reason=metrics.IDLE, ttft_reason=metrics.IDLE,
+            prefill_tok_s_last=1240.0, prefill_last_age_s=34.0,
+            prefill_tok_s_avg=3013.3, gen_tok_s_avg=104.4, ttft_s_avg=8.62,
+        ),
+        "prefilling, nothing decoded yet": _payload(
+            prefill_tok_s=1240.0, gen_reason=metrics.IDLE, ttft_reason=metrics.IDLE,
+            gen_tok_s_last=249.0, gen_last_age_s=6.0,
+            prefill_tok_s_avg=3013.3, gen_tok_s_avg=104.4, ttft_s_avg=8.62,
+        ),
+        "completely idle": _payload(
+            prefill_reason=metrics.IDLE, gen_reason=metrics.IDLE,
+            ttft_reason=metrics.IDLE,
+            prefill_tok_s_avg=3013.3, gen_tok_s_avg=104.4, ttft_s_avg=8.62,
+        ),
+        "backend gone": metrics.unreachable_snapshot(),
+    }
+    for name, payload in states.items():
+        dom = _render(payload, _SERVING)
+        for cell in _CELLS:
+            assert dom[cell]["text"].strip(), f"{name}: {cell} rendered empty"
+            assert dom[cell + "S"]["text"].strip(), f"{name}: {cell} has no state line"
+            assert dom[cell + "L"]["text"].strip(), f"{name}: {cell} has no lifetime line"
+        # The three cells are three different questions; two of them showing
+        # the same string means one has been substituted for another.
+        shown = [dom[c]["text"] for c in _CELLS if dom[c]["text"] not in ("idle", "n/a")]
+        assert len(set(shown)) == len(shown), f"{name}: a figure was duplicated: {shown}"
+
+
+def test_an_idle_figure_shows_its_last_value_and_an_age_not_a_blank() -> None:
+    """"Show it as idle or stale with its last value and an age, never blank
+    and never silently replaced by the other.\""""
+    dom = _render(
+        _payload(
+            gen_tok_s=249.0,
+            prefill_reason=metrics.IDLE,
+            prefill_tok_s_last=1240.0,
+            prefill_last_age_s=34.0,
+            prefill_tok_s_avg=3013.3,
+        ),
+        _SERVING,
+    )
+    assert dom["thPrefill"]["text"] == "idle"
+    note = dom["thPrefillS"]["text"]
+    assert "1,240 tok/s" in note, f"the last reading is missing: {note}"
+    assert "34 s ago" in note, f"the age is missing: {note}"
+    # ...and the decode cell is untouched by any of it.
+    assert dom["thDecode"]["text"] == "249.0 tok/s"
+
+
+def test_an_idle_figure_is_never_filled_in_with_the_lifetime_average() -> None:
+    """The substitution that made the panel unreadable: a lifetime average,
+    same font, same slot, marked only with a "~". On this recording the two
+    differ by 12x for prefill and 2.4x for decode."""
+    dom = _render(
+        _payload(
+            prefill_reason=metrics.IDLE, gen_reason=metrics.IDLE,
+            prefill_tok_s_avg=3013.3, gen_tok_s_avg=104.4,
+        ),
+        _SERVING,
+    )
+    assert dom["thPrefill"]["text"] == "idle"
+    assert dom["thDecode"]["text"] == "idle"
+    assert "3,013" not in dom["thPrefill"]["text"]
+    assert "104" not in dom["thDecode"]["text"]
+    # The lifetime figures are still on screen -- on their own line, naming
+    # their own denominator, which is what makes them readable at all.
+    assert "3,013 tok/s" in dom["thPrefillL"]["text"]
+    assert "per second of prefill time" in dom["thPrefillL"]["text"]
+    assert "104.4 tok/s" in dom["thDecodeL"]["text"]
+    assert "per second of decode time" in dom["thDecodeL"]["text"]
+
+
+def test_every_rendered_throughput_number_carries_its_unit() -> None:
+    """"a lone number appears with no unit". Any figure on the strip is either
+    a word ("idle"/"n/a") or a number with a unit attached to it."""
+    dom = _render(
+        _payload(
+            prefill_tok_s=1240.0, gen_tok_s=249.0, ttft_s=1.85,
+            prefill_tok_s_avg=3013.3, gen_tok_s_avg=104.4, ttft_s_avg=8.62,
+        ),
+        _SERVING,
+    )
+    for cell, unit in (("thPrefill", "tok/s"), ("thDecode", "tok/s"), ("thTtft", "s")):
+        text = dom[cell]["text"]
+        assert text.split()[-1].strip(), text
+        assert not text.replace(",", "").replace(".", "").strip().isdigit(), (
+            f"{cell} rendered a bare number with no unit: {text!r}"
+        )
+        assert unit in text, f"{cell} is missing its unit: {text!r}"
+
+
+def test_ttft_is_labelled_as_a_mean_and_never_as_a_percentile() -> None:
+    """It is delta(_sum)/delta(_count) -- a mean, not p50 and not p95. A
+    percentile label on a mean is a bigger lie than no label."""
+    dom = _render(_payload(ttft_s=1.85, ttft_s_avg=8.62, ttft_requests=1728), _SERVING)
+    assert "mean" in INDEX_HTML.lower()
+    life = dom["thTtftL"]["text"]
+    assert "mean" in life, life
+    assert "over 1,728 requests" in life, f"the sample size is missing: {life}"
+    for word in ("p50", "p95", "p99", "percentile", "median"):
+        assert word not in life.lower(), f"TTFT is a mean, not {word}: {life}"
+        assert word not in INDEX_HTML.lower()
+
+
+def test_the_serving_line_labels_every_figure_before_its_number() -> None:
+    """"the text is confusing due to formatting". The line read
+    "249.0 tok/s gen": you meet the number before the word that says what it
+    measures, and an absent figure collapsed to a bare em dash with no unit,
+    beside a neighbour that still had a number."""
+    dom = _render(
+        _payload(prefill_tok_s=1240.0, gen_tok_s=249.0, ttft_s=1.85), _SERVING
+    )
+    line = dom["sMeta"]["text"]
+    for label in ("prefill", "decode", "time to first token"):
+        assert label in line, f"{label!r} missing from the serving line: {line}"
+        # label first, number after
+        after = line.split(label, 1)[1].lstrip()
+        assert after and (after[0].isdigit() or after.startswith(("idle", "n/a"))), (
+            f"{label!r} is not followed by its figure: {line}"
+        )
+    assert "—" not in line, f"an em dash is not a reading: {line}"
+
+
+def test_the_serving_line_says_idle_rather_than_dropping_a_figure() -> None:
+    """The state the owner was looking at: decoding, nothing prefilling. Both
+    words stay on the line, and the one with no reading says why."""
+    dom = _render(
+        _payload(gen_tok_s=249.0, prefill_reason=metrics.IDLE,
+                 ttft_reason=metrics.IDLE),
+        _SERVING,
+    )
+    line = dom["sMeta"]["text"]
+    assert "prefill idle" in line, line
+    assert "decode 249.0 tok/s" in line, line
+
+
+def test_the_serving_line_breaks_only_between_labelled_segments() -> None:
+    """A number and its label must not be able to wrap apart. The line is
+    built as one element per figure; CSS makes each of them nowrap."""
+    dom = _render(
+        _payload(prefill_tok_s=1240.0, gen_tok_s=249.0, ttft_s=1.85), _SERVING
+    )
+    assert "createElement" in _serving_line(), (
+        "the serving line must be built as elements, not as one text node that "
+        "wraps wherever it happens to fit"
+    )
+    css = (_app.WEB / "style.css").read_text()
+    assert ".smeta .seg{white-space:nowrap}" in css.replace("\n", "")
+    assert 'class="status-meta smeta mono"' in INDEX_HTML
+    # every segment is one nowrap element, so nothing renders as a lone number
+    assert dom["sMeta"]["text"].count("·") >= 4
+
+
+def test_the_strip_never_wraps_a_figure_away_from_its_unit() -> None:
+    css = (_app.WEB / "style.css").read_text()
+    block = css[css.index(".tcell .n{") : css.index(".tcell .n.na")]
+    assert "white-space:nowrap" in block, (
+        f"a 20px figure in a 1/3-width cell will wrap between number and unit: {block}"
+    )
+
+
+def test_the_page_switches_on_reason_codes_not_on_english_prose() -> None:
+    """Matching on the reason SENTENCE means rewording one string in Python
+    silently changes what the dashboard renders."""
+    codes = set(metrics.REASON_CODE.values())
+    for body in (_fn_body("windowFigure"), _fn_body("segFigure")):
+        for literal in re.findall(r'"([a-z_]{3,})"', body):
+            if literal in ("idle", "n/a", "number", "no reading"):
+                continue
+            assert literal in codes, (
+                f"{literal!r} is neither a reason code nor a rendered word: {body}"
+            )
+    # The prose may be DISPLAYED (the strip prints the backend's reason
+    # verbatim); it must never be compared against.
+    for reason in metrics.REASON_CODE:
+        for op in ('=== "', '== "', 'indexOf("'):
+            assert op + reason not in APP_JS, (
+                f"the page matches on the prose {reason!r}; use its code instead"
+            )
+
+
+def test_the_js_engine_that_runs_these_tests_is_a_declared_dev_dependency() -> None:
+    """Otherwise the rendering tests silently skip on a clean checkout and the
+    only coverage of what the page draws is the substring tests above."""
+    pyproject = (_app.WEB.parent.parent / "pyproject.toml").read_text()
+    assert "dukpy" in pyproject, "add dukpy to the dev extra"
+
+
+def test_app_js_parses_in_a_real_js_engine() -> None:
+    """Stronger than the bracket-balance scanner above, which is a heuristic
+    written because "there is no JavaScript engine installed anywhere on this
+    box". There is one now, and a single unbalanced brace white-screens the
+    whole dashboard, so parse the file for real.
+
+    Wrapped in a function body so that parsing does not RUN it: app.js ends by
+    calling init(), which opens an EventSource.
+    """
+    dukpy = pytest.importorskip("dukpy")
+    dukpy.evaljs("function __parse_only() {\n" + APP_JS + "\n}\n1;")

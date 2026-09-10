@@ -340,7 +340,28 @@ canvas{display:block;width:100%;height:42px;margin-top:9px}
 .tcell{padding:11px 15px;border-right:1px solid var(--line)}
 .tcell:last-child{border-right:none}
 @media(max-width:640px){.tcell{border-right:none;border-bottom:1px solid var(--line)}}
-.tcell .n{font-size:20px;font-weight:600;letter-spacing:-.02em;margin-top:2px}
-.tcell .n.na{color:var(--muted);font-weight:500}
+/* white-space:nowrap on every line that pairs a number with its unit or its
+   label. Without it "249.0 tok/s" wraps between the number and the unit at a
+   narrow width, and the strip's own grid guarantees narrow widths -- a lone
+   "249.0" on one line with "tok/s" on the next is the formatting the owner
+   called confusing. The cell scrolls rather than breaking the pair. */
+.tcell .n{
+  font-size:20px;font-weight:600;letter-spacing:-.02em;margin-top:2px;
+  white-space:nowrap;overflow-x:auto
+}
+.tcell .n.na{color:var(--muted);font-weight:500;font-size:15px}
 .tcell .s{font-size:11px;color:var(--muted);margin-top:2px}
+/* The lifetime companion. Always present, always visibly subordinate to the
+   window figure above it, never promoted into it. */
+.tcell .l{
+  font-size:11px;color:var(--muted);margin-top:5px;padding-top:5px;
+  border-top:1px dotted var(--line)
+}
 .lk .tu{text-transform:none;letter-spacing:0;font-weight:400;opacity:.75}
+/* One segment of the serving line ("prefill 1,240 tok/s"). Each is atomic:
+   the line wraps BETWEEN segments and never inside one, so a number can never
+   end up on a different line from the word that says which number it is. */
+.smeta{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 9px}
+.smeta .seg{white-space:nowrap}
+.smeta .seg b{font-weight:600;color:var(--ink-2)}
+.smeta .sep{color:var(--line)}

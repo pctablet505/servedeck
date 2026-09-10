@@ -55,7 +55,7 @@
           <span class="pill" id="pill"><span class="d"></span><span id="pillTxt">Serving</span></span>
           <div>
             <div class="status-model" id="sModel">—</div>
-            <div class="status-meta mono" id="sMeta">connecting…</div>
+            <div class="status-meta smeta mono" id="sMeta">connecting…</div>
           </div>
           <span class="queued mono" id="queued"><span id="qN">—</span> agents holding</span>
         </div>
@@ -232,24 +232,37 @@
 
     <!-- Prefill, decode and TTFT are three different questions and one number
          cannot answer them: a 17 s time-to-first-token and a slow decode look
-         identical when only one figure is on screen. All three are always
-         rendered, always labelled, and a figure that is not available says
-         "n/a" plus the reason it is not. -->
+         identical when only one figure is on screen.
+
+         Every cell has the SAME three lines at all times, and no line is ever
+         empty or borrowed by another cell:
+           .n  the current window reading, or "idle" when nothing ran
+           .s  what that line is (window, or the last value and its age)
+           .l  the lifetime companion, which never decays and never moves up
+               into .n -- the two are different quantities (the window figure
+               is aggregate, per second of WALL clock; the lifetime figure is
+               per second of PREFILL/DECODE time) and the panel used to swap
+               one for the other marked only by a "~".
+         Units are on the label AND on the number, so a figure read on its own
+         still carries one. -->
     <div class="thru" id="thru">
       <div class="tcell">
-        <div class="lk">Prefill <span class="tu">prompt tok/s</span></div>
+        <div class="lk">Prefill <span class="tu">prompt tokens/second</span></div>
         <div class="n mono" id="thPrefill">n/a</div>
         <div class="s" id="thPrefillS">connecting…</div>
+        <div class="l" id="thPrefillL">lifetime —</div>
       </div>
       <div class="tcell">
-        <div class="lk">Decode <span class="tu">generated tok/s</span></div>
+        <div class="lk">Decode <span class="tu">generated tokens/second</span></div>
         <div class="n mono" id="thDecode">n/a</div>
         <div class="s" id="thDecodeS">connecting…</div>
+        <div class="l" id="thDecodeL">lifetime —</div>
       </div>
       <div class="tcell">
-        <div class="lk">TTFT <span class="tu">time to first token</span></div>
+        <div class="lk" title="from vllm:time_to_first_token_seconds, which is measured from request ARRIVAL — a request queued behind others carries that wait in its TTFT">Time to first token <span class="tu">seconds, mean · includes queue wait</span></div>
         <div class="n mono" id="thTtft">n/a</div>
         <div class="s" id="thTtftS">connecting…</div>
+        <div class="l" id="thTtftL">lifetime —</div>
       </div>
     </div>
 
