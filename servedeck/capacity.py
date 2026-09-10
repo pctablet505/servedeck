@@ -420,8 +420,8 @@ def compute(
                         level="warn",
                         title="Thin VRAM margin",
                         detail=(
-                            f"free {free_mib} MiB leaves under "
-                            f"{VRAM_GUARD_HEADROOM_MIB} MiB above the {need_mib} MiB budget. "
+                            f"free {free_mib:,} MiB leaves under "
+                            f"{VRAM_GUARD_HEADROOM_MIB:,} MiB above the {need_mib:,} MiB budget. "
                             "It should start, but fragmentation could cause an OOM mid-session."
                         ),
                         fix="Lower utilization slightly for more headroom.",
@@ -434,10 +434,10 @@ def compute(
                         level="block",
                         title="Not enough free VRAM",
                         detail=(
-                            f"free {free_mib} MiB (total {total_mib}, used "
-                            f"{live.used_mib}, our own {own_mib} discounted) < "
-                            f"need {need_mib} MiB = {want_mib} at util {util:.2f} "
-                            f"+ {VRAM_GUARD_HEADROOM_MIB} headroom."
+                            f"free {free_mib:,} MiB (total {total_mib:,}, used "
+                            f"{live.used_mib:,}, our own {own_mib:,} discounted) < "
+                            f"need {need_mib:,} MiB = {want_mib:,} at util {util:.2f} "
+                            f"+ {VRAM_GUARD_HEADROOM_MIB:,} headroom."
                         ),
                         fix="Lower util, or stop a holder, then try again.",
                     )

@@ -375,13 +375,13 @@ def test_not_enough_free_vram_blocks_same_arithmetic_as_qwen_server_run():
     f = _code(r.findings, "NOT_ENOUGH_FREE_VRAM")
     assert f is not None
     assert f.level == "block"
-    assert "7887" in f.detail  # free_mib
+    assert "7,887" in f.detail  # free_mib, grouped like every other figure on the page
     # need_mib is the utilization budget itself (48943), NOT budget + headroom.
     # Adding the 4096 MiB fragmentation margin on top of a fraction-of-total
     # budget makes the check unsatisfiable for any util >= 0.958 -- see
     # test_high_util_is_not_impossible below. The margin is reported separately
     # as the THIN_VRAM_MARGIN warning.
-    assert "48943" in f.detail  # need_mib = int(97887 * 0.50)
+    assert "48,943" in f.detail  # need_mib = int(97887 * 0.50)
     assert r.can_apply is False
 
 
