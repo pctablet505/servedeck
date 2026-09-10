@@ -86,6 +86,12 @@ MONITOR_POLL_S = 1.0
 DEATH_RECORD_TIMEOUT_S = 15.0
 STOP_RESULT_GRACE_S = 3.0
 
+#: How long restart() waits for the previous engine to actually exit before
+#: launching its replacement. procctl.stop()'s own budget is 60 s of SIGTERM
+#: plus a SIGKILL wait, so anything shorter would routinely give up on a
+#: process that was about to die.
+STOP_JOIN_TIMEOUT_S = 90.0
+
 _DESIRED_VERSION = 1
 
 
@@ -554,6 +560,40 @@ def shell_extra_args(backend: str | None) -> str:
     return (cfg.get("EXTRA_ARGS") or "").strip()
 
 
+def _reject_settings(
+    *, util: float | None, max_model_len: int | None, max_num_seqs: int | None
+) -> str | None:
+    """The reason these settings cannot be started, or None.
+
+    Deliberately only the values whose ranges are FACTS rather than opinions:
+    ``--gpu-memory-utilization`` is a fraction of one card, and a context
+    length or a sequence count below 1 is not a configuration. Anything that
+    merely looks large (ctx 999,999,999) is left to the engine, which refuses
+    it safely and legibly; guessing a ceiling here would refuse launches that
+    would have worked.
+    """
+    if util is not None:
+        try:
+            u = float(util)
+        except (TypeError, ValueError):
+            return f"util must be a number in (0, 1], got {util!r}"
+        if not (0 < u <= 1):
+            return (
+                f"util must be a fraction of the GPU in (0, 1], got {util}. "
+                "(0.47 means 47% of the card, not 47.)"
+            )
+    for name, value in (("ctx (max_model_len)", max_model_len), ("max_num_seqs", max_num_seqs)):
+        if value is None:
+            continue
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            return f"{name} must be a positive integer, got {value!r}"
+        if n < 1:
+            return f"{name} must be a positive integer, got {value}"
+    return None
+
+
 def _default_log_paths(
     backend: str | None, *, boot_log_dir: Path | None = None
 ) -> list[Path]:
@@ -629,6 +669,9 @@ class Supervisor:
         self._stopping_deliberately = False
         self._last_stop_result: procctl.StopResult | None = None
         self._unmanaged_pid: int | None = None
+        #: The in-flight ``_run_stop_signal`` task, so restart() can wait for
+        #: the process to actually be GONE before launching its replacement.
+        self._stop_task: "asyncio.Task[None] | None" = None
 
     # ----------------------------------------------------------------- #
     # Startup reconciliation — SPEC.md §6, all five cases
@@ -753,6 +796,38 @@ class Supervisor:
             )
             return
 
+        # Every value is checked BEFORE anything is persisted or written.
+        # util=5.0 used to be accepted here, persisted into desired.json, and
+        # written into .config key by key until shellconfig.set_util() raised
+        # ValueError half way through -- leaving .config describing a
+        # configuration nobody asked for and the supervisor stuck in
+        # PREFLIGHT, which disables every control on the page.
+        rejected = _reject_settings(util=util, max_model_len=max_model_len, max_num_seqs=max_num_seqs)
+        if rejected is not None:
+            self.actual_state = "FAILED"
+            self.last_error = rejected
+            return
+
+        self.actual_state = "PREFLIGHT"
+        checks = preflight.run_preflight(
+            backend=backend, actual_state=self.actual_state, port=port
+        )
+        failures = preflight.blocking_failures(checks)
+        if failures:
+            self.actual_state = "FAILED"
+            self.last_error = "; ".join(f"{c.id}: {c.detail}" for c in failures)
+            self._record_boot_failure_before_launch(
+                reason="preflight_blocked", repo_id=repo_id, backend=backend
+            )
+            return
+
+        # Intent is persisted only once the start is going ahead. Writing it
+        # first meant a start that PREFLIGHT refused still published its port:
+        # updetect ranks desired.json's port, found the unrelated listener the
+        # preflight had just refused (:8000, ats-optimizer, pid 2922), followed
+        # it, labelled it with this backend's name, reported its 29 h uptime as
+        # the model server's -- and app.py's catch_all proxied every /v1
+        # request into it.
         d = self.desired
         d.desired_state = "RUNNING"
         d.repo_id, d.backend, d.served_name, d.port = repo_id, backend, served_name, port
@@ -763,20 +838,26 @@ class Supervisor:
         save_desired(d, self.state_dir)
         self._write_flat_desired_state_file()
 
-        self.actual_state = "PREFLIGHT"
-        checks = preflight.run_preflight(
-            backend=backend, actual_state=self.actual_state, port=port
-        )
-        failures = preflight.blocking_failures(checks)
-        if failures:
-            self.actual_state = "FAILED"
-            self.last_error = "; ".join(f"{c.id}: {c.detail}" for c in failures)
-            self._record_boot_failure_before_launch(reason="preflight_blocked")
-            return
+        # Read EXTRA_ARGS BEFORE _sync_shell_config() rewrites BACKEND.
+        # shell_extra_args() refuses to hand one backend's flags to another by
+        # comparing .config's BACKEND against the backend being started -- and
+        # _sync_shell_config() writes the NEW backend into that very key one
+        # step earlier, so the guard was comparing the new backend against
+        # itself and always passed. On 2026-09-10 that put Flash-Next's
+        # `--prefix-match-unit 208` on the 27B's launcher and killed the engine
+        # 205 s into the boot. The value that matters is the file's state
+        # before we touched it.
+        extra_args = shell_extra_args(backend)
 
         try:
             self._sync_shell_config(repo_id=repo_id, backend=backend, served_name=served_name, port=port, util=util, max_model_len=max_model_len, max_num_seqs=max_num_seqs)
-        except (shellconfig.ShellConfigError, shellconfig.ServerRunningError) as exc:
+        except (shellconfig.ShellConfigError, shellconfig.ServerRunningError, ValueError, OSError) as exc:
+            # ValueError/OSError included deliberately: shellconfig's own
+            # validators raise ValueError, and an uncaught one left
+            # actual_state at "PREFLIGHT" -- a state start()'s idempotence
+            # guard returns early on, so every later start silently did
+            # nothing and only Stop (disabled by that same state in the UI)
+            # could clear it.
             self.actual_state = "FAILED"
             self.last_error = f"failed to write local_llm/.config: {exc}"
             self._record_boot_failure_before_launch(reason="config_write_failed")
@@ -795,6 +876,7 @@ class Supervisor:
             backend=backend, repo_id=repo_id, served_name=served_name or repo_id,
             port=port, util=util,
             max_model_len=max_model_len, max_num_seqs=max_num_seqs,
+            extra_args=extra_args,
         )
         try:
             handle = self._launch_fn(argv, env, cwd, log_paths[0])
@@ -820,7 +902,25 @@ class Supervisor:
         self._cancel_pending_restart()
 
         if self._handle is None:
+            # No handle does NOT mean nothing is running. A superseded
+            # handle's _on_exit() used to clear the current one, and a server
+            # started outside Servedeck never had one -- in both cases this
+            # branch reported "STOPPED", i.e. the GPU is free, while an engine
+            # went on holding 44 GiB and answering on the port. Ask the socket
+            # table before making that claim.
+            orphan = self._listener_pid(self.desired.port)
+            if orphan is not None:
+                self._unmanaged_pid = orphan
+                self.actual_state = "UNMANAGED"
+                self.last_error = (
+                    f"stop: nothing to signal — Servedeck holds no process handle, but "
+                    f"pid {orphan} is still listening on :{self.desired.port} and still "
+                    "holds its GPU memory. Adopt it (\"Manage running server\") and stop "
+                    "it again, or kill that pid by hand."
+                )
+                return
             self.actual_state = "STOPPED"
+            self.last_error = None
             return
 
         self.actual_state = "STOPPING"
@@ -832,7 +932,41 @@ class Supervisor:
         # procctl.stop()'s own timeout) and does the actual bookkeeping via
         # _on_exit(). Awaiting it here would block every other request
         # this single-process server is handling for up to 70s.
-        asyncio.create_task(self._run_stop_signal(handle))
+        self._stop_task = asyncio.create_task(self._run_stop_signal(handle))
+
+    def _listener_pid(self, port: int | None) -> int | None:
+        """Which pid, if any, is listening on `port` right now. Never raises:
+        a socket table we cannot read must not break a stop."""
+        if not port:
+            return None
+        try:
+            return procctl.listener_pid(port)
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _await_stop_complete(self, timeout_s: float = STOP_JOIN_TIMEOUT_S) -> None:
+        """Wait for the stop signalled by stop() to finish.
+
+        `self._stop_fn` (procctl.stop) returns only once the process group is
+        actually gone -- it waits out SIGTERM and escalates to SIGKILL -- and
+        it runs in an executor, so awaiting it here blocks nothing else. This
+        is what keeps restart() from putting a second engine on the card
+        beside one that is still dying: a vLLM parent mid-boot takes tens of
+        seconds to exit, and the PORT_IN_USE preflight cannot see it because
+        vLLM binds its port only after loading weights.
+        """
+        task = self._stop_task
+        if task is None:
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            self.last_error = (
+                f"stop did not complete within {timeout_s:.0f}s; starting anyway — "
+                "if the port is still held the preflight will refuse"
+            )
+        except Exception:  # noqa: BLE001 - a failed stop is reported by stop() itself
+            pass
 
     async def _run_stop_signal(self, handle: procctl.ServerHandle) -> None:
         loop = asyncio.get_running_loop()
@@ -852,6 +986,10 @@ class Supervisor:
             await self._drain(d.port)
 
         await self.stop()
+        # Wait for the old process to be GONE, not merely signalled. Without
+        # this, restart-during-boot ran two vLLM engines on the same card at
+        # once (2026-09-10 23:16, pids 3780019 + 3783809).
+        await self._await_stop_complete()
         # stop() leaves actual_state == "STOPPING", and start()'s idempotence
         # guard returns early on any non-STOPPED state -- so without settling
         # to STOPPED here, restart() silently degrades into a plain stop
@@ -955,6 +1093,7 @@ class Supervisor:
     def _build_launch(
         self, *, backend: str, repo_id: str, served_name: str, port: int,
         util: float | None, max_model_len: int | None, max_num_seqs: int | None,
+        extra_args: str | None = None,
     ) -> tuple[list[str], dict[str, str], str, list[str]]:
         """Returns (argv, env, cwd, log_paths). `log_paths[0]` is what gets
         passed to launch_fn() as the process's own stdout/stderr sink;
@@ -988,7 +1127,11 @@ class Supervisor:
             "max_num_seqs": str(max_num_seqs or ""),
             "served_name": served_name,
             "kv_dtype": "auto",
-            "extra_args": shell_extra_args(backend),
+            # Passed in by start(), which reads it before .config is
+            # rewritten; recomputed here only for callers that do not (tests,
+            # and any future caller that builds a command line without a
+            # config sync in front of it).
+            "extra_args": shell_extra_args(backend) if extra_args is None else extra_args,
         }
         env = {
             var: settings[key]
@@ -1120,6 +1263,14 @@ class Supervisor:
     # ----------------------------------------------------------------- #
 
     async def _on_exit(self, handle: procctl.ServerHandle, *, reaped_status: int | None) -> None:
+        # A monitor belonging to a SUPERSEDED run must never write over the
+        # current one. restart() (and any start after a boot that was killed
+        # mid-flight) installs a new handle while the old process is still
+        # dying; its exit then arrived here and cleared self._handle, which
+        # orphaned the live engine -- Stop became inert, and /api/state
+        # reported FAILED, then STOPPED, while 44 GiB stayed allocated.
+        if self._handle is not None and self._handle is not handle:
+            return
         reached_ready = bool(self._tracker and self._tracker.reached_ready)
         now = self._clock()
         deliberate = self._stopping_deliberately
@@ -1259,7 +1410,9 @@ class Supervisor:
             return msg
         return "boot never reached READY (no specific error line matched)."
 
-    def _record_boot_failure_before_launch(self, *, reason: str) -> None:
+    def _record_boot_failure_before_launch(
+        self, *, reason: str, repo_id: str | None = None, backend: str | None = None
+    ) -> None:
         """A preflight/config-write/launch-exec failure — never even got a
         PID, so there is nothing to death-watch, but it is still a boot
         attempt that belongs in history (SPEC.md §4: "written ... after a
@@ -1267,8 +1420,11 @@ class Supervisor:
         principle that a failed attempt is itself data, not noise)."""
         now = self._clock()
         record = {
-            "repo_id": self.desired.repo_id,
-            "backend": self.desired.backend,
+            # Explicit, because a preflight failure is now recorded BEFORE the
+            # attempt is persisted into desired -- reading it back off desired
+            # would file the attempt under the PREVIOUS model.
+            "repo_id": repo_id if repo_id is not None else self.desired.repo_id,
+            "backend": backend if backend is not None else self.desired.backend,
             "started_at": _iso(now),
             "reached_ready": False,
             "cold": False,

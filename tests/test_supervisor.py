@@ -177,3 +177,238 @@ def test_adopted_server_monitor_notices_the_process_exiting(tmp_path: Path, monk
         "report the exit; instead it crashed on tick 1 and the UI sat on a "
         "stale READY forever"
     )
+
+
+# --------------------------------------------------------------------------
+# Phase-1 sweep regressions (2026-09-10, driven against the live 27B)
+# --------------------------------------------------------------------------
+def _launch_recorder(s: supervisor.Supervisor) -> list[tuple[list, dict]]:
+    """Replace the fake launcher with one that records env as well as argv."""
+    seen: list[tuple[list, dict]] = []
+
+    def rec(argv, env, cwd, log_path):
+        seen.append((list(argv), dict(env)))
+        return procctl.ServerHandle(
+            pid=9000 + len(seen), pgid=9000 + len(seen), argv=list(argv),
+            cwd="/tmp", log_path="/tmp/fake.log", started_at=0.0,
+        )
+
+    s._launch_fn = rec  # type: ignore[assignment]
+    return seen
+
+
+def test_extra_args_are_read_before_servedeck_rewrites_backend(tmp_path, monkeypatch) -> None:
+    """F1 (BLOCKER): the 27B was launched with Flash-Next's EXTRA_ARGS.
+
+    ``shell_extra_args()`` refuses to hand one backend's flags to another by
+    comparing ``.config``'s BACKEND against the backend being started. But
+    ``start()`` calls ``_sync_shell_config()`` -- which WRITES the new
+    BACKEND into ``.config`` -- before ``_build_launch()`` reads it, so the
+    guard compared the new backend against itself and always passed.
+
+    Observed 2026-09-10 22:54: the inline (27B) launcher received Flash-Next's
+    ``--prefix-match-unit 208`` and the engine died 205 s in with
+    "Invalid prefix_match_unit=208".
+    """
+    from servedeck import shellconfig
+
+    s, _ = _fake_supervisor(tmp_path, monkeypatch)
+    launches = _launch_recorder(s)
+
+    # .config as shipped: it describes Flash-Next, and carries Flash-Next's flags.
+    cfg = {"BACKEND": "flashnext", "EXTRA_ARGS": "--prefix-match-unit 208"}
+    monkeypatch.setattr(shellconfig, "read_config", lambda: dict(cfg))
+
+    # The real _sync_shell_config writes BACKEND first; model that exactly.
+    def sync(self, **kw):  # noqa: ANN001
+        cfg["BACKEND"] = kw["backend"]
+
+    s._sync_shell_config = types.MethodType(sync, s)  # type: ignore[assignment]
+
+    asyncio.run(s.start(**{**_CFG, "backend": "inline", "port": 8004,
+                           "repo_id": "RadixArk/Qwen3.8-27B-NVFP4",
+                           "served_name": "Qwen3.8-27B-NVFP4"}))
+
+    assert launches, "the start should have launched something"
+    env = launches[0][1]
+    assert "208" not in env.get("EXTRA_ARGS", ""), (
+        "the inline backend was handed Flash-Next's EXTRA_ARGS "
+        f"({env.get('EXTRA_ARGS')!r}) -- servedeck rewrote .config's BACKEND "
+        "one step before the guard that reads it"
+    )
+
+
+def test_restart_waits_for_the_old_engine_to_exit(tmp_path, monkeypatch) -> None:
+    """F4(a) GPU SAFETY: restart-during-boot ran two vLLM engines at once.
+
+    ``stop()`` deliberately does not await the SIGTERM; ``restart()`` then
+    slept 0.2 s and started the next engine. A vLLM parent mid-boot takes tens
+    of seconds to die, and PORT_IN_USE cannot catch it because vLLM binds its
+    port only after loading weights. Observed 2026-09-10 23:16:48: pids
+    3780019 and 3783809 both loading weights on the same card for ~60 s.
+    """
+    import time as _time
+
+    s, launches = _fake_supervisor(tmp_path, monkeypatch)
+
+    def slow_stop(h, **kw):  # noqa: ANN001 - the real one waits for the pgid to die
+        _time.sleep(0.5)
+        return procctl.StopResult(True, "sigterm", 0.5, "exited after SIGTERM")
+
+    s._stop_fn = slow_stop  # type: ignore[assignment]
+
+    async def scenario() -> int:
+        await s.start(**_CFG)
+        s.actual_state = "READY"
+        task = asyncio.create_task(s.restart(mode="immediate"))
+        await asyncio.sleep(0.3)      # the old process is still dying here
+        mid = len(launches)
+        await task
+        return mid
+
+    mid = asyncio.run(scenario())
+    assert len(launches) == 2, "restart must still relaunch"
+    assert mid == 1, (
+        f"a second engine was launched while the first was still being "
+        f"stopped ({mid} launches 0.3 s into a 0.5 s stop)"
+    )
+
+
+def test_a_stale_handles_exit_does_not_orphan_the_running_engine(tmp_path, monkeypatch) -> None:
+    """F4(b) GPU SAFETY: _on_exit() cleared _handle unconditionally.
+
+    The previous boot's monitor fires AFTER start() has installed the new
+    handle, so the live process was orphaned: /api/state reported FAILED (and
+    later STOPPED) while a 44 GiB engine went on serving on :8004, and Stop
+    was inert because stop() took its ``self._handle is None`` branch.
+    """
+    s, _ = _fake_supervisor(tmp_path, monkeypatch)
+
+    async def scenario():
+        await s.start(**_CFG)
+        old = s._handle
+        s.actual_state = "STOPPED"        # pretend the first boot settled
+        await s.start(**_CFG)
+        new = s._handle
+        assert old is not None and new is not None and old is not new
+        await s._on_exit(old, reaped_status=0)   # the OLD process finally dies
+        return new
+
+    new = asyncio.run(scenario())
+
+    assert s._handle is new, (
+        "the exit of a superseded handle cleared the handle of the engine "
+        "that is actually running — Stop then signals nothing"
+    )
+    assert s.actual_state == "STARTING", (
+        f"actual_state was overwritten to {s.actual_state!r} by an exit that "
+        "belongs to a previous run"
+    )
+
+
+def test_stop_does_not_claim_stopped_while_a_listener_holds_the_port(tmp_path, monkeypatch) -> None:
+    """F4(b), second half: Stop reported the GPU released while it was not.
+
+    With no handle installed, stop() set actual_state=STOPPED and signalled
+    nothing — while pid 3783809 kept listening on :8004 and holding 44,472
+    MiB, and the SAME /api/state payload reported upstream.up=true.
+    """
+    s, _ = _fake_supervisor(tmp_path, monkeypatch)
+    s.desired.port = 8004
+    monkeypatch.setattr(procctl, "listener_pid", lambda port: 3783809 if port == 8004 else None)
+
+    asyncio.run(s.stop())
+
+    assert s.actual_state != "STOPPED", (
+        "stop() reported STOPPED with a listener still on the port it was "
+        "asked to free"
+    )
+    assert "3783809" in (s.last_error or ""), (
+        f"the operator is not told what is still holding the port: {s.last_error!r}"
+    )
+
+
+def test_a_refused_start_never_persists_the_port_it_was_refused(tmp_path, monkeypatch) -> None:
+    """F5 SEVERE: a start refused by preflight still published its intent.
+
+    start() wrote desired.json (port + desired_state RUNNING) BEFORE running
+    preflight. updetect ranks desired.json's port, found ats-optimizer's
+    listener on the refused :8000 and followed it: /api/state reported
+    upstream http://localhost:8000, backend "inline", pid 2922 and
+    server_uptime_s 105114 — 29 h of an unrelated service displayed as the
+    model server — and app.py's catch_all proxied every /v1 request there.
+    """
+    s, launches = _fake_supervisor(tmp_path, monkeypatch)
+    blocked = preflight.PreflightCheck(
+        "PORT_IN_USE", False, "block", "port already in use",
+        "pid 2922 is already listening on :8000.", None,
+    )
+    monkeypatch.setattr(preflight, "run_preflight", lambda **kw: [blocked])
+    monkeypatch.setattr(preflight, "blocking_failures", lambda checks: [blocked])
+
+    asyncio.run(s.start(**{**_CFG, "port": 8000}))
+
+    assert not launches
+    assert s.actual_state == "FAILED"
+    assert s.desired.port != 8000, (
+        "the refused port was written into the supervisor's desired state, "
+        "and updetect follows it straight to the unrelated listener"
+    )
+    on_disk = supervisor.load_desired(tmp_path)
+    assert on_disk.port != 8000, f"state/desired.json persisted the refused port: {on_disk.port}"
+    assert on_disk.desired_state != "RUNNING", (
+        "a start that never launched must not leave intent RUNNING"
+    )
+
+
+def test_an_out_of_range_util_is_refused_before_anything_is_written(tmp_path, monkeypatch) -> None:
+    """F6 SEVERE: util 5.0 was accepted, half-written, and wedged PREFLIGHT.
+
+    _sync_shell_config() wrote BACKEND/MODEL_REPO/SERVED_NAME/PORT/
+    MAX_MODEL_LEN/MAX_NUM_SEQS and only THEN did shellconfig.set_util() raise
+    ValueError — which start() does not catch — so .config was left describing
+    a configuration nobody asked for and actual_state stayed "PREFLIGHT"
+    forever. PREFLIGHT is in the UI's BUSY_PHASES, so Apply and Stop were both
+    disabled: the page had no control left.
+    """
+    s, launches = _fake_supervisor(tmp_path, monkeypatch)
+    writes: list = []
+    s._sync_shell_config = types.MethodType(lambda self, **kw: writes.append(kw), s)  # type: ignore[assignment]
+
+    asyncio.run(s.start(**{**_CFG, "util": 5.0}))
+
+    assert writes == [], "an invalid configuration was written to .config anyway"
+    assert not launches
+    assert s.actual_state == "FAILED", (
+        f"actual_state left at {s.actual_state!r} — anything but a settled "
+        "state disables every control on the page"
+    )
+    assert "5.0" in (s.last_error or ""), (
+        f"the operator is not told which value was rejected: {s.last_error!r}"
+    )
+    assert s.desired.util != 5.0, "the rejected value was persisted as intent"
+
+
+def test_a_config_write_that_raises_does_not_wedge_the_supervisor(tmp_path, monkeypatch) -> None:
+    """F6, second half: the ValueError escaped start() entirely.
+
+    start() catches only ShellConfigError/ServerRunningError, so any other
+    failure inside the config write left actual_state at "PREFLIGHT" and the
+    next VALID start returned 202 and did nothing (the idempotence guard
+    returns early on PREFLIGHT).
+    """
+    s, launches = _fake_supervisor(tmp_path, monkeypatch)
+
+    def boom(self, **kw):  # noqa: ANN001
+        raise ValueError("GPU_MEM_UTIL must be a number in (0, 1], got 5.0")
+
+    s._sync_shell_config = types.MethodType(boom, s)  # type: ignore[assignment]
+    asyncio.run(s.start(**_CFG))
+
+    assert s.actual_state == "FAILED", f"wedged at {s.actual_state!r}"
+    assert "GPU_MEM_UTIL" in (s.last_error or ""), s.last_error
+
+    # ... and the supervisor still accepts the next, valid start.
+    s._sync_shell_config = types.MethodType(lambda self, **kw: None, s)  # type: ignore[assignment]
+    asyncio.run(s.start(**_CFG))
+    assert len(launches) == 1, "the supervisor was wedged: a valid start did nothing"
