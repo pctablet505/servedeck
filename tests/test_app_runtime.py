@@ -207,7 +207,7 @@ def test_running_model_id_prefers_the_flag_then_the_positional(monkeypatch) -> N
 # --------------------------------------------------------------------------
 # Starting a backend that only configuration knows about
 # --------------------------------------------------------------------------
-def test_start_accepts_any_configured_backend(config_path, tmp_path) -> None:
+def test_start_accepts_any_configured_backend(config_path, tmp_path, monkeypatch) -> None:
     """Regression: the start gate was `backend not in ("flashnext", "inline")`.
 
     That literal refused every backend added through servedeck.toml — which is
@@ -245,8 +245,12 @@ SOME_LOCAL_KNOB = "7"
         stop_fn=lambda h, **kw: procctl.StopResult(True, "term", 0.0, "faked"),
         history_path=tmp_path / "history.jsonl",
     )
-    preflight.run_preflight = lambda **kw: []           # type: ignore[assignment]
-    preflight.blocking_failures = lambda checks: []     # type: ignore[assignment]
+    # monkeypatch, not assignment: a bare rebind here leaked into every test
+    # that ran after it in the same session, so preflight was silently
+    # disabled for the rest of the suite -- including tests whose entire
+    # subject is a preflight check refusing a start.
+    monkeypatch.setattr(preflight, "run_preflight", lambda **kw: [])
+    monkeypatch.setattr(preflight, "blocking_failures", lambda checks: [])
     s._sync_shell_config = types.MethodType(lambda self, **kw: None, s)           # type: ignore[assignment]
     s._run_monitor = types.MethodType(lambda self, *a, **k: asyncio.sleep(0), s)  # type: ignore[assignment]
 
@@ -342,3 +346,369 @@ needs_tty = {str(declared_tty).lower()}
         now=1000.0,
     )
     assert (decision.code == _sup.FLASHNEXT_HUMAN_GATE_CODE) is expected_block, decision
+
+
+# --------------------------------------------------------------------------
+# Where the MEASURED KV size comes from
+# --------------------------------------------------------------------------
+def test_live_kv_size_prefers_the_running_engine_over_a_boot_log(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A boot log outlives the server that wrote it, and a hand-launched
+    server writes to no log Servedeck knows about at all. The engine publishes
+    its own resolved capacity on vllm:cache_config_info, so read it there and
+    let the log fill in only what /metrics does not carry."""
+    from servedeck import metrics
+
+    stale = tmp_path / "old.log"
+    stale.write_text(
+        "GPU KV cache size: 111,111 tokens, "
+        "Maximum concurrency for 262,144 tokens per request: 0.42x\n"
+        "Available KV cache memory: 3.21 GiB\n"
+        "Model loading took 78.47 GiB memory and 90.6 seconds\n"
+    )
+    monkeypatch.setattr(capp, "_boot_log_candidates", lambda *a, **k: (stale,))
+    monkeypatch.setattr(capp, "_running_model_id", lambda: None)
+
+    live = (Path(__file__).parent / "fixtures" / "metrics_flashnext_live.txt").read_text()
+    snap = metrics.MetricsSnapshot()
+    parsed = metrics.parse_prometheus(live)
+    labels = parsed[metrics.CACHE_CONFIG][0][0]
+    snap.reachable = True
+    snap.kv_cache_size_tokens = int(labels["kv_cache_size_tokens"])
+    snap.kv_cache_max_concurrency = float(labels["kv_cache_max_concurrency"])
+    snap.kv_cache_gpu_util = float(labels["gpu_memory_utilization"])
+    monkeypatch.setattr(capp.rt, "metrics", snap.to_dict())
+
+    facts = capp._live_boot_facts()
+    assert facts["kv_tokens"] == 290_925, "the stale log's 111,111 won"
+    assert facts["kv_source"] == "engine"
+    assert facts["kv_trust"] == "measured"
+    assert facts["util_effective"] == pytest.approx(0.95)
+    # And the log still supplies what /metrics does not carry.
+    assert facts["kv_gib"] == pytest.approx(3.21)
+    assert facts["weights_gib"] == pytest.approx(78.47)
+
+
+def test_live_kv_size_falls_back_to_the_boot_log(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An older vLLM that does not publish cache_config_info must still get
+    its measured KV size out of the log."""
+    log = tmp_path / "boot.log"
+    log.write_text("GPU KV cache size: 272,062 tokens\n")
+    monkeypatch.setattr(capp, "_boot_log_candidates", lambda *a, **k: (log,))
+    monkeypatch.setattr(capp, "_running_model_id", lambda: None)
+    monkeypatch.setattr(capp.rt, "metrics", {"reachable": True})
+
+    facts = capp._live_boot_facts()
+    assert facts["kv_tokens"] == 272_062
+    assert facts["kv_source"] == "boot log"
+
+
+# --------------------------------------------------------------------------
+# The parallelism panel's payload (_sizing_payload)
+# --------------------------------------------------------------------------
+def _window(p90: int, p99: int | None = None, n: int = 100) -> dict:
+    """A window payload of the shape reqstats.WindowStats.to_dict() emits."""
+    p99 = p99 if p99 is not None else p90
+    pc = lambda v: {"lo": v, "hi": v, "exact": True}  # noqa: E731
+    return {
+        "n": n, "capacity": 100, "exact_n": n, "age_s": 42.0,
+        "p50": pc(p90 // 2), "p90": pc(p90), "p99": pc(p99), "max": pc(p99),
+        "partial": n < 100,
+    }
+
+
+@pytest.fixture
+def _sizing(monkeypatch: pytest.MonkeyPatch):
+    """Drive _sizing_payload off a scripted metrics snapshot and cmdline."""
+    def go(metrics: dict, *, max_num_seqs: int | None = 16, model: str | None = None):
+        monkeypatch.setattr(capp.rt, "metrics", metrics, raising=False)
+        monkeypatch.setattr(capp.rt, "serving_model", model, raising=False)
+        monkeypatch.setattr(capp, "_running_max_num_seqs", lambda: max_num_seqs)
+        return capp._sizing_payload()
+    return go
+
+
+def test_sizing_refuses_to_recommend_without_a_live_backend(_sizing) -> None:
+    out = _sizing({"reachable": False})
+    assert out["recommended"] is None
+    assert out["reason"] == "backend not reachable"
+
+
+def test_sizing_refuses_to_guess_the_kv_pool(_sizing) -> None:
+    """The pool must be the RUNNING engine's kv_cache_size_tokens. Falling back
+    to the 280,813 the cost curve was calibrated on would hand a confident
+    recommendation to a server launched at a different
+    --gpu-memory-utilization, which is how you over-subscribe."""
+    out = _sizing({"reachable": True, "prompt_stats": _window(8_102)})
+    assert out["recommended"] is None
+    assert "KV pool" in out["reason"]
+
+
+def test_sizing_says_how_empty_the_window_is_rather_than_recommending(_sizing) -> None:
+    """Fewer than 100 is fine; ZERO is not a distribution. The reason names the
+    real count so the operator knows to wait rather than to distrust the GPU."""
+    from servedeck import reqstats
+
+    out = _sizing({
+        "reachable": True,
+        "kv_cache_size_tokens": 280_813,
+        "prompt_stats": dict(reqstats.EMPTY_STATS),
+    })
+    assert out["recommended"] is None
+    assert "0 of 100" in out["reason"]
+
+
+def test_sizing_reproduces_the_measured_concurrency_end_to_end(_sizing) -> None:
+    """The whole path, not just the formula: a window whose p90 is 30,116
+    tokens must come out of /api/state recommending 4 agents, which is what was
+    measured on this box."""
+    out = _sizing({
+        "reachable": True,
+        "kv_cache_size_tokens": 280_813,
+        "running": 1,
+        "preemptions": 0,
+        "prompt_stats": _window(30_116),
+    })
+    assert out["recommended"]["n"] == 4
+    assert out["recommended"]["pool_tokens"] == 280_813
+    assert "p90 of the last 100 requests" in out["recommended"]["basis"]
+
+
+def test_sizing_is_based_on_the_p90_upper_bound_not_the_mean(_sizing) -> None:
+    """A bucket-bounded p90 is an interval; sizing on its UPPER bound
+    under-recommends, which is the safe direction. Sizing on the lower bound --
+    or on the lifetime mean the panel used to show -- over-recommends."""
+    out = _sizing({
+        "reachable": True,
+        "kv_cache_size_tokens": 280_813,
+        "avg_prompt_tokens": 615,   # the old input: would have said 16
+        "running": 0,
+        "prompt_stats": {
+            **_window(30_116),
+            "p90": {"lo": 20_001, "hi": 50_000, "exact": False},
+        },
+    })
+    assert out["recommended"]["prompt_tokens"] == 50_000
+    # 280,813 / 97,969 = 2.87, x 0.94 headroom = 2. The lifetime mean of 615
+    # tokens in the same payload would have said 16.
+    assert out["recommended"]["n"] == 2
+
+
+def test_sizing_reports_what_p99_would_change_it_to(_sizing) -> None:
+    out = _sizing({
+        "reachable": True,
+        "kv_cache_size_tokens": 280_813,
+        "running": 0,
+        "prompt_stats": _window(8_102, p99=105_108),
+    })
+    assert out["recommended"]["n"] == 8
+    assert out["at_p99"]["n"] == 1
+
+
+def test_sizing_warns_when_live_concurrency_exceeds_the_recommendation(_sizing) -> None:
+    """The warning condition. Its confirming signal, num_preemptions_total,
+    travels in the same payload so the page never has to reach for it."""
+    out = _sizing({
+        "reachable": True,
+        "kv_cache_size_tokens": 280_813,
+        "running": 9,
+        "preemptions": 31,
+        "prompt_stats": _window(30_116),
+    })
+    assert out["over_subscribed"] is True
+    assert out["preemptions"] == 31
+
+
+def test_sizing_does_not_warn_at_or_below_the_recommendation(_sizing) -> None:
+    out = _sizing({
+        "reachable": True,
+        "kv_cache_size_tokens": 280_813,
+        "running": 4,
+        "preemptions": 0,
+        "prompt_stats": _window(30_116),
+    })
+    assert out["over_subscribed"] is False
+
+
+def test_sizing_clamps_to_the_running_servers_max_num_seqs(_sizing) -> None:
+    """--max-num-seqs is a hard scheduler ceiling, and it is read off the live
+    process, not off servedeck.toml: for an adopted server the two need not
+    agree."""
+    out = _sizing(
+        {
+            "reachable": True,
+            "kv_cache_size_tokens": 280_813,
+            "running": 0,
+            "prompt_stats": _window(615),
+        },
+        max_num_seqs=4,
+    )
+    assert out["recommended"]["n"] == 4
+    assert out["recommended"]["clamped"] is True
+    assert out["max_num_seqs"] == 4
+
+
+def test_sizing_names_the_model_the_cost_curve_was_calibrated_on(_sizing) -> None:
+    """A curve fitted to one hybrid model must not present itself as universal
+    when something else is serving."""
+    out = _sizing(
+        {"reachable": True, "kv_cache_size_tokens": 280_813,
+         "running": 0, "prompt_stats": _window(8_102)},
+        model="llama-3-70b",
+    )
+    assert "llama-3-70b" in out["calibration_note"]
+    assert "upper bound" in out["calibration_note"]
+
+
+def test_max_num_seqs_comes_from_the_live_command_line(monkeypatch) -> None:
+    """vLLM's /metrics does not publish max_num_seqs (cache_config_info carries
+    only cache settings), so the process's own argv is the single live source."""
+    argv = ["vllm", "serve", "m", "--max-model-len", "262144", "--max-num-seqs", "16"]
+    monkeypatch.setattr(capp, "_listener_argv", lambda: argv)
+    assert capp._running_max_num_seqs() == 16
+    monkeypatch.setattr(capp, "_listener_argv", lambda: [])
+    assert capp._running_max_num_seqs() is None, (
+        "an unreadable cmdline must not fabricate a ceiling"
+    )
+
+
+# --------------------------------------------------------------------------
+# The model scan must expire
+# --------------------------------------------------------------------------
+def _fake_entry(repo_id: str, disk_bytes: int):
+    from servedeck.registry import ModelEntry
+
+    return ModelEntry(
+        repo_id=repo_id,
+        hub_dirname="models--" + repo_id.replace("/", "--"),
+        snapshot_path="/nowhere",
+        skipped=False,
+        servable=True,
+        backend="flashnext",
+        safetensors_gib=disk_bytes / (1024**3),
+        safetensors_count=1,
+        disk_bytes=disk_bytes,
+        disk_local_bytes=disk_bytes,
+        config_exists=True,
+        architectures0="Qwen4ExpForConditionalGeneration",
+        model_type="qwen4_exp",
+        max_position_embeddings=262144,
+        num_hidden_layers=48,
+        num_key_value_heads=8,
+        head_dim=128,
+        full_attention_interval=None,
+        quant_algo="NVFP4",
+        reason=None,
+    )
+
+
+def test_the_model_scan_expires_so_a_deletion_becomes_visible(monkeypatch) -> None:
+    """The cache had no expiry at all: scanned on the first /api/models and
+    then served for the life of the process.
+
+    On 2026-09-09 a 95.37 GiB BF16 PLE table was deleted and a 47.68 GiB FP8
+    one hardlinked in while the dashboard was up. The panel went on reporting
+    the pre-deletion size for hours, which is what "the size displayed is
+    wrong" meant. A whole-hub scan is ~25 ms warm; there was nothing worth
+    pinning forever.
+    """
+    from servedeck import app as capp
+    from servedeck import registry as _reg
+
+    sizes = [95 * 1024**3]
+    monkeypatch.setattr(_reg, "discover_models", lambda *a, **k: [_fake_entry("A/B", sizes[0])])
+    monkeypatch.setattr(
+        _reg, "resolve_inputs", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no store"))
+    )
+    capp.rt._models_cache = None
+    capp.rt._models_cache_at = 0.0
+
+    first = capp._model_rows(now=1000.0)
+    assert first[0]["disk_bytes"] == 95 * 1024**3
+
+    # The table is deleted and a smaller one installed.
+    sizes[0] = 47 * 1024**3
+
+    # Within the TTL the cached answer stands -- that is the cache doing its
+    # job, not the bug.
+    assert capp._model_rows(now=1000.0 + capp.MODELS_CACHE_TTL_S / 2)[0]["disk_bytes"] == (
+        95 * 1024**3
+    )
+    # Past it, the scan is retaken.
+    fresh = capp._model_rows(now=1000.0 + capp.MODELS_CACHE_TTL_S + 0.1)
+    assert fresh[0]["disk_bytes"] == 47 * 1024**3, (
+        "the model scan never expired: a deleted 95 GiB table stayed on screen"
+    )
+    capp.rt._models_cache = None
+    capp.rt._models_cache_at = 0.0
+
+
+def test_the_disk_payload_is_statvfs_and_labels_its_unit(monkeypatch) -> None:
+    """/api/disk must be the kernel's arithmetic, not an approximation of it.
+
+    Pinned against a FIXED statvfs result rather than a live one: this box is
+    writing continuously, so a real statvfs taken a millisecond after the
+    payload disagrees by a few MiB and the test would be measuring the clock.
+    The live agreement is checked separately, with a tolerance.
+    """
+    import os
+
+    from servedeck import app as capp
+    from servedeck import disksize as _dsz
+
+    # 1 TiB filesystem, 4 KiB fragments, 200 GiB free of which 150 GiB is
+    # available to a non-root user (the rest is ext4's root reserve).
+    frag = 4096
+    fake = os.statvfs_result(
+        (
+            frag,  # f_bsize
+            frag,  # f_frsize
+            (1024**4) // frag,  # f_blocks
+            (200 * 1024**3) // frag,  # f_bfree
+            (150 * 1024**3) // frag,  # f_bavail
+            0, 0, 0, 0, 255,
+        )
+    )
+    monkeypatch.setattr(_dsz.os, "statvfs", lambda _p: fake)
+    capp.rt._models_cache = None
+    capp.rt._models_cache_at = 0.0
+
+    d = capp._disk_payload()
+
+    assert d["total_bytes"] == 1024**4
+    assert d["avail_bytes"] == 150 * 1024**3
+    assert d["used_bytes"] == 1024**4 - 200 * 1024**3
+    # df's Use%: used / (used + avail), which excludes the root reserve.
+    assert d["used_pct"] == round(100 * (1024 - 200) / (1024 - 200 + 150), 1)
+    assert d["unit"] == "bytes", "the payload must not leave its unit to be guessed"
+    # Bytes on another mount are real but are not space on this filesystem.
+    assert d["hub_bytes"] - d["hub_local_bytes"] == d["hub_foreign_bytes"]
+    assert d["hub_local_bytes"] <= d["hub_bytes"]
+    capp.rt._models_cache = None
+    capp.rt._models_cache_at = 0.0
+
+
+def test_the_disk_payload_agrees_with_the_live_kernel() -> None:
+    """The over-correction guard for the fixture above: a payload that only
+    ever matches a fake statvfs would pass while reading the wrong path or
+    the wrong syscall. A live filesystem moves under us, so this allows drift
+    -- but not the 5% a units or formula slip would produce."""
+    import os
+
+    from servedeck import app as capp
+
+    capp.rt._models_cache = None
+    capp.rt._models_cache_at = 0.0
+    d = capp._disk_payload()
+    s = os.statvfs(d["path"])
+    frsize = s.f_frsize or s.f_bsize
+
+    assert d["total_bytes"] == s.f_blocks * frsize, "total does not move; it must match exactly"
+    tol = 1024**3  # 1 GiB of live churn
+    assert abs(d["avail_bytes"] - s.f_bavail * frsize) < tol
+    assert abs(d["used_bytes"] - (s.f_blocks - s.f_bfree) * frsize) < tol
+    capp.rt._models_cache = None
+    capp.rt._models_cache_at = 0.0

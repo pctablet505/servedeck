@@ -25,7 +25,11 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from . import capacity, config, events, gpu, registry, shellconfig, supervisor as _sup
+from . import capacity
+from . import disksize
+from . import kvcalc, config, events, gpu, registry, shellconfig, supervisor as _sup
+from . import metrics as _metrics_mod
+from . import parallelism, reqstats
 from .metrics import MetricsPoller
 
 HERE = Path(__file__).resolve().parent
@@ -64,12 +68,24 @@ class Runtime:
         self.port = _config_port() or _default_port()
         self.upstream = f"{UPSTREAM_HOST}:{self.port}"
         self.poller = MetricsPoller(self.upstream)
-        self.metrics: dict[str, Any] = {"reachable": False}
+        self.metrics: dict[str, Any] = _metrics_mod.unreachable_snapshot()
         self.gpu: dict[str, Any] = {}
         self.serving_model: str | None = None
+        #: Every id /v1/models advertises on the live port. A vLLM server can
+        #: advertise several aliases for one loaded model, and taking data[0]
+        #: alone made an alias that happened to sort first the whole answer.
+        self.serving_models: list[str] = []
         self.upstream_up = False
         self.client: httpx.AsyncClient | None = None
         self._models_cache: list[dict[str, Any]] | None = None
+        #: When the model scan was taken. The cache used to have no expiry at
+        #: all: scanned once on the first /api/models and then served for the
+        #: life of the process. On the day a 95.37 GiB BF16 PLE table was
+        #: deleted and a 47.68 GiB FP8 one installed, the panel went on
+        #: reporting the pre-deletion sizes for hours -- the whole reason the
+        #: displayed disk figure "looked wrong". A whole-hub scan is ~25 ms
+        #: warm, so there is nothing to protect with a permanent cache.
+        self._models_cache_at: float = 0.0
 
     def config(self) -> dict[str, str]:
         return _safe_config()
@@ -94,8 +110,11 @@ class Runtime:
         self.port = port
         self.upstream = f"{UPSTREAM_HOST}:{port}"
         self.poller = MetricsPoller(self.upstream)
-        self.metrics = {"reachable": False}
+        self.metrics = _metrics_mod.unreachable_snapshot()
         self.serving_model = None
+        self.serving_models = []
+        # The cached socket-table answer belongs to the OLD port.
+        _invalidate_listener()
         return True
 
 
@@ -132,7 +151,7 @@ def _server_uptime_s() -> int | None:
     from . import procctl
 
     try:
-        pid = procctl.listener_pid(rt.port)
+        pid = _listener_pid_now()
         return procctl.process_uptime_s(pid) if pid else None
     except Exception:  # noqa: BLE001
         return None
@@ -170,6 +189,16 @@ def sup() -> _sup.Supervisor | None:
     return _supervisor
 
 
+def _snap() -> dict[str, Any]:
+    """The supervisor's snapshot, or {} when there is no supervisor at all.
+
+    The guard belongs here rather than at each of the two call sites that build
+    a payload: `sup().snapshot() if sup() is not None else {}` calls sup() twice,
+    and a third copy written as `sup() and sup().snapshot()` would return None
+    rather than {} and put a null where the page expects an object.
+    """
+    s = sup()
+    return s.snapshot() if s is not None else {}
 
 
 # ------------------------------------------------------------- SSE hub ----
@@ -189,6 +218,11 @@ async def _poll_loop() -> None:
                     {"level": "info", "code": "retargeted",
                      "body": f"upstream port changed — now watching {rt.upstream}"},
                 )
+            # A request cannot exceed the engine's own --max-model-len, so
+            # that is the ceiling for the histogram's open-ended +Inf bucket.
+            # Set every poll rather than once: a restart at a different
+            # context length must not keep the old ceiling.
+            rt.poller.ceiling_tokens = _running_max_model_len()
             snap = await rt.poller.scrape(rt.client)
             rt.metrics = snap.to_dict()
             rt.upstream_up = snap.reachable
@@ -206,10 +240,13 @@ async def _poll_loop() -> None:
                 else {}
             )
 
-            if rt.upstream_up and rt.serving_model is None:
-                rt.serving_model = await _fetch_served_model()
+            if rt.upstream_up and not rt.serving_models:
+                _SERVED_NAME_REPO.clear()   # a new server may be a new model
+                rt.serving_models = await _fetch_served_models()
+                rt.serving_model = rt.serving_models[0] if rt.serving_models else None
             if not rt.upstream_up:
                 rt.serving_model = None
+                rt.serving_models = []
 
             # A server that comes back on its own — started from a terminal
             # after a blocker was cleared — must be noticed. Without this the
@@ -219,7 +256,12 @@ async def _poll_loop() -> None:
 
             hub.publish(
                 "telemetry",
-                {"gpu": rt.gpu, "vllm": rt.metrics, "uptime_s": int(time.time() - STARTED_AT)},
+                {
+                    "gpu": rt.gpu,
+                    "vllm": rt.metrics,
+                    "sizing": _sizing_payload(),
+                    "uptime_s": int(time.time() - STARTED_AT),
+                },
             )
         except asyncio.CancelledError:
             raise
@@ -258,11 +300,55 @@ def _max_model_len_from(argv: list[str]) -> int | None:
     return value if value > 0 else None
 
 
-def _listener_argv() -> list[str]:
-    """The command line of whatever is listening on rt.port."""
+#: (port, monotonic deadline, pid) of the last socket-table lookup.
+_LISTENER_CACHE: tuple[int, float, int | None] | None = None
+
+#: How long one socket-table answer is reused. Deliberately far shorter than
+#: the dashboard's own poll interval, so no two polls ever share an answer:
+#: the point is only that the several questions asked WITHIN one poll — the
+#: running model id, the running max_model_len, the serving identity, the
+#: server's uptime — share the one `ss` between them instead of spawning one
+#: each. A longer window would start hiding a server that just came up.
+_LISTENER_TTL_S = 0.25
+
+
+def _invalidate_listener() -> None:
+    """Forget the cached socket-table answer.
+
+    Called wherever Servedeck itself changes what is listening (a start, a
+    stop, a port move), so the next question re-reads rather than waiting out
+    the TTL.
+    """
+    global _LISTENER_CACHE
+    _LISTENER_CACHE = None
+
+
+def _listener_pid_now() -> int | None:
+    """PID listening on rt.port, from a lookup shared across one poll.
+
+    ``procctl.listener_pid`` shells out to ``ss``: one fork+exec per call, and
+    /api/state asked it five separate times for one listening socket, several
+    times a second, for a fact that cannot change between the questions.
+
+    Keyed on the port, so a repoint (``Runtime.repoint``) can never be
+    answered from the previous port's lookup — that would be the stale-port
+    class of bug this file already carries two fixes for.
+    """
+    global _LISTENER_CACHE
     from . import procctl
 
+    now = time.monotonic()
+    cached = _LISTENER_CACHE
+    if cached is not None and cached[0] == rt.port and now < cached[1]:
+        return cached[2]
     pid = procctl.listener_pid(rt.port)
+    _LISTENER_CACHE = (rt.port, now + _LISTENER_TTL_S, pid)
+    return pid
+
+
+def _listener_argv() -> list[str]:
+    """The command line of whatever is listening on rt.port."""
+    pid = _listener_pid_now()
     if pid is None:
         return []
     try:
@@ -283,6 +369,25 @@ def _running_max_model_len() -> int | None:
     _running_model_id() already argues for the model name.
     """
     return _max_model_len_from(_listener_argv())
+
+
+def _running_max_num_seqs() -> int | None:
+    """``--max-num-seqs`` of the LIVE server, from its own command line.
+
+    The hard ceiling on parallelism: however much KV is free, the scheduler
+    will not run more sequences than this concurrently, so a recommendation
+    above it is a recommendation to build a queue. Read from the process for
+    the same reason as --max-model-len -- servedeck.toml says what Servedeck
+    would launch, which for an adopted server need not be what is running.
+    vLLM's /metrics does not publish it (cache_config_info carries the cache
+    settings only), so the command line is the only live source.
+    """
+    raw = _argv_flag(_listener_argv(), "--max-num-seqs")
+    try:
+        value = int(raw) if raw is not None else 0
+    except ValueError:
+        return None
+    return value if value > 0 else None
 
 
 def _running_model_id() -> str | None:
@@ -335,15 +440,155 @@ def _boot_log_candidates(
     return primary + rest
 
 
+def _boot_payload() -> dict[str, Any]:
+    """Boot progress for the phase bar: the ordered phase list, the per-phase
+    times the supervisor recorded, the elapsed clock, and the ETA.
+
+    The page has drawn none of this since the prototype — #phases/#elapsed
+    shipped markup with no painter, so a multi-minute boot sat on "Elapsed —"
+    with an empty track. The supervisor already tracks the phase and its
+    per-phase times; the only thing computed here is the ETA, which needs the
+    boot history and must stay attributed when it falls back to SPEC.md's
+    calibration figures (history.eta_for handles that; this only forwards it).
+
+    The history read happens ONLY while a boot is in progress. In the steady
+    state — server up, nothing booting — the bar is not drawn, so the 5 s
+    state poll must not open history.jsonl twice for a bar nobody sees.
+    """
+    from . import history, phases
+
+    snap = _snap()
+    out: dict[str, Any] = {
+        "phases": [p.value for p in phases.PHASE_ORDER],
+        "phase": snap.get("phase"),
+        "phase_times": snap.get("phase_times") or {},
+        "elapsed_s": snap.get("run_elapsed_s"),
+        "reached_ready": bool(snap.get("reached_ready")),
+        "eta_s": None,
+        "eta_p90_s": None,
+        "eta_source": None,
+        "eta_note": None,
+        "cold": None,
+    }
+    repo_id = snap.get("repo_id") or rt.serving_model
+    booting = out["phase"] is not None and not out["reached_ready"]
+    if not booting or not repo_id:
+        return out
+    backend = snap.get("backend") or rt.config().get("BACKEND") or ""
+    try:
+        cold = not history.has_prior_success(repo_id, backend)
+        eta = history.eta_for(repo_id, backend, cold=cold)
+    except Exception:  # noqa: BLE001 - an unreadable history must not blank the bar
+        return out
+    out["cold"] = cold
+    out["eta_s"] = eta.median_total_s
+    out["eta_p90_s"] = eta.p90_total_s
+    out["eta_source"] = eta.source
+    out["eta_note"] = eta.note
+    return out
+
+
+def _sizing_payload() -> dict[str, Any]:
+    """The parallelism panel's whole payload: window stats + the recommendation.
+
+    Computed in Python, not in the page, for one reason: the formula has to be
+    testable. ``tests/test_parallelism.py`` reproduces the measured
+    concurrency table against :func:`parallelism.recommend`; a copy of the same
+    arithmetic living in app.js would be a second, untested implementation that
+    silently disagrees.
+
+    Everything here degrades to a stated REASON rather than to a number. "We do
+    not know yet" and "8 agents" must never look alike on a panel whose whole
+    job is to tell you how hard to push the GPU.
+    """
+    m = rt.metrics or {}
+    window = m.get("prompt_stats") or dict(reqstats.EMPTY_STATS)
+    out: dict[str, Any] = {
+        "window": window,
+        "gen_window": m.get("gen_stats") or dict(reqstats.EMPTY_STATS),
+        "calibration_note": parallelism.calibration_note(rt.serving_model),
+        "running": m.get("running") if m.get("reachable") else None,
+        "preemptions": m.get("preemptions") if m.get("reachable") else None,
+        "max_num_seqs": _running_max_num_seqs(),
+        "recommended": None,
+        "at_p99": None,
+        "over_subscribed": False,
+        "reason": None,
+    }
+    if not m.get("reachable"):
+        out["reason"] = "backend not reachable"
+        return out
+    pool = m.get("kv_cache_size_tokens")
+    if not pool:
+        # The pool must be the RUNNING engine's own kv_cache_size_tokens.
+        # Falling back to the 280,813 the cost curve was calibrated on would
+        # produce a confident recommendation for a server launched at a
+        # different --gpu-memory-utilization, which is how you over-subscribe.
+        out["reason"] = "engine has not published its KV pool size yet"
+        return out
+    p90 = (window.get("p90") or {}).get("hi")
+    if not p90:
+        out["reason"] = (
+            f"no requests observed yet — {window.get('n', 0)} of "
+            f"{window.get('capacity', reqstats.WINDOW_SIZE)} in the window"
+        )
+        return out
+
+    seqs = out["max_num_seqs"]
+    n = window.get("n", 0)
+    rec = parallelism.recommend(
+        pool_tokens=int(pool),
+        prompt_tokens=float(p90),
+        max_num_seqs=seqs,
+        basis=f"p90 of the last {n} request{'' if n == 1 else 's'}",
+    )
+    out["recommended"] = rec.to_dict()
+
+    p99 = (window.get("p99") or {}).get("hi")
+    if p99:
+        out["at_p99"] = parallelism.recommend(
+            pool_tokens=int(pool),
+            prompt_tokens=float(p99),
+            max_num_seqs=seqs,
+            basis=f"p99 of the last {n} request{'' if n == 1 else 's'}",
+        ).to_dict()
+
+    # The warning. Live concurrency above the recommendation is the condition;
+    # num_preemptions_total is the confirmation, because preemption is what
+    # over-subscription actually DOES -- vLLM evicts a sequence's KV and
+    # recomputes it, so work already paid for is thrown away.
+    running = m.get("running") or 0
+    out["over_subscribed"] = bool(running > rec.n)
+    return out
+
+
 def _live_boot_facts() -> dict[str, Any]:
     """Read the RUNNING server's real KV size from its boot log.
 
     The live 'KV in use' readout must be a fraction of what the running engine
-    actually allocated - NOT of some other model's estimate. vLLM's /metrics
-    exposes kv_cache_usage_perc but not the absolute token total, and that
-    total is only ever printed once, at boot.
+    actually allocated - NOT of some other model's estimate.
+
+    FIRST from /metrics. This build publishes the engine's whole resolved cache
+    configuration on vllm:cache_config_info, whose LABELS carry
+    kv_cache_size_tokens - the same figure the boot log prints once as
+    "GPU KV cache size: N tokens". Reading it there needs no log at all, which
+    matters because a server launched by hand in a terminal writes to no log
+    Servedeck knows about, and the boot log of a PREVIOUS run of another model
+    is the wrong file to fall back to.
+
+    The boot log is still read, for the two things /metrics does not carry:
+    the KV pool in GiB and the weights measurement.
     """
     facts: dict[str, Any] = {}
+    m = rt.metrics or {}
+    if m.get("reachable") and m.get("kv_cache_size_tokens"):
+        facts["kv_tokens"] = int(m["kv_cache_size_tokens"])
+        facts["kv_source"] = "engine"
+        facts["kv_trust"] = "measured"
+        if m.get("kv_cache_max_concurrency"):
+            facts["concurrency_x"] = round(float(m["kv_cache_max_concurrency"]), 3)
+        if m.get("kv_cache_gpu_util"):
+            facts["util_effective"] = float(m["kv_cache_gpu_util"])
     # Pick the log belonging to the backend actually running on our port, and
     # read the LAST match: launcher logs are append-only across restarts, so
     # the first match is the oldest boot's numbers.
@@ -364,14 +609,18 @@ def _live_boot_facts() -> dict[str, Any]:
         kv_all = _KV_RE.findall(text)
         if not kv_all:
             continue
-        facts["kv_tokens"] = int(kv_all[-1].replace(",", ""))
+        # /metrics already answered, and it is the running engine rather than
+        # a file that outlives it. Do not overwrite it with a log line.
+        facts.setdefault("kv_tokens", int(kv_all[-1].replace(",", "")))
+        facts.setdefault("kv_source", "boot log")
+        facts.setdefault("kv_trust", "measured")
         gib_all = _KVGIB_RE.findall(text)
         if gib_all:
             facts["kv_gib"] = float(gib_all[-1])
         conc_all = _CONC_RE.findall(text)
         if conc_all:
             facts["ctx"] = int(conc_all[-1][0].replace(",", ""))
-            facts["concurrency_x"] = float(conc_all[-1][1])
+            facts.setdefault("concurrency_x", float(conc_all[-1][1]))
         w_all = _WEIGHTS_RE.findall(text)
         if w_all:
             facts["weights_gib"] = float(w_all[-1])
@@ -380,7 +629,7 @@ def _live_boot_facts() -> dict[str, Any]:
         # this the UI's slider shows a value the server is not running at.
         if "weights_gib" in facts and "kv_gib" in facts:
             budget = facts["weights_gib"] + facts["kv_gib"] + capacity.OVERHEAD_GIB_DEFAULT
-            facts["util_effective"] = round(budget / capacity.GPU_TOTAL_GIB, 3)
+            facts.setdefault("util_effective", round(budget / capacity.GPU_TOTAL_GIB, 3))
         facts["source"] = str(log)
         break
     return facts
@@ -397,7 +646,7 @@ async def _recover_if_server_returned() -> None:
         return  # intent says stopped: leave it alone, offer adoption in the UI
     from . import procctl
 
-    pid = procctl.listener_pid(rt.port)
+    pid = _listener_pid_now()
     if pid is None or not procctl.is_attributable(pid):
         return
     try:
@@ -415,16 +664,91 @@ async def _recover_if_server_returned() -> None:
         hub.publish("notice", {"level": "warn", "code": "recover_failed", "body": str(exc)[:200]})
 
 
-async def _fetch_served_model() -> str | None:
+async def _fetch_served_models() -> list[str]:
+    """Every model id the live server advertises on ``/v1/models``.
+
+    This is the ONLY authority for what the server calls itself. It is not the
+    authority for what the server actually loaded -- see _serving_identity().
+    """
     try:
         r = await rt.client.get(f"{rt.upstream}/v1/models", timeout=3.0)  # type: ignore[union-attr]
         if r.status_code == 200:
             data = r.json().get("data") or []
-            if data:
-                return data[0].get("id")
+            return [str(d.get("id")) for d in data if d.get("id")]
     except Exception:  # noqa: BLE001
         pass
-    return None
+    return []
+
+
+#: Memo for _repo_for_served_name, keyed on the name. discover_models() walks
+#: the whole model cache -- a directory listing and a config.json parse per
+#: repo -- and _state() runs on every dashboard poll and every SSE state
+#: publish. A served name changes only when a server restarts, so resolving it
+#: once per name is the difference between a lookup and a filesystem scan
+#: several times a second.
+_SERVED_NAME_REPO: dict[str, str | None] = {}
+
+
+def _repo_for_served_name(name: str | None) -> str | None:
+    """The cached repo a served-model-name refers to, if exactly one does.
+
+    Exact match on the repo id or on its final path segment, and only when the
+    match is unique -- a name that fits two cached repos identifies neither.
+    """
+    if not name:
+        return None
+    if name not in _SERVED_NAME_REPO:
+        hits = [
+            e.repo_id
+            for e in registry.discover_models()
+            if e.repo_id == name or e.repo_id.rsplit("/", 1)[-1] == name
+        ]
+        _SERVED_NAME_REPO[name] = hits[0] if len(hits) == 1 else None
+    return _SERVED_NAME_REPO[name]
+
+
+def _serving_identity() -> dict[str, Any]:
+    """Which model is REALLY serving on rt.port, and how we know.
+
+    Sources, in decreasing order of trust:
+
+    1. the live process's own ``--model`` argument -- what vLLM was actually
+       told to load, read from ``/proc/<pid>/cmdline``;
+    2. ``/v1/models`` on the live port, resolved against the model cache --
+       what the server calls itself;
+    3. nothing, and then we say nothing.
+
+    The shell config header is deliberately NOT a source. ``BACKEND`` /
+    ``MODEL_REPO`` record what somebody last INTENDED; on this box that header
+    said GLM while Qwen was serving, and every reader that trusted it was
+    wrong together. ``mismatch`` is true when 1 and 2 disagree -- the
+    ``--served-model-name`` was reused from another model, which is exactly
+    when a name-matching UI shows the wrong row (or no row at all).
+    """
+    from_process = _running_model_id()
+    served_names = list(rt.serving_models)
+    from_name = next(
+        (r for r in (_repo_for_served_name(n) for n in served_names) if r), None
+    )
+    repo_id = from_process or from_name
+    source = "process" if from_process else ("served_name" if from_name else "unknown")
+    pid = None
+    backend = None
+    if rt.upstream_up:
+        from . import procctl
+
+        try:
+            pid = _listener_pid_now()
+            backend = procctl.backend_of_pid(pid) if pid else None
+        except Exception:  # noqa: BLE001
+            backend = None
+    return {
+        "repo_id": repo_id,
+        "source": source,
+        "backend": backend,
+        "served_names": served_names,
+        "mismatch": bool(from_process and from_name and from_process != from_name),
+    }
 
 
 @app.on_event("startup")
@@ -452,8 +776,15 @@ async def _shutdown() -> None:
 
 
 # ------------------------------------------------------------- helpers ----
-def _model_rows() -> list[dict[str, Any]]:
-    if rt._models_cache is not None:
+#: Seconds a model scan stays fresh. Short enough that a deletion shows up
+#: while the operator is still looking at the screen, long enough that the
+#: 2 s telemetry tick does not re-walk the hub cache on every poll.
+MODELS_CACHE_TTL_S = 5.0
+
+
+def _model_rows(*, now: float | None = None) -> list[dict[str, Any]]:
+    t = time.monotonic() if now is None else now
+    if rt._models_cache is not None and (t - rt._models_cache_at) < MODELS_CACHE_TTL_S:
         return rt._models_cache
     rows: list[dict[str, Any]] = []
     for e in registry.discover_models():
@@ -485,7 +816,12 @@ def _model_rows() -> list[dict[str, Any]]:
                 "backend": e.backend,
                 "servable": e.servable,
                 "unservable_reason": e.reason,
-                "disk_gib": round(e.safetensors_gib or 0.0, 2),
+                # Bytes, not a pre-rounded GiB float: the unit belongs to the
+                # formatter. Shipping "disk_gib" and rendering it beside the
+                # letters "GB" is how a 125.99 GiB model came to be displayed
+                # as 125.91 GB -- a 7.4% error that reads as a rounding slip.
+                "disk_bytes": e.disk_bytes,
+                "disk_local_bytes": e.disk_local_bytes,
                 "quant": e.quant_algo or "—",
                 "model_max_ctx": ctx_for_trust,
                 "trust": trust,
@@ -494,7 +830,40 @@ def _model_rows() -> list[dict[str, Any]]:
         )
     rows.sort(key=lambda r: (not r["servable"], r["name"]))
     rt._models_cache = rows
+    rt._models_cache_at = t
     return rows
+
+
+def _disk_payload() -> dict[str, Any]:
+    """Filesystem free/used from statvfs, plus what the hub cache costs.
+
+    The filesystem half never comes from a directory walk. A walk sees only
+    what it can read, so it under-reports "used" by every tree the server
+    cannot enter, and it cannot see free space at all. ``statvfs`` is the
+    kernel's own answer and is what ``df`` prints.
+
+    ``hub_bytes`` versus ``hub_local_bytes``: blobs reached through symlinks
+    to another mount are real bytes but sit on another filesystem, so they
+    must not be subtracted from the ``df`` figure shown beside them.
+    """
+    hub = registry.default_hub_dir()
+    fs = disksize.filesystem_usage(hub if hub.exists() else Path("/"))
+    rows = _model_rows()
+    hub_bytes = sum(r["disk_bytes"] for r in rows)
+    hub_local = sum(r["disk_local_bytes"] for r in rows)
+    return {
+        "path": fs.path,
+        "total_bytes": fs.total_bytes,
+        "used_bytes": fs.used_bytes,
+        "avail_bytes": fs.avail_bytes,
+        "used_pct": round(fs.used_pct, 1),
+        "hub_bytes": hub_bytes,
+        "hub_local_bytes": hub_local,
+        "hub_foreign_bytes": hub_bytes - hub_local,
+        # Named so no consumer has to guess. Everything above is bytes; the
+        # UI divides by 1024 and says GiB.
+        "unit": "bytes",
+    }
 
 
 def _own_gpu_mib() -> int:
@@ -506,9 +875,7 @@ def _own_gpu_mib() -> int:
     processes that are actually part of the server on our upstream port.
     """
     try:
-        from . import procctl
-
-        listener = procctl.listener_pid(rt.port)
+        listener = _listener_pid_now()
     except Exception:  # noqa: BLE001
         listener = None
     if listener is None:
@@ -541,11 +908,58 @@ def _own_gpu_mib() -> int:
     return own
 
 
+def _cache_flags(backend: str | None) -> tuple[str | None, str | None]:
+    """(kv_cache_dtype, mamba_ssm_cache_dtype) this backend would launch with.
+
+    They belong in the estimate because they change the cache LAYOUT, not just
+    its speed: --mamba-ssm-cache-dtype bfloat16 halves the GDN recurrent state
+    and is worth 6.9% of the token count on this box's delivered Flash-Next
+    configuration. Estimating without them describes a server nobody starts.
+
+    Sources, in the order a launch resolves them: the backend's own fixed
+    `env` in servedeck.toml, then EXTRA_ARGS out of the shell config -- which
+    supervisor.shell_extra_args() already guards on BACKEND, so another
+    backend's flags can never be read as this one's.
+    """
+    kv = ssm = None
+    b = config.get().backend(backend) if backend else None
+    if b is not None:
+        kv = b.env.get("KV_DTYPE") or None
+    argv = _sup.shell_extra_args(backend).split()
+    kv = _argv_flag(argv, "--kv-cache-dtype") or kv
+    ssm = _argv_flag(argv, "--mamba-ssm-cache-dtype") or ssm
+    return kv, ssm
+
+
+def _kv_geometry(repo_id: str, ctx: int, backend: str | None = None) -> dict[str, Any] | None:
+    """The per-architecture KV breakdown, for the panel's tooltip.
+
+    None when the checkpoint's config.json cannot be read locally — never a
+    network fetch, and never a fabricated breakdown.
+    """
+    try:
+        cfg = registry.load_model_config(repo_id)
+        if cfg is None:
+            return None
+        kv, ssm = _cache_flags(backend)
+        geo = kvcalc.geometry(cfg, kv_cache_dtype=kv, mamba_ssm_dtype=ssm)
+        out = kvcalc.summarise(geo, ctx)
+        out["launch_flags"] = {"kv_cache_dtype": kv, "mamba_ssm_cache_dtype": ssm}
+        return out
+    except Exception:  # noqa: BLE001 - a bad config must not blank the panel
+        return None
+
+
 def _estimate(repo_id: str, util: float, ctx: int, seqs: int) -> dict[str, Any]:
-    ri = registry.resolve_inputs(repo_id, util, ctx)
     # servable/reason live on ModelEntry, not ResolvedInputs - look them up
     # rather than defaulting servable=True, which made MODEL_UNSERVABLE dead.
+    # The entry also names the backend, which is what decides WHICH launch
+    # flags apply -- so it has to be read before the estimate, not after.
     entry = next((e for e in registry.discover_models() if e.repo_id == repo_id), None)
+    kv_dtype, ssm_dtype = _cache_flags(entry.backend if entry else None)
+    ri = registry.resolve_inputs(
+        repo_id, util, ctx, kv_cache_dtype=kv_dtype, mamba_ssm_dtype=ssm_dtype
+    )
     mi = capacity.ModelInputs(
         repo_id=repo_id,
         backend=ri.backend or "inline",
@@ -587,10 +1001,20 @@ def _estimate(repo_id: str, util: float, ctx: int, seqs: int) -> dict[str, Any]:
         "agents_at_ctx": r.agents_at_ctx,
         "effective_parallel": r.effective_parallel,
         "max_single_ctx": r.max_single_ctx,
+        # Bounds for the context control. The UI must not offer a length that
+        # either the model or the KV budget cannot serve.
+        "ctx_max_model": r.ctx_max_model,
+        "ctx_max_fit": r.ctx_max_fit,
+        "agents": seqs,
         "confidence": r.confidence,
         "can_apply": r.can_apply,
         "weights_gib": mi.weights_gib,
         "kv_kib_per_token": mi.kv_kib_per_token,
+        # measured (this repo booted at this context) vs estimated (the
+        # per-architecture calculator). The panel labels them differently and
+        # must never present the second as the first.
+        "kv_source": ri.kv_source,
+        "kv_geometry": _kv_geometry(repo_id, ctx, entry.backend if entry else ri.backend),
         "bar": {
             "weights_pct": round(r.bar.weights_pct, 2),
             "kv_pct": round(r.bar.kv_pct, 2),
@@ -619,6 +1043,9 @@ def _state() -> dict[str, Any]:
             "up": rt.upstream_up,
             "model": rt.serving_model,          # --served-model-name
             "model_id": _running_model_id(),     # what is REALLY loaded
+            # Which model is serving, and how we know -- never the config
+            # header. The UI matches its model list on this.
+            "identity": _serving_identity(),
             # The running engine's OWN --max-model-len, not desired config.
             "max_model_len": _running_max_model_len(),
             "port": rt.port,
@@ -632,9 +1059,11 @@ def _state() -> dict[str, Any]:
         },
         "gpu": rt.gpu,
         "vllm": rt.metrics,
+        "sizing": _sizing_payload(),
+        "boot": _boot_payload(),
         "control_enabled": sup() is not None,
         "control_note": _supervisor_error or "",
-        "supervisor": (sup().snapshot() if sup() is not None else {}),
+        "supervisor": _snap(),
         # Servedeck's own uptime. The UI's "Serving ... up Nm" must NOT use
         # this: restarting the UI would make a long-running server look fresh.
         "uptime_s": int(time.time() - STARTED_AT),
@@ -655,7 +1084,12 @@ async def api_state() -> dict[str, Any]:
 
 @app.get("/api/models")
 async def api_models() -> dict[str, Any]:
-    return {"models": _model_rows(), "serving": rt.serving_model}
+    return {"models": _model_rows(), "serving": rt.serving_model, "disk": _disk_payload()}
+
+
+@app.get("/api/disk")
+async def api_disk() -> dict[str, Any]:
+    return _disk_payload()
 
 
 @app.post("/api/capacity/estimate")
@@ -715,10 +1149,20 @@ async def api_adopt(body: dict[str, Any] | None = None) -> Any:
     d = s.desired
     d.desired_state = "RUNNING"
     d.port = port
-    if not d.repo_id:
+    ident = _serving_identity()
+    # Adopt what is RUNNING, not what a header says was intended. `d.repo_id`
+    # was filled from the served-model-name (an alias an operator reuses) and
+    # `d.backend` from the shell config's BACKEND -- the exact header that
+    # said GLM while Qwen was serving. Both now come from the live process,
+    # and only fall back when the process cannot be read at all.
+    if ident["repo_id"]:
+        d.repo_id = ident["repo_id"]
+    elif not d.repo_id:
         d.repo_id = rt.serving_model
-    if not d.backend:
-        d.backend = _safe_config().get("BACKEND") or "flashnext"
+    if ident["backend"]:
+        d.backend = ident["backend"]
+    elif not d.backend:
+        d.backend = _safe_config().get("BACKEND") or None
     _sup.save_desired(d, s.state_dir)
     s._run_repo_id, s._run_backend = d.repo_id, d.backend
     s._adopt_ready(pid)
@@ -745,13 +1189,23 @@ async def api_start(body: dict[str, Any] | None = None) -> Any:
         return s
     b = body or {}
     d = s.desired
+    repo_id = b.get("repo_id") or d.repo_id
+    backend = b.get("backend") or d.backend
+    # Port and served name come from the backend/model being started, not from
+    # whatever the PREVIOUS run left in desired.json -- see the two resolvers'
+    # docstrings. Falling through to d.port/d.served_name is what launched one
+    # backend on another's port under the other's model name.
+    port = _sup.resolve_port(backend, d, explicit=b.get("port"), fallback=rt.port)
+    served_name = _sup.resolve_served_name(
+        backend, repo_id, d, explicit=b.get("served_name")
+    )
     asyncio.create_task(
         _run_and_report(
             s.start(
-                repo_id=b.get("repo_id") or d.repo_id,
-                backend=b.get("backend") or d.backend,
-                served_name=b.get("served_name") or d.served_name,
-                port=int(b.get("port") or d.port or rt.port),
+                repo_id=repo_id,
+                backend=backend,
+                served_name=served_name,
+                port=int(port or rt.port),
                 util=float(b["util"]) if b.get("util") is not None else d.util,
                 max_model_len=int(b["ctx"]) if b.get("ctx") is not None else d.max_model_len,
                 max_num_seqs=int(b["max_num_seqs"]) if b.get("max_num_seqs") is not None else d.max_num_seqs,

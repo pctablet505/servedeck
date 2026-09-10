@@ -27,7 +27,6 @@ StartLimitBurst=20
 
 [Service]
 Type=exec
-WorkingDirectory=%h/servedeck
 # %h is the user's home. Adjust WorkingDirectory if you cloned elsewhere.
 WorkingDirectory=%h/servedeck
 ExecStart=%h/servedeck/.venv/bin/uvicorn servedeck.app:app --host 127.0.0.1 --port 8010

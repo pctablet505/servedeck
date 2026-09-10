@@ -476,6 +476,84 @@ def _read_metric(text: str, name: str) -> float | None:
 BOOT_LOG_DIRNAME = "boot_logs"
 
 
+def resolve_port(
+    backend: str | None, desired: "DesiredState", *,
+    explicit: object = None, fallback: int | None = None,
+) -> int | None:
+    """Which port a start should use.
+
+    The dashboard's Apply button sends a model and a backend but no port, and
+    the old fallback chain was ``explicit or desired.port or rt.port`` -- the
+    PREVIOUS run's port. Switching backends therefore launched the new backend
+    on the old one's port: on this box, picking a Flash-Next model while
+    ``desired.json`` still said 8002 started Flash-Next on GLM's port, and the
+    gateway (pointed at 8001) reported "backend not reachable" about a server
+    that had booted perfectly.
+
+    A backend's port is part of the launch contract it declares in
+    servedeck.toml, so that is the answer whenever the backend is changing.
+    An explicit port always wins, and a port already chosen for the SAME
+    backend is preserved -- otherwise a deliberate one-off move would be
+    silently undone on the next restart.
+    """
+    if explicit:
+        return int(explicit)  # type: ignore[arg-type]
+    if backend == desired.backend and desired.port:
+        return desired.port
+    b = config.get().backend(backend)
+    if b is not None:
+        return b.port
+    return desired.port or fallback
+
+
+def resolve_served_name(
+    backend: str | None, repo_id: str | None, desired: "DesiredState", *,
+    explicit: str | None = None,
+) -> str | None:
+    """The ``--served-model-name`` a start should use.
+
+    The dashboard sends no served name either, so the old ``desired.served_name``
+    fallback carried the PREVIOUS model's alias onto the new one: launching a
+    Qwen checkpoint after a GLM one advertised it over ``/v1/models`` as
+    ``glm53-flash``. Nothing downstream could then tell the two apart -- which
+    is exactly the "unable to detect the model correctly" report.
+
+    A name chosen for the SAME repo is kept (clients are configured against
+    it); a different repo gets its own name, derived from the repo id.
+    """
+    if explicit:
+        return explicit
+    if repo_id and repo_id == desired.repo_id and desired.served_name:
+        return desired.served_name
+    if not repo_id:
+        return desired.served_name
+    return repo_id.rsplit("/", 1)[-1]
+
+
+def shell_extra_args(backend: str | None) -> str:
+    """``EXTRA_ARGS`` from the shell config, for this backend only.
+
+    ``local_llm/llm start`` exports ``EXTRA_ARGS="${EXTRA_ARGS:-}"`` from
+    ``.config`` on every launch, and on this box that string carries flags the
+    model does not boot correctly without. Servedeck passed nothing, so a
+    launch from the dashboard and a launch from the CLI produced two different
+    servers from the same configuration.
+
+    Guarded on ``BACKEND``: ``.config`` describes ONE backend at a time, and
+    handing GLM's extra flags to a Qwen launcher is worse than handing it
+    none. Never raises -- an unreadable ``.config`` means "no extra args".
+    """
+    if not backend:
+        return ""
+    try:
+        cfg = shellconfig.read_config()
+    except Exception:  # noqa: BLE001 - the shell config is optional
+        return ""
+    if (cfg.get("BACKEND") or "").strip() != backend:
+        return ""
+    return (cfg.get("EXTRA_ARGS") or "").strip()
+
+
 def _default_log_paths(
     backend: str | None, *, boot_log_dir: Path | None = None
 ) -> list[Path]:
@@ -686,7 +764,9 @@ class Supervisor:
         self._write_flat_desired_state_file()
 
         self.actual_state = "PREFLIGHT"
-        checks = preflight.run_preflight(backend=backend, actual_state=self.actual_state)
+        checks = preflight.run_preflight(
+            backend=backend, actual_state=self.actual_state, port=port
+        )
         failures = preflight.blocking_failures(checks)
         if failures:
             self.actual_state = "FAILED"
@@ -908,12 +988,23 @@ class Supervisor:
             "max_num_seqs": str(max_num_seqs or ""),
             "served_name": served_name,
             "kv_dtype": "auto",
+            "extra_args": shell_extra_args(backend),
         }
         env = {
             var: settings[key]
             for key, var in b.env_map.items()
             if key in settings and settings[key] != ""
         }
+        # EXTRA_ARGS is exported whether or not env_map names it, exactly as
+        # `local_llm/llm start` does: it is the launcher's own verbatim
+        # passthrough slot, and a launcher that does not read it ignores it.
+        # Dropping it made a dashboard launch boot a DIFFERENT configuration
+        # from the CLI's -- on this box that silently lost
+        # `--language-model-only --mamba-ssm-cache-dtype bfloat16
+        # --prefix-match-unit 208` for Flash-Next.
+        extra_var = b.env_map.get("extra_args", "EXTRA_ARGS")
+        if settings["extra_args"] and extra_var not in env:
+            env[extra_var] = settings["extra_args"]
         env.update(b.env)
         # SPEC.md correction C9: "Add HF_HUB_OFFLINE=1 to the unit
         # Environment — verified to remove the DNS class" (17 of 72 recorded
@@ -927,7 +1018,12 @@ class Supervisor:
         log_paths = [my_log]
         if b.writes_own_log and b.log_path is not None:
             log_paths.append(str(b.log_path))
-        return [str(b.launcher)], env, str(b.launcher.parent), log_paths
+        # run_cwd, not launcher.parent: launcher.parent is the shell CLI's own
+        # rule (`cd "$(dirname "$SERVE_SH")"`) and is right for a serve script
+        # at a project root, but a launcher under bin/ is not at the root of
+        # the tree it belongs to. Backend.cwd lets that be declared; when it is
+        # unset run_cwd IS launcher.parent, so this changes nothing by itself.
+        return [str(b.launcher)], env, str(b.run_cwd), log_paths
 
     # ----------------------------------------------------------------- #
     # Boot / liveness monitor
@@ -1321,4 +1417,19 @@ class Supervisor:
             "reached_ready": bool(self._tracker and self._tracker.reached_ready),
             "next_restart_at": self._next_restart_at,
             "unmanaged_pid": self._unmanaged_pid,
+            # The boot-progress bar and its elapsed clock. The page had the
+            # markup for both (#phases, #elapsed) since the prototype and
+            # nothing ever painted them, so a multi-minute boot showed
+            # "Elapsed —" with no track. These two fields are the whole
+            # contract the painter needs: which phase we are in, when each
+            # phase was first seen, and when the run began.
+            "phase_times": dict(self._phase_times),
+            # Elapsed seconds, not a timestamp: the page must not diff its own
+            # clock against the supervisor's, and an ISO string parsed in JS is
+            # how a timezone bug gets into an "Elapsed" readout.
+            "run_elapsed_s": (
+                round(now - self._run_started_at, 1)
+                if self._run_started_at is not None
+                else None
+            ),
         }

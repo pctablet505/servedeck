@@ -375,13 +375,13 @@ def test_not_enough_free_vram_blocks_same_arithmetic_as_qwen_server_run():
     f = _code(r.findings, "NOT_ENOUGH_FREE_VRAM")
     assert f is not None
     assert f.level == "block"
-    assert "7887" in f.detail  # free_mib
+    assert "7,887" in f.detail  # free_mib, grouped like every other figure on the page
     # need_mib is the utilization budget itself (48943), NOT budget + headroom.
     # Adding the 4096 MiB fragmentation margin on top of a fraction-of-total
     # budget makes the check unsatisfiable for any util >= 0.958 -- see
     # test_high_util_is_not_impossible below. The margin is reported separately
     # as the THIN_VRAM_MARGIN warning.
-    assert "48943" in f.detail  # need_mib = int(97887 * 0.50)
+    assert "48,943" in f.detail  # need_mib = int(97887 * 0.50)
     assert r.can_apply is False
 
 
@@ -815,3 +815,46 @@ def test_env_var_overrides_the_configured_markers(config_path, monkeypatch):
     config_path('training_markers = ["/tmp/from-file"]\n')
     monkeypatch.setenv("SERVEDECK_TRAINING_MARKERS", "/tmp/x:/tmp/y")
     assert tuple(cap._cfg_markers()) == ("/tmp/x", "/tmp/y")
+
+
+# ---------------------------------------------------------------------------
+# Context bounds — "Context per agent is hardcoded and offered even for models
+# that cannot run it"
+# ---------------------------------------------------------------------------
+def test_ctx_ceiling_is_the_model_ceiling_when_the_budget_is_generous() -> None:
+    """The 27B at util 0.47 buys ~530k tokens of KV. One agent can therefore
+    have the whole 262,144 the checkpoint allows, and nothing beyond it: the
+    model ceiling is the binding limit here."""
+    r = compute(NVFP4_27B, util=0.47, ctx=262144, max_num_seqs=1)
+    assert r.ctx_max_model == 262144
+    assert r.ctx_max_fit == 262144
+    assert r.kv_tokens > 262144
+
+
+def test_ctx_ceiling_falls_when_the_agents_have_to_share() -> None:
+    """The same budget split four ways cannot give each agent the model's full
+    context. The old control offered it anyway; the engine then loads weights
+    for minutes and refuses."""
+    one = compute(NVFP4_27B, util=0.47, ctx=262144, max_num_seqs=1)
+    four = compute(NVFP4_27B, util=0.47, ctx=262144, max_num_seqs=4)
+    assert four.ctx_max_fit == min(262144, one.kv_tokens // 4)
+    assert four.ctx_max_fit < four.ctx_max_model, (
+        "with four agents the KV budget, not the checkpoint, is the binding limit"
+    )
+
+
+def test_ctx_ceiling_is_what_fits_when_the_budget_is_the_smaller_limit() -> None:
+    """Flash-Next at util 0.95 holds ~272k tokens for one agent — just over its
+    262,144 ceiling. Two agents cannot each have that."""
+    r = compute(FLASHNEXT, util=0.95, ctx=262144, max_num_seqs=2)
+    assert r.ctx_max_fit == r.kv_tokens // 2
+    assert r.ctx_max_fit < 262144
+
+
+def test_unservable_model_offers_no_context_at_all() -> None:
+    m = ModelInputs(
+        repo_id="x/y", backend="inline", model_max_ctx=262144,
+        servable=False, unservable_reason="GGUF-only",
+    )
+    r = compute(m, util=0.9, ctx=262144, max_num_seqs=1)
+    assert r.ctx_max_fit == 0

@@ -59,6 +59,9 @@ from typing import Any
 
 from servedeck import paths
 
+from . import config as _config
+from . import legacy
+
 # ---------------------------------------------------------------------------
 # Storage
 # ---------------------------------------------------------------------------
@@ -71,8 +74,24 @@ from servedeck import paths
 _WRITE_LOCK = threading.Lock()
 
 
+HISTORY_FILENAME = "history.jsonl"
+
+
 def default_history_path() -> Path:
-    return paths.STATE_DIR / "history.jsonl"
+    """``history.jsonl`` inside the CONFIGURED state directory.
+
+    This used to be ``paths.STATE_DIR`` unconditionally — the directory next
+    to the package — which agrees with ``state_dir`` only at its default
+    value. A systemd unit with a ``StateDirectory=``, or any ``state_dir``
+    setting at all, then had the supervisor appending boots to one file while
+    registry.py read measurements out of another. Nothing failed; the boot-ETA
+    statistics simply stayed empty forever. registry.default_measurements_path()
+    already resolved this way, and the two must agree.
+    """
+    try:
+        return _config.get().state_dir / HISTORY_FILENAME
+    except Exception:  # noqa: BLE001 - an unreadable config must not hide history
+        return paths.STATE_DIR / HISTORY_FILENAME
 
 
 def now_iso() -> str:
@@ -98,14 +117,32 @@ def load_all(path: Path | str | None = None) -> list[dict[str, Any]]:
     """Read every record. Missing file -> []. A malformed trailing line
     (e.g. a write that was interrupted mid-flush) is skipped, not fatal —
     every earlier line still parses and is returned; never raises."""
-    p = Path(path) if path is not None else default_history_path()
+    if path is not None:
+        # An explicit path means "read exactly this file" -- see the same
+        # guard in registry.load_observations().
+        return _read_history_file(Path(path))
+    p = default_history_path()
+    # Boots recorded by the pre-rename `coldstart` tree come FIRST: they are
+    # older, and these records are chronological. Merged rather than used as a
+    # fallback -- "read the old file only when the new one is missing" would
+    # make every historic boot vanish the moment this tree recorded its first
+    # one. De-duplicated on content so that copying the old file across (which
+    # docs/MIGRATION.md suggests) does not count each boot twice.
+    records: list[dict[str, Any]] = legacy.merge_jsonl(p, HISTORY_FILENAME)
+    records.extend(_read_history_file(p))
+    return legacy.dedupe(records)
+
+
+def _read_history_file(p: Path) -> list[dict[str, Any]]:
+    """One JSONL file's records. Missing file -> []; a torn trailing line is
+    skipped rather than fatal; never raises."""
     if not p.is_file():
         return []
-    records: list[dict[str, Any]] = []
     try:
         text = p.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return []
+    out: list[dict[str, Any]] = []
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -115,8 +152,8 @@ def load_all(path: Path | str | None = None) -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             continue
         if isinstance(obj, dict):
-            records.append(obj)
-    return records
+            out.append(obj)
+    return out
 
 
 def query(
@@ -198,6 +235,27 @@ SPEC_COLD_BOOT_RANGE_S: dict[str, tuple[float, float]] = {
 }
 
 
+def cold_boot_range_s(backend: str | None) -> tuple[float, float] | None:
+    """The cold-boot envelope for a backend with no measured history yet.
+
+    ``cold_boot_range_s`` in servedeck.toml wins over the built-in map. How
+    long a checkpoint takes to load is a fact about one machine (181 GiB of
+    weights plus a Marlin repack behaves nothing like a 40 GiB model), so it
+    belongs in configuration -- the fold-in dropped a measured 420-900 s
+    envelope for one backend because it lived in the package as a literal and
+    the package is public.
+    """
+    if not backend:
+        return None
+    try:
+        b = _config.get().backend(backend)
+    except Exception:  # noqa: BLE001 - an unreadable config falls back
+        b = None
+    if b is not None and b.cold_boot_range_s is not None:
+        return b.cold_boot_range_s
+    return SPEC_COLD_BOOT_RANGE_S.get(backend)
+
+
 @dataclass(frozen=True)
 class EtaStats:
     """What supervisor.py / the API layer needs to render SPEC.md §8's
@@ -243,7 +301,7 @@ def _phase_stat(records: list[dict[str, Any]], stat_fn) -> dict[str, float]:
 
 def _spec_calibration(repo_id: str, backend: str, cold: bool) -> EtaStats:
     if cold:
-        rng = SPEC_COLD_BOOT_RANGE_S.get(backend)
+        rng = cold_boot_range_s(backend)
         if rng is not None:
             lo, hi = rng
             return EtaStats(

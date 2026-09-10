@@ -27,6 +27,7 @@ from servedeck.registry import (
     KNOWN_ARCHS,
     ModelEntry,
     append_observation,
+    default_measurements_path,
     discover_models,
     load_observations,
     resolve_inputs,
@@ -613,7 +614,26 @@ def test_tier3_qwen4_exp_refusal_holds_even_with_other_repos_measured(tmp_path: 
     assert r.weights_source == "unknown"
 
 
-def test_tier3_kv_rate_is_median_of_measured_same_architecture(tmp_path: Path) -> None:
+#: A config.json that names an architecture but declares no attention
+#: geometry — the only case in which the family median is still reachable.
+GEOMETRYLESS_CONFIG = {
+    "architectures": ["Qwen3_5ForConditionalGeneration"],
+    "model_type": "qwen3_5",
+    "text_config": {"max_position_embeddings": 262144, "num_hidden_layers": 48},
+}
+
+
+def test_tier3_kv_rate_comes_from_the_layer_stack_not_a_family_median(
+    tmp_path: Path,
+) -> None:
+    """A family median answers with a DIFFERENT model's number.
+
+    KV size is a property of the layer stack — this config has 48 attention
+    layers of 8 KV heads at head_dim 128 in bf16, which is
+    48 * 2 * 8 * 128 * 2 = 196,608 bytes = 192 KiB/token by arithmetic. The two
+    observations below would have made the old rule say 35 KiB/token, a 5.5x
+    error, purely because those models share a family name with this one.
+    """
     _make_repo(
         tmp_path,
         "models--A--NeverBooted",
@@ -621,7 +641,26 @@ def test_tier3_kv_rate_is_median_of_measured_same_architecture(tmp_path: Path) -
         safetensors={"m.safetensors": int(10 * GIB)},
     )
     obs = [
-        # Same architecture (Qwen3_5*), trust="measured" -> counts.
+        _obs("Other/One", "inline", 262144, weights_gib=1.0, kv_gib=10.0, kv_tokens=int(10 * 1048576 / 30)),
+        _obs("Other/Two", "inline", 262144, weights_gib=1.0, kv_gib=10.0, kv_tokens=int(10 * 1048576 / 40)),
+    ]
+    r = resolve_inputs("A/NeverBooted", util=0.5, ctx=262144, observations=obs, hub_dir=tmp_path)
+    assert r.kv_kib_per_token == pytest.approx(192.0, abs=0.5)
+    assert r.kv_source == "estimated"
+
+
+def test_tier3_falls_back_to_the_family_median_when_the_stack_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    """The median is not deleted, only demoted: a config.json that declares an
+    architecture but no attention geometry still gets the family's answer."""
+    _make_repo(
+        tmp_path,
+        "models--A--NeverBooted",
+        config=GEOMETRYLESS_CONFIG,
+        safetensors={"m.safetensors": int(10 * GIB)},
+    )
+    obs = [
         _obs("Other/One", "inline", 262144, weights_gib=1.0, kv_gib=10.0, kv_tokens=int(10 * 1048576 / 30)),
         _obs("Other/Two", "inline", 262144, weights_gib=1.0, kv_gib=10.0, kv_tokens=int(10 * 1048576 / 40)),
     ]
@@ -633,7 +672,7 @@ def test_tier3_kv_rate_ignores_non_measured_trust_observations(tmp_path: Path) -
     _make_repo(
         tmp_path,
         "models--A--NeverBooted",
-        config=INLINE_CONFIG,
+        config=GEOMETRYLESS_CONFIG,
         safetensors={"m.safetensors": int(10 * GIB)},
     )
     estimated_obs = _obs("Other/One", "inline", 262144, weights_gib=1.0, kv_kib_per_token=999.0)
@@ -709,7 +748,10 @@ pytestmark_real = pytest.mark.skipif(
 @pytestmark_real
 def test_real_hub_entries_are_internally_consistent() -> None:
     for e in discover_models():
-        assert e.repo_id and "/" in e.repo_id
+        # "org/name", or a legacy single-segment id: the hub still serves
+        # `gpt2` and `bert-base-uncased` under `models--<name>`, and one of
+        # them turning up in a real cache is not a registry defect.
+        assert e.repo_id and not e.repo_id.startswith("/")
         if e.skipped:
             continue
         # Servability must always be explainable: either it is servable, or
@@ -723,13 +765,26 @@ def test_real_hub_entries_are_internally_consistent() -> None:
 
 
 @pytestmark_real
-def test_real_hub_gguf_only_models_are_rejected_with_a_reason() -> None:
-    """A GGUF-only checkpoint has no config.json and cannot be loaded."""
+def test_real_hub_unloadable_models_say_what_is_actually_wrong() -> None:
+    """An entry with no config.json and no safetensors must name its cause.
+
+    This used to assert every such entry was GGUF-only. It is not the only
+    way to get there: a snapshot whose blobs live on an unmounted external
+    drive scans as zero safetensors and an unreadable config.json too, and
+    "0 safetensors, no config.json" reads as a failed download -- sending the
+    operator to re-fetch ~180 GiB that is sitting on a disk they only have to
+    plug back in. Whatever the cause, the reason has to name it.
+    """
     for e in discover_models():
         if e.skipped or e.config_exists or e.safetensors_count:
             continue
         assert not e.servable
-        assert e.reason and "GGUF" in e.reason.upper()
+        assert e.reason, f"{e.repo_id} is unservable with no reason"
+        upper = e.reason.upper()
+        assert "GGUF" in upper or "SYMLINK" in upper or "PARTIAL" in upper, (
+            f"{e.repo_id}: reason {e.reason!r} does not name a cause a human "
+            "can act on"
+        )
 
 
 @pytestmark_real
@@ -748,3 +803,202 @@ def test_weights_estimator_refuses_host_offload_architectures() -> None:
             assert ri.weights_source == "unknown", (
                 f"{e.repo_id}: offload architecture must not be estimated from disk size"
             )
+
+
+def test_a_snapshot_whose_blobs_are_offline_says_so(tmp_path) -> None:
+    """A hub snapshot on this box points its files at blobs on an external
+    drive. Unplug the drive and the scan is byte-for-byte identical to a
+    failed download: zero safetensors, unreadable config.json. Reporting it as
+    "0 safetensors, no config.json" sends the operator to re-fetch ~180 GiB
+    that is sitting on a disk they only have to plug back in.
+    """
+    from servedeck.registry import _scan_snapshot_files
+
+    snap = tmp_path / "snapshots" / "abc"
+    snap.mkdir(parents=True)
+    gone = tmp_path / "not-mounted" / "blob"
+    (snap / "model-00001.safetensors").symlink_to(gone)
+    (snap / "config.json").symlink_to(gone)
+    real = snap / "tokenizer.json"
+    real.write_text("{}")
+
+    scan = _scan_snapshot_files(snap)
+    assert (scan.safetensors_bytes, scan.safetensors_count, scan.gguf_count) == (0, 0, 0)
+    assert scan.dangling_count == 2, "unresolved symlinks were counted as ordinary files"
+
+
+def test_a_healthy_snapshot_reports_no_dangling_symlinks(tmp_path) -> None:
+    """The over-correction guard: a normal hub snapshot IS a directory of
+    symlinks into blobs/, and every one of them resolves. Counting those as
+    broken would label every cached model unloadable."""
+    from servedeck.registry import _scan_snapshot_files
+
+    blobs = tmp_path / "blobs"
+    blobs.mkdir()
+    blob = blobs / "deadbeef"
+    blob.write_bytes(b"x" * 4096)
+    snap = tmp_path / "snapshots" / "abc"
+    snap.mkdir(parents=True)
+    (snap / "model-00001.safetensors").symlink_to(blob)
+    (snap / "config.json").symlink_to(blob)
+
+    scan = _scan_snapshot_files(snap)
+    assert scan.dangling_count == 0
+    assert scan.safetensors_count == 1
+    assert scan.safetensors_bytes > 0
+
+
+def test_the_observation_store_lives_in_the_configured_state_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The registry read `<package>/../state/measurements.json` whatever
+    `state_dir` said. Point state_dir somewhere else — which is what a systemd
+    unit with its own StateDirectory does — and boots are recorded in one
+    place and read from another, so every model reads "never booted" forever
+    while the measurements pile up unseen."""
+    from servedeck import config as _cfg
+
+    store = tmp_path / "elsewhere"
+    monkeypatch.setenv("SERVEDECK_STATE_DIR", str(store))
+    _cfg.reset()
+    try:
+        assert default_measurements_path() == store / "measurements.json"
+    finally:
+        monkeypatch.delenv("SERVEDECK_STATE_DIR", raising=False)
+        _cfg.reset()
+
+
+# --------------------------------------------------------------------------- #
+# Size on disk (see tests/test_disksize.py for the walker's own contract)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_hardlinked_shard_is_not_counted_twice_in_a_models_disk_size(tmp_path: Path) -> None:
+    """Production shape, built the way production built it.
+
+    The FP8 PLE table was installed into the Flash-Next snapshot as hardlinks
+    of the files in ~/.cache/huggingface/ple-fp8-staging (43 shards, st_nlink
+    2). The hub also stores every snapshot entry as a symlink into blobs/, so
+    a per-name walk of a ``models--*`` directory sees each blob at least twice
+    already. ``disk_bytes`` is what a panel headed "Models on disk" claims, so
+    it must be what deleting the directory would actually free.
+
+    Real bytes, not the sparse files _write_safetensors uses: st_blocks is the
+    measurement, and a fixture of holes would make any implementation pass.
+    """
+    repo_dir = _make_repo(tmp_path, "models--A--B", config=INLINE_CONFIG)
+    snapshot = repo_dir / "snapshots" / "abc123"
+    blobs = repo_dir / "blobs"
+    blobs.mkdir(parents=True, exist_ok=True)
+
+    shard_size = 2 * 1024 * 1024
+    blob = blobs / "blob-shard"
+    blob.write_bytes(b"\xa5" * shard_size)
+    # (a) the hub's own symlink from the snapshot into blobs/
+    (snapshot / "model-00001.safetensors").symlink_to(blob)
+    # (b) the PLE-staging shape: a second directory entry, same inode
+    os.link(blob, snapshot / "model-plefp8-00.safetensors")
+    assert blob.stat().st_nlink == 2, "fixture is not actually hardlinked"
+
+    one_shard = blob.stat().st_blocks * 512
+    e = discover_models(tmp_path)[0]
+
+    assert e.disk_bytes == pytest.approx(one_shard, abs=64 * 1024), (
+        f"one 2 MiB blob under three names reported as {e.disk_bytes} bytes"
+    )
+    assert e.disk_bytes < 2 * one_shard
+    assert e.disk_local_bytes == e.disk_bytes, "nothing here is on another mount"
+
+
+def test_disk_size_counts_the_repo_not_only_the_resolved_snapshot(tmp_path: Path) -> None:
+    """What deleting a model frees is the whole ``models--*`` directory.
+
+    blobs/ is where the bytes live and it is shared by every snapshot; an
+    older revision's blob is still occupying space even though the resolved
+    snapshot does not name it. Measuring only the resolved snapshot
+    under-reports openai/gpt-oss-20b on this box by 21 GiB (3.91 GiB of
+    resolved snapshot against 24.79 GiB of hub directory).
+    """
+    repo_dir = _make_repo(tmp_path, "models--A--B", config=INLINE_CONFIG)
+    blobs = repo_dir / "blobs"
+    blobs.mkdir(parents=True, exist_ok=True)
+    (blobs / "orphan-from-an-older-revision").write_bytes(b"\xa5" * (3 * 1024 * 1024))
+
+    e = discover_models(tmp_path)[0]
+
+    assert e.disk_bytes >= 3 * 1024 * 1024, (
+        "a blob no live snapshot names is still occupying the disk"
+    )
+
+
+def test_safetensors_size_still_ignores_sparseness(tmp_path: Path) -> None:
+    """Over-correction guard for the two sizes not collapsing into one.
+
+    ``safetensors_gib`` feeds the tier-3 VRAM estimate: a sparse hole becomes
+    zeros in RAM, so that figure must stay APPARENT size even though
+    ``disk_bytes`` moved to blocks. Swapping the weights estimate to st_blocks
+    would make every model in this repo's own test fixtures — which are all
+    sparse — estimate as needing no VRAM at all.
+    """
+    _make_repo(
+        tmp_path,
+        "models--A--B",
+        config=INLINE_CONFIG,
+        safetensors={"m.safetensors": 8 * GIB},  # sparse, per _write_safetensors
+    )
+    e = discover_models(tmp_path)[0]
+    assert round(e.safetensors_gib, 2) == pytest.approx(8.0, abs=0.01)
+    assert e.disk_bytes < 1 * GIB, "fixture is not sparse; the guard proves nothing"
+
+
+def test_a_partial_download_says_so_instead_of_looking_like_three_other_faults(
+    tmp_path: Path,
+) -> None:
+    """"0 safetensors, no config.json" has three causes and one message.
+
+    GGUF-only (get a loader), blobs on an unmounted drive (plug it in), and a
+    download that stopped partway (resume it) all scan identically. Only the
+    third has no marker of its own, and it is the live case on this box:
+    mistralai/Magistral-Small-2509 has one resolvable file (a tokenizer) and
+    nothing else.
+    """
+    repo_dir = _make_repo(tmp_path, "models--A--B", config=None)
+    snapshot = repo_dir / "snapshots" / "abc123"
+    blobs = repo_dir / "blobs"
+    blobs.mkdir(parents=True, exist_ok=True)
+    blob = blobs / "blob-tokenizer"
+    blob.write_bytes(b"{}")
+    (snapshot / "tekken.json").symlink_to(blob)
+
+    e = discover_models(tmp_path)[0]
+
+    assert not e.servable
+    assert e.reason and "partial download" in e.reason, (
+        f"reason {e.reason!r} does not name a cause the operator can act on"
+    )
+
+
+def test_an_empty_snapshot_is_not_called_a_partial_download(tmp_path: Path) -> None:
+    """Over-correction guard. A snapshot with no files at all is a download
+    that never started, and calling it "partial — 0 file(s) present" is a
+    sentence that argues with itself. The prefix requires evidence."""
+    _make_repo(tmp_path, "models--A--B", config=None)
+
+    e = discover_models(tmp_path)[0]
+
+    assert e.reason == "0 safetensors, no config.json"
+
+
+def test_unmounted_blobs_still_win_over_the_partial_download_message(tmp_path: Path) -> None:
+    """Over-correction guard. A snapshot with one resolvable file AND dangling
+    symlinks is the unmounted-drive case; that message names a 180 GiB
+    re-download the operator must not start, so it must not be displaced by
+    the gentler one."""
+    repo_dir = _make_repo(tmp_path, "models--A--B", config=None)
+    snapshot = repo_dir / "snapshots" / "abc123"
+    (snapshot / "tekken.json").write_text("{}")
+    (snapshot / "model-00001.safetensors").symlink_to(tmp_path / "not-mounted" / "blob")
+
+    e = discover_models(tmp_path)[0]
+
+    assert e.reason and "unresolved symlink" in e.reason

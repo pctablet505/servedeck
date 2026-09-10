@@ -1,0 +1,15 @@
+{
+  "_": "Recorded off the live vLLM Flash-Next server on http://127.0.0.1:8001, 2026-09-10. Unmodified exposition text. dt_s is the monotonic interval between the two scrapes of each pair.",
+  "win": {
+    "t1": "metrics_live_win_t1.txt",
+    "t2": "metrics_live_win_t2.txt",
+    "dt_s": 60.007,
+    "shows": "A 60 s window in which the engine decoded and did not prefill: d(generation_tokens_total)=14940, d(prompt_tokens_total)=0. The decode figure is a number (249.0 tok/s) and the prefill window figure is idle -- the exact state in which the old panel showed one number where the other had been."
+  },
+  "prefill_lag": {
+    "t1": "metrics_live_prefill_lag_t1.txt",
+    "t2": "metrics_live_prefill_lag_t2.txt",
+    "dt_s": 10.016,
+    "shows": "d(prompt_tokens_total)=0 while d(request_prefill_time_seconds_sum)=20.005 over one observed request. The prefill-time histogram is observed at first token and carries the whole prefill duration, so it cannot be the denominator of a windowed rate."
+  }
+}

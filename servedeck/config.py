@@ -2,7 +2,8 @@
 
 Resolution order, first match wins:
 
-1. ``SERVEDECK_*`` environment variables
+1. ``SERVEDECK_*`` environment variables — each also readable under its
+   pre-rename ``COLDSTART_*`` spelling, which is deprecated (see legacy.py)
 2. ``servedeck.toml`` — next to the package, or at ``$SERVEDECK_CONFIG``
 3. Auto-detection (GPU size from ``nvidia-smi``, model cache from ``$HF_HOME``)
 4. Documented defaults
@@ -19,6 +20,8 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from . import legacy
 
 # A GPU size is only used when detection fails. 0 means "unknown", which makes
 # capacity refuse to guess rather than invent a budget.
@@ -85,6 +88,29 @@ class Backend:
     # which makes unattended restart impossible. Servedeck reports
     # blocked-needs-human rather than looping.
     needs_tty: bool = False
+    #: Working directory for the launcher. Defaults to the directory the
+    #: launcher lives in — which is what the shell CLI on this box does
+    #: (``cd "$(dirname "$SERVE_SH")"``) and is right for a serve script that
+    #: sits at a project root. It is NOT right for a launcher under ``bin/``:
+    #: that directory is not the tree the server belongs to, and any relative
+    #: path the launcher uses resolves one level down from where it means to.
+    #:
+    #: Whether that matters is a property of the launcher, which is why this is
+    #: declared rather than derived. ``local_llm/bin/qwen-server-run.sh``, for
+    #: one, derives its own root from ``${BASH_SOURCE[0]}/..`` and so does not
+    #: care — setting ``cwd`` for it changes nothing today. A launcher that
+    #: does care has nowhere else to say so.
+    cwd: Path | None = None
+    #: Cold-boot ETA envelope (low, high) in seconds, used only until this
+    #: model has produced measured boot history of its own. A model family's
+    #: cold boot is a fact about a checkpoint on one machine, so it is
+    #: configuration, not a constant in the package.
+    cold_boot_range_s: tuple[float, float] | None = None
+
+    @property
+    def run_cwd(self) -> Path:
+        """Where to run the launcher from."""
+        return self.cwd if self.cwd is not None else self.launcher.parent
 
 
 @dataclass(frozen=True)
@@ -141,7 +167,7 @@ def detect_gpu_total_mib() -> int:
 
 
 def default_model_cache() -> Path:
-    if v := os.environ.get("SERVEDECK_MODEL_CACHE"):
+    if v := legacy.env("MODEL_CACHE"):
         return Path(v).expanduser()
     if v := os.environ.get("HF_HUB_CACHE"):
         return Path(v).expanduser()
@@ -151,7 +177,7 @@ def default_model_cache() -> Path:
 
 
 def _config_file() -> Path | None:
-    if v := os.environ.get("SERVEDECK_CONFIG"):
+    if v := legacy.env("CONFIG"):
         p = Path(v).expanduser()
         return p if p.is_file() else None
     for candidate in (
@@ -192,6 +218,12 @@ def _parse_backend(name: str, raw: dict[str, Any]) -> Backend:
         env={str(k): str(v) for k, v in (raw.get("env") or {}).items()},
         architectures=tuple(raw.get("architectures", ())),
         needs_tty=bool(raw.get("needs_tty", False)),
+        cwd=Path(str(raw["cwd"])).expanduser() if raw.get("cwd") else None,
+        cold_boot_range_s=(
+            (float(raw["cold_boot_range_s"][0]), float(raw["cold_boot_range_s"][1]))
+            if raw.get("cold_boot_range_s")
+            else None
+        ),
     )
 
 
@@ -204,7 +236,7 @@ def load(path: Path | None = None) -> Config:
             raw = tomllib.load(fh)
 
     state_dir = Path(
-        os.environ.get("SERVEDECK_STATE_DIR")
+        legacy.env("STATE_DIR")
         or raw.get("state_dir")
         or (Path(__file__).resolve().parent.parent / "state")
     ).expanduser()
@@ -213,7 +245,7 @@ def load(path: Path | None = None) -> Config:
         _parse_backend(name, spec) for name, spec in (raw.get("backends") or {}).items()
     )
 
-    gpu_total = int(os.environ.get("SERVEDECK_GPU_TOTAL_MIB") or raw.get("gpu_total_mib") or 0)
+    gpu_total = int(legacy.env("GPU_TOTAL_MIB") or raw.get("gpu_total_mib") or 0)
     if not gpu_total:
         gpu_total = detect_gpu_total_mib()
 
@@ -225,8 +257,8 @@ def load(path: Path | None = None) -> Config:
         gpu_total_mib=gpu_total,
         overhead_gib=float(raw.get("overhead_gib", DEFAULT_OVERHEAD_GIB)),
         frag_margin_mib=int(raw.get("frag_margin_mib", DEFAULT_FRAG_MARGIN_MIB)),
-        listen_host=str(os.environ.get("SERVEDECK_HOST") or raw.get("listen_host", "127.0.0.1")),
-        listen_port=int(os.environ.get("SERVEDECK_PORT") or raw.get("listen_port", 8010)),
+        listen_host=str(legacy.env("HOST") or raw.get("listen_host", "127.0.0.1")),
+        listen_port=int(legacy.env("PORT") or raw.get("listen_port", 8010)),
         shell_config_script=Path(shell_script).expanduser() if shell_script else None,
         training_markers=tuple(
             str(Path(str(m)).expanduser()) for m in raw.get("training_markers", ())

@@ -1,7 +1,7 @@
 """Servedeck smoke test — SPEC.md §8 "SMOKE TEST".
 
 Two requests, run THROUGH the gateway (http://127.0.0.1:8010 by default,
-never directly at :8001/:8000) so this proves the gateway path too, not
+never directly at the backend port) so this proves the gateway path too, not
 just that vLLM itself is alive:
 
 1. Tool call: one function ``get_time(timezone)``, ``tool_choice="auto"``,

@@ -27,7 +27,7 @@ _CFG = dict(
 )
 
 
-def _fake_supervisor(tmp: Path) -> tuple[supervisor.Supervisor, list]:
+def _fake_supervisor(tmp: Path, monkeypatch) -> tuple[supervisor.Supervisor, list]:
     """A Supervisor with launch/stop/preflight/config/monitor all faked out."""
     launches: list = []
 
@@ -47,21 +47,26 @@ def _fake_supervisor(tmp: Path) -> tuple[supervisor.Supervisor, list]:
     )
     # preflight touches the GPU and real files; the monitor polls HTTP and
     # tails logs. Neither belongs in a unit test of the state machine.
-    preflight.run_preflight = lambda **kw: []           # type: ignore[assignment]
-    preflight.blocking_failures = lambda checks: []     # type: ignore[assignment]
+    #
+    # monkeypatch, not assignment: these used to be rebound on the module
+    # permanently, so every test that ran AFTER one of these in the same
+    # session had preflight silently disabled -- including the tests whose
+    # whole subject is a preflight check refusing a start.
+    monkeypatch.setattr(preflight, "run_preflight", lambda **kw: [])
+    monkeypatch.setattr(preflight, "blocking_failures", lambda checks: [])
     s._sync_shell_config = types.MethodType(lambda self, **kw: None, s)          # type: ignore[assignment]
     s._run_monitor = types.MethodType(lambda self, *a, **k: asyncio.sleep(0), s)  # type: ignore[assignment]
     return s, launches
 
 
-def test_restart_actually_relaunches(tmp_path: Path) -> None:
+def test_restart_actually_relaunches(tmp_path: Path, monkeypatch) -> None:
     """Regression: restart() used to be a silent no-op stop.
 
     stop() leaves actual_state == "STOPPING"; start()'s idempotence guard
     returns early on that state, so the relaunch never happened — 0 launches,
     ending at actual=STOPPING / desired=STOPPED.
     """
-    s, launches = _fake_supervisor(tmp_path)
+    s, launches = _fake_supervisor(tmp_path, monkeypatch)
 
     async def scenario() -> None:
         await s.start(**_CFG)
@@ -82,7 +87,7 @@ def test_restart_actually_relaunches(tmp_path: Path) -> None:
     assert s.actual_state != "STOPPING"
 
 
-def test_adopted_server_reports_reached_ready() -> None:
+def test_adopted_server_reports_reached_ready(monkeypatch) -> None:
     """Regression: an adopted server's crash was filed as a failed boot.
 
     _adopt_ready() left _tracker None, so reached_ready computed False and
@@ -105,7 +110,7 @@ def test_adopted_server_reports_reached_ready() -> None:
         )
 
 
-def test_failed_boot_is_never_auto_restarted() -> None:
+def test_failed_boot_is_never_auto_restarted(monkeypatch) -> None:
     """The other half of the rule: a boot that never served must not loop.
 
     Six consecutive boots failed on 2026-08-27, each with a different root
@@ -122,7 +127,7 @@ def test_failed_boot_is_never_auto_restarted() -> None:
 # --------------------------------------------------------------------------
 # Monitor / adoption regressions
 # --------------------------------------------------------------------------
-def test_adopted_server_monitor_notices_the_process_exiting(tmp_path: Path) -> None:
+def test_adopted_server_monitor_notices_the_process_exiting(tmp_path: Path, monkeypatch) -> None:
     """Regression: _run_monitor died on its first tick for an ADOPTED server.
 
     _adopt_ready() calls _run_monitor(already_ready=True), which leaves
@@ -134,7 +139,7 @@ def test_adopted_server_monitor_notices_the_process_exiting(tmp_path: Path) -> N
     Observed consequence on a live instance: /api/state reported actual_state
     READY with nothing listening on the port at all.
     """
-    s, _ = _fake_supervisor(tmp_path)
+    s, _ = _fake_supervisor(tmp_path, monkeypatch)
     # _fake_supervisor stubs _run_monitor out; this test is about the real one.
     del s._run_monitor
     s.desired.backend = "flashnext"

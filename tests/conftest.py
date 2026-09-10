@@ -61,6 +61,14 @@ def _isolated_config(tmp_path_factory: pytest.TempPathFactory):
     path.write_text(_TOML)
     previous = os.environ.get("SERVEDECK_CONFIG")
     os.environ["SERVEDECK_CONFIG"] = str(path)
+    # Same reason, for the pre-rename state directory: legacy.legacy_state_dir()
+    # defaults to ~/Projects/coldstart/state, which exists on the maintainer's
+    # box and nowhere else. Left on, every test that reads the default history
+    # or measurements store would silently merge one machine's real boot
+    # records into its fixture. "" turns the compatibility read off; the tests
+    # that are ABOUT it set the variable themselves.
+    previous_legacy = os.environ.get("SERVEDECK_LEGACY_STATE_DIR")
+    os.environ["SERVEDECK_LEGACY_STATE_DIR"] = ""
     config.reset()
     capacity.refresh_limits()
     try:
@@ -70,6 +78,10 @@ def _isolated_config(tmp_path_factory: pytest.TempPathFactory):
             os.environ.pop("SERVEDECK_CONFIG", None)
         else:
             os.environ["SERVEDECK_CONFIG"] = previous
+        if previous_legacy is None:
+            os.environ.pop("SERVEDECK_LEGACY_STATE_DIR", None)
+        else:
+            os.environ["SERVEDECK_LEGACY_STATE_DIR"] = previous_legacy
         config.reset()
         capacity.refresh_limits()
 
@@ -90,3 +102,42 @@ def config_path(tmp_path: Path):
         return config.get()
 
     return _write
+
+
+# --------------------------------------------------------------------------
+# Guard: a test that permanently rebinds a module entry point
+# --------------------------------------------------------------------------
+_GUARDED = (
+    ("servedeck.preflight", "run_preflight"),
+    ("servedeck.preflight", "blocking_failures"),
+    ("servedeck.registry", "discover_models"),
+)
+
+
+@pytest.fixture(autouse=True)
+def _no_permanent_module_stubs():
+    """Fail the test that leaves a stub behind, not the innocent test after it.
+
+    Two tests replaced ``preflight.run_preflight`` by plain assignment to skip
+    a GPU probe. Assignment is not undone at teardown, so preflight stayed
+    disabled for every test that ran later in the same session -- and the
+    tests that noticed were the ones whose whole subject is a preflight check
+    refusing a start. They failed in a full run and passed in isolation, which
+    reads as flakiness rather than as the pollution it is.
+    """
+    import importlib
+
+    before = {
+        (mod, attr): getattr(importlib.import_module(mod), attr)
+        for mod, attr in _GUARDED
+    }
+    yield
+    leaked = [
+        f"{mod}.{attr}"
+        for (mod, attr), original in before.items()
+        if getattr(importlib.import_module(mod), attr) is not original
+    ]
+    assert not leaked, (
+        "this test replaced " + ", ".join(leaked) + " and did not restore it; "
+        "use monkeypatch.setattr so the next test is not affected"
+    )

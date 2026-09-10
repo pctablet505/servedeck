@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from servedeck import config, gpu, paths
+from servedeck import capacity, config, gpu, paths
 
 Level = Literal["block", "warn", "info"]
 
@@ -100,10 +100,30 @@ def check_gpu_responsive() -> PreflightCheck:
     )
 
 
+def training_marker_paths() -> tuple[str, ...]:
+    """Every marker path that should block a start.
+
+    The CONFIGURED markers, not just the two the package happens to know:
+    `training_markers` in servedeck.toml was parsed, exposed through
+    capacity.TRAINING_MARKER_PATHS, and then never consulted by the only code
+    that can actually refuse a launch. A marker the operator declared was
+    therefore a guard that read as switched on and was not -- on this box that
+    was the AlgoTrading training marker, which stopped blocking the GPU when
+    the fork was folded in.
+    """
+    configured = tuple(capacity.TRAINING_MARKER_PATHS)
+    builtin = tuple(str(p) for p in paths.TRAINING_MARKERS)
+    seen: dict[str, None] = {}
+    for raw in (*configured, *builtin):
+        seen.setdefault(str(Path(raw).expanduser()), None)
+    return tuple(seen)
+
+
 def check_training_marker() -> PreflightCheck:
     """SPEC.md §3 TRAINING_MARKER — qwen-server-run.sh:75-79's own guard 1:
-    presence of ANY of the three marker paths means "keep off the GPU"."""
-    hits = [str(p) for p in paths.TRAINING_MARKERS if p.exists()]
+    presence of ANY marker path means "keep off the GPU"."""
+    candidates = training_marker_paths()
+    hits = [p for p in candidates if Path(p).exists()]
     ok = not hits
     return PreflightCheck(
         id="TRAINING_MARKER",
@@ -111,12 +131,62 @@ def check_training_marker() -> PreflightCheck:
         level="block",
         title="No training in progress" if ok else "Training in progress",
         detail=(
-            "None of the three training-marker paths are present."
+            f"None of the {len(candidates)} training-marker paths are present."
             if ok
             else "Training marker present at: " + ", ".join(hits) + ". Refusing to take the GPU."
         ),
         fix_command=None if ok else f"rm {hits[0]}   # only once training has actually finished",
     )
+
+
+def check_port_free(port: int | None) -> PreflightCheck | None:
+    """The port must be free, or the boot is doomed before it starts.
+
+    vLLM binds its HTTP port LAST, after loading weights -- so starting on a
+    taken port spends four to ten minutes loading a model and then dies on
+    "address already in use", and the dashboard shows a long, healthy-looking
+    boot that ends in a failure whose cause scrolled past. `llm start` checks
+    this first (`up "$PORT"` before it will launch anything) and Servedeck did
+    not check it at all.
+
+    It matters here specifically: :8000 is permanently held by an unrelated
+    autostarting service, and a start aimed at a port another Servedeck-managed
+    server is already serving on is the most likely way to hit this.
+    """
+    if not port:
+        return None
+    pid = _listener_pid(port)
+    ok = pid is None
+    return PreflightCheck(
+        id="PORT_IN_USE",
+        ok=ok,
+        level="block",
+        title=f"Port {port} is free" if ok else f"Port {port} is already in use",
+        detail=(
+            f"Nothing is listening on :{port}."
+            if ok
+            else f"pid {pid} is already listening on :{port}. vLLM binds its port only "
+            "after loading weights, so this start would spend minutes loading and then "
+            "die on 'address already in use'. Stop that process, or start on another port."
+        ),
+        fix_command=None if ok else f"ss -lntp 'sport = :{port}'",
+    )
+
+
+def _listener_pid(port: int) -> int | None:
+    """procctl's socket-table lookup, imported lazily.
+
+    preflight is imported by capacity-only callers that never touch /proc, and
+    procctl pulls in the whole process-control surface. Never raises: an
+    unreadable socket table means "cannot tell", which must not be reported as
+    "in use" and block every start.
+    """
+    try:
+        from servedeck import procctl
+
+        return procctl.listener_pid(port)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _read_ptrace_scope() -> int | None:
@@ -268,7 +338,11 @@ def check_launcher(backend: str | None) -> PreflightCheck | None:
 # ---------------------------------------------------------------------------
 
 
-def run_preflight(backend: str | None = None, actual_state: str | None = None) -> list[PreflightCheck]:
+def run_preflight(
+    backend: str | None = None,
+    actual_state: str | None = None,
+    port: int | None = None,
+) -> list[PreflightCheck]:
     """Run every applicable check and return the full list (blocking AND
     passing AND warn/info) — callers decide what to do with ``ok``/``level``
     themselves (SPEC.md §8's ``GET /api/preflight`` renders all of them;
@@ -294,6 +368,9 @@ def run_preflight(backend: str | None = None, actual_state: str | None = None) -
     launcher_check = check_launcher(backend)
     if launcher_check is not None:
         checks.append(launcher_check)
+    port_check = check_port_free(port)
+    if port_check is not None:
+        checks.append(port_check)
     return checks
 
 

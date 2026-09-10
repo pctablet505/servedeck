@@ -79,7 +79,7 @@ body{
 .mono{font-family:"IBM Plex Mono","DejaVu Sans Mono",ui-monospace,SFMono-Regular,Menlo,monospace;font-variant-numeric:tabular-nums}
 h1,h2,h3{margin:0;text-wrap:balance}
 
-.wrap{max-width:1180px;margin:0 auto;padding:20px 20px 40px}
+.wrap{max-width:1400px;margin:0 auto;padding:18px 18px 36px}
 
 /* ---------- header ---------- */
 .top{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:6px}
@@ -105,7 +105,12 @@ h1,h2,h3{margin:0;text-wrap:balance}
 .vram-head .lbl{font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);font-weight:600}
 .vram-head .val{font-size:12px;color:var(--ink-2)}
 .bar{height:26px;border-radius:6px;overflow:hidden;display:flex;background:var(--surface-2);border:1px solid var(--line)}
-.seg{display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;color:#fff;letter-spacing:.03em;min-width:0;transition:width .5s cubic-bezier(.4,0,.2,1)}
+/* Scoped to .bar on purpose. `.seg` bare also matched the serving line's
+   segments (`.smeta .seg`), which are text on the page background — so this
+   rule's `color:#fff` painted them white on a #FBFCFD surface and
+   `font-size:10px` shrank them. The line was rendered, measured and
+   invisible: getComputedStyle reported rgb(255,255,255) on every segment. */
+.bar .seg{display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;color:#fff;letter-spacing:.03em;min-width:0;transition:width .5s cubic-bezier(.4,0,.2,1)}
 .seg.weights{background:var(--accent)}
 .seg.kv{background:var(--ok)}
 .seg.overhead{background:var(--line-strong)}
@@ -114,7 +119,7 @@ h1,h2,h3{margin:0;text-wrap:balance}
 .legend i{width:9px;height:9px;border-radius:2px;display:inline-block;margin-right:5px;vertical-align:-1px}
 
 /* ---------- layout ---------- */
-.grid{display:grid;grid-template-columns:300px 1fr;gap:18px;align-items:start}
+.grid{display:grid;grid-template-columns:340px 1fr;gap:16px;align-items:start}
 @media(max-width:860px){.grid{grid-template-columns:1fr}}
 
 .panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow)}
@@ -133,10 +138,24 @@ h1,h2,h3{margin:0;text-wrap:balance}
 }
 .mcard:hover{background:var(--surface-2)}
 .mcard:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+/* An unservable model is aria-disabled, not disabled: a disabled button is
+   skipped by Tab entirely, so the operator cannot reach the card to read WHY
+   it cannot be served. The reason is on the card's note line, which is only
+   readable if the card is focusable. */
+.mcard[aria-disabled="true"]{opacity:.5;cursor:not-allowed}
+.mcard[aria-disabled="true"]:hover{background:transparent}
 .mcard[aria-pressed="true"]{background:var(--accent-soft);border-color:var(--accent)}
 .mcard .r1{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
 .mcard .nm{font-weight:600;letter-spacing:-.005em}
-.mcard .sz{font-size:11px;color:var(--muted)}
+.mcard .sz{font-size:11px;color:var(--muted);white-space:nowrap}
+/* The marker on a model whose blobs live on another mount: its size is real
+   but is not space on the filesystem whose free figure sits above it. */
+.mcard .sz .off{margin-left:3px;opacity:.7}
+.dfline{
+  display:flex;justify-content:space-between;gap:8px;
+  padding:6px 10px;font-size:11px;color:var(--muted);
+  border-bottom:1px solid var(--line);
+}
 .mcard .r2{display:flex;align-items:center;gap:6px;margin-top:4px}
 .mcard .note{font-size:11px;color:var(--muted);margin-top:3px;line-height:1.35}
 
@@ -184,26 +203,38 @@ h1,h2,h3{margin:0;text-wrap:balance}
 .alloc{padding:14px;border-top:1px solid var(--line)}
 .field{margin-bottom:15px}
 .field:last-child{margin-bottom:0}
-.flabel{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:7px}
-.flabel .k{font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);font-weight:600}
-.flabel .v{font-size:14px;font-weight:600}
+
+/* One line per control: label, control, value. The field used to be three
+   lines tall (label, a full-width slider, a tick row), which made the
+   allocator taller than the panels it feeds. The tick row's range moved into
+   each control's title, where it is read on hover rather than always burning
+   vertical space. */
+.frow{display:flex;align-items:center;gap:11px;margin-bottom:9px}
+.frow:last-child{margin-bottom:0}
+.frow .k{flex:0 0 118px;font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);font-weight:600}
+.frow input[type=range]{flex:1 1 auto;min-width:0;width:auto}
+.frow .v{flex:0 0 auto;min-width:52px;text-align:right;font-size:14px;font-weight:600}
+.frow .s{flex:0 0 auto;font-size:10.5px;color:var(--muted);white-space:nowrap}
+/* The field says one agent count and the KV budget holds fewer. Quiet grey
+   made "KV fits 1" read as a caption of the field rather than a contradiction
+   of it, next to a field showing 16. */
+.frow .s.overfit{color:var(--warn);font-weight:600}
+input[type=number].num{
+  flex:0 0 76px;width:76px;padding:5px 8px;border-radius:6px;
+  border:1px solid var(--line-strong);background:var(--surface);color:var(--ink);
+  font-family:"IBM Plex Mono","DejaVu Sans Mono",monospace;font-size:14px;
+  font-variant-numeric:tabular-nums
+}
+input[type=number].num:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
 
 input[type=range]{width:100%;accent-color:var(--accent);height:22px}
 input[type=range]:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
-.ticks{display:flex;justify-content:space-between;font-size:10px;color:var(--muted);margin-top:-2px}
-
-.segbtns{display:flex;gap:5px;flex-wrap:wrap}
-.segbtn{
-  flex:1;min-width:64px;cursor:pointer;padding:7px 4px;border-radius:7px;
-  border:1px solid var(--line-strong);background:var(--surface);color:var(--ink-2);
-  font-family:"IBM Plex Mono",monospace;font-size:12px;font-variant-numeric:tabular-nums;transition:.13s
-}
-.segbtn:hover{border-color:var(--accent)}
-.segbtn:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
-.segbtn[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:600}
 
 /* derived readout */
 .derived{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-top:4px}
+/* One figure now; the other two cells echoed the controls above them. Still a
+   grid, so a future readout does not need new CSS. */
+.derived.one{grid-template-columns:1fr}
 @media(max-width:520px){.derived{grid-template-columns:1fr}}
 .dcell{background:var(--surface-2);border:1px solid var(--line);border-radius:8px;padding:10px 11px}
 .dcell .k{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:600;display:flex;align-items:center;gap:5px}
@@ -231,6 +262,8 @@ input[type=range]:focus-visible{outline:2px solid var(--accent);outline-offset:3
 .btn.pri{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
 .btn.pri:hover{filter:brightness(1.08)}
 .btn:disabled{opacity:.42;cursor:not-allowed;border-color:var(--line)}
+/* Inline beside a field, so it must not compete with the action bar. */
+.btn.tiny{padding:4px 9px;font-size:11px;border-radius:6px}
 .dirty{margin-left:auto;font-size:12px;color:var(--warn);font-weight:600;display:none}
 .dirty.on{display:block}
 
@@ -242,38 +275,37 @@ input[type=range]:focus-visible{outline:2px solid var(--accent);outline-offset:3
 .chk.warn .m{color:var(--warn)}
 
 /* ---------- live utilization ---------- */
-.live{margin-top:18px}
-.livegrid{display:grid;grid-template-columns:1.35fr 1fr 1.15fr;gap:0}
+.live{margin-top:16px}
+/* The recommendation column used to be the narrowest of the three while
+   carrying the most text (the arithmetic, the p99 alternative, the calibration
+   note), so it wrapped into a column of broken lines. The KV column needs the
+   least width per line and gives some of its share up. */
+.livegrid{display:grid;grid-template-columns:1.15fr 1fr 1.3fr;gap:0}
 @media(max-width:900px){.livegrid{grid-template-columns:1fr}}
 .lcol{padding:13px 15px;border-right:1px solid var(--line)}
 .lcol:last-child{border-right:none}
 @media(max-width:900px){.lcol{border-right:none;border-bottom:1px solid var(--line)}}
 .lk{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:600}
+/* The time base of a counter ("now", "since boot"). Subordinate to the label it
+   qualifies and never uppercase, so it cannot be read as part of the name. */
+.lk .tb{text-transform:none;letter-spacing:0;font-weight:400;opacity:.8}
 .lbig{font-size:27px;font-weight:600;letter-spacing:-.025em;line-height:1.05;margin-top:2px}
 .lsub{font-size:11.5px;color:var(--muted);margin-top:2px}
-canvas{display:block;width:100%;height:42px;margin-top:9px}
+/* Was a bare `canvas` selector, which pinned every canvas on the page to 42px
+   of CSS height — fine for the sparkline, and a squashed plot for the
+   request-size histogram, whose bitmap is twice that tall. */
+#spark{display:block;width:100%;height:42px;margin-top:9px}
+#reqHist{display:block;width:100%;height:96px;margin-top:8px}
 .lrow{display:flex;gap:18px;margin-top:11px}
 .lrow>div{flex:1}
 .lrow .n{font-size:16px;font-weight:600;margin-top:1px}
 .lrow .n.hot{color:var(--warn)}
-.lrow .n.bad{color:var(--crit)}
+/* A preemption tally since boot is not an alarm: 593 of them accumulated over
+   days of serving and the number would be red forever. The alarm lives in
+   #oversub, which fires on the condition rather than the cumulative count, so
+   this stays in normal ink and only carries the number. */
+.lrow .n.bad{color:var(--ink)}
 
-.twoup{display:flex;gap:9px;margin-top:9px}
-.cap{flex:1;border:1px solid var(--line);border-radius:8px;padding:9px 10px;background:var(--surface-2)}
-.cap.bet{border-color:var(--accent);background:var(--accent-soft)}
-.cap .t{font-size:9.5px;text-transform:uppercase;letter-spacing:.07em;font-weight:700;color:var(--muted)}
-.cap.bet .t{color:var(--accent)}
-.cap .n{font-size:25px;font-weight:600;letter-spacing:-.02em;line-height:1.1;margin-top:1px}
-.cap .d{font-size:10.5px;color:var(--muted);margin-top:1px;line-height:1.3}
-
-.setrow{display:flex;gap:7px;align-items:center;margin-top:11px}
-.setrow input[type=number]{
-  width:74px;padding:6px 8px;border-radius:6px;border:1px solid var(--line-strong);
-  background:var(--surface);color:var(--ink);font-family:"IBM Plex Mono",monospace;
-  font-size:13px;font-variant-numeric:tabular-nums
-}
-.setrow input:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
-.setrow .btn{padding:6px 12px;font-size:12px}
 .hint{font-size:10.5px;color:var(--muted);margin-top:6px;line-height:1.4}
 
 .oversub{
@@ -283,30 +315,35 @@ canvas{display:block;width:100%;height:42px;margin-top:9px}
 .oversub.on{display:block}
 .oversub b{font-weight:700}
 
-.winsel{display:flex;gap:4px;margin-top:7px}
-.winsel button{
-  cursor:pointer;font-family:"IBM Plex Mono",monospace;font-size:10.5px;padding:3px 8px;
-  border-radius:5px;border:1px solid var(--line-strong);background:var(--surface);color:var(--muted)
-}
-.winsel button[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:600}
-.winsel button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
-
 /* ---------- log ---------- */
-.log{margin-top:18px}
+.log{margin-top:16px}
+/* The log is the least important thing on the page and used to occupy 190px of
+   it permanently. Collapsed by default; the header says how many lines are in
+   it, so an operator knows whether opening it is worth a click. */
 .logbody{
   padding:11px 14px;max-height:190px;overflow-y:auto;
   font-family:"IBM Plex Mono",monospace;font-size:11.5px;line-height:1.65;color:var(--ink-2)
 }
+.log.folded .logbody{display:none}
+.log .fold{
+  cursor:pointer;font-family:inherit;font-size:10.5px;font-weight:600;padding:3px 9px;
+  border-radius:6px;border:1px solid var(--line-strong);background:var(--surface);color:var(--muted)
+}
+.log .fold:hover{border-color:var(--accent);color:var(--ink-2)}
+.log .fold:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .logbody div{white-space:pre-wrap;word-break:break-word}
 .logbody .t{color:var(--muted)}
 .logbody .e{color:var(--crit)}
 .logbody .w{color:var(--warn)}
 .logbody .g{color:var(--ok)}
 
-/* queued agents + eta + auto-restart */
+/* In-flight requests, and the boot ETA. */
+/* Neutral, not amber: this is a count of work in progress, and colouring it
+   like the over-subscription warning made an ordinary request read as a fault. */
 .queued{
   margin-left:auto;display:none;align-items:center;gap:6px;font-size:11.5px;font-weight:600;
-  color:var(--warn);background:var(--warn-soft);border-radius:999px;padding:4px 11px
+  color:var(--ink-2);background:var(--surface-2);border:1px solid var(--line);
+  border-radius:999px;padding:3px 11px
 }
 .queued.on{display:inline-flex}
 .eta{
@@ -315,21 +352,41 @@ canvas{display:block;width:100%;height:42px;margin-top:9px}
 }
 .eta .el{font-weight:600;color:var(--ink-2)}
 .eta .over{color:var(--warn);font-weight:600}
-.toggles{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-right:auto}
-.tog{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--ink-2);cursor:pointer;user-select:none}
-.tog input{accent-color:var(--accent);width:15px;height:15px;cursor:pointer;margin:0}
-.tog input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.banner{
-  margin:0 14px 13px;padding:11px 13px;border-radius:8px;display:none;
-  font-size:12.5px;line-height:1.5;background:var(--crit-soft);color:var(--crit);
-  border-left:3px solid currentColor
-}
-.banner.on{display:block}
-.banner b{display:block;margin-bottom:3px;font-size:13px}
-.banner .act{margin-top:8px;display:flex;gap:7px}
-.banner .act button{
-  cursor:pointer;font-family:inherit;font-size:12px;font-weight:600;padding:5px 11px;
-  border-radius:6px;border:1px solid currentColor;background:transparent;color:inherit
-}
 .foot{margin-top:20px;font-size:11.5px;color:var(--muted);line-height:1.6;border-top:1px solid var(--line);padding-top:13px}
 .foot b{color:var(--ink-2);font-weight:600}
+
+/* Throughput strip: prefill / decode / TTFT, always all three. */
+.thru{display:grid;grid-template-columns:repeat(3,1fr);border-top:1px solid var(--line)}
+/* Its own home is now the status block, where it replaced the one-line summary
+   of the same figures. Framed rather than flush, because it no longer sits on
+   a panel edge. */
+.status .thru{margin-top:13px;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+@media(max-width:640px){.thru{grid-template-columns:1fr}}
+.tcell{padding:11px 15px;border-right:1px solid var(--line)}
+.tcell:last-child{border-right:none}
+@media(max-width:640px){.tcell{border-right:none;border-bottom:1px solid var(--line)}}
+/* white-space:nowrap on every line that pairs a number with its unit or its
+   label. Without it "249.0 tok/s" wraps between the number and the unit at a
+   narrow width, and the strip's own grid guarantees narrow widths -- a lone
+   "249.0" on one line with "tok/s" on the next is the formatting the owner
+   called confusing. The cell scrolls rather than breaking the pair. */
+.tcell .n{
+  font-size:20px;font-weight:600;letter-spacing:-.02em;margin-top:2px;
+  white-space:nowrap;overflow-x:auto
+}
+.tcell .n.na{color:var(--muted);font-weight:500;font-size:15px}
+.tcell .s{font-size:11px;color:var(--muted);margin-top:2px}
+/* The lifetime companion. Always present, always visibly subordinate to the
+   window figure above it, never promoted into it. */
+.tcell .l{
+  font-size:11px;color:var(--muted);margin-top:5px;padding-top:5px;
+  border-top:1px dotted var(--line)
+}
+.lk .tu{text-transform:none;letter-spacing:0;font-weight:400;opacity:.75}
+/* One segment of the serving line ("prefill 1,240 tok/s"). Each is atomic:
+   the line wraps BETWEEN segments and never inside one, so a number can never
+   end up on a different line from the word that says which number it is. */
+.smeta{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 9px}
+.smeta .seg{white-space:nowrap}
+.smeta .seg b{font-weight:600;color:var(--ink-2)}
+.smeta .sep{color:var(--line)}

@@ -20,6 +20,7 @@ browser ──► servedeck (127.0.0.1:8010)
 | `config` | every machine-specific value; nothing else may hardcode one |
 | `capacity` | the VRAM arithmetic. Pure — no I/O, no subprocess |
 | `registry` | model discovery, and the measurement store |
+| `kvcalc` | per-architecture KV cache arithmetic from a checkpoint's `config.json` |
 | `metrics` | scrapes Prometheus `/metrics` |
 | `phases` | boot-phase detection and failure classification from logs |
 | `logtail` | follows a log across rotation and truncation |
@@ -27,6 +28,29 @@ browser ──► servedeck (127.0.0.1:8010)
 | `supervisor` | intent state machine and auto-restart |
 | `gateway` | holds requests while the backend restarts |
 | `app` | HTTP surface |
+
+## Where a KV figure comes from
+
+Three sources, and the panel says which one it used:
+
+1. **The running engine.** `vllm:cache_config_info` on `/metrics` carries
+   `kv_cache_size_tokens` — the same figure the boot log prints once as
+   "GPU KV cache size: N tokens". Labelled **measured**. Preferred whenever
+   the model on screen is the one running, at the context it is running at.
+2. **A recorded boot.** `state/measurements.json`, keyed on repo and context.
+   Labelled **measured**, or **measured at another context** when the only
+   record is from a different length.
+3. **`kvcalc`.** Per-architecture arithmetic over the checkpoint's own
+   `config.json`: attention K/V per layer, MLA latent, QSA compressed keys,
+   and the Mamba/GDN recurrent state charged per sequence rather than per
+   token. Labelled **estimated**.
+
+`kvcalc` does not reimplement vLLM's block allocator. Each architecture family
+carries one empirical correction for the padding it does not model, calibrated
+against boots measured on the machine it runs on and shipped with the residual
+it leaves — see the constants in `servedeck/kvcalc.py`, which name every boot
+they were fitted to. A family with no such boot has a correction of 1.0 and
+reports `calibrated: false`; the caller must present that as a floor.
 
 ## Two rules the design turns on
 
