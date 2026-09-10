@@ -61,7 +61,11 @@ from servedeck import config, paths
 # ---------------------------------------------------------------------------
 
 #: Role of one live process in a vLLM tree, as classified from `comm`.
-_ROLE_SERVER = "server"
+#: ROLE_SERVER is public: it is the api-server process, the one that holds the
+#: listening socket, and the upstream resolver selects on it. A caller that had
+#: to spell "server" itself would be a second copy of this classification.
+ROLE_SERVER = "server"
+_ROLE_SERVER = ROLE_SERVER
 _ROLE_ENGINE_CORE = "engine_core"
 _ROLE_WORKER = "worker"
 _ROLE_OTHER_VLLM = "vllm_internal"
@@ -293,6 +297,32 @@ def listener_pid(port: int) -> int | None:
         if match:
             return int(match.group(1))
     return None
+
+
+def listening_pids() -> dict[int, int]:
+    """``port -> pid`` for every listening TCP socket, from ONE ``ss`` call.
+
+    :func:`listener_pid` answers for one port and forks an ``ss`` to do it.
+    The upstream resolver asks about every known backend's port at once, and
+    one fork per question is how a dashboard's own cost outgrows the box it
+    is watching. Same source, same parser, asked once.
+    """
+    out: dict[int, int] = {}
+    for pid, ports in _listening_ports_by_pid().items():
+        for port in ports:
+            out.setdefault(port, pid)
+    return out
+
+
+def cmdline_of(pid: int) -> list[str]:
+    """``/proc/<pid>/cmdline`` as a list, or [] if it cannot be read.
+
+    Public because app.py needs the command line of a process it did not scan
+    (whatever holds the upstream socket) and was reading /proc itself to get
+    it -- a second implementation of this file's one job, with its own
+    encoding and NUL handling.
+    """
+    return _read_cmdline_list(pid)
 
 
 def _listening_ports_by_pid() -> dict[int, list[int]]:

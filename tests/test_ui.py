@@ -746,7 +746,8 @@ function __dump(ids) {
 #: The functions under test, lifted verbatim out of web/app.js.
 _RENDER_FNS = (
     "agoTxt", "secsTxt", "rateTxt", "windowFigure", "lifeTxt",
-    "uptimeTxt", "busyPhase", "paintThroughput", "paintServingMeta",
+    "uptimeTxt", "busyPhase", "resolutionNote", "resolutionDetail",
+    "paintThroughput", "paintServingMeta",
 )
 
 
@@ -2067,6 +2068,8 @@ def test_the_pure_decisions_are_actually_wired_into_their_painters() -> None:
         ("paintEstimate", "badgeOf("),
         ("paintRequestStats", "winSpan("),
         ("paintServingMeta", "busyPhase("),
+        ("paintServingMeta", "resolutionNote("),
+        ("paintServingMeta", "resolutionDetail("),
         ("paintState", "busyPhase("),
     ):
         # Comments stripped: renderCtx carries a "see agentsFitNote()" note, so
@@ -2075,3 +2078,74 @@ def test_the_pure_decisions_are_actually_wired_into_their_painters() -> None:
             f"{painter}() no longer calls {call.strip('(')} — the tested decision "
             "is dead code and the page renders something else"
         )
+
+
+def test_a_dashboard_that_cannot_find_a_server_says_which_port_and_why() -> None:
+    """The serving line's whole message was "nothing serving on
+    http://localhost:8002".
+
+    On 2026-09-10 that sentence was true and useless: :8002 came from a shell
+    config naming a backend that had been dead for a week, a healthy server was
+    answering on :8001, and nothing on the page — or in the payload behind it —
+    said which port had been chosen or why. The backend now resolves the port
+    and explains itself (updetect.py); this is the page rendering that answer
+    rather than a blank.
+    """
+    resolution = {
+        "port": 8002,
+        "source": "shell_config",
+        "reason": ("nothing is listening on any known port (checked :8002 "
+                   "(backends.glm53), :8001 (backends.flashnext)); showing "
+                   ":8002 (backends.glm53), named by the shell config's PORT"),
+        "backend": "glm53",
+        "pid": None,
+        "live": False,
+        "candidates": [
+            {"port": 8002, "source": "shell_config", "backend": "glm53",
+             "listening": False, "pid": None},
+            {"port": 8001, "source": "backend_config", "backend": "flashnext",
+             "listening": True, "pid": 3102188},
+        ],
+    }
+    dom = _render(
+        _payload(reachable=False),
+        {"upstream": {"up": False, "port": 8002, "resolution": resolution},
+         "server_uptime_s": None},
+    )
+
+    text = dom["sMeta"]["text"]
+    assert "http://localhost:8002" in text, text
+    assert resolution["reason"] in text, (
+        f"the page dropped the reason the backend gave it: {text!r}"
+    )
+    title = dom["sMeta"]["title"]
+    assert ":8001 (flashnext)" in title and "pid 3102188 listening" in title, title
+    assert ":8002 (glm53): nothing listening" in title, title
+
+
+def test_a_port_that_was_never_probed_is_not_drawn_as_an_empty_one() -> None:
+    """`listening: null` means the socket table was not read for that port.
+    Painting it as "nothing listening" would put a claim on the page that
+    nothing ever checked — the failure this whole chain is about, one layer
+    up."""
+    dom = _render(
+        _payload(reachable=False),
+        {"upstream": {"up": False, "port": 8002, "resolution": {
+            "port": 8002, "source": "shell_config", "reason": "not probed yet",
+            "candidates": [{"port": 8002, "source": "shell_config",
+                            "backend": None, "listening": None, "pid": None}],
+        }}},
+    )
+    assert ":8002: not probed" in dom["sMeta"]["title"], dom["sMeta"]["title"]
+    assert "nothing listening" not in dom["sMeta"]["title"], dom["sMeta"]["title"]
+
+
+def test_the_serving_line_says_nothing_extra_when_there_is_no_resolution() -> None:
+    """Over-correction guard: an older payload (a browser holding a stale page
+    across a restart) carries no `resolution`, and the line must degrade to the
+    sentence it always had rather than rendering "undefined"."""
+    dom = _render(_payload(reachable=False), {"upstream": {"up": False, "port": 8001}})
+    assert dom["sMeta"]["text"] == "nothing serving on http://localhost:8001", (
+        dom["sMeta"]["text"]
+    )
+    assert dom["sMeta"]["title"] == "", dom["sMeta"]["title"]
