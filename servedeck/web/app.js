@@ -1105,6 +1105,38 @@ function busyPhase(sv) {
   return BUSY_PHASES[(sv || {}).actual_state] || "";
 }
 
+/* Why the page is watching THIS port, in one clause.
+ *
+ * When the dashboard could not find a server it said "nothing serving on
+ * http://localhost:8002" and stopped there — no hint that :8002 came from a
+ * shell config naming a backend that had been dead for a week, and none that
+ * a healthy server was answering on :8001. The backend now resolves the port
+ * and explains itself (updetect.py); the page is where that explanation has
+ * to land, because the page is the only thing the operator reads.
+ */
+function resolutionNote(res) {
+  const reason = (res || {}).reason;
+  return reason ? " \u2014 " + reason : "";
+}
+
+/* Every port the resolver looked at and what it found there, for the tooltip.
+ *
+ * `listening` is tri-state: false is "probed, nothing there" and null is "not
+ * probed at all". Rendering the second as the first would put a claim on the
+ * page that nothing ever checked.
+ */
+function resolutionDetail(res) {
+  const cand = ((res || {}).candidates) || [];
+  if (!cand.length) return "";
+  return "ports checked \u2014 " + cand.map(function (c) {
+    const where = c.backend ? `:${c.port} (${c.backend})` : `:${c.port}`;
+    const state = c.listening === true
+      ? `pid ${c.pid} listening`
+      : c.listening === false ? "nothing listening" : "not probed";
+    return `${where}: ${state} [${c.source}]`;
+  }).join("; ");
+}
+
 /* The serving line.
  *
  * Split out of paintState() because its two throughput figures come from the
@@ -1162,7 +1194,9 @@ function paintServingMeta() {
   ];
   meta.textContent = "";
   if (!up.up) {
-    meta.textContent = `nothing serving on ${base}`;
+    // The reason, not just the blank. An operator who cannot see WHICH port
+    // was chosen and why cannot tell a dead box from a misaimed dashboard.
+    meta.textContent = `nothing serving on ${base}${resolutionNote(up.resolution)}`;
   } else {
     segs.forEach((seg, i) => {
       if (i > 0) {
@@ -1189,7 +1223,7 @@ function paintServingMeta() {
       "and how long it has been up. Throughput is NOT here: the strip below " +
       "carries prefill, decode and time-to-first-token with their reasons and " +
       "lifetime companions."
-    : "";
+    : resolutionDetail(up.resolution);
 }
 
 /* A duration for the boot bar: "48 s", "3m 12s", "1h 04m".

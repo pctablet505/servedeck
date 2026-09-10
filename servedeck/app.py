@@ -28,6 +28,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from . import capacity
 from . import disksize
 from . import kvcalc, config, events, gpu, registry, shellconfig, supervisor as _sup
+from . import updetect
 from . import metrics as _metrics_mod
 from . import parallelism, reqstats
 from .metrics import MetricsPoller
@@ -52,9 +53,6 @@ UPSTREAM_HOST = "http://localhost"
 #: max_position_embeddings. A fallback, never a claim: it exists so the UI has
 #: something to draw, and every real number overrides it.
 DEFAULT_MODEL_MAX_CTX = 262144
-#: A port a listener can actually be on. A hand-edited shell config must not be
-#: able to retarget the whole dashboard at nothing.
-_PORT_RANGE = range(1, 65536)
 STARTED_AT = time.time()
 
 app = FastAPI(title="Servedeck", docs_url=None, redoc_url=None)
@@ -65,7 +63,13 @@ class Runtime:
     """Process-wide mutable state. One instance, created at startup."""
 
     def __init__(self) -> None:
-        self.port = _config_port() or _default_port()
+        #: How this port was chosen, in words. Never None: a dashboard that
+        #: cannot find a server must still be able to say what it looked at.
+        #: Files only at construction -- this runs at import, and a /proc walk
+        #: plus a socket-table read there would be paid by every consumer of
+        #: the module, tests included. The first poll resolves it properly.
+        self.resolution = _resolve_upstream(discover=False)
+        self.port = self.resolution.port
         self.upstream = f"{UPSTREAM_HOST}:{self.port}"
         self.poller = MetricsPoller(self.upstream)
         self.metrics: dict[str, Any] = _metrics_mod.unreachable_snapshot()
@@ -90,25 +94,46 @@ class Runtime:
     def config(self) -> dict[str, str]:
         return _safe_config()
 
-    def retarget_from_config(self) -> bool:
-        """Follow the shell config's PORT if it has moved. True if it moved.
+    def retarget(self, *, discover: bool | None = None) -> bool:
+        """Re-resolve the upstream and follow it if it moved. True if it moved.
 
-        The port was read exactly once, at construction. Every start rewrites
-        PORT (supervisor._sync_shell_config), so starting a server on a
-        different port left the metrics poller, the uptime lookup, the
-        running-model probe, the own-VRAM discount and the /v1 proxy all
-        watching the old port for the life of the process — each reporting
-        "not reachable" about a server that was serving perfectly.
+        The port used to be read from the shell config exactly once, at
+        construction, and then only ever re-read from that same file. Both
+        halves were wrong. The first left the metrics poller, the uptime
+        lookup, the running-model probe, the own-VRAM discount and the /v1
+        proxy watching a dead port for the life of the process. The second
+        made ONE hand-edited file the whole truth: on 2026-09-10 that file's
+        last uncommented lines said ``BACKEND="glm53"`` / ``PORT="8002"``,
+        GLM had been dead for a week, Flash-Next was serving on :8001, and the
+        dashboard reported the box as dead with every figure blank.
+
+        ``discover`` decides whether this tick re-resolves at all. Left as
+        None it does so exactly when the answer can change: when what we are
+        watching is not answering. While the upstream IS answering, the port
+        stays put -- a server we are talking to outranks every file, and the
+        cheap files-only re-resolution would happily move us onto whatever the
+        shell config names (on this box, the dead backend), whereupon the next
+        poll would find that port dead and move us back. A flap every 2 s,
+        rebuilding the poller each way, so no throughput figure would ever
+        live long enough to be computed.
 
         The poller is rebuilt rather than re-pointed: it carries a two-sample
         throughput baseline belonging to the OLD server, and carrying that
         across would produce one fabricated rate spanning two processes.
         """
-        port = _config_port()
-        if port is None or port == self.port:
+        if discover is None:
+            discover = not self.upstream_up
+        if not discover:
             return False
-        self.port = port
-        self.upstream = f"{UPSTREAM_HOST}:{port}"
+        return self.follow(_resolve_upstream(discover=True, current_port=self.port))
+
+    def follow(self, resolution: updetect.Upstream) -> bool:
+        """Adopt `resolution` as the answer, moving the port if it changed."""
+        self.resolution = resolution
+        if resolution.port == self.port:
+            return False
+        self.port = resolution.port
+        self.upstream = f"{UPSTREAM_HOST}:{self.port}"
         self.poller = MetricsPoller(self.upstream)
         self.metrics = _metrics_mod.unreachable_snapshot()
         self.serving_model = None
@@ -118,14 +143,92 @@ class Runtime:
         return True
 
 
-def _config_port() -> int | None:
-    """The upstream port the shell config names, or None if it names nothing
-    usable. None means "keep what we have", never "fall back to zero"."""
+def _configured_ports() -> list[tuple[str, int]]:
+    """(backend name, port) for every backend servedeck.toml declares, in
+    declaration order. Empty when there is no readable config at all."""
     try:
-        port = int(_safe_config().get("PORT") or 0)
-    except (TypeError, ValueError):
-        return None
-    return port if port in _PORT_RANGE else None
+        return [(b.name, b.port) for b in config.get().backends if b.port]
+    except Exception:  # noqa: BLE001 - an unreadable config must not blind the UI
+        return []
+
+
+def _desired_target() -> tuple[object, str | None]:
+    """(port, backend) out of state/desired.json — what Servedeck last WANTED.
+
+    Read through the supervisor when one already exists, and straight off the
+    file otherwise: constructing a Supervisor touches the state directory and
+    starts reconciliation, which is far too much to do just to read a port.
+    """
+    if _supervisor is not None:
+        return _supervisor.desired.port, _supervisor.desired.backend
+    try:
+        d = _sup.load_desired()
+    except Exception:  # noqa: BLE001
+        return None, None
+    return d.port, d.backend
+
+
+def _live_servers() -> list[updetect.LiveServer]:
+    """Every live vLLM api-server process holding a listening socket.
+
+    From ``/proc`` and the socket table — the system itself — never from a
+    file. This is the fact that outranks every configuration: a process that
+    is running is not somebody's intention.
+    """
+    from . import procctl
+
+    try:
+        procs = procctl.scan_vllm_processes()
+    except Exception:  # noqa: BLE001 - a scan failure means "found nothing"
+        return []
+    return [
+        updetect.LiveServer(
+            pid=p.pid, port=p.port, backend=p.venv, cmdline=tuple(p.cmdline)
+        )
+        for p in procs
+        if p.role == procctl.ROLE_SERVER and p.port
+    ]
+
+
+def _port_probe():
+    """A ``port -> pid`` probe backed by ONE socket-table read.
+
+    The resolver asks about several ports; ``procctl.listener_pid`` forks an
+    ``ss`` per question, and asking four times a poll for one table is how the
+    dashboard's own cost grows faster than the box it watches.
+    """
+    from . import procctl
+
+    try:
+        table = procctl.listening_pids()
+    except Exception:  # noqa: BLE001
+        table = {}
+    return lambda port: table.get(port)
+
+
+def _resolve_upstream(
+    *, discover: bool = True, current_port: int | None = None
+) -> updetect.Upstream:
+    """Which port to watch and why — see updetect.py for the precedence.
+
+    ``discover=False`` resolves from files alone (no process scan, no socket
+    probing), which is what construction wants.
+    """
+    cfg = _safe_config()
+    desired_port, desired_backend = _desired_target()
+    return updetect.resolve(
+        scan=_live_servers if discover else (lambda: []),
+        # None, not a probe that always says no: an unprobed port must be
+        # reported as unprobed, never as "nothing is listening there".
+        probe=_port_probe() if discover else None,
+        shell_port=cfg.get("PORT"),
+        shell_backend=(cfg.get("BACKEND") or "").strip() or None,
+        desired_port=desired_port,
+        desired_backend=desired_backend,
+        backends=_configured_ports(),
+        current_port=current_port,
+        fallback_port=_default_port(),
+    )
 
 
 def _training_marker_hits() -> list[str]:
@@ -170,13 +273,14 @@ def _safe_config() -> dict[str, str]:
         return {}
 
 
-rt = Runtime()
-
 # One supervisor for the process. Created lazily: constructing it touches the
 # state directory, and an import-time failure would take the whole UI down
-# rather than just disabling the controls.
+# rather than just disabling the controls. Declared BEFORE the runtime because
+# resolving the upstream port reads desired state through it when one exists.
 _supervisor: _sup.Supervisor | None = None
 _supervisor_error: str | None = None
+
+rt = Runtime()
 
 
 def sup() -> _sup.Supervisor | None:
@@ -212,11 +316,11 @@ async def _poll_loop() -> None:
     assert rt.client is not None
     while True:
         try:
-            if rt.retarget_from_config():
+            if rt.retarget():
                 hub.publish(
                     "notice",
                     {"level": "info", "code": "retargeted",
-                     "body": f"upstream port changed — now watching {rt.upstream}"},
+                     "body": f"now watching {rt.upstream} — {rt.resolution.reason}"},
                 )
             # A request cannot exceed the engine's own --max-model-len, so
             # that is the ceiling for the histogram's open-ended +Inf bucket.
@@ -348,14 +452,10 @@ def _listener_pid_now() -> int | None:
 
 def _listener_argv() -> list[str]:
     """The command line of whatever is listening on rt.port."""
+    from . import procctl
+
     pid = _listener_pid_now()
-    if pid is None:
-        return []
-    try:
-        raw = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
-    except OSError:
-        return []
-    return [a for a in raw.split("\0") if a]
+    return procctl.cmdline_of(pid) if pid is not None else []
 
 
 def _running_max_model_len() -> int | None:
@@ -398,7 +498,16 @@ def _running_model_id() -> str | None:
     across different models, leaving two models indistinguishable over the
     API).
     """
-    argv = _listener_argv()
+    return _model_id_from(_listener_argv())
+
+
+def _model_id_from(argv: list[str]) -> str | None:
+    """The repo a command line loads: ``--model X`` or ``vllm serve X``.
+
+    Split out of _running_model_id() so adoption can ask the same question
+    about a process on a port we are NOT currently watching -- which is the
+    whole of discovering a server somewhere else.
+    """
     if not argv:
         return None
     for i, a in enumerate(argv):
@@ -670,14 +779,79 @@ async def _fetch_served_models() -> list[str]:
     This is the ONLY authority for what the server calls itself. It is not the
     authority for what the server actually loaded -- see _serving_identity().
     """
+    return await _probe_models(rt.port)
+
+
+async def _probe_models(port: int) -> list[str]:
+    """``/v1/models`` on any local port: the ids it advertises, or [].
+
+    Takes a port rather than reading rt.upstream because discovery asks this
+    of ports the dashboard is NOT watching -- that is how it finds a server
+    the configuration has lost track of. Loopback GET only, the read-only kind
+    of request SPEC.md's rule 1b allows against a running server.
+
+    Borrows the poller's client when there is one; a request that arrives
+    before startup (a test, a CLI call) opens its own rather than failing.
+    """
+    url = f"{UPSTREAM_HOST}:{port}/v1/models"
     try:
-        r = await rt.client.get(f"{rt.upstream}/v1/models", timeout=3.0)  # type: ignore[union-attr]
+        if rt.client is not None:
+            r = await rt.client.get(url, timeout=3.0)
+        else:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(url, timeout=3.0)
         if r.status_code == 200:
             data = r.json().get("data") or []
             return [str(d.get("id")) for d in data if d.get("id")]
     except Exception:  # noqa: BLE001
         pass
     return []
+
+
+async def _discover_servers() -> list[dict[str, Any]]:
+    """Every known port that answers as a model server, best first.
+
+    "Known" is the resolver's own candidate list -- the live processes, the
+    shell config's port, desired state's port, every configured backend's port
+    -- so adoption and the dashboard can never be looking at two different
+    boxes. A port qualifies only if BOTH halves agree: something holds the
+    socket, and ``/v1/models`` answers on it. The process's command line is
+    read for the same reason adoption reads it at all: it says what was
+    actually loaded, while ``/v1/models`` says only what the server calls
+    itself.
+    """
+    from . import procctl
+
+    resolution = _resolve_upstream(discover=True, current_port=rt.port)
+    probe = _port_probe()
+    found: list[dict[str, Any]] = []
+    for candidate in resolution.candidates:
+        if any(f["port"] == candidate.port for f in found):
+            continue
+        pid = candidate.pid if candidate.listening else probe(candidate.port)
+        if pid is None:
+            continue
+        models = await _probe_models(candidate.port)
+        if not models:
+            continue
+        argv = procctl.cmdline_of(pid)
+        found.append(
+            {
+                "port": candidate.port,
+                "pid": pid,
+                "models": models,
+                "repo_id": _model_id_from(argv),
+                "backend": procctl.backend_of_pid(pid),
+                "attributable": procctl.is_attributable(pid),
+                "cmdline": argv,
+            }
+        )
+    # An attributable server first: it is the only kind Servedeck can then
+    # stop or watch for a crash. The rest are still reported -- "a server is
+    # there and I cannot control it" is an answer, and it is the one the UI
+    # needs to explain itself.
+    found.sort(key=lambda f: (not f["attributable"], f["port"] != rt.port))
+    return found
 
 
 #: Memo for _repo_for_served_name, keyed on the name. discover_models() walks
@@ -754,6 +928,11 @@ def _serving_identity() -> dict[str, Any]:
 @app.on_event("startup")
 async def _startup() -> None:
     rt.client = httpx.AsyncClient()
+    # Resolve the upstream BEFORE anything can ask for it. Construction is
+    # files-only (a /proc walk on import would be paid by every importer), so
+    # without this the first page load -- and reconcile_startup below it --
+    # would be answered from a port nothing had yet probed.
+    rt.retarget(discover=True)
     app.state.poller_task = asyncio.create_task(_poll_loop())
     # Adopt a server that is already running, so the UI shows READY rather
     # than STOPPED and a later crash is classified as crash-while-serving.
@@ -1049,6 +1228,11 @@ def _state() -> dict[str, Any]:
             # The running engine's OWN --max-model-len, not desired config.
             "max_model_len": _running_max_model_len(),
             "port": rt.port,
+            # Which port this is, and WHY it is this one. A dashboard that
+            # cannot find a server used to render blanks and nothing else:
+            # no port, no reason, nothing to act on. The reason is written for
+            # a human and the candidate list is what was checked.
+            "resolution": rt.resolution.to_dict(),
             # the RUNNING engine's own numbers, not an estimate for some other model
             "live": _live_boot_facts() if rt.upstream_up else {},
         },
@@ -1129,40 +1313,103 @@ async def api_adopt(body: dict[str, Any] | None = None) -> Any:
     s = _need_sup()
     if isinstance(s, JSONResponse):
         return s
-    port = int((body or {}).get("port") or s.desired.port or rt.port)
     from . import procctl
 
-    pid = procctl.listener_pid(port)
-    if pid is None:
-        return JSONResponse({"error": f"nothing is listening on port {port}"}, status_code=409)
-    if not procctl.is_attributable(pid):
-        return JSONResponse(
-            {
-                "error": (
-                    f"a server is serving on :{port} but its process (pid {pid}) cannot be "
-                    "attributed, so Servedeck cannot control it. Stop it from the terminal "
-                    "that launched it."
+    explicit = (body or {}).get("port")
+    if explicit:
+        # A named port is a named port: probe exactly it, and say precisely
+        # why it cannot be adopted rather than quietly adopting something else.
+        port = int(explicit)
+        pid = procctl.listener_pid(port)
+        if pid is None:
+            return JSONResponse({"error": f"nothing is listening on port {port}"}, status_code=409)
+        if not procctl.is_attributable(pid):
+            return JSONResponse(
+                {
+                    "error": (
+                        f"a server is serving on :{port} but its process (pid {pid}) cannot be "
+                        "attributed, so Servedeck cannot control it. Stop it from the terminal "
+                        "that launched it."
+                    )
+                },
+                status_code=409,
+            )
+    else:
+        # No port named: DISCOVER one. This used to fall back to
+        # `s.desired.port or rt.port` -- both files -- so pressing Adopt while
+        # the configuration named a dead backend re-probed the dead port and
+        # reported nothing listening, with a healthy server one port away.
+        rt.retarget(discover=True)
+        found = await _discover_servers()
+        adoptable = next((f for f in found if f["attributable"]), None)
+        if adoptable is None:
+            if found:
+                other = found[0]
+                return JSONResponse(
+                    {
+                        "error": (
+                            f"a server is serving on :{other['port']} "
+                            f"({', '.join(other['models'])}) but its process "
+                            f"(pid {other['pid']}) cannot be attributed, so Servedeck "
+                            "cannot control it. Stop it from the terminal that launched it."
+                        ),
+                        "resolution": rt.resolution.to_dict(),
+                    },
+                    status_code=409,
                 )
-            },
-            status_code=409,
+            checked = ", ".join(f":{c.port}" for c in rt.resolution.candidates) or "no ports"
+            return JSONResponse(
+                {
+                    "error": (
+                        f"no server answered /v1/models on any known port (checked {checked})"
+                    ),
+                    "reason": rt.resolution.reason,
+                    "resolution": rt.resolution.to_dict(),
+                },
+                status_code=409,
+            )
+        port, pid = adoptable["port"], adoptable["pid"]
+    # Watch what we just adopted. Adoption used to leave rt.port alone, so
+    # adopting a server on another port produced a managed server the
+    # dashboard still could not see -- and _serving_identity() below would
+    # have read the command line of whatever was on the OLD port.
+    rt.follow(
+        updetect.Upstream(
+            port=port,
+            source=updetect.LIVE_PROCESS,
+            reason=f"adopted by hand: pid {pid} is serving on :{port}",
+            pid=pid,
+            live=True,
+            candidates=(updetect.Candidate(port, updetect.LIVE_PROCESS, None, True, pid),),
         )
+    )
     d = s.desired
     d.desired_state = "RUNNING"
     d.port = port
-    ident = _serving_identity()
     # Adopt what is RUNNING, not what a header says was intended. `d.repo_id`
     # was filled from the served-model-name (an alias an operator reuses) and
     # `d.backend` from the shell config's BACKEND -- the exact header that
     # said GLM while Qwen was serving. Both now come from the live process,
     # and only fall back when the process cannot be read at all.
-    if ident["repo_id"]:
-        d.repo_id = ident["repo_id"]
-    elif not d.repo_id:
-        d.repo_id = rt.serving_model
-    if ident["backend"]:
-        d.backend = ident["backend"]
-    elif not d.backend:
-        d.backend = _safe_config().get("BACKEND") or None
+    #
+    # Read the process DIRECTLY here rather than only through
+    # _serving_identity(): that helper answers about the port the dashboard is
+    # watching and only once the upstream has been observed up, which at the
+    # instant of an adoption it has not been -- so on this path its answer was
+    # empty and the shell config's header was silently taking over again.
+    ident = _serving_identity()
+    d.repo_id = (
+        _model_id_from(procctl.cmdline_of(pid))
+        or ident["repo_id"]
+        or d.repo_id
+        or rt.serving_model
+    )
+    d.backend = (
+        procctl.backend_of_pid(pid)
+        or ident["backend"]
+        or d.backend
+        or (_safe_config().get("BACKEND") or None)
+    )
     _sup.save_desired(d, s.state_dir)
     s._run_repo_id, s._run_backend = d.repo_id, d.backend
     s._adopt_ready(pid)

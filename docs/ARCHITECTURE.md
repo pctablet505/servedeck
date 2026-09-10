@@ -25,9 +25,32 @@ browser ──► servedeck (127.0.0.1:8010)
 | `phases` | boot-phase detection and failure classification from logs |
 | `logtail` | follows a log across rotation and truncation |
 | `procctl` | process control by PID and process group |
+| `updetect` | which port the upstream is on, and why — see below |
 | `supervisor` | intent state machine and auto-restart |
 | `gateway` | holds requests while the backend restarts |
 | `app` | HTTP surface |
+
+## Which port the dashboard watches
+
+Four sources, in this order, and `/api/state` says which one answered:
+
+1. **A live process.** Every vLLM api-server process on the machine, found by
+   walking `/proc` and reading the socket table — never a file. A process that
+   is running is a fact; everything below it is somebody's intention.
+2. **The shell config's `PORT`** (`local_llm/.config`), what the CLI last set up.
+3. **`state/desired.json`**, what Servedeck last wanted.
+4. **A configured backend's port**, as a last resort.
+
+And one rule across all four: if the port a file names has nothing listening
+while another known backend's port does, the dashboard follows the live one
+and says so. The failure this replaces was silent — `.config` ended with
+`BACKEND="glm53"` / `PORT="8002"`, GLM had been dead for a week, Flash-Next
+was serving on :8001, and the dashboard reported the box as dead with every
+figure blank and no indication of which port it had been looking at.
+
+`upstream.resolution` in `/api/state` carries the chosen port, the source, a
+sentence explaining it, and every candidate that was checked (with
+`listening: null` meaning "not probed", never "nothing there").
 
 ## Where a KV figure comes from
 

@@ -103,6 +103,22 @@ def test_app_spells_no_absolute_path_of_its_own() -> None:
 # --------------------------------------------------------------------------
 # Which port the poller watches
 # --------------------------------------------------------------------------
+def _quiet_machine(monkeypatch, *, backends=(("flashnext", 8001), ("inline", 8000))) -> None:
+    """A box with no vLLM process and nothing listening on any port.
+
+    Both seams are the real ones the resolver reads -- ``scan_vllm_processes``
+    is the /proc walk, ``listening_pids`` the socket table -- so a test that
+    fakes them is testing the production path with the machine replaced, not a
+    parallel one. Nothing here contacts, starts or stops a server.
+    """
+    from servedeck import procctl
+
+    monkeypatch.setattr(procctl, "scan_vllm_processes", lambda: [])
+    monkeypatch.setattr(procctl, "listening_pids", dict)
+    monkeypatch.setattr(capp, "_configured_ports", lambda: list(backends))
+    monkeypatch.setattr(capp, "_desired_target", lambda: (None, None))
+
+
 def test_runtime_retargets_when_the_configured_port_changes(monkeypatch) -> None:
     """Regression: rt.port was read from the shell config exactly once, at
     construction.
@@ -113,14 +129,19 @@ def test_runtime_retargets_when_the_configured_port_changes(monkeypatch) -> None
     own-VRAM discount and the /v1 proxy all kept pointing at the old port for
     the life of the process — every one of them reporting "not reachable" for
     a server that was serving fine.
+
+    (Was ``retarget_from_config``. The shell config is now the SECOND source,
+    behind a live process — see test_updetect.py — but it is still a source,
+    and a move it makes must still be followed.)
     """
+    _quiet_machine(monkeypatch)
     monkeypatch.setattr(capp, "_safe_config", lambda: {"PORT": "8001"})
     rt = capp.Runtime()
     assert rt.port == 8001 and rt.upstream.endswith(":8001")
     first_poller = rt.poller
 
     monkeypatch.setattr(capp, "_safe_config", lambda: {"PORT": "8002"})
-    changed = rt.retarget_from_config()
+    changed = rt.retarget()
 
     assert changed is True
     assert rt.port == 8002
@@ -135,22 +156,33 @@ def test_runtime_retargets_when_the_configured_port_changes(monkeypatch) -> None
 def test_runtime_retarget_is_a_no_op_when_the_port_is_unchanged(monkeypatch) -> None:
     """The poller's rate baseline must survive an ordinary poll tick — it is
     two samples long, and rebuilding it every 2 s would mean no rate ever."""
+    _quiet_machine(monkeypatch)
     monkeypatch.setattr(capp, "_safe_config", lambda: {"PORT": "8002"})
     rt = capp.Runtime()
     poller = rt.poller
-    assert rt.retarget_from_config() is False
+    assert rt.retarget() is False
     assert rt.poller is poller
 
 
 def test_runtime_retarget_ignores_a_junk_port(monkeypatch) -> None:
     """A hand-edited shell config must not be able to point the UI at
-    nothing."""
+    nothing.
+
+    It now falls through to a port some other source names (here a configured
+    backend's) rather than staying on the last good one — but the invariant
+    the original test was written for is the one asserted: a value that is not
+    a port never becomes the port the dashboard watches.
+    """
+    _quiet_machine(monkeypatch)
     monkeypatch.setattr(capp, "_safe_config", lambda: {"PORT": "8002"})
     rt = capp.Runtime()
+    assert rt.port == 8002
     for junk in ("", "not-a-port", "0", "99999"):
         monkeypatch.setattr(capp, "_safe_config", lambda junk=junk: {"PORT": junk})
-        assert rt.retarget_from_config() is False, junk
-        assert rt.port == 8002, junk
+        rt.retarget()
+        assert rt.port == 8001, junk        # backends.flashnext, the first configured
+        assert rt.resolution.source == "backend_config", junk
+        assert str(rt.port) != junk and rt.port in capp.updetect.PORT_RANGE, junk
 
 
 # --------------------------------------------------------------------------

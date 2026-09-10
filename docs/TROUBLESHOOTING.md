@@ -12,6 +12,23 @@ Stop it first:  /path/to/servedeck/stop.sh
 Note uvicorn prints its bind error *after* "Application startup complete",
 which reads like a crash. It never got the port.
 
+## It says nothing is serving, but a server IS up
+
+Read the serving line: when the dashboard cannot find a server it now names
+the port it chose and why, and hovering it lists every port it checked. The
+same thing is in `/api/state` under `upstream.resolution`.
+
+A live vLLM process outranks every configuration file, so this should only
+happen when the server is on a port no backend declares AND its process cannot
+be seen (a different uid, a container). Declare that port as a backend in
+`servedeck.toml`, or press **Adopt** — with no port in the request it scans the
+known ports, matches on `/v1/models` and the process command line, and adopts
+what it finds.
+
+Note what it does NOT do: trust `.config`'s `BACKEND`/`PORT` header, or
+`state/server.json`. That file records a launch, not a running process; a pid
+in it that has since exited decides nothing.
+
 ## The page loads unstyled
 
 Hard-refresh (`Ctrl+Shift+R`). A stylesheet served once with the wrong
