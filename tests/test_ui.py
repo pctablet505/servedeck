@@ -174,8 +174,12 @@ def test_measured_models_are_not_all_labelled_estimated() -> None:
 _LIVE_DATA_SLOTS = (
     "sMeta", "gpuUsed", "gpuTotal", "vramTxt", "mcount", "dKv", "dKvTok",
     "dAgents", "dAgentsS", "dCtx", "dCtxS", "dBadge", "kvPct", "kvTok",
-    "mRun", "mWait", "mPre", "hitRate", "avgCtx", "avgSrc", "capWorst",
-    "capWorstD", "capAvg", "capAvgD",
+    "mRun", "mWait", "mPre", "hitRate",
+    # The request-size window and the parallelism recommendation. Same rule:
+    # until their painter runs there is no reading, and a shipped digit here
+    # would be a fabricated one.
+    "pctP90", "pctP50", "pctP99", "pctMax", "winMeta", "genMeta", "statsProv",
+    "recN", "recBasis", "recMath", "recP99", "recCal",
 )
 
 
@@ -828,6 +832,23 @@ def test_every_rendered_throughput_number_carries_its_unit() -> None:
         assert unit in text, f"{cell} is missing its unit: {text!r}"
 
 
+def _ttft_cell_markup() -> str:
+    """The markup of the TTFT cell alone, from its `<div class="tcell">` to the
+    end of its lifetime line.
+
+    Scoped on purpose. This assertion used to run over the WHOLE of
+    index.html, which was safe only while nothing on the page was a genuine
+    percentile. The request-size panel now labels p50/p90/p99 — and those ARE
+    percentiles — so a document-wide ban on the word would fail on a correct
+    page and would be "fixed" by deleting the honest labels. What must never
+    carry a percentile label is THIS figure, which is a mean.
+    """
+    end = INDEX_HTML.index('id="thTtftL"')
+    start = INDEX_HTML.rindex('<div class="tcell">', 0, end)
+    stop = INDEX_HTML.index("\n", end)
+    return INDEX_HTML[start:stop]
+
+
 def test_ttft_is_labelled_as_a_mean_and_never_as_a_percentile() -> None:
     """It is delta(_sum)/delta(_count) -- a mean, not p50 and not p95. A
     percentile label on a mean is a bigger lie than no label."""
@@ -836,9 +857,12 @@ def test_ttft_is_labelled_as_a_mean_and_never_as_a_percentile() -> None:
     life = dom["thTtftL"]["text"]
     assert "mean" in life, life
     assert "over 1,728 requests" in life, f"the sample size is missing: {life}"
+    cell = _ttft_cell_markup()
+    assert 'id="thTtft"' in cell, "the slice missed the cell it is meant to check"
+    assert "mean" in cell.lower(), "the TTFT cell must say it is a mean"
     for word in ("p50", "p95", "p99", "percentile", "median"):
         assert word not in life.lower(), f"TTFT is a mean, not {word}: {life}"
-        assert word not in INDEX_HTML.lower()
+        assert word not in cell.lower(), f"the TTFT cell calls a mean {word}: {cell}"
 
 
 def test_the_serving_line_labels_every_figure_before_its_number() -> None:
@@ -936,3 +960,138 @@ def test_app_js_parses_in_a_real_js_engine() -> None:
     """
     dukpy = pytest.importorskip("dukpy")
     dukpy.evaljs("function __parse_only() {\n" + APP_JS + "\n}\n1;")
+
+
+# --------------------------------------------------------------------------
+# Request-size window and the parallelism recommendation
+# --------------------------------------------------------------------------
+def _request_stats_painter() -> str:
+    return _fn_body("paintRequestStats")
+
+
+def _rendered_text(src: str) -> str:
+    """The painter with its own comments removed.
+
+    Without this, an assertion that the page "names vllm:num_preemptions_total"
+    is satisfied by a comment that merely mentions it — the string could be
+    dropped from the rendered warning and the test would still pass. Comments
+    are for the reader; only what survives here reaches the screen.
+    """
+    out = []
+    for line in src.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("//") or stripped.startswith("*") or stripped.startswith("/*"):
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def test_provenance_label_is_rendered_beside_the_percentiles() -> None:
+    """The estimate's provenance is not optional decoration.
+
+    The percentiles are bucket-quantised (vLLM publishes a histogram, not
+    per-request rows) and cover only requests that finished while Servedeck was
+    watching. A p90 shown without that caveat reads as an exact measurement of
+    the server's whole traffic, which it is not. This pins BOTH halves: the
+    markup has the slot, and the painter fills it from the backend's own
+    string rather than from a copy in the page that could drift.
+    """
+    assert 'id="statsProv"' in INDEX_HTML, "no slot for the provenance label"
+    painter = _request_stats_painter()
+    assert 'set("statsProv"' in painter, "the provenance slot is never filled"
+    assert "sz.provenance" in painter, (
+        "the label must come from reqstats.PROVENANCE via the payload, not be "
+        "restated in the page where it can drift from the module that computes "
+        "the estimate"
+    )
+
+
+def test_provenance_string_actually_reaches_the_page_payload() -> None:
+    """The other end of the same contract: the field the painter reads is the
+    field the backend emits, carrying the real sentence."""
+    from servedeck import reqstats
+
+    payload = _app._sizing_payload()
+    assert payload["provenance"] == reqstats.PROVENANCE
+    assert "bucket" in payload["provenance"].lower()
+
+
+def test_percentile_intervals_are_rendered_as_intervals() -> None:
+    """A bucket-bounded percentile must render as "20,001–50,000", never as a
+    midpoint or a bare upper edge. Collapsing it to one number is exactly the
+    "silently present an estimate as exact" failure."""
+    painter = _request_stats_painter()
+    assert "p.exact" in painter, "the painter ignores whether a percentile is exact"
+    assert "p.lo" in painter and "p.hi" in painter, (
+        "an interval-valued percentile is rendered from one bound only"
+    )
+
+
+def test_the_page_reads_only_fields_the_sizing_payload_emits() -> None:
+    """Key-for-key against the real serialisers, the way this file checks every
+    other payload. A painter reading `rec.agents` off a payload that has never
+    had that key renders an empty headline with a 200 in the network tab."""
+    from servedeck import parallelism, reqstats
+
+    painter = _request_stats_painter()
+    rec_keys = set(
+        parallelism.recommend(
+            pool_tokens=280_813, prompt_tokens=8_102, max_num_seqs=16
+        ).to_dict()
+    )
+    win_keys = set(reqstats.EMPTY_STATS)
+    sizing_keys = set(_app._sizing_payload())
+
+    assert _reads_of("rec", painter) <= rec_keys, (
+        f"painter reads unknown recommendation fields: "
+        f"{_reads_of('rec', painter) - rec_keys}"
+    )
+    assert _reads_of("w", painter) <= win_keys, (
+        f"painter reads unknown window fields: {_reads_of('w', painter) - win_keys}"
+    )
+    assert _reads_of("sz", painter) <= sizing_keys, (
+        f"painter reads unknown sizing fields: "
+        f"{_reads_of('sz', painter) - sizing_keys}"
+    )
+
+
+def test_the_page_shows_the_arithmetic_behind_the_recommendation() -> None:
+    """The headline is a claim about how hard to push the GPU. It has to be
+    checkable on screen: pool, per-request cost, the raw fit, the headroom
+    factor and the clamp."""
+    painter = _request_stats_painter()
+    for term in ("pool_tokens", "cost_tokens", "fit_n", "headroom", "n_before_clamp"):
+        assert term in painter, f"the arithmetic does not show {term}"
+    assert "max_num_seqs" in painter, "the clamp is applied but never shown"
+
+
+def test_the_page_shows_what_p99_would_change_it_to() -> None:
+    painter = _request_stats_painter()
+    assert "at_p99" in painter
+    assert 'set("recP99"' in painter
+
+
+def test_over_subscription_warning_names_preemptions_as_the_confirmation() -> None:
+    """Preemption is what over-subscription actually does. The warning has to
+    point at vllm:num_preemptions_total, or it is an opinion with no evidence
+    attached."""
+    painter = _request_stats_painter()
+    assert "over_subscribed" in painter
+    assert "preemptions" in painter
+    assert "num_preemptions_total" in _rendered_text(painter), (
+        "the warning must name the metric that confirms it, in text the "
+        "operator can see — a comment mentioning it does not count"
+    )
+
+
+def test_the_lifetime_average_is_no_longer_the_sizing_input() -> None:
+    """The defect this work removes: sizing was floor(kv_tokens / mean prompt
+    size), where the mean was sum/count over every request since the engine
+    booted. Both halves were wrong -- a lifetime mean, and a division that
+    ignores the fixed per-sequence KV cost."""
+    painter = _request_stats_painter()
+    assert "avg_prompt_tokens" not in painter, (
+        "the sizing panel is reading the lifetime mean again"
+    )
+    assert "avg_prompt_tokens" not in _fn_body("paintTelemetry")
+    assert 'id="avgCtx"' not in INDEX_HTML

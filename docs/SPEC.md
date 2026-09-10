@@ -394,6 +394,28 @@ POST /api/codex/subagents {n} | /api/smoke
 All mutating endpoints return 202 immediately; progress on SSE. NO endpoint blocks for a boot.
 
 ### LIVE-METRICS AGENT SIZING (user requirement)
+SUPERSEDED 2026-09-10 by the owner's own follow-up: "we need to not just say avg context per
+request, but the statistics of last 100 requests, that gives better analysis on num subagents to
+keep running in parallel". The original text is kept below the rule, struck through in intent, so
+the reason for the change stays visible.
+
+WHAT IS BUILT NOW (servedeck/reqstats.py, servedeck/parallelism.py):
+  Distribution, not a mean. p50 / p90 / p99 / max prompt tokens over a rolling window of the last
+  100 FINISHED requests, reconstructed from vllm:request_prompt_tokens_bucket deltas. The window
+  reports its own sample count, age, and how many observations are exact rather than
+  bucket-bounded; fewer than 100 is stated, never padded. A percentile over bucket-bounded
+  observations is rendered as an INTERVAL, and reqstats.PROVENANCE is on screen beside it.
+  ONE headline number: the recommended parallel-agent count, sized on the p90 upper bound.
+    N = clamp(floor(kv_pool_tokens / kv_cost(p90) * headroom), 1, max_num_seqs)
+  kv_cost() is calibrated to the KV-pool cost MEASURED on this server (615/8,102/30,116/105,108
+  prompt tokens -> 5.0/10.5/23.3/67 % of the pool), not derived from token counts: on a hybrid
+  attention/Mamba model each sequence takes a ~12.8k-token fixed state page, which is why the
+  obvious floor(pool / prompt_tokens) — the same thing vLLM publishes as kv_cache_max_concurrency —
+  says 34 agents fit at 8k prompts where measurement says 8. headroom = 0.94, the only round value
+  reproducing every measured cell. kv_pool_tokens is the LIVE vllm:cache_config_info value, never a
+  constant. The page shows every term of that arithmetic, plus what p99 would change it to.
+
+--- superseded ---
 Show TWO numbers side by side, never one:
   "Safe floor"       = agents at configured max ctx        (a guarantee)
   "At observed avg"  = kv_total_tokens / avg_prompt_tokens (a BET — style it differently)

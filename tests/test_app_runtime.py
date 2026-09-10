@@ -404,3 +404,172 @@ def test_live_kv_size_falls_back_to_the_boot_log(
     facts = capp._live_boot_facts()
     assert facts["kv_tokens"] == 272_062
     assert facts["kv_source"] == "boot log"
+
+
+# --------------------------------------------------------------------------
+# The parallelism panel's payload (_sizing_payload)
+# --------------------------------------------------------------------------
+def _window(p90: int, p99: int | None = None, n: int = 100) -> dict:
+    """A window payload of the shape reqstats.WindowStats.to_dict() emits."""
+    p99 = p99 if p99 is not None else p90
+    pc = lambda v: {"lo": v, "hi": v, "exact": True}  # noqa: E731
+    return {
+        "n": n, "capacity": 100, "exact_n": n, "age_s": 42.0,
+        "p50": pc(p90 // 2), "p90": pc(p90), "p99": pc(p99), "max": pc(p99),
+        "partial": n < 100,
+    }
+
+
+@pytest.fixture
+def _sizing(monkeypatch: pytest.MonkeyPatch):
+    """Drive _sizing_payload off a scripted metrics snapshot and cmdline."""
+    def go(metrics: dict, *, max_num_seqs: int | None = 16, model: str | None = None):
+        monkeypatch.setattr(capp.rt, "metrics", metrics, raising=False)
+        monkeypatch.setattr(capp.rt, "serving_model", model, raising=False)
+        monkeypatch.setattr(capp, "_running_max_num_seqs", lambda: max_num_seqs)
+        return capp._sizing_payload()
+    return go
+
+
+def test_sizing_refuses_to_recommend_without_a_live_backend(_sizing) -> None:
+    out = _sizing({"reachable": False})
+    assert out["recommended"] is None
+    assert out["reason"] == "backend not reachable"
+
+
+def test_sizing_refuses_to_guess_the_kv_pool(_sizing) -> None:
+    """The pool must be the RUNNING engine's kv_cache_size_tokens. Falling back
+    to the 280,813 the cost curve was calibrated on would hand a confident
+    recommendation to a server launched at a different
+    --gpu-memory-utilization, which is how you over-subscribe."""
+    out = _sizing({"reachable": True, "prompt_stats": _window(8_102)})
+    assert out["recommended"] is None
+    assert "KV pool" in out["reason"]
+
+
+def test_sizing_says_how_empty_the_window_is_rather_than_recommending(_sizing) -> None:
+    """Fewer than 100 is fine; ZERO is not a distribution. The reason names the
+    real count so the operator knows to wait rather than to distrust the GPU."""
+    from servedeck import reqstats
+
+    out = _sizing({
+        "reachable": True,
+        "kv_cache_size_tokens": 280_813,
+        "prompt_stats": dict(reqstats.EMPTY_STATS),
+    })
+    assert out["recommended"] is None
+    assert "0 of 100" in out["reason"]
+
+
+def test_sizing_reproduces_the_measured_concurrency_end_to_end(_sizing) -> None:
+    """The whole path, not just the formula: a window whose p90 is 30,116
+    tokens must come out of /api/state recommending 4 agents, which is what was
+    measured on this box."""
+    out = _sizing({
+        "reachable": True,
+        "kv_cache_size_tokens": 280_813,
+        "running": 1,
+        "preemptions": 0,
+        "prompt_stats": _window(30_116),
+    })
+    assert out["recommended"]["n"] == 4
+    assert out["recommended"]["pool_tokens"] == 280_813
+    assert "p90 of the last 100 requests" in out["recommended"]["basis"]
+
+
+def test_sizing_is_based_on_the_p90_upper_bound_not_the_mean(_sizing) -> None:
+    """A bucket-bounded p90 is an interval; sizing on its UPPER bound
+    under-recommends, which is the safe direction. Sizing on the lower bound --
+    or on the lifetime mean the panel used to show -- over-recommends."""
+    out = _sizing({
+        "reachable": True,
+        "kv_cache_size_tokens": 280_813,
+        "avg_prompt_tokens": 615,   # the old input: would have said 16
+        "running": 0,
+        "prompt_stats": {
+            **_window(30_116),
+            "p90": {"lo": 20_001, "hi": 50_000, "exact": False},
+        },
+    })
+    assert out["recommended"]["prompt_tokens"] == 50_000
+    # 280,813 / 97,969 = 2.87, x 0.94 headroom = 2. The lifetime mean of 615
+    # tokens in the same payload would have said 16.
+    assert out["recommended"]["n"] == 2
+
+
+def test_sizing_reports_what_p99_would_change_it_to(_sizing) -> None:
+    out = _sizing({
+        "reachable": True,
+        "kv_cache_size_tokens": 280_813,
+        "running": 0,
+        "prompt_stats": _window(8_102, p99=105_108),
+    })
+    assert out["recommended"]["n"] == 8
+    assert out["at_p99"]["n"] == 1
+
+
+def test_sizing_warns_when_live_concurrency_exceeds_the_recommendation(_sizing) -> None:
+    """The warning condition. Its confirming signal, num_preemptions_total,
+    travels in the same payload so the page never has to reach for it."""
+    out = _sizing({
+        "reachable": True,
+        "kv_cache_size_tokens": 280_813,
+        "running": 9,
+        "preemptions": 31,
+        "prompt_stats": _window(30_116),
+    })
+    assert out["over_subscribed"] is True
+    assert out["preemptions"] == 31
+
+
+def test_sizing_does_not_warn_at_or_below_the_recommendation(_sizing) -> None:
+    out = _sizing({
+        "reachable": True,
+        "kv_cache_size_tokens": 280_813,
+        "running": 4,
+        "preemptions": 0,
+        "prompt_stats": _window(30_116),
+    })
+    assert out["over_subscribed"] is False
+
+
+def test_sizing_clamps_to_the_running_servers_max_num_seqs(_sizing) -> None:
+    """--max-num-seqs is a hard scheduler ceiling, and it is read off the live
+    process, not off servedeck.toml: for an adopted server the two need not
+    agree."""
+    out = _sizing(
+        {
+            "reachable": True,
+            "kv_cache_size_tokens": 280_813,
+            "running": 0,
+            "prompt_stats": _window(615),
+        },
+        max_num_seqs=4,
+    )
+    assert out["recommended"]["n"] == 4
+    assert out["recommended"]["clamped"] is True
+    assert out["max_num_seqs"] == 4
+
+
+def test_sizing_names_the_model_the_cost_curve_was_calibrated_on(_sizing) -> None:
+    """A curve fitted to one hybrid model must not present itself as universal
+    when something else is serving."""
+    out = _sizing(
+        {"reachable": True, "kv_cache_size_tokens": 280_813,
+         "running": 0, "prompt_stats": _window(8_102)},
+        model="llama-3-70b",
+    )
+    assert "llama-3-70b" in out["calibration_note"]
+    assert "upper bound" in out["calibration_note"]
+
+
+def test_max_num_seqs_comes_from_the_live_command_line(monkeypatch) -> None:
+    """vLLM's /metrics does not publish max_num_seqs (cache_config_info carries
+    only cache settings), so the process's own argv is the single live source."""
+    argv = ["vllm", "serve", "m", "--max-model-len", "262144", "--max-num-seqs", "16"]
+    monkeypatch.setattr(capp, "_listener_argv", lambda: argv)
+    assert capp._running_max_num_seqs() == 16
+    monkeypatch.setattr(capp, "_listener_argv", lambda: [])
+    assert capp._running_max_num_seqs() is None, (
+        "an unreadable cmdline must not fabricate a ceiling"
+    )
