@@ -41,6 +41,38 @@ PROMPT_TOK_CACHED_TOTAL = "vllm:prompt_tokens_cached_total"
 # Histogram of per-request prefill wall time (first SCHEDULED -> first token,
 # v1/metrics/stats.py:544). _sum over all finished requests is the denominator
 # of the lifetime prefill rate.
+#
+# WHY IT IS NOT THE DENOMINATOR OF THE *WINDOW* RATE.
+# "Prefill throughput is prompt tokens per second of prefill time, not per
+# second of wall clock" is right about the quantity and impossible to compute
+# per window on this build. prompt_tokens_total accrues CONTINUOUSLY, one
+# increment per engine iteration; this histogram is observed ONCE, when a
+# request reaches its first token, and the observation carries the request's
+# whole prefill duration. The two are not co-timed, so their deltas over a
+# short window are not a ratio of anything.
+#
+# Measured on the live Flash-Next server (:8001), 10.016 s apart, recorded at
+# tests/fixtures/metrics_live_prefill_lag_t{1,2}.txt:
+#     d(prompt_tokens_total)               =      0 tokens
+#     d(request_prefill_time_seconds_sum)  = 20.005 s
+#     d(request_prefill_time_seconds_count)=      1 request
+# A request that had been prefilling across earlier windows reached its first
+# token inside this one. Dividing gives 0 / 20.005 = 0 tok/s for a window in
+# which the engine had, in fact, prefilled. The wall-clock denominator gives
+# 0 tok/s too, but says something TRUE: no prompt tokens were computed in
+# this window.
+#
+# And there is no substitute: this build exposes no cumulative counter of
+# seconds the ENGINE spent prefilling (checked against the full family list of
+# a live scrape -- the only prefill-time family is this per-request latency
+# histogram). So:
+#   window   figure = computed prompt tokens / wall seconds   (aggregate; the
+#            same quantity vLLM's own log prints as "Avg prompt throughput")
+#   lifetime figure = computed prompt tokens / prefill seconds (per second of
+#            prefill time, as asked -- the completion lag averages out over
+#            thousands of requests)
+# They are DIFFERENT QUANTITIES and the panel must never substitute one for
+# the other in the same slot. It used to, marked only by a "~".
 PREFILL_TIME_SUM = "vllm:request_prefill_time_seconds_sum"
 PREFILL_TIME_COUNT = "vllm:request_prefill_time_seconds_count"
 #: Time-to-first-token histogram. _sum/_count over the poll window give the
@@ -145,6 +177,27 @@ COUNTER_RESET = "counters reset — the server restarted during this window"
 IDLE = "idle — nothing ran in the sampling window"
 NOT_EXPOSED = "not published by this vLLM build"
 
+#: A short machine-readable code beside every reason. The page has to render
+#: an idle figure differently from an absent one (idle keeps its last value and
+#: an age; "this build does not publish that metric" has no last value to
+#: keep), and matching on the PROSE above would mean an edit to one word of
+#: English here silently changed how the dashboard behaves. tests/test_ui.py
+#: asserts the page switches on codes from this table and on nothing else.
+REASON_CODE = {
+    UNREACHABLE: "unreachable",
+    NO_BASELINE: "no_baseline",
+    COUNTER_RESET: "reset",
+    IDLE: "idle",
+    NOT_EXPOSED: "not_exposed",
+}
+
+
+def _state(value: float | None, reason: str | None) -> str:
+    """"ok" when there is a window reading, else the reason's code."""
+    if value is not None:
+        return "ok"
+    return REASON_CODE.get(reason or "", "unknown")
+
 
 def _label_int(labels: dict[str, str], key: str) -> int | None:
     """An integer label, or None. vLLM writes the string "None" for unset
@@ -162,6 +215,13 @@ def _label_float(labels: dict[str, str], key: str) -> float | None:
         return float(raw) if raw not in (None, "", "None") else None
     except ValueError:
         return None
+
+
+def _age(v: float | None) -> int | None:
+    """Seconds since a reading, whole seconds. Sub-second precision on the age
+    of a stale figure is noise -- the poll interval is 2 s -- and printing
+    "0.7 s ago" invites reading it as a measurement rather than as a clock."""
+    return None if v is None else int(v)
 
 
 def _by_label(parsed: dict, name: str, key: str, val: str) -> float:
@@ -210,6 +270,22 @@ class MetricsSnapshot:
     #: Same quantity over the server's whole life, so the panel still has a
     #: TTFT to show when no request started in the last two seconds.
     ttft_s_avg: float | None = None
+    #: Requests whose time-to-first-token has been observed (the sample count
+    #: behind ttft_s_avg), so the panel can say "mean of N", not just "mean".
+    ttft_requests: int = 0
+    #: The last WINDOW reading this poller saw for each figure, and how many
+    #: seconds ago it was taken. A cell whose window is idle renders these
+    #: instead of blanking: "idle - last 249.0 tok/s, 34 s ago" is a fact, an
+    #: empty box is not, and the empty box is what let the panel look as
+    #: though one figure had replaced the other. Cleared when the counters
+    #: reset, because a reading from the previous process describes a server
+    #: that no longer exists.
+    prefill_tok_s_last: float | None = None
+    prefill_last_age_s: float | None = None
+    gen_tok_s_last: float | None = None
+    gen_last_age_s: float | None = None
+    ttft_s_last: float | None = None
+    ttft_last_age_s: float | None = None
     #: Why each of the four figures above is not a number, when it is not.
     #: Never None at the same time as its value: exactly one of the pair is
     #: set, so the UI can always print either a reading or a reason.
@@ -247,9 +323,21 @@ class MetricsSnapshot:
             # round(_, 1) would print it as 0.0.
             "ttft_s": None if self.ttft_s is None else round(self.ttft_s, 3),
             "ttft_s_avg": None if self.ttft_s_avg is None else round(self.ttft_s_avg, 3),
+            "ttft_requests": self.ttft_requests,
+            "prefill_tok_s_last": rate(self.prefill_tok_s_last),
+            "prefill_last_age_s": _age(self.prefill_last_age_s),
+            "gen_tok_s_last": rate(self.gen_tok_s_last),
+            "gen_last_age_s": _age(self.gen_last_age_s),
+            "ttft_s_last": (
+                None if self.ttft_s_last is None else round(self.ttft_s_last, 3)
+            ),
+            "ttft_last_age_s": _age(self.ttft_last_age_s),
             "gen_reason": self.gen_reason,
             "prefill_reason": self.prefill_reason,
             "ttft_reason": self.ttft_reason,
+            "gen_state": _state(self.gen_tok_s, self.gen_reason),
+            "prefill_state": _state(self.prefill_tok_s, self.prefill_reason),
+            "ttft_state": _state(self.ttft_s, self.ttft_reason),
             "kv_cache_size_tokens": self.kv_cache_size_tokens,
             "kv_cache_max_concurrency": self.kv_cache_max_concurrency,
             "kv_cache_gpu_util": self.kv_cache_gpu_util,
@@ -298,15 +386,56 @@ class MetricsPoller:
         # and a backwards step silently scales every throughput number the UI
         # has ever shown.
         self._monotonic = monotonic
+        # key -> (monotonic ts, value) of the last WINDOW reading that was a
+        # number. The panel renders these while a window is idle so a figure
+        # is never blank and never appears to have been replaced by its
+        # neighbour. Not a rate cache: it is only ever shown with its age.
+        self._last: dict[str, tuple[float, float]] = {}
+
+    def _remember(self, snap: MetricsSnapshot, now: float) -> None:
+        """Record this scrape's window readings, then attach the newest one
+        for every figure -- including the figures this scrape has no reading
+        for, which is the whole point.
+
+        Called on EVERY exit path, unreachable ones included: a backend that
+        just went away is exactly when "last 249.0 tok/s, 12 s ago" beats an
+        empty box.
+        """
+        for key, live in (
+            ("prefill", snap.prefill_tok_s),
+            ("gen", snap.gen_tok_s),
+            ("ttft", snap.ttft_s),
+        ):
+            if live is not None:
+                self._last[key] = (now, live)
+        for key, val_attr, age_attr in (
+            ("prefill", "prefill_tok_s_last", "prefill_last_age_s"),
+            ("gen", "gen_tok_s_last", "gen_last_age_s"),
+            ("ttft", "ttft_s_last", "ttft_last_age_s"),
+        ):
+            rec = self._last.get(key)
+            if rec is None:
+                continue
+            ts, value = rec
+            setattr(snap, val_attr, value)
+            # max(0.0, ...) because a caller may inject a clock that does not
+            # advance; a negative age would render as "-0 s ago".
+            setattr(snap, age_attr, max(0.0, now - ts))
 
     async def scrape(self, client: httpx.AsyncClient) -> MetricsSnapshot:
         snap = MetricsSnapshot()
         snap.gen_reason = snap.prefill_reason = snap.ttft_reason = UNREACHABLE
+        # ONE clock read per scrape, taken before the request and used for
+        # both the rate window and the age of every stale reading. Two reads
+        # would date the window and the ages from different instants, which is
+        # how an age of "-1 s ago" gets onto a dashboard.
+        now = self._monotonic()
         try:
             r = await client.get(f"{self.base_url}/metrics", timeout=4.0)
             if r.status_code != 200:
                 snap.error = f"HTTP {r.status_code}"
                 self._prev = None
+                self._remember(snap, now)
                 return snap  # reasons already say UNREACHABLE
             text = r.text
         except Exception as exc:  # noqa: BLE001 - any transport failure means "down"
@@ -316,6 +445,7 @@ class MetricsPoller:
             # so a backend that was down for ten minutes came back reporting a
             # plausible-looking throughput averaged over its own downtime.
             self._prev = None
+            self._remember(snap, now)
             return snap
 
         p = parse_prometheus(text)
@@ -358,7 +488,6 @@ class MetricsPoller:
         ttft_count = _first(p, TTFT_COUNT)
         has_ttft = bool(p.get(TTFT_COUNT))
 
-        now = self._monotonic()
         if self._prev is None:
             snap.gen_reason = snap.prefill_reason = snap.ttft_reason = NO_BASELINE
         else:
@@ -371,6 +500,12 @@ class MetricsPoller:
             if dt <= 0 or reset:
                 reason = COUNTER_RESET if reset else NO_BASELINE
                 snap.gen_reason = snap.prefill_reason = snap.ttft_reason = reason
+                if reset:
+                    # A reading taken from the process that just died is not a
+                    # stale reading of THIS server, it is a reading of a
+                    # different one. Showing it with an age would be a lie
+                    # with a timestamp on it.
+                    self._last.clear()
             else:
                 snap.gen_tok_s = _rate(gen_total - prev_gen, dt)
                 snap.prefill_tok_s = _rate(prompt_computed - prev_prompt, dt)
@@ -393,6 +528,7 @@ class MetricsPoller:
         # marked as lifetime rather than silently substituted for the window.
         if has_ttft and ttft_count > 0:
             snap.ttft_s_avg = ttft_sum / ttft_count
+            snap.ttft_requests = int(ttft_count)
         decode_seconds = _first(p, DECODE_TIME_SUM)
         if decode_seconds > 0 and gen_total > 0:
             snap.gen_tok_s_avg = gen_total / decode_seconds
@@ -415,4 +551,5 @@ class MetricsPoller:
         snap.prefill_requests = int(_first(p, PREFILL_TIME_COUNT))
         if prefill_seconds > 0 and prompt_computed > 0:
             snap.prefill_tok_s_avg = prompt_computed / prefill_seconds
+        self._remember(snap, now)
         return snap

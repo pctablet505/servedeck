@@ -11,6 +11,7 @@ be started, stopped or leaned on by a unit test.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 
@@ -437,3 +438,272 @@ def test_the_prescrape_placeholder_has_the_same_shape_as_a_snapshot() -> None:
     assert placeholder["reachable"] is False
     for key in ("gen_reason", "prefill_reason", "ttft_reason"):
         assert placeholder[key] == metrics.UNREACHABLE
+
+
+# --------------------------------------------------------------------------
+# Rates derived from two RECORDED live snapshots with a known interval
+# --------------------------------------------------------------------------
+#
+# Owner, on the panel that showed one throughput number at a time: "prefill
+# might be badly wired". These pin what the two denominators are, using
+# exposition text scraped off the running Flash-Next server on :8001 rather
+# than invented numbers -- the pathology below is not one anybody would have
+# thought to write down.
+
+_FIXTURES = Path(__file__).resolve().parent / "fixtures"
+_WINDOWS = json.loads((_FIXTURES / "metrics_live_windows.json").read_text())
+
+
+def _pair(key: str) -> tuple[str, str, float]:
+    """The recorded (t1, t2, dt) of one live pair."""
+    spec = _WINDOWS[key]
+    return (
+        (_FIXTURES / spec["t1"]).read_text(),
+        (_FIXTURES / spec["t2"]).read_text(),
+        float(spec["dt_s"]),
+    )
+
+
+def _scrape_pair(key: str) -> metrics.MetricsSnapshot:
+    """Scrape both halves of a recorded pair with the recorded dt, and return
+    the second snapshot -- the one that has a window to report on."""
+    t1, t2, dt = _pair(key)
+    return _scrape_all([t1, t2], [0.0, dt])[1]
+
+
+def test_window_rate_is_a_delta_over_the_recorded_interval() -> None:
+    """tokens/second, from two real scrapes 60.007 s apart.
+
+    d(generation_tokens_total) = 14,940 over dt = 60.007 s, so the decode
+    window figure is 248.97 tok/s and nothing else. A "total divided by
+    uptime" would have produced 6,424,697 / (server uptime), a completely
+    different number that happens to look just as plausible.
+    """
+    t1, t2, dt = _pair("win")
+    p1, p2 = metrics.parse_prometheus(t1), metrics.parse_prometheus(t2)
+    d_gen = metrics._first(p2, metrics.GEN_TOK_TOTAL) - metrics._first(
+        p1, metrics.GEN_TOK_TOTAL
+    )
+    assert d_gen == 14940.0, "fixture changed; the arithmetic below is pinned to it"
+
+    snap = _scrape_pair("win")
+    assert snap.gen_tok_s == pytest.approx(d_gen / dt, rel=1e-9)
+    assert snap.gen_tok_s == pytest.approx(248.97, abs=0.01)
+
+
+def test_the_live_window_that_produced_the_owners_report() -> None:
+    """The exact state the owner described: "when one is not displayed, the
+    prefill speed shows, when it is not running, while generate shows when
+    generating."
+
+    In this recorded 60 s window the engine decoded 14,940 tokens and computed
+    ZERO prompt tokens. So decode has a window reading and prefill does not --
+    and the panel used to fill the prefill slot with a lifetime average
+    instead, in the same font, marked only with a "~". Both facts are asserted
+    here because the fix is that the second one no longer follows from the
+    first.
+    """
+    snap = _scrape_pair("win")
+    assert snap.gen_tok_s is not None, "decode had traffic in this window"
+    assert snap.prefill_tok_s is None, "no prompt tokens were computed"
+    assert snap.prefill_reason == metrics.IDLE
+    payload = snap.to_dict()
+    assert payload["gen_state"] == "ok"
+    assert payload["prefill_state"] == "idle"
+    # The lifetime companion is still published -- in its own field, which the
+    # panel renders on its own line. It must never arrive as prefill_tok_s.
+    assert payload["prefill_tok_s"] is None
+    assert payload["prefill_tok_s_avg"] == pytest.approx(3013.3, abs=1.0)
+
+
+def test_lifetime_prefill_divides_by_prefill_time_not_wall_clock() -> None:
+    """"Prefill throughput is prompt tokens per second of prefill time."
+
+    Computed prompt tokens 25,244,710 over 8,378.13 s of prefill time =
+    3,013.3 tok/s. Over the server's WALL uptime the same numerator gives a
+    figure smaller by orders of magnitude, and over the poll window it gives
+    0. The denominator is what makes this figure mean anything, so the test
+    perturbs the denominator and requires the answer to move with it.
+    """
+    _t1, t2, _dt = _pair("win")
+    p = metrics.parse_prometheus(t2)
+    computed = metrics._first(p, metrics.PROMPT_TOK_TOTAL) - metrics._first(
+        p, metrics.PROMPT_TOK_CACHED_TOTAL
+    )
+    prefill_seconds = metrics._first(p, metrics.PREFILL_TIME_SUM)
+    assert prefill_seconds > 0
+
+    snap = _scrape_pair("win")
+    assert snap.prefill_tok_s_avg == pytest.approx(computed / prefill_seconds, rel=1e-9)
+
+    # Halve the prefill seconds; the rate must double. A wall-clock (or
+    # uptime) denominator would not move at all.
+    halved = _bump(t2, "vllm:request_prefill_time_seconds_sum", -prefill_seconds / 2)
+    snap2 = _scrape_all([t2, halved], [0.0, 60.0])[1]
+    assert snap2.prefill_tok_s_avg == pytest.approx(2 * snap.prefill_tok_s_avg, rel=1e-6)
+
+
+def test_lifetime_decode_divides_by_decode_time_not_wall_clock() -> None:
+    """The decode companion, same rule, different denominator -- and the two
+    denominators are why the window figure and the lifetime figure of the SAME
+    cell disagree by 2.4x on this recording (248.97 vs 104.4 tok/s). They are
+    different quantities; the panel must not swap one for the other."""
+    _t1, t2, _dt = _pair("win")
+    p = metrics.parse_prometheus(t2)
+    gen = metrics._first(p, metrics.GEN_TOK_TOTAL)
+    decode_seconds = metrics._first(p, metrics.DECODE_TIME_SUM)
+    snap = _scrape_pair("win")
+    assert snap.gen_tok_s_avg == pytest.approx(gen / decode_seconds, rel=1e-9)
+    assert snap.gen_tok_s_avg == pytest.approx(104.4, abs=0.1)
+    assert snap.gen_tok_s == pytest.approx(248.97, abs=0.01)
+
+
+def test_the_window_rate_cannot_use_the_prefill_time_histogram() -> None:
+    """Why prefill's WINDOW figure divides by wall clock even though prefill
+    throughput is properly per second of prefill time.
+
+    Recorded live, 10.016 s apart: d(prompt_tokens_total) = 0 while
+    d(request_prefill_time_seconds_sum) = 20.005 over ONE observed request.
+    The counter accrues per engine iteration; the histogram is observed once,
+    at first token, carrying the request's whole prefill duration. Their
+    deltas over a short window are not a ratio of anything -- dividing them
+    gives 0 tok/s for a window in which the engine had been prefilling.
+
+    This test exists so that a future "fix" that switches the window figure to
+    that denominator fails here with the reason written down.
+    """
+    t1, t2, dt = _pair("prefill_lag")
+    p1, p2 = metrics.parse_prometheus(t1), metrics.parse_prometheus(t2)
+    d_prompt = metrics._first(p2, metrics.PROMPT_TOK_TOTAL) - metrics._first(
+        p1, metrics.PROMPT_TOK_TOTAL
+    )
+    d_prefill_s = metrics._first(p2, metrics.PREFILL_TIME_SUM) - metrics._first(
+        p1, metrics.PREFILL_TIME_SUM
+    )
+    d_prefill_n = metrics._first(p2, metrics.PREFILL_TIME_COUNT) - metrics._first(
+        p1, metrics.PREFILL_TIME_COUNT
+    )
+    assert d_prompt == 0.0
+    assert d_prefill_s == pytest.approx(20.005, abs=0.01)
+    assert d_prefill_n == 1.0
+
+    snap = _scrape_all([t1, t2], [0.0, dt])[1]
+    # Wall clock over this window: zero prompt tokens computed, which is
+    # reported as idle -- a true statement -- and NOT as "0 tok/s".
+    assert snap.prefill_tok_s is None
+    assert snap.prefill_reason == metrics.IDLE
+    # And the lifetime figure, whose denominator IS prefill seconds, is still
+    # a number, because thousands of requests average the observation lag out.
+    assert snap.prefill_tok_s_avg is not None and snap.prefill_tok_s_avg > 1000
+
+
+def test_no_family_on_this_build_gives_engine_prefill_seconds() -> None:
+    """The reason the window figure has no better denominator available.
+
+    Only per-request latency histograms carry prefill time. If a future vLLM
+    grows a cumulative engine-side prefill-seconds counter, this test fails and
+    the window figure should be rewired to use it.
+    """
+    _t1, t2, _dt = _pair("win")
+    families = {
+        line.split()[2]
+        for line in t2.splitlines()
+        if line.startswith("# TYPE") and len(line.split()) > 2
+    }
+    prefill_time_families = {
+        f
+        for f in families
+        if "prefill" in f
+        and ("time" in f or "seconds" in f)
+        # `_created` is prometheus_client's per-family creation TIMESTAMP, not
+        # a duration; it is not a candidate denominator.
+        and not f.endswith("_created")
+    }
+    assert prefill_time_families == {"vllm:request_prefill_time_seconds"}, (
+        f"this build now publishes {prefill_time_families}"
+    )
+
+
+def test_the_parser_reads_a_whole_unedited_live_exposition() -> None:
+    """Reality check on the parser: 678 lines of the real page, histograms,
+    `le` labels, `+Inf`, scientific notation and all."""
+    _t1, t2, _dt = _pair("win")
+    p = metrics.parse_prometheus(t2)
+    assert metrics._first(p, metrics.GEN_TOK_TOTAL) == 6461615.0
+    assert metrics._first(p, metrics.PROMPT_TOK_TOTAL) == 90749177.0
+    # Scientific notation is what the exposition actually uses for these: the
+    # value on the wire is the string "9.0749177e+07", not 90749177.
+    assert "9.0749177e+07" in t2
+    # A bucketed histogram parses into many rows, one per `le`.
+    assert len(p["vllm:time_to_first_token_seconds_bucket"]) > 10
+    # And the engine's own resolved KV size comes off a LABEL, not a value.
+    snap = _scrape_pair("win")
+    assert snap.kv_cache_size_tokens == 280813
+
+
+# --------------------------------------------------------------------------
+# The idle/stale path: a figure that has no reading keeps its last one
+# --------------------------------------------------------------------------
+def test_an_idle_figure_keeps_its_last_reading_and_an_age() -> None:
+    """A blank cell is what let one figure look as though it had been replaced
+    by the other. An idle window must publish the last value it DID see and
+    how old that value is."""
+    snaps = _scrape_all(
+        [
+            _exposition(gen_total=0),
+            _exposition(gen_total=100),   # 50 tok/s over 2 s
+            _exposition(gen_total=100),   # idle
+            _exposition(gen_total=100),   # still idle
+        ],
+        [0.0, 2.0, 4.0, 10.0],
+    )
+    assert snaps[1].gen_tok_s == pytest.approx(50.0)
+    assert snaps[2].gen_tok_s is None and snaps[2].gen_reason == metrics.IDLE
+    assert snaps[2].gen_tok_s_last == pytest.approx(50.0)
+    assert snaps[2].gen_last_age_s == pytest.approx(2.0)
+    # The age grows; the value does not change.
+    assert snaps[3].gen_tok_s_last == pytest.approx(50.0)
+    assert snaps[3].gen_last_age_s == pytest.approx(8.0)
+    assert snaps[3].to_dict()["gen_last_age_s"] == 8
+
+
+def test_a_last_reading_survives_the_backend_going_away() -> None:
+    """"last 50.0 tok/s, 12 s ago" beats an empty box for a backend that just
+    died, so the unreachable path publishes it too."""
+    snaps = _scrape_all(
+        [_exposition(gen_total=0), _exposition(gen_total=100), ConnectionError("boom")],
+        [0.0, 2.0, 20.0],
+    )
+    assert snaps[2].reachable is False
+    assert snaps[2].gen_tok_s_last == pytest.approx(50.0)
+    assert snaps[2].gen_last_age_s == pytest.approx(18.0)
+    assert snaps[2].to_dict()["gen_state"] == "unreachable"
+
+
+def test_a_counter_reset_throws_the_last_reading_away() -> None:
+    """A reading from the process that just died is not a stale reading of
+    THIS server; it is a reading of a different one. Keeping it would put a
+    number from the old model beside an age that makes it look current."""
+    snaps = _scrape_all(
+        [_exposition(gen_total=0), _exposition(gen_total=100), _exposition(gen_total=3)],
+        [0.0, 2.0, 4.0],
+    )
+    assert snaps[1].gen_tok_s_last == pytest.approx(50.0)
+    assert snaps[2].gen_reason == metrics.COUNTER_RESET
+    assert snaps[2].gen_tok_s_last is None
+    assert snaps[2].gen_last_age_s is None
+    assert snaps[2].to_dict()["gen_state"] == "reset"
+
+
+def test_every_figure_publishes_a_state_code_the_ui_can_switch_on() -> None:
+    """The page must not match on the English of a reason string: an edit to
+    one word here would silently change how the dashboard renders."""
+    payload = metrics.unreachable_snapshot()
+    for key in ("gen_state", "prefill_state", "ttft_state"):
+        assert payload[key] == "unreachable"
+    assert set(metrics.REASON_CODE.values()) == {
+        "unreachable", "no_baseline", "reset", "idle", "not_exposed",
+    }
+    for reason, code in metrics.REASON_CODE.items():
+        assert metrics._state(None, reason) == code
+    assert metrics._state(12.0, metrics.IDLE) == "ok", "a reading always wins"
