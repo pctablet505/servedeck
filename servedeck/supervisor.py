@@ -899,6 +899,10 @@ class Supervisor:
         save_desired(d, self.state_dir)
         self._write_flat_desired_state_file()
         self._stopping_deliberately = True
+        # Forget the previous stop's task before this one decides whether to
+        # create a new one: restart() waits on _stop_task, and waiting on a
+        # task that finished two stops ago would be a wait that proves nothing.
+        self._stop_task = None
         self._cancel_pending_restart()
 
         if self._handle is None:

@@ -1022,6 +1022,16 @@ function paintRequestStats() {
   // the plot instead of here.
   set("pctP90", pct(w.p90));
 
+  // Is that p90 a measurement or a bucket edge? A percentile over
+  // bucket-bounded observations is an interval, rendered as one by pct()
+  // just above; the recommendation divides by its UPPER edge (the
+  // conservative end), and both places that quoted that number stated it as
+  // an equality -- a histogram bucket edge printed as a measurement, on the
+  // same panel that had just said 20,001-50,000. Declared out here, not
+  // inside `if (rec)`, because the over-subscription banner below reads it
+  // too and a const is block-scoped.
+  const p90Exact = !!(w.p90 && (w.p90.exact || w.p90.lo === w.p90.hi));
+
   // The window's own honesty line, as short as it can be; see winSpan().
   set("winMeta", winSpan(w));
   reqHist(w);
@@ -1033,7 +1043,8 @@ function paintRequestStats() {
       ur.disabled = false;
       ur.title = `write ${rec.n} into the Parallel agents field`;
     }
-    set("recBasis", `${rec.basis} = ${fmt(rec.prompt_tokens)} prompt tokens`);
+    set("recBasis",
+      `${rec.basis} ${p90Exact ? "=" : "\u2264"} ${fmt(rec.prompt_tokens)} prompt tokens`);
     // The arithmetic, in full. pool / cost gives the raw fit; the headroom
     // factor keeps the last admitted sequence off the preemption edge; the
     // clamp is max_num_seqs, which the scheduler enforces whatever the KV says.
@@ -1068,7 +1079,8 @@ function paintRequestStats() {
   if (rec && sz.over_subscribed) {
     os.className = "oversub on";
     os.innerHTML = `<b>Over-subscribed: ${sz.running} requests in flight, `
-      + `${rec.n} recommended</b> at a p90 of ${fmt(rec.prompt_tokens)} prompt tokens. `
+      + `${rec.n} recommended</b> at a p90 of ${p90Exact ? "" : "at most "}`
+      + `${fmt(rec.prompt_tokens)} prompt tokens. `
       + (pre ? `${pre} preemptions since this server started — that is vLLM `
              + `evicting and recomputing KV, i.e. work already paid for being thrown away.`
              : `No preemptions yet; <span class="mono">vllm:num_preemptions_total</span> `

@@ -2172,3 +2172,31 @@ def test_apply_reaches_the_endpoint_that_actually_relaunches() -> None:
     )
     # ... and starting a stopped server must still go through start.
     assert "/api/server/start" in apply_handler
+
+
+def test_the_recommendation_does_not_state_a_bucket_edge_as_the_measured_p90() -> None:
+    """F9: the two halves of the request-statistics panel disagree.
+
+    A percentile over bucket-bounded observations is an INTERVAL, and the
+    panel renders it as one three lines higher ("20,001–50,000" via pct()).
+    The recommendation is divided by the interval's UPPER edge -- deliberately,
+    it is the conservative end -- but printed it as an equality: "p90 of the
+    last 5 requests = 50,000 prompt tokens", i.e. a histogram bucket edge
+    stated as a measurement. Only when every observation at that rank was
+    exact (reqstats.Percentile.exact) is "=" true.
+    """
+    paint = _fn_body("paintRequestStats")
+    start = paint.index('set("recBasis"')
+    statement = paint[start : paint.index(";", start) + 1]
+    assert "rec.basis" in statement, "the recommendation's basis line is gone"
+    assert "exact" in statement.lower(), (
+        "the basis line states the p90 as an equality without consulting "
+        f"p90.exact: {statement}"
+    )
+    # The over-subscription banner quotes the same number and sits OUTSIDE
+    # `if (rec) {`. A block-scoped const declared inside it is a
+    # ReferenceError there, and there is no JS runtime in this venv to catch
+    # one -- so pin the declaration ahead of the block.
+    assert paint.index("const p90Exact") < paint.index("if (rec) {"), (
+        "p90Exact is declared inside `if (rec)` but read again outside it"
+    )
