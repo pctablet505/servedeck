@@ -136,7 +136,15 @@ h1,h2,h3{margin:0;text-wrap:balance}
 .mcard[aria-pressed="true"]{background:var(--accent-soft);border-color:var(--accent)}
 .mcard .r1{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
 .mcard .nm{font-weight:600;letter-spacing:-.005em}
-.mcard .sz{font-size:11px;color:var(--muted)}
+.mcard .sz{font-size:11px;color:var(--muted);white-space:nowrap}
+/* The marker on a model whose blobs live on another mount: its size is real
+   but is not space on the filesystem whose free figure sits above it. */
+.mcard .sz .off{margin-left:3px;opacity:.7}
+.dfline{
+  display:flex;justify-content:space-between;gap:8px;
+  padding:6px 10px;font-size:11px;color:var(--muted);
+  border-bottom:1px solid var(--border);
+}
 .mcard .r2{display:flex;align-items:center;gap:6px;margin-top:4px}
 .mcard .note{font-size:11px;color:var(--muted);margin-top:3px;line-height:1.35}
 

@@ -781,7 +781,7 @@ def test_real_hub_unloadable_models_say_what_is_actually_wrong() -> None:
         assert not e.servable
         assert e.reason, f"{e.repo_id} is unservable with no reason"
         upper = e.reason.upper()
-        assert "GGUF" in upper or "SYMLINK" in upper, (
+        assert "GGUF" in upper or "SYMLINK" in upper or "PARTIAL" in upper, (
             f"{e.repo_id}: reason {e.reason!r} does not name a cause a human "
             "can act on"
         )
@@ -822,9 +822,9 @@ def test_a_snapshot_whose_blobs_are_offline_says_so(tmp_path) -> None:
     real = snap / "tokenizer.json"
     real.write_text("{}")
 
-    gib, st_count, gguf_count, dangling = _scan_snapshot_files(snap)
-    assert (gib, st_count, gguf_count) == (0.0, 0, 0)
-    assert dangling == 2, "unresolved symlinks were counted as ordinary files"
+    scan = _scan_snapshot_files(snap)
+    assert (scan.safetensors_bytes, scan.safetensors_count, scan.gguf_count) == (0, 0, 0)
+    assert scan.dangling_count == 2, "unresolved symlinks were counted as ordinary files"
 
 
 def test_a_healthy_snapshot_reports_no_dangling_symlinks(tmp_path) -> None:
@@ -842,10 +842,10 @@ def test_a_healthy_snapshot_reports_no_dangling_symlinks(tmp_path) -> None:
     (snap / "model-00001.safetensors").symlink_to(blob)
     (snap / "config.json").symlink_to(blob)
 
-    gib, st_count, gguf_count, dangling = _scan_snapshot_files(snap)
-    assert dangling == 0
-    assert st_count == 1
-    assert gib > 0
+    scan = _scan_snapshot_files(snap)
+    assert scan.dangling_count == 0
+    assert scan.safetensors_count == 1
+    assert scan.safetensors_bytes > 0
 
 
 def test_the_observation_store_lives_in_the_configured_state_dir(
@@ -866,3 +866,139 @@ def test_the_observation_store_lives_in_the_configured_state_dir(
     finally:
         monkeypatch.delenv("SERVEDECK_STATE_DIR", raising=False)
         _cfg.reset()
+
+
+# --------------------------------------------------------------------------- #
+# Size on disk (see tests/test_disksize.py for the walker's own contract)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_hardlinked_shard_is_not_counted_twice_in_a_models_disk_size(tmp_path: Path) -> None:
+    """Production shape, built the way production built it.
+
+    The FP8 PLE table was installed into the Flash-Next snapshot as hardlinks
+    of the files in ~/.cache/huggingface/ple-fp8-staging (43 shards, st_nlink
+    2). The hub also stores every snapshot entry as a symlink into blobs/, so
+    a per-name walk of a ``models--*`` directory sees each blob at least twice
+    already. ``disk_bytes`` is what a panel headed "Models on disk" claims, so
+    it must be what deleting the directory would actually free.
+
+    Real bytes, not the sparse files _write_safetensors uses: st_blocks is the
+    measurement, and a fixture of holes would make any implementation pass.
+    """
+    repo_dir = _make_repo(tmp_path, "models--A--B", config=INLINE_CONFIG)
+    snapshot = repo_dir / "snapshots" / "abc123"
+    blobs = repo_dir / "blobs"
+    blobs.mkdir(parents=True, exist_ok=True)
+
+    shard_size = 2 * 1024 * 1024
+    blob = blobs / "blob-shard"
+    blob.write_bytes(b"\xa5" * shard_size)
+    # (a) the hub's own symlink from the snapshot into blobs/
+    (snapshot / "model-00001.safetensors").symlink_to(blob)
+    # (b) the PLE-staging shape: a second directory entry, same inode
+    os.link(blob, snapshot / "model-plefp8-00.safetensors")
+    assert blob.stat().st_nlink == 2, "fixture is not actually hardlinked"
+
+    one_shard = blob.stat().st_blocks * 512
+    e = discover_models(tmp_path)[0]
+
+    assert e.disk_bytes == pytest.approx(one_shard, abs=64 * 1024), (
+        f"one 2 MiB blob under three names reported as {e.disk_bytes} bytes"
+    )
+    assert e.disk_bytes < 2 * one_shard
+    assert e.disk_local_bytes == e.disk_bytes, "nothing here is on another mount"
+
+
+def test_disk_size_counts_the_repo_not_only_the_resolved_snapshot(tmp_path: Path) -> None:
+    """What deleting a model frees is the whole ``models--*`` directory.
+
+    blobs/ is where the bytes live and it is shared by every snapshot; an
+    older revision's blob is still occupying space even though the resolved
+    snapshot does not name it. Measuring only the resolved snapshot
+    under-reports openai/gpt-oss-20b on this box by 21 GiB (3.91 GiB of
+    resolved snapshot against 24.79 GiB of hub directory).
+    """
+    repo_dir = _make_repo(tmp_path, "models--A--B", config=INLINE_CONFIG)
+    blobs = repo_dir / "blobs"
+    blobs.mkdir(parents=True, exist_ok=True)
+    (blobs / "orphan-from-an-older-revision").write_bytes(b"\xa5" * (3 * 1024 * 1024))
+
+    e = discover_models(tmp_path)[0]
+
+    assert e.disk_bytes >= 3 * 1024 * 1024, (
+        "a blob no live snapshot names is still occupying the disk"
+    )
+
+
+def test_safetensors_size_still_ignores_sparseness(tmp_path: Path) -> None:
+    """Over-correction guard for the two sizes not collapsing into one.
+
+    ``safetensors_gib`` feeds the tier-3 VRAM estimate: a sparse hole becomes
+    zeros in RAM, so that figure must stay APPARENT size even though
+    ``disk_bytes`` moved to blocks. Swapping the weights estimate to st_blocks
+    would make every model in this repo's own test fixtures — which are all
+    sparse — estimate as needing no VRAM at all.
+    """
+    _make_repo(
+        tmp_path,
+        "models--A--B",
+        config=INLINE_CONFIG,
+        safetensors={"m.safetensors": 8 * GIB},  # sparse, per _write_safetensors
+    )
+    e = discover_models(tmp_path)[0]
+    assert round(e.safetensors_gib, 2) == pytest.approx(8.0, abs=0.01)
+    assert e.disk_bytes < 1 * GIB, "fixture is not sparse; the guard proves nothing"
+
+
+def test_a_partial_download_says_so_instead_of_looking_like_three_other_faults(
+    tmp_path: Path,
+) -> None:
+    """"0 safetensors, no config.json" has three causes and one message.
+
+    GGUF-only (get a loader), blobs on an unmounted drive (plug it in), and a
+    download that stopped partway (resume it) all scan identically. Only the
+    third has no marker of its own, and it is the live case on this box:
+    mistralai/Magistral-Small-2509 has one resolvable file (a tokenizer) and
+    nothing else.
+    """
+    repo_dir = _make_repo(tmp_path, "models--A--B", config=None)
+    snapshot = repo_dir / "snapshots" / "abc123"
+    blobs = repo_dir / "blobs"
+    blobs.mkdir(parents=True, exist_ok=True)
+    blob = blobs / "blob-tokenizer"
+    blob.write_bytes(b"{}")
+    (snapshot / "tekken.json").symlink_to(blob)
+
+    e = discover_models(tmp_path)[0]
+
+    assert not e.servable
+    assert e.reason and "partial download" in e.reason, (
+        f"reason {e.reason!r} does not name a cause the operator can act on"
+    )
+
+
+def test_an_empty_snapshot_is_not_called_a_partial_download(tmp_path: Path) -> None:
+    """Over-correction guard. A snapshot with no files at all is a download
+    that never started, and calling it "partial — 0 file(s) present" is a
+    sentence that argues with itself. The prefix requires evidence."""
+    _make_repo(tmp_path, "models--A--B", config=None)
+
+    e = discover_models(tmp_path)[0]
+
+    assert e.reason == "0 safetensors, no config.json"
+
+
+def test_unmounted_blobs_still_win_over_the_partial_download_message(tmp_path: Path) -> None:
+    """Over-correction guard. A snapshot with one resolvable file AND dangling
+    symlinks is the unmounted-drive case; that message names a 180 GiB
+    re-download the operator must not start, so it must not be displaced by
+    the gentler one."""
+    repo_dir = _make_repo(tmp_path, "models--A--B", config=None)
+    snapshot = repo_dir / "snapshots" / "abc123"
+    (snapshot / "tekken.json").write_text("{}")
+    (snapshot / "model-00001.safetensors").symlink_to(tmp_path / "not-mounted" / "blob")
+
+    e = discover_models(tmp_path)[0]
+
+    assert e.reason and "unresolved symlink" in e.reason

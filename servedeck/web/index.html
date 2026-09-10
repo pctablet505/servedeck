@@ -45,6 +45,11 @@
     <!-- model rail -->
     <div class="panel">
       <div class="panel-h"><span>Models on disk</span><span class="mono" id="mcount">—</span></div>
+      <!-- Real, measured, and unit-labelled. The previous version of this page
+           carried a hardcoded "412 GiB disk" span that nothing computed; this
+           one is statvfs on the filesystem holding the hub cache, refreshed
+           every 15 s so a large deletion is visible without a reload. -->
+      <div class="dfline mono"><span id="dhub">—</span><span id="dfree">—</span></div>
       <div class="mlist" id="mlist"></div>
     </div>
 
@@ -149,9 +154,11 @@
       <!-- Live preflight, painted from the estimate's own findings. This was
            four static spans claiming the GPU was free, the weights cached,
            ptrace_scope relaxed and several hundred GiB of disk left. None of
-           the four was ever computed, all four were on screen whenever the
-           backend was unreachable and the rest of the page was empty, and
-           nothing in this codebase has ever measured free disk. -->
+           the four was ever computed, and all four were on screen whenever
+           the backend was unreachable and the rest of the page was empty.
+           Free disk is now measured for real, but it belongs beside the
+           models it constrains (the .dfline above), not in a strip about
+           whether this configuration can start. -->
       <div class="pref" id="pref"></div>
 
       <div class="actions">

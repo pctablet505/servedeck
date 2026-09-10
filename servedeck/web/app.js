@@ -9,6 +9,26 @@
 const $ = (id) => document.getElementById(id);
 const fmt = (n) => (n == null ? "—" : Number(n).toLocaleString("en-US"));
 
+/* Bytes -> a string that carries its own unit.
+ *
+ * Binary (1024), because everything else on this page is: df, free,
+ * nvidia-smi and every vLLM log line. The unit is returned WITH the number
+ * on purpose. The model cards used to render a GiB value next to hardcoded
+ * markup reading "GB" -- 125.99 GiB shown as "125.91 GB", a 7.4% error that
+ * looks exactly like a rounding slip and is not one. Nothing here may print
+ * a size without calling this.
+ */
+const BYTE_UNITS = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+function bytesTxt(n, digits) {
+  if (n == null || !isFinite(n)) return "—";
+  const d = digits == null ? 2 : digits;
+  let v = Math.abs(Number(n));
+  const sign = Number(n) < 0 ? "-" : "";
+  let i = 0;
+  while (v >= 1024 && i < BYTE_UNITS.length - 1) { v /= 1024; i++; }
+  return i === 0 ? `${sign}${Math.round(v)} B` : `${sign}${v.toFixed(d)} ${BYTE_UNITS[i]}`;
+}
+
 /* A throughput reading, or an em dash.
  *
  * null/undefined means "not known right now" — an idle server has no tok/s,
@@ -110,6 +130,25 @@ function uptimeTxt(sec) {
  * architecture, SPEC.md §3 UNKNOWN_CAPACITY) and must not be laundered into
  * "estimated", which carries a specific "~25% optimistic" meaning.
  */
+/* Why a model's size may not be space on THIS filesystem.
+ *
+ * Half the hub cache here is snapshots whose blobs are symlinks onto an
+ * exfat stick mounted under /run/media. Those bytes are real -- the model
+ * loads from them -- but deleting the model frees none of the free space
+ * shown next to it. The card marks the difference instead of silently
+ * adding 126 GiB to a figure the operator will compare against df.
+ */
+function diskTitle(m) {
+  const total = bytesTxt(m.disk_bytes);
+  if (!(m.disk_bytes > m.disk_local_bytes)) {
+    return `${total} on disk (each blob counted once; hardlinks and repeated snapshot symlinks are not double-counted)`;
+  }
+  return (
+    `${total} on disk, of which only ${bytesTxt(m.disk_local_bytes)} is on this filesystem — ` +
+    `the rest lives on another mount, so deleting this model frees ${bytesTxt(m.disk_local_bytes)} here, not ${total}`
+  );
+}
+
 function trustTag(trust) {
   if (trust === "measured") return '<span class="tag meas">measured</span>';
   if (trust === "measured_other_ctx")
@@ -229,7 +268,7 @@ function renderModels() {
     if (!m.servable) tags.push('<span class="tag est">unservable</span>');
     else tags.push(trustTag(m.trust));
     b.innerHTML =
-      `<span class="r1"><span class="nm"></span><span class="sz mono">${m.disk_gib || "—"} GB</span></span>
+      `<span class="r1"><span class="nm"></span><span class="sz mono" title="${diskTitle(m)}">${bytesTxt(m.disk_bytes)}${m.disk_bytes > m.disk_local_bytes ? '<span class="off">↗</span>' : ""}</span></span>
        <span class="r2">${tags.join("")}</span>
        <span class="note"></span>`;
     b.querySelector(".nm").textContent = m.name;
@@ -296,9 +335,10 @@ async function doEstimate() {
 /* The preflight strip: what would stop this configuration starting.
  *
  * It used to be four hardcoded spans that were on screen no matter what the
- * machine was doing, including one ("disk 412 GiB") that nothing has ever
- * measured. Every entry here is a finding capacity.compute() actually
- * produced for the configuration on screen.
+ * machine was doing, including one ("disk 412 GiB") that nothing measured.
+ * Every entry here is a finding capacity.compute() actually produced for the
+ * configuration on screen. Real free disk lives in the model rail's .dfline,
+ * measured by statvfs.
  */
 function paintPreflight(d) {
   const el = $("pref");
@@ -396,9 +436,14 @@ function paintEstimate(d) {
   // function — so the old guard passed and then threw on the real null.
   // weights_gib IS null for models whose weights cannot be estimated
   // (host-offload architectures), which is a normal state, not an error.
-  const gib = (v) => (typeof v === "number" ? v.toFixed(1) : "—");
+  // Each figure carries its own unit rather than three numbers sharing a
+  // trailing one. Same rule as bytesTxt above, and for the same reason: a
+  // unit that lives in the template instead of with the value is a unit that
+  // can drift away from it. These are VRAM gibibytes from capacity.compute(),
+  // already in GiB — NOT bytes, so bytesTxt is the wrong formatter here.
+  const gib = (v) => (typeof v === "number" ? `${v.toFixed(1)} GiB` : "—");
   set("vramTxt",
-    `weights ${gib(d.weights_gib)} · KV ${gib(d.kv_gib)} · budget ${gib(d.budget_gib)} GiB`);
+    `weights ${gib(d.weights_gib)} · KV ${gib(d.kv_gib)} · budget ${gib(d.budget_gib)}`);
 
   showFindings(d.findings || []);
   paintAgentSizing();
@@ -814,6 +859,7 @@ async function init() {
     const r = await fetch("/api/models");
     const d = await r.json();
     MODELS = d.models || [];
+    paintDisk(d.disk);
     const i = MODELS.findIndex((m) => m.servable);
     sel = i >= 0 ? i : 0;
     renderModels();
@@ -825,6 +871,12 @@ async function init() {
   } catch (e) {
     log("could not load models: " + e, "e");
   }
+
+  // The scan behind these numbers has a 5 s TTL server-side; repolling it is
+  // what makes a 95 GiB deletion visible without a reload. The old panel
+  // cached its scan for the life of the process and went on reporting sizes
+  // for files that no longer existed.
+  setInterval(refreshDisk, 15000);
 
   const es = new EventSource("/api/events");
   es.addEventListener("state", (ev) => paintState(JSON.parse(ev.data)));
@@ -845,3 +897,40 @@ async function init() {
 }
 
 init();
+
+
+/* The disk line under "Models on disk".
+ *
+ * Filesystem figures come from statvfs (the kernel's own answer, identical to
+ * df byte-for-byte), never from adding up a directory walk: a walk cannot see
+ * free space at all, and under-reports "used" by every tree it may not read.
+ *
+ * The percentage is used / (used + avail), which is how df computes Use%.
+ * Using used / total instead would ignore ext4's root-reserved blocks (45 GiB
+ * here) and read four points low against the df the operator will check.
+ */
+function paintDisk(d) {
+  const el = $("dfree");
+  if (!el || !d) return;
+  el.textContent = `${bytesTxt(d.avail_bytes, 0)} free`;
+  el.title =
+    `${bytesTxt(d.used_bytes, 1)} used of ${bytesTxt(d.total_bytes, 1)} (${d.used_pct}% full) on ${d.path}\n` +
+    `hub cache: ${bytesTxt(d.hub_bytes, 1)} of models, ${bytesTxt(d.hub_local_bytes, 1)} of it on this filesystem\n` +
+    `from statvfs; binary units (1 GiB = 1024³ bytes)`;
+  const hub = $("dhub");
+  if (hub) {
+    hub.textContent = `${bytesTxt(d.hub_local_bytes, 1)} of models here`;
+    hub.title =
+      d.hub_foreign_bytes > 0
+        ? `${bytesTxt(d.hub_bytes, 1)} of models in the hub cache, but ${bytesTxt(d.hub_foreign_bytes, 1)} of that is on another mount`
+        : `${bytesTxt(d.hub_bytes, 1)} of models in the hub cache, each blob counted once`;
+  }
+}
+
+async function refreshDisk() {
+  try {
+    paintDisk(await (await fetch("/api/disk")).json());
+  } catch (_) {
+    /* the panel keeps its last real figure rather than inventing one */
+  }
+}

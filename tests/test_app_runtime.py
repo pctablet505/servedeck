@@ -404,3 +404,142 @@ def test_live_kv_size_falls_back_to_the_boot_log(
     facts = capp._live_boot_facts()
     assert facts["kv_tokens"] == 272_062
     assert facts["kv_source"] == "boot log"
+
+
+# --------------------------------------------------------------------------
+# The model scan must expire
+# --------------------------------------------------------------------------
+def _fake_entry(repo_id: str, disk_bytes: int):
+    from servedeck.registry import ModelEntry
+
+    return ModelEntry(
+        repo_id=repo_id,
+        hub_dirname="models--" + repo_id.replace("/", "--"),
+        snapshot_path="/nowhere",
+        skipped=False,
+        servable=True,
+        backend="flashnext",
+        safetensors_gib=disk_bytes / (1024**3),
+        safetensors_count=1,
+        disk_bytes=disk_bytes,
+        disk_local_bytes=disk_bytes,
+        config_exists=True,
+        architectures0="Qwen4ExpForConditionalGeneration",
+        model_type="qwen4_exp",
+        max_position_embeddings=262144,
+        num_hidden_layers=48,
+        num_key_value_heads=8,
+        head_dim=128,
+        full_attention_interval=None,
+        quant_algo="NVFP4",
+        reason=None,
+    )
+
+
+def test_the_model_scan_expires_so_a_deletion_becomes_visible(monkeypatch) -> None:
+    """The cache had no expiry at all: scanned on the first /api/models and
+    then served for the life of the process.
+
+    On 2026-09-09 a 95.37 GiB BF16 PLE table was deleted and a 47.68 GiB FP8
+    one hardlinked in while the dashboard was up. The panel went on reporting
+    the pre-deletion size for hours, which is what "the size displayed is
+    wrong" meant. A whole-hub scan is ~25 ms warm; there was nothing worth
+    pinning forever.
+    """
+    from servedeck import app as capp
+    from servedeck import registry as _reg
+
+    sizes = [95 * 1024**3]
+    monkeypatch.setattr(_reg, "discover_models", lambda *a, **k: [_fake_entry("A/B", sizes[0])])
+    monkeypatch.setattr(
+        _reg, "resolve_inputs", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no store"))
+    )
+    capp.rt._models_cache = None
+    capp.rt._models_cache_at = 0.0
+
+    first = capp._model_rows(now=1000.0)
+    assert first[0]["disk_bytes"] == 95 * 1024**3
+
+    # The table is deleted and a smaller one installed.
+    sizes[0] = 47 * 1024**3
+
+    # Within the TTL the cached answer stands -- that is the cache doing its
+    # job, not the bug.
+    assert capp._model_rows(now=1000.0 + capp.MODELS_CACHE_TTL_S / 2)[0]["disk_bytes"] == (
+        95 * 1024**3
+    )
+    # Past it, the scan is retaken.
+    fresh = capp._model_rows(now=1000.0 + capp.MODELS_CACHE_TTL_S + 0.1)
+    assert fresh[0]["disk_bytes"] == 47 * 1024**3, (
+        "the model scan never expired: a deleted 95 GiB table stayed on screen"
+    )
+    capp.rt._models_cache = None
+    capp.rt._models_cache_at = 0.0
+
+
+def test_the_disk_payload_is_statvfs_and_labels_its_unit(monkeypatch) -> None:
+    """/api/disk must be the kernel's arithmetic, not an approximation of it.
+
+    Pinned against a FIXED statvfs result rather than a live one: this box is
+    writing continuously, so a real statvfs taken a millisecond after the
+    payload disagrees by a few MiB and the test would be measuring the clock.
+    The live agreement is checked separately, with a tolerance.
+    """
+    import os
+
+    from servedeck import app as capp
+    from servedeck import disksize as _dsz
+
+    # 1 TiB filesystem, 4 KiB fragments, 200 GiB free of which 150 GiB is
+    # available to a non-root user (the rest is ext4's root reserve).
+    frag = 4096
+    fake = os.statvfs_result(
+        (
+            frag,  # f_bsize
+            frag,  # f_frsize
+            (1024**4) // frag,  # f_blocks
+            (200 * 1024**3) // frag,  # f_bfree
+            (150 * 1024**3) // frag,  # f_bavail
+            0, 0, 0, 0, 255,
+        )
+    )
+    monkeypatch.setattr(_dsz.os, "statvfs", lambda _p: fake)
+    capp.rt._models_cache = None
+    capp.rt._models_cache_at = 0.0
+
+    d = capp._disk_payload()
+
+    assert d["total_bytes"] == 1024**4
+    assert d["avail_bytes"] == 150 * 1024**3
+    assert d["used_bytes"] == 1024**4 - 200 * 1024**3
+    # df's Use%: used / (used + avail), which excludes the root reserve.
+    assert d["used_pct"] == round(100 * (1024 - 200) / (1024 - 200 + 150), 1)
+    assert d["unit"] == "bytes", "the payload must not leave its unit to be guessed"
+    # Bytes on another mount are real but are not space on this filesystem.
+    assert d["hub_bytes"] - d["hub_local_bytes"] == d["hub_foreign_bytes"]
+    assert d["hub_local_bytes"] <= d["hub_bytes"]
+    capp.rt._models_cache = None
+    capp.rt._models_cache_at = 0.0
+
+
+def test_the_disk_payload_agrees_with_the_live_kernel() -> None:
+    """The over-correction guard for the fixture above: a payload that only
+    ever matches a fake statvfs would pass while reading the wrong path or
+    the wrong syscall. A live filesystem moves under us, so this allows drift
+    -- but not the 5% a units or formula slip would produce."""
+    import os
+
+    from servedeck import app as capp
+
+    capp.rt._models_cache = None
+    capp.rt._models_cache_at = 0.0
+    d = capp._disk_payload()
+    s = os.statvfs(d["path"])
+    frsize = s.f_frsize or s.f_bsize
+
+    assert d["total_bytes"] == s.f_blocks * frsize, "total does not move; it must match exactly"
+    tol = 1024**3  # 1 GiB of live churn
+    assert abs(d["avail_bytes"] - s.f_bavail * frsize) < tol
+    assert abs(d["used_bytes"] - (s.f_blocks - s.f_bfree) * frsize) < tol
+    capp.rt._models_cache = None
+    capp.rt._models_cache_at = 0.0
