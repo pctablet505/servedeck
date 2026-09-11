@@ -327,7 +327,8 @@ def test_telemetry_paints_the_token_strip() -> None:
     the whole telemetry painter runs against the shim (its canvases return
     early without a 2D context), and the strip must come out painted."""
     ids = sorted(set(re.findall(r'id="([A-Za-z0-9_]+)"', INDEX_HTML)))
-    fns = ("agoTxt", "secsTxt", "rateTxt", "windowFigure", "lifeTxt", "uptimeTxt",
+    fns = ("agoTxt", "secsTxt", "rateTxt", "windowFigure", "lifeTxt", "streamLifeTxt",
+           "uptimeTxt",
            "busyPhase", "resolutionNote", "resolutionDetail", "paintThroughput",
            "paintServingMeta", "winSpan", "durTxt", "histData", "markRows",
            "reqHist", "mixModel", "paintMix", "paintRequestStats", "spark",

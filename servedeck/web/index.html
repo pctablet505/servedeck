@@ -79,9 +79,12 @@
                .s  what that line is (window, or the last value and its age)
                .l  the lifetime companion, which never decays and never moves up
                    into .n -- the two are different quantities (the window figure
-                   is aggregate, per second of WALL clock; the lifetime figure is
-                   per second of PREFILL/DECODE time) and the panel used to swap
-                   one for the other marked only by a "~".
+                   is AGGREGATE, every running request together per second of
+                   WALL clock; the prefill/decode lifetime figure is PER REQUEST,
+                   one stream's speed over summed per-request time) and the panel
+                   used to swap one for the other marked only by a "~", then
+                   labelled them alike until 858.6 tok/s over "lifetime 68.0 tok/s"
+                   was read as a slow server.
              Units are on the label AND on the number, so a figure read on its own
              still carries one.
 
@@ -93,13 +96,13 @@
              up and the summary shrank to the facts only it carries. -->
         <div class="thru" id="thru">
           <div class="tcell">
-            <div class="lk">Prefill <span class="tu">prompt tokens/second</span></div>
+            <div class="lk" title="The large figure is every running request together: computed (non-cached) prompt tokens per wall-clock second over the last poll. The per-request line is ONE request's prefill speed: computed prompt tokens ÷ the summed prefill time of every finished request (vllm:request_prefill_time_seconds), in which two requests prefilling side by side count two seconds per second.">Prefill <span class="tu">prompt tokens/second</span></div>
             <div class="n mono" id="thPrefill">n/a</div>
             <div class="s" id="thPrefillS">—</div>
             <div class="l" id="thPrefillL">—</div>
           </div>
           <div class="tcell">
-            <div class="lk">Decode <span class="tu">generated tokens/second</span></div>
+            <div class="lk" title="The large figure is every running request together: generated tokens per wall-clock second over the last poll. The per-request line is ONE request's decode speed: generated tokens ÷ the summed decode time of every finished request (vllm:request_decode_time_seconds), in which thirteen requests decoding side by side count thirteen seconds per second.">Decode <span class="tu">generated tokens/second</span></div>
             <div class="n mono" id="thDecode">n/a</div>
             <div class="s" id="thDecodeS">—</div>
             <div class="l" id="thDecodeL">—</div>

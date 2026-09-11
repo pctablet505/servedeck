@@ -763,7 +763,7 @@ function __dump(ids) {
 
 #: The functions under test, lifted verbatim out of web/app.js.
 _RENDER_FNS = (
-    "agoTxt", "secsTxt", "rateTxt", "windowFigure", "lifeTxt",
+    "agoTxt", "secsTxt", "rateTxt", "windowFigure", "lifeTxt", "streamLifeTxt",
     "uptimeTxt", "busyPhase", "resolutionNote", "resolutionDetail",
     "paintThroughput", "paintServingMeta",
 )
@@ -920,12 +920,11 @@ def test_an_idle_figure_is_never_filled_in_with_the_lifetime_average() -> None:
     assert dom["thDecode"]["text"] == "idle"
     assert "3,013" not in dom["thPrefill"]["text"]
     assert "104" not in dom["thDecode"]["text"]
-    # The lifetime figures are still on screen -- on their own line, naming
-    # their own denominator, which is what makes them readable at all.
-    assert "3,013 tok/s" in dom["thPrefillL"]["text"]
-    assert "per second of prefill time" in dom["thPrefillL"]["text"]
-    assert "104.4 tok/s" in dom["thDecodeL"]["text"]
-    assert "per second of decode time" in dom["thDecodeL"]["text"]
+    # The lifetime figures are still on screen -- on their own line, saying
+    # what kind of figure they are (one request's speed, not the aggregate),
+    # which is what makes them readable at all. See tests/test_ui_rates.py.
+    assert dom["thPrefillL"]["text"].startswith("per request: 3,013 tok/s")
+    assert dom["thDecodeL"]["text"].startswith("per request: 104.4 tok/s")
 
 
 def test_every_rendered_throughput_number_carries_its_unit() -> None:
