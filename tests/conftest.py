@@ -55,6 +55,31 @@ architectures = ["Qwen3_5ForConditionalGeneration"]
 
 
 @pytest.fixture(autouse=True)
+def _isolated_run_dir(tmp_path_factory: pytest.TempPathFactory):
+    """Keep every test out of the local_llm launcher's real run/ directory.
+
+    paths.RUN_DIR is ~/Projects/local_llm/run, owned by the launcher, not by
+    servedeck. Supervisor._write_flat_desired_state_file() writes
+    RUN_DIR/"desired_state" there, so before this fixture every suite run left
+    that file saying "running" (observed 2026-09-11), silently changing a file
+    another tool reads to decide what should be serving. The writer reads
+    paths.RUN_DIR at call time, so rebinding the module attribute reaches it.
+    tests/test_run_dir_isolation.py pins both halves.
+
+    Saved and restored by hand, NOT via the shared ``monkeypatch`` fixture:
+    requesting ``monkeypatch`` from an autouse fixture sets it up before
+    _no_permanent_module_stubs, so it would tear down AFTER that guard and the
+    guard would see every test's own monkeypatch.setattr still in place.
+    """
+    previous = paths.RUN_DIR
+    paths.RUN_DIR = tmp_path_factory.mktemp("run")
+    try:
+        yield
+    finally:
+        paths.RUN_DIR = previous
+
+
+@pytest.fixture(autouse=True)
 def _isolated_config(tmp_path_factory: pytest.TempPathFactory):
     """Point every test at the fixed configuration above, not at the box's."""
     path = tmp_path_factory.mktemp("cfg") / "servedeck.toml"
