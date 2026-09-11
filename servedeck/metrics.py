@@ -84,13 +84,22 @@ PROMPT_TOK_CACHED_TOTAL = "vllm:prompt_tokens_cached_total"
 # seconds the ENGINE spent prefilling (checked against the full family list of
 # a live scrape -- the only prefill-time family is this per-request latency
 # histogram). So:
-#   window   figure = computed prompt tokens / wall seconds   (aggregate; the
-#            same quantity vLLM's own log prints as "Avg prompt throughput")
-#   lifetime figure = computed prompt tokens / prefill seconds (per second of
-#            prefill time, as asked -- the completion lag averages out over
-#            thousands of requests)
+#   window   figure = computed prompt tokens / wall seconds   (AGGREGATE: every
+#            running request together; the same quantity vLLM's own log
+#            prints as "Avg prompt throughput")
+#   lifetime figure = computed prompt tokens / prefill seconds (PER REQUEST.
+#            Each request's prefill is timed on its own clock and the sum is
+#            request-seconds, not wall seconds: two requests prefilling side
+#            by side for one second add two. So this is how fast ONE request
+#            prefills on average, not what the engine does in aggregate --
+#            the completion lag averages out over thousands of requests)
 # They are DIFFERENT QUANTITIES and the panel must never substitute one for
-# the other in the same slot. It used to, marked only by a "~".
+# the other in the same slot. It used to, marked only by a "~". Nor may it
+# label them alike: the page printed the per-request decode figure as
+# "lifetime 68.0 tok/s per second of decode time" under an aggregate 858.6
+# tok/s, and it was read as "lifetime throughput is low" (2026-09-11: 235
+# requests, 398,172 tokens over 6,020 request-seconds = 66 tok/s per stream
+# while ~13 streams together produced 858.6 tok/s).
 PREFILL_TIME_SUM = "vllm:request_prefill_time_seconds_sum"
 PREFILL_TIME_COUNT = "vllm:request_prefill_time_seconds_count"
 #: Time-to-first-token histogram. _sum/_count over the poll window give the
@@ -106,8 +115,11 @@ TTFT_COUNT = "vllm:time_to_first_token_seconds_count"
 #: shorter name silently yields "not exposed" forever.
 TPOT_SUM = "vllm:request_time_per_output_token_seconds_sum"
 TPOT_COUNT = "vllm:request_time_per_output_token_seconds_count"
-#: Seconds spent DECODING, the denominator of the lifetime decode rate. Like
-#: prefill time, it does not decay while the server is idle.
+#: Seconds each finished request spent DECODING, summed over requests: the
+#: denominator of the lifetime per-request decode speed. Request-seconds, not
+#: wall seconds (N requests decoding together add N per second), so the rate
+#: it yields is one stream's, not the engine's aggregate. Like prefill time,
+#: it does not decay while the server is idle.
 DECODE_TIME_SUM = "vllm:request_decode_time_seconds_sum"
 DECODE_TIME_COUNT = "vllm:request_decode_time_seconds_count"
 #: The engine's own resolved cache configuration, exposed as one info metric
@@ -325,20 +337,24 @@ class MetricsSnapshot:
     #: computed prompt tokens per second. Same derivation as gen_tok_s, and
     #: the same quantity vLLM's own log prints as "Avg prompt throughput".
     prefill_tok_s: float | None = None
-    #: Lifetime prefill throughput: computed prompt tokens per second OF
-    #: PREFILL TIME (not of wall time). Prefill is bursty -- at
+    #: Lifetime PER-REQUEST prefill speed: computed prompt tokens per
+    #: request-second of prefill (the summed per-request prefill times, not
+    #: wall time). How fast one request prefills on average -- NOT the
+    #: engine's aggregate, which is prefill_tok_s above; with requests
+    #: prefilling side by side the two differ. Prefill is bursty -- at
     #: --max-num-seqs 1 a 10k prompt prefills for ~10 s and then nothing
     #: prefills for minutes -- so the windowed rate above is unknown almost
-    #: always. This one does not decay while the server is idle, because its
-    #: denominator is prefill seconds.
+    #: always. This one does not decay while the server is idle.
     prefill_tok_s_avg: float | None = None
     #: Requests that have finished a prefill (the sample count behind the avg).
     prefill_requests: int = 0
-    #: Lifetime decode throughput: generated tokens per second OF DECODE TIME.
-    #: The windowed gen_tok_s above is unknown whenever nothing is generating;
-    #: this one is the answer to "how fast does this server decode", and it
-    #: survives an idle poll.
+    #: Lifetime PER-REQUEST decode speed: generated tokens per request-second
+    #: of decode. One stream's speed, not the server's throughput: 66 tok/s
+    #: per stream while ~13 streams together produced 858.6 tok/s (gen_tok_s)
+    #: on 2026-09-11. It survives an idle poll, which the window rate does not.
     gen_tok_s_avg: float | None = None
+    #: Requests that have finished decoding (the sample count behind the avg).
+    gen_requests: int = 0
     #: Mean time-to-first-token of the requests that FINISHED PREFILLING in the
     #: last window (delta of the histogram sum over the delta of its count).
     ttft_s: float | None = None
@@ -401,6 +417,7 @@ class MetricsSnapshot:
             "prefill_tok_s": rate(self.prefill_tok_s),
             "prefill_tok_s_avg": rate(self.prefill_tok_s_avg),
             "prefill_requests": self.prefill_requests,
+            "gen_requests": self.gen_requests,
             # Seconds, not rounded to 1dp: a 0.04 s TTFT is a real reading and
             # round(_, 1) would print it as 0.0.
             "ttft_s": None if self.ttft_s is None else round(self.ttft_s, 3),
@@ -680,6 +697,7 @@ class MetricsPoller:
             snap.ttft_s_avg = ttft_sum / ttft_count
             snap.ttft_requests = int(ttft_count)
         decode_seconds = _first(p, DECODE_TIME_SUM)
+        snap.gen_requests = int(_first(p, DECODE_TIME_COUNT))
         if decode_seconds > 0 and gen_total > 0:
             snap.gen_tok_s_avg = gen_total / decode_seconds
 
@@ -692,8 +710,10 @@ class MetricsPoller:
             snap.kv_cache_gpu_util = _label_float(labels, "gpu_memory_utilization")
             break
 
-        # Lifetime prefill rate. Denominator is seconds spent prefilling, not
-        # seconds elapsed, so it stays meaningful while the server sits idle.
+        # Lifetime per-request prefill speed. The denominator is every
+        # request's prefill time summed (request-seconds, not seconds elapsed),
+        # so it stays meaningful while the server sits idle -- and it is one
+        # request's speed, not the engine's aggregate.
         # The numerator counts in-flight requests the denominator has not seen
         # yet (the histogram only observes finished ones), so it overshoots
         # briefly during a large prefill and then settles.

@@ -701,9 +701,15 @@ def _sizing_payload() -> dict[str, Any]:
         "at_p99": None,
         "over_subscribed": False,
         "reason": None,
+        # Long and short requests sharing the live pool; see
+        # parallelism.mixed_capacity(). None with a reason when it cannot be
+        # computed, like the recommendation.
+        "mixed": None,
+        "mixed_reason": None,
     }
     if not m.get("reachable"):
         out["reason"] = "backend not reachable"
+        out["mixed_reason"] = out["reason"]
         return out
     pool = m.get("kv_cache_size_tokens")
     if not pool:
@@ -712,7 +718,31 @@ def _sizing_payload() -> dict[str, Any]:
         # produce a confident recommendation for a server launched at a
         # different --gpu-memory-utilization, which is how you over-subscribe.
         out["reason"] = "engine has not published its KV pool size yet"
+        out["mixed_reason"] = out["reason"]
         return out
+
+    # How the pool splits between full-length requests and the smaller ones
+    # beside them. "Full length" is the running engine's own --max-model-len:
+    # that is the longest request this server will accept. Computed before
+    # the window check because the full-length count needs no request history;
+    # the smaller sizes are added when the window has them.
+    full_ctx = _running_max_model_len()
+    if full_ctx:
+        sizes: dict[str, tuple[float, bool]] = {}
+        for label in ("p50", "p90"):
+            # The UPPER edge of the percentile's interval, as the
+            # recommendation uses: the conservative end of a bucket.
+            pct = window.get(label) or {}
+            if pct.get("hi"):
+                exact = bool(pct.get("exact") or pct.get("lo") == pct.get("hi"))
+                sizes[label] = (float(pct["hi"]), exact)
+        out["mixed"] = parallelism.mixed_capacity(
+            pool_tokens=int(pool), full_ctx=int(full_ctx), sizes=sizes,
+            max_num_seqs=out["max_num_seqs"],
+        ).to_dict()
+    else:
+        out["mixed_reason"] = "the running server's --max-model-len is not on its command line"
+
     p90 = (window.get("p90") or {}).get("hi")
     if not p90:
         out["reason"] = (
@@ -1207,13 +1237,15 @@ def _kv_geometry(repo_id: str, ctx: int, backend: str | None = None) -> dict[str
         return None
 
 
-def _estimate(repo_id: str, util: float, ctx: int, seqs: int) -> dict[str, Any]:
-    # servable/reason live on ModelEntry, not ResolvedInputs - look them up
-    # rather than defaulting servable=True, which made MODEL_UNSERVABLE dead.
-    # The entry also names the backend, which is what decides WHICH launch
-    # flags apply -- so it has to be read before the estimate, not after.
-    entry = next((e for e in registry.discover_models() if e.repo_id == repo_id), None)
-    kv_dtype, ssm_dtype = _cache_flags(entry.backend if entry else None)
+def _model_inputs(
+    repo_id: str, util: float, ctx: int, entry: Any, kv_dtype: str | None, ssm_dtype: str | None
+) -> tuple[registry.ResolvedInputs, capacity.ModelInputs]:
+    """What capacity.compute() needs for one model at one context length.
+
+    The context matters: the KV rate is resolved per length (a measurement at
+    exactly this length, or the per-architecture calculator at it), because a
+    hybrid model's per-sequence state is spread over the context.
+    """
     ri = registry.resolve_inputs(
         repo_id, util, ctx, kv_cache_dtype=kv_dtype, mamba_ssm_dtype=ssm_dtype
     )
@@ -1232,6 +1264,56 @@ def _estimate(repo_id: str, util: float, ctx: int, seqs: int) -> dict[str, Any]:
         used_ctx_for_rate=ri.matched_ctx or ctx,
         known_kv_rates=ri.other_ctx_kv_rates or {},
     )
+    return ri, mi
+
+
+def _native_ctx_fit(
+    repo_id: str, util: float, entry: Any, kv_dtype: str | None, ssm_dtype: str | None,
+    *, native: int, known: dict[int, tuple[registry.ResolvedInputs, capacity.CapacityResult]],
+) -> tuple[int, str | None]:
+    """(the longest context one request can use, why it is below the model's).
+
+    This is what a launch defaults to: the model's own max_position_embeddings,
+    read from its local config.json, lowered ONLY when the KV budget cannot
+    hold even one request of that length. It is resolved AT the model's
+    ceiling, never at whatever the slider happens to say: a hybrid model's
+    pool is smaller at a shorter context, so asking "does the full length
+    fit?" with the rate of a lowered one answers no for Flash-Next at util
+    0.95, which does fit.
+
+    It is never divided by the agent count. See capacity.CapacityResult's
+    ctx_max_fit for what that division did.
+
+    (0, None) when the budget is not known (weights that cannot be predicted,
+    no KV rate) or holds nothing: the page then keeps the model's ceiling and
+    the blocking finding says why.
+    """
+
+    def at(length: int) -> tuple[registry.ResolvedInputs, capacity.CapacityResult]:
+        if length not in known:
+            ri, mi = _model_inputs(repo_id, util, length, entry, kv_dtype, ssm_dtype)
+            known[length] = (ri, capacity.compute(mi, util=util, ctx=length, max_num_seqs=1))
+        return known[length]
+
+    ri_max, r_max = at(native)
+    if ri_max.weights_source == "unknown" or not ri_max.kv_kib_per_token or r_max.kv_tokens <= 0:
+        return 0, None
+    fit = capacity.single_request_fit(native, lambda length: at(length)[1].kv_tokens)
+    reason = capacity.ctx_fit_reason(
+        model_max_ctx=native, pool_at_max=r_max.kv_tokens, fit=fit, util=util,
+        kv_source=ri_max.kv_source,
+    )
+    return fit, reason
+
+
+def _estimate(repo_id: str, util: float, ctx: int, seqs: int) -> dict[str, Any]:
+    # servable/reason live on ModelEntry, not ResolvedInputs - look them up
+    # rather than defaulting servable=True, which made MODEL_UNSERVABLE dead.
+    # The entry also names the backend, which is what decides WHICH launch
+    # flags apply -- so it has to be read before the estimate, not after.
+    entry = next((e for e in registry.discover_models() if e.repo_id == repo_id), None)
+    kv_dtype, ssm_dtype = _cache_flags(entry.backend if entry else None)
+    ri, mi = _model_inputs(repo_id, util, ctx, entry, kv_dtype, ssm_dtype)
     g = gpu.gpu_summary()
     # own_mib matters: the VRAM held by the server we are ALREADY running is not
     # a competitor for the config being estimated - restarting reclaims it first.
@@ -1250,6 +1332,16 @@ def _estimate(repo_id: str, util: float, ctx: int, seqs: int) -> dict[str, Any]:
         training_markers=_training_marker_hits(),
     )
     r = capacity.compute(mi, util=util, ctx=ctx, max_num_seqs=seqs, live=live)
+    # The context a launch defaults to, and the slider's ceiling: the model's
+    # own length unless one request of it cannot fit. Resolved at the model's
+    # ceiling with no agent count in it; the result at the slider's own
+    # length is reused when the two coincide, which is the default case.
+    known: dict[int, tuple[registry.ResolvedInputs, capacity.CapacityResult]] = {}
+    if mi.model_max_ctx == ctx:
+        known[ctx] = (ri, r)
+    fit, fit_reason = _native_ctx_fit(
+        repo_id, util, entry, kv_dtype, ssm_dtype, native=mi.model_max_ctx, known=known,
+    )
     return {
         "kv_gib": round(r.kv_gib, 2),
         "kv_tokens": r.kv_tokens,
@@ -1258,10 +1350,23 @@ def _estimate(repo_id: str, util: float, ctx: int, seqs: int) -> dict[str, Any]:
         "agents_at_ctx": r.agents_at_ctx,
         "effective_parallel": r.effective_parallel,
         "max_single_ctx": r.max_single_ctx,
-        # Bounds for the context control. The UI must not offer a length that
-        # either the model or the KV budget cannot serve.
+        # Bounds for the context control, and the default it rests on. The UI
+        # must not offer a length the model or a single request's KV cannot
+        # serve -- and must not cap it any lower than that.
         "ctx_max_model": r.ctx_max_model,
-        "ctx_max_fit": r.ctx_max_fit,
+        "ctx_max_fit": fit,
+        "ctx_fit_reason": fit_reason,
+        # How many requests of the configured length the pool holds at once,
+        # on the calibrated per-request cost (fixed per-sequence page
+        # included) -- the figure shown beside the agents field. Advice about
+        # sharing the pool, never a cap on the context.
+        "full_at_once": (
+            parallelism.recommend(
+                pool_tokens=r.kv_tokens, prompt_tokens=ctx,
+                basis=f"one {ctx:,}-token request",
+            ).to_dict()
+            if r.kv_tokens > 0 else None
+        ),
         "agents": seqs,
         "confidence": r.confidence,
         "can_apply": r.can_apply,

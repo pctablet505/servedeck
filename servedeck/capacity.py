@@ -12,6 +12,7 @@ SPEC.md §3 verbatim. Do not "improve" the measured constants.
 """
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -152,10 +153,12 @@ class CapacityResult:
     max_single_ctx: int
     #: The model's own ceiling (max_position_embeddings), 0 if unknown.
     ctx_max_model: int
-    #: The largest per-agent context that ACTUALLY FITS: the KV budget divided
-    #: between max_num_seqs agents, capped by the model ceiling. The UI offered
-    #: context lengths off a hardcoded ladder, so a length that cannot be
-    #: served was selectable and the engine refused it minutes into a boot.
+    #: The longest context ONE request can use: the model ceiling, or less
+    #: when the KV budget cannot hold even one request of that length. It is
+    #: never divided among agents. --max-model-len is a per-request ceiling;
+    #: the pool is shared, and vLLM admits what fits and queues the rest.
+    #: Dividing it by max_num_seqs capped the 27B at 110,592 on a pool of
+    #: 1,595,321 tokens, and the next 110,593-token prompt failed outright.
     ctx_max_fit: int
     confidence: str
     bar: CapacityBar
@@ -576,13 +579,17 @@ def compute(
     valid_seqs = isinstance(max_num_seqs, int) and max_num_seqs >= 1
     effective_parallel = min(agents_at_ctx, max_num_seqs) if valid_seqs else 0
 
-    # What the context control may offer. Two independent ceilings, and the
-    # smaller one wins: the model's own max_position_embeddings (asking for
-    # more is refused at boot) and the KV budget shared between the agents the
-    # operator asked for (asking for more boots a server that cannot hold the
-    # agents it was sized for). A hardcoded ladder honoured neither.
-    per_agent_fit = (kv_tokens // max_num_seqs) if valid_seqs and kv_tokens else 0
-    ctx_max_fit = min(m.model_max_ctx, per_agent_fit) if m.model_max_ctx > 0 else per_agent_fit
+    # What the context control may offer: the longest request ONE sequence
+    # can use. Two ceilings, and the smaller wins: the model's own
+    # max_position_embeddings (asking for more is refused at boot) and the
+    # whole KV budget (a request longer than the pool cannot be admitted at
+    # all). The agent count is deliberately NOT a divisor here. This used to
+    # be kv_tokens // max_num_seqs, which treats every agent as permanently
+    # holding a full-length context; the pool is shared and vLLM's scheduler
+    # admits what fits and queues the rest, so that division only made the
+    # long requests fail. How long and short requests share the pool is
+    # parallelism.mixed_capacity()'s job, and it is advice, never a cap.
+    ctx_max_fit = max_single_ctx
 
     if valid_seqs and max_num_seqs < agents_at_ctx:
         findings.append(
@@ -643,6 +650,73 @@ def compute(
         bar=bar,
         findings=tuple(findings),
         can_apply=can_apply,
+    )
+
+
+# ---------------------------------------------------------------------------
+# The context a launch defaults to
+# ---------------------------------------------------------------------------
+
+
+def single_request_fit(
+    ceiling: int, tokens_at: Callable[[int], int], *, max_steps: int = 12
+) -> int:
+    """The longest context, at most ``ceiling``, that ONE request can use.
+
+    ``tokens_at(L)`` is the KV pool, in tokens, of a server configured for
+    context ``L``. It is a function rather than a number because the pool
+    depends on ``L``: a hybrid model's per-sequence recurrent state is spread
+    over the context length, so the same memory holds fewer tokens at a
+    shorter context (kvcalc.KvGeometry.bytes_per_token). Taking the pool at
+    the model ceiling and calling that the fit is therefore optimistic by the
+    state term, and a default that optimistic would be refused by this
+    module's own KV_TOO_SMALL_FOR_ONE_CTX -- or by the engine, minutes into a
+    boot.
+
+    The answer is the fixed point of ``L -> tokens_at(L)`` reached from
+    above. The pool shrinks as ``L`` shrinks by only the amortised state, so
+    each step closes most of the remaining gap and a handful of steps
+    suffices. A constant rate (a measured observation) converges in one.
+    Returns ``ceiling`` untouched when one request of that length fits, and 0
+    when the budget holds nothing at all.
+    """
+    length = int(ceiling)
+    for _ in range(max_steps):
+        if length <= 0:
+            return 0
+        pool = int(tokens_at(length))
+        if pool >= length:
+            return length
+        length = pool
+    # Not converged in max_steps, which needs a pool that shrinks almost as
+    # fast as the length (no real layer stack does). Take one more step down:
+    # smaller is the safe direction, and the estimate at that length still
+    # carries its own KV_TOO_SMALL_FOR_ONE_CTX finding if it does not fit.
+    return max(0, min(length, int(tokens_at(length)) if length > 0 else 0))
+
+
+def ctx_fit_reason(
+    *, model_max_ctx: int, pool_at_max: int, fit: int, util: float, kv_source: str
+) -> str | None:
+    """Why the context defaults below the model's own ceiling, or None.
+
+    The only reason a launch may start below max_position_embeddings without
+    the operator asking is that the KV pool cannot hold even one request of
+    that length. It is said in the page, with the numbers, because a lowered
+    context that nobody chose is the defect this replaces.
+    """
+    if model_max_ctx <= 0 or fit <= 0 or fit >= model_max_ctx:
+        return None
+    kind = "measured" if kv_source in ("measured", "measured_other_ctx") else "estimated"
+    # Without this clause the two numbers read as a contradiction ("a pool of
+    # 238,657 ... the longest that fits is 207,150"): the pool is quoted at
+    # the full length, and a shorter context costs more KV per token.
+    why = " (a shorter context costs more KV per token on this model)" if fit < pool_at_max else ""
+    return (
+        f"One request at the model's full {model_max_ctx:,}-token context does not fit: "
+        f"util {util:.2f} buys a KV pool of {pool_at_max:,} tokens at that length ({kind}). "
+        f"The longest request that fits is {fit:,} tokens{why}. "
+        "Raise GPU utilization for the full context."
     )
 
 

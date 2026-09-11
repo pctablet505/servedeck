@@ -415,16 +415,34 @@ def test_context_control_is_bounded_by_the_model_and_by_what_fits() -> None:
     """
     assert "const CTXS" not in APP_JS, "the hardcoded context array is back"
     assert 'id="ctx"' in INDEX_HTML and 'type="range"' in INDEX_HTML, (
-        "context per agent must be a slider over a real range"
+        "the context must be a slider over a real range"
     )
     assert 'id="ctxBtns"' not in INDEX_HTML, "the fixed ladder of buttons is back"
-    body = _fn_body("renderCtx")
-    assert "ctx_max_model" in body, "the model's own ceiling must bound the slider"
-    assert "ctx_max_fit" in body, "what the KV budget holds must bound the slider"
-    assert "Math.min(modelMax, fit)" in body, (
-        f"the binding limit is the SMALLER of the two bounds: {body}"
-    )
-    assert "DEFAULT_MAX_CTX" in body, "a model with no declared ceiling needs a fallback"
+
+    def rng(model_max, fit, running=None):
+        return _exec(("ctxTop", "ctxRange"),
+                     f"ctxRange({model_max}, {fit}, {json.dumps(running)})")
+
+    # The model's own ceiling when one request of it fits, or when the budget
+    # is not known (fit 0): the blocker explains a budget that holds nothing.
+    assert rng(262_144, 1_595_321) == {"min": 8192, "max": 262_144,
+                                       "ceiling": 262_144, "binding": "model"}
+    assert rng(262_144, 0)["max"] == 262_144
+    # The KV budget binds only when it cannot hold ONE request of the model's
+    # length, and then the top is snapped DOWN (238,671 -> 237,568).
+    assert rng(262_144, 238_671) == {"min": 8192, "max": 237_568,
+                                     "ceiling": 238_671, "binding": "kv"}
+    # A model ceiling off the 4,096 grid is still reachable exactly: GLM-4.7
+    # declares 202,752, and snapping it down would launch at 200,704.
+    assert rng(202_752, 0) == {"min": 10_240, "max": 202_752,
+                               "ceiling": 202_752, "binding": "model"}
+    assert rng(1_048_576, 0)["max"] == 1_048_576
+    # A server running this model at a length the estimate says does not fit
+    # is proof that it does; the range reaches it. A running value BELOW the
+    # model's never lowers the ceiling.
+    assert rng(262_144, 238_671, 245_760)["max"] == 245_760
+    assert rng(262_144, 238_671, 245_760)["binding"] == "running"
+    assert rng(262_144, 1_595_321, 110_592)["max"] == 262_144
 
 
 def test_the_agent_count_is_an_input_not_a_hardcoded_one() -> None:
@@ -745,7 +763,7 @@ function __dump(ids) {
 
 #: The functions under test, lifted verbatim out of web/app.js.
 _RENDER_FNS = (
-    "agoTxt", "secsTxt", "rateTxt", "windowFigure", "lifeTxt",
+    "agoTxt", "secsTxt", "rateTxt", "windowFigure", "lifeTxt", "streamLifeTxt",
     "uptimeTxt", "busyPhase", "resolutionNote", "resolutionDetail",
     "paintThroughput", "paintServingMeta",
 )
@@ -902,12 +920,11 @@ def test_an_idle_figure_is_never_filled_in_with_the_lifetime_average() -> None:
     assert dom["thDecode"]["text"] == "idle"
     assert "3,013" not in dom["thPrefill"]["text"]
     assert "104" not in dom["thDecode"]["text"]
-    # The lifetime figures are still on screen -- on their own line, naming
-    # their own denominator, which is what makes them readable at all.
-    assert "3,013 tok/s" in dom["thPrefillL"]["text"]
-    assert "per second of prefill time" in dom["thPrefillL"]["text"]
-    assert "104.4 tok/s" in dom["thDecodeL"]["text"]
-    assert "per second of decode time" in dom["thDecodeL"]["text"]
+    # The lifetime figures are still on screen -- on their own line, saying
+    # what kind of figure they are (one request's speed, not the aggregate),
+    # which is what makes them readable at all. See tests/test_ui_rates.py.
+    assert dom["thPrefillL"]["text"].startswith("per request: 3,013 tok/s")
+    assert dom["thDecodeL"]["text"].startswith("per request: 104.4 tok/s")
 
 
 def test_every_rendered_throughput_number_carries_its_unit() -> None:
@@ -1620,7 +1637,7 @@ def _paint_request_stats(sizing: dict) -> dict:
         *_PRELUDE,
         _const_line("BUSY_PHASES"),
         *[_fn_body(n) for n in (*helpers, "set", "winSpan", "histData", "reqHist",
-                                "paintRequestStats")],
+                                "mixModel", "paintMix", "paintRequestStats")],
         f"__mk({json.dumps(ids)});",
         f"var liveSizing = {json.dumps(sizing)};",
         "paintRequestStats();",
@@ -1952,14 +1969,11 @@ def test_the_context_ceiling_lands_on_the_step_grid() -> None:
     assert top(1_000) == 8_192, top(1_000)
     assert top(1_048_576) == 1_048_576, "a model ceiling on the grid must be reachable"
 
-    # And the painter must actually use it, rather than recomputing inline.
-    body = _fn_body("renderCtx")
-    assert "ctxTop(ceiling)" in body, "renderCtx does not snap the ceiling"
-    assert "el.max = String(top)" in body, "the slider's max is not the snapped value"
-    assert "if (ctx > top)" in body, (
-        "the context value is still clamped to the unsnapped ceiling, so it can "
-        "be set to a value the thumb cannot show"
-    )
+    # And the range the painter draws must use it for a KV-bound top, rather
+    # than recomputing inline. renderCtx() itself is executed against this
+    # range in tests/test_ui_ctx.py.
+    kv = _exec(("ctxTop", "ctxRange"), "ctxRange(262144, 19100, null)")
+    assert kv["max"] == 16_384 and kv["min"] == 8_192, kv
 
 
 def test_close_percentile_labels_stack_and_stay_inside_the_canvas() -> None:
@@ -2082,28 +2096,35 @@ def test_an_unservable_model_is_still_reachable_by_the_keyboard() -> None:
     )
 
 
-def test_the_agents_field_shows_its_own_kv_limit() -> None:
-    """"KV fits 1" sat beside a field reading "16" with nothing connecting the
-    two, in the same quiet grey as a caption. The contradiction has to be said
-    and has to be loud. Executed with literal oracles: an assertion that
-    recomputed `fitN < want` would pass with the comparison flipped.
-    """
-    over = _exec(("agentsFitNote",), "agentsFitNote(1, 16, 16384)")
-    assert over["text"] == "KV fits 1"
-    assert over["overfit"] is True, "asking for 16 when 1 fits is not flagged"
-    assert "over budget" in over["title"], over["title"]
-    assert "16,384" in over["title"], "the note must name the context it is about"
+def test_the_agents_field_shows_how_many_full_length_requests_fit() -> None:
+    """The line beside the agents field used to read "KV fits 1" and turn
+    amber next to "16": the page treating every agent as permanently holding a
+    full-length context, and calling 16 agents over budget. That is not how the
+    pool works -- vLLM admits what fits and queues the rest -- nor how this box
+    is used (two or three long agents, the rest short).
 
-    fits = _exec(("agentsFitNote",), "agentsFitNote(8, 8, 8192)")
-    assert fits["overfit"] is False, "asking for exactly what fits is not over budget"
-    assert "over budget" not in fits["title"], fits["title"]
+    It now states how many full-length requests fit at once, from the
+    calibrated per-request cost (the backend's `full_at_once`, which is
+    parallelism.recommend() at the configured length), and never flags the
+    agent count. Executed on the payload the backend really builds for the
+    live 27B pool."""
+    from servedeck import parallelism
 
-    unknown = _exec(("agentsFitNote",), "agentsFitNote(0, 4, 8192)")
-    assert unknown["text"] == "—", "a bound nothing computed must not print a number"
-    assert unknown["overfit"] is False
+    full = parallelism.recommend(
+        pool_tokens=1_595_321, prompt_tokens=262_144, basis="one 262,144-token request",
+    ).to_dict()
+    note = _exec(("agentsFitNote",), f"agentsFitNote({json.dumps(full)}, 262144)")
+    assert note["text"] == "3 at 256k at once", note
+    assert "overfit" not in note, "the agent count is flagged as over budget again"
+    assert "over budget" not in note["title"], note["title"]
+    for part in ("1,595,321", "445,115", "0.94", "not a cap"):
+        assert part in note["title"], (part, note["title"])
+
+    unknown = _exec(("agentsFitNote",), "agentsFitNote(null, 262144)")
+    assert unknown["text"] == "—", "a figure nothing computed must not print a number"
 
     css = (_app.WEB / "style.css").read_text().replace("\n", "")
-    assert ".frow .s.overfit" in css, "the over-budget note has no distinct style"
+    assert ".frow .s.overfit" not in css, "the agent count is styled as over budget again"
 
 
 def test_the_provenance_badge_never_prints_the_enum() -> None:
