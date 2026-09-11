@@ -112,6 +112,41 @@
           </div>
         </div>
 
+        <!-- Token accounting: how many tokens went in, how many came out, and how
+             much of the input the prefix cache served instead of the engine
+             computing it. Painted by paintTokens() from the `tokens` block of
+             the metrics payload (servedeck/tokens.py).
+
+             Every total is "since this server started" and says how long ago
+             that was: the counters are born at 0 with the process, so a bare
+             total is meaningless across a restart. The window line is a
+             counter delta over the ~60 s of scrapes it names, not a total over
+             an uptime. A 2 s window is useless here: vLLM counts a prompt once,
+             whole, when its prefill completes, so two seconds hold either
+             nothing or a 30,000-token jump. -->
+        <div class="thru tok" id="tok">
+          <div class="tcell">
+            <div class="lk" id="tkInK" title="vllm:prompt_tokens_total: the prompt tokens of every request whose prefill has completed (counted at its first token), including the ones served from the prefix cache. Resets to 0 when the server restarts.">Input (prompt) <span class="tu">tokens since this server started</span></div>
+            <div class="n mono" id="tkIn">n/a</div>
+            <div class="s" id="tkInS">—</div>
+            <div class="l" id="tkInW">—</div>
+            <div class="s" id="tkInR" title="From the vllm:request_prompt_tokens histogram, over the last requests that finished while Servedeck was watching. A range is a request known only to one of vLLM's buckets; a single number is exact.">—</div>
+          </div>
+          <div class="tcell">
+            <div class="lk" id="tkOutK" title="vllm:generation_tokens_total: every token the server has generated, counted as it is produced. Resets to 0 when the server restarts.">Output (generated) <span class="tu">tokens since this server started</span></div>
+            <div class="n mono" id="tkOut">n/a</div>
+            <div class="s" id="tkOutS">—</div>
+            <div class="l" id="tkOutW">—</div>
+            <div class="s" id="tkOutR" title="From the vllm:request_generation_tokens histogram, over the last requests that finished while Servedeck was watching. A range is a request known only to one of vLLM's buckets; a single number is exact.">—</div>
+          </div>
+          <div class="tcell">
+            <div class="lk" id="tkCacheK" title="vllm:prompt_tokens_cached_total ÷ vllm:prompt_tokens_total. Cached tokens skipped prefill; computed ones are the prefill work the engine actually did. Not the same ratio as Prefix cache below (hits ÷ queries): a query is counted every time the scheduler looks a request up, again after a preemption, while a cached token is counted once, when its prefill completes.">Input from prefix cache <span class="tu">share of input (prompt) tokens</span></div>
+            <div class="n mono" id="tkCache">n/a</div>
+            <div class="s" id="tkCacheS">—</div>
+            <div class="l" id="tkCacheW">—</div>
+          </div>
+        </div>
+
         <div class="phases" id="phases">
           <!-- The ETA string was a literal. history.py computes a real one
                per model from measured boots and says when it is falling back

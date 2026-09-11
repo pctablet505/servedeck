@@ -23,6 +23,9 @@ from typing import Any
 import httpx
 
 from .reqstats import EMPTY_STATS, RequestWindow
+from .tokens import Sample as _TokenSample
+from .tokens import TokenLedger
+from .tokens import unreachable_payload as _tokens_unreachable
 
 # --- metric names, verified live -----------------------------------------
 KV_USAGE = "vllm:kv_cache_usage_perc"
@@ -115,6 +118,12 @@ CACHE_CONFIG = "vllm:cache_config_info"
 SUCCESS_TOTAL = "vllm:request_success_total"
 PREFIX_HITS = "vllm:prefix_cache_hits_total"
 PREFIX_QUERIES = "vllm:prefix_cache_queries_total"
+#: When the process that owns every counter on this page started, as a unix
+#: timestamp. prometheus_client's own process collector, not a vLLM family;
+#: present in every full live exposition recorded under tests/fixtures
+#: (metrics_live_win_t{1,2}.txt carry 1.78901026252e+09). It is what the token
+#: totals are "since", and a value that moves means a different process.
+PROCESS_START = "process_start_time_seconds"
 
 
 def parse_prometheus(text: str) -> dict[str, list[tuple[dict[str, str], float]]]:
@@ -267,6 +276,25 @@ def _by_label(parsed: dict, name: str, key: str, val: str) -> float:
     return 0.0
 
 
+def _total(parsed: dict, name: str) -> float | None:
+    """A counter family's value summed over its series, or None when absent.
+
+    Summed, because with data parallelism vLLM publishes one series per engine
+    and the server's total is their sum (one series on this box). None, not
+    ``_first``'s 0.0: a family this build does not publish must read as "not
+    published", never as "no tokens yet".
+    """
+    rows = parsed.get(name)
+    return sum(v for _labels, v in rows) if rows else None
+
+
+def _gauge(parsed: dict, name: str) -> float | None:
+    """A gauge's first series, or None when absent. For values that must not
+    be summed -- two start times added together are not a start time."""
+    rows = parsed.get(name)
+    return rows[0][1] if rows else None
+
+
 @dataclass
 class MetricsSnapshot:
     reachable: bool = False
@@ -347,6 +375,11 @@ class MetricsSnapshot:
     kv_cache_gpu_util: float | None = None
     requests_succeeded: int = 0
     prefix_hit_rate: float | None = None   # None = no queries yet, NOT 0%
+    #: Input / output token totals since the serving process started, their
+    #: rates over a ~60 s window, and the prefix-cache share of the input. Built
+    #: by tokens.TokenLedger; the default is the unreachable block, so a
+    #: snapshot that never scraped says why rather than carrying zeros.
+    tokens: dict[str, Any] = field(default_factory=_tokens_unreachable)
     error: str | None = None
     ts: float = field(default_factory=time.time)
 
@@ -394,6 +427,7 @@ class MetricsSnapshot:
             "prefix_hit_rate": (
                 None if self.prefix_hit_rate is None else round(self.prefix_hit_rate, 4)
             ),
+            "tokens": self.tokens,
             "error": self.error,
         }
 
@@ -424,9 +458,17 @@ class MetricsPoller:
     """
 
     def __init__(
-        self, base_url: str, *, monotonic: Callable[[], float] = time.monotonic
+        self,
+        base_url: str,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+        wall: Callable[[], float] = time.time,
     ) -> None:
         self.base_url = base_url.rstrip("/")
+        #: Token totals and their window. On the poller for the same reason as
+        #: the request windows below: a repoint builds a new poller, and a new
+        #: upstream must start with no history of the old one.
+        self.tokens = TokenLedger(wall=wall)
         # (ts, generation_tokens_total, computed_prompt_tokens, ttft_sum,
         # ttft_count). One baseline for every windowed figure, so the numbers
         # on the panel can never describe different windows.
@@ -498,6 +540,7 @@ class MetricsPoller:
                 self._prev = None
                 self.prompt_window.drop_baseline()
                 self.gen_window.drop_baseline()
+                snap.tokens = self.tokens.unreachable()
                 self._remember(snap, now)
                 return snap  # reasons already say UNREACHABLE
             text = r.text
@@ -510,6 +553,7 @@ class MetricsPoller:
             self._prev = None
             self.prompt_window.drop_baseline()
             self.gen_window.drop_baseline()
+            snap.tokens = self.tokens.unreachable()
             self._remember(snap, now)
             return snap
 
@@ -526,6 +570,24 @@ class MetricsPoller:
         count = _first(p, PROMPT_TOK_COUNT)
         snap.prompt_token_count = int(count)
         snap.avg_prompt_tokens = (total / count) if count else 0.0
+
+        # Is this a different PROCESS from the last one seen? The token ledger
+        # can tell -- by the start time, or by a counter that went down -- even
+        # across the failed scrapes a restart causes. The request windows below
+        # cannot: a failed scrape drops their baseline, so a new process's first
+        # scrape is taken as a fresh baseline and the dead process's requests
+        # stay in the "last 100", where the token strip prints them beside the
+        # new server's totals. Empty them before they are fed.
+        tok_sample = _TokenSample(
+            ts=now,
+            prompt=_total(p, PROMPT_TOK_TOTAL),
+            cached=_total(p, PROMPT_TOK_CACHED_TOTAL),
+            gen=_total(p, GEN_TOK_TOTAL),
+            started=_gauge(p, PROCESS_START),
+        )
+        if self.tokens.is_new_process(tok_sample):
+            self.prompt_window.clear()
+            self.gen_window.clear()
 
         # Feed the rolling windows the delta of this scrape's histograms. Done
         # BEFORE the counter-reset check below on purpose: the window does its
@@ -639,5 +701,9 @@ class MetricsPoller:
         snap.prefill_requests = int(_first(p, PREFILL_TIME_COUNT))
         if prefill_seconds > 0 and prompt_computed > 0:
             snap.prefill_tok_s_avg = prompt_computed / prefill_seconds
+
+        # Input / output token totals and their window, off the same clock
+        # read as every other window figure on this snapshot.
+        snap.tokens = self.tokens.observe(tok_sample)
         self._remember(snap, now)
         return snap

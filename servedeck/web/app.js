@@ -47,7 +47,11 @@ function bytesTxt(n, digits) {
  */
 function rateTxt(v, digits) {
   if (typeof v !== "number" || !isFinite(v)) return "—";
-  return (digits ? v.toFixed(digits) : fmt(Math.round(v))) + " tok/s";
+  if (!digits) return fmt(Math.round(v)) + " tok/s";
+  // The integer part is grouped like every other number on the page: a bare
+  // toFixed() printed an input rate as "2995.2 tok/s" beside "90,749,177".
+  const s = v.toFixed(digits), dot = s.indexOf(".");
+  return fmt(Number(s.slice(0, dot))) + s.slice(dot) + " tok/s";
 }
 
 /* How long ago, in words. Whole seconds/minutes: this is the age of a
@@ -142,6 +146,134 @@ function paintThroughput() {
     if (n) { n.textContent = f.value; n.className = "n mono" + (f.na ? " na" : ""); }
     if (sub) sub.textContent = f.note;
     if (lifeEl) lifeEl.textContent = life;
+  });
+}
+
+/* ------------------------------------------------------ token strip ---- */
+
+/* A percentile of bucket-bounded observations, as the interval it is.
+ *
+ * "20,001–50,000" when the requests at that rank are known only to a vLLM
+ * bucket, one number when every one of them was exact, "> N" for the open top
+ * bucket. Never a midpoint: that would be a value no measurement supports.
+ */
+function pctTxt(p) {
+  if (!p) return "—";
+  if (p.hi == null) return "> " + fmt(p.lo);
+  if (p.exact || p.lo === p.hi) return fmt(p.hi);
+  return fmt(p.lo) + "–" + fmt(p.hi);
+}
+
+/* A share (0..1) as a percentage, or null when it is not a number.
+ *
+ * null is the caller's cue to print the reason instead. Guarding on the type
+ * AND on finiteness is the point: `(x * 100).toFixed(1)` turns a null into
+ * "0.0%" and a 0/0 into "NaN%", and both look like measurements.
+ */
+function shareTxt(v) {
+  return (typeof v === "number" && isFinite(v)) ? (v * 100).toFixed(1) + "%" : null;
+}
+
+/* The window's span in whole seconds: "60 s", "61 s". Not durTxt(), which
+ * prints a span that normally sits between 60 and 62 s as "1m 00s". */
+function spanTxt(s) {
+  return (typeof s === "number" && isFinite(s) && s >= 0) ? Math.round(s) + " s" : "—";
+}
+
+/* The window line shared by all three cells: the reading over the span it
+ * was measured on, or the reason there is none. The span is the backend's
+ * measured interval (tokens.window_s), never an assumed 60 s. Switches on the
+ * state CODE; the prose is only displayed. */
+function tokWindowTxt(t, f, readingFn) {
+  if (f.state === "ok") {
+    const reading = readingFn(f);
+    if (reading) return "last " + spanTxt(t.window_s) + ": " + reading;
+  }
+  if (f.state === "idle") return "last " + spanTxt(t.window_s) + ": " + (f.reason || "idle");
+  return "window: " + (f.reason || "no reading");
+}
+
+/* The per-request line: p50 / p90 / max over the request window, with the
+ * sample it was taken from and how much of it is only bucket-bounded. */
+function perRequestTxt(w, f, reachable) {
+  if (!reachable) return "per request: " + ((f && f.reason) || "no reading");
+  if (!w || !w.n) return "per request: " + winSpan(w);
+  const binned = w.n - (w.exact_n || 0);
+  return `per request, last ${w.n}/${w.capacity}`
+    + (binned > 0 ? ` (${binned} bucket-bounded)` : "")
+    + `: p50 ${pctTxt(w.p50)} · p90 ${pctTxt(w.p90)} · max ${pctTxt(w.max)}`;
+}
+
+/* The input or the output cell, as text: {value, na, since, win, per}.
+ *
+ * Pure, so the test engine can execute every server state against it. The
+ * headline is the since-start total with its unit, or "n/a"; the line under it
+ * says when "since" was, because the counters reset with the process and a
+ * bare total is meaningless across a restart.
+ */
+function tokenCell(t, key, w) {
+  t = t || {};
+  const f = t[key] || {};
+  const has = typeof f.total === "number" && isFinite(f.total);
+  let since;
+  if (!has) {
+    since = f.total_reason || t.started_reason || "no reading";
+  } else if (typeof t.started_ago_s === "number" && isFinite(t.started_ago_s)) {
+    since = "server started " + durTxt(t.started_ago_s) + " ago";
+  } else {
+    since = "server start time unknown — " + (t.started_reason || "no reading");
+  }
+  return {
+    value: has ? fmt(f.total) + " tokens" : "n/a",
+    na: !has,
+    since: since,
+    win: tokWindowTxt(t, f, function (g) {
+      return (typeof g.rate === "number" && isFinite(g.rate))
+        ? fmt(g.window) + " tokens · " + rateTxt(g.rate, 1) : null;
+    }),
+    per: perRequestTxt(w, f, !!t.reachable),
+  };
+}
+
+/* The prefix-cache cell: what share of the input was served from the cache
+ * rather than computed, since the server started and over the window. The
+ * computed count is the prefill work the engine actually did. */
+function cacheCell(t) {
+  t = t || {};
+  const c = t.cached || {};
+  const share = shareTxt(c.share);
+  const counts = typeof c.total === "number" && typeof c.computed === "number";
+  return {
+    value: share ? share + " of input" : "n/a",
+    na: !share,
+    since: (share && counts)
+      ? `since server start: ${fmt(c.total)} cached · ${fmt(c.computed)} computed`
+      : (c.share_reason || c.reason || "no reading"),
+    win: tokWindowTxt(t, c, function (g) {
+      const sw = shareTxt(g.share_window);
+      return sw ? `${sw} · ${fmt(g.window)} cached · ${fmt(g.window_computed)} computed` : null;
+    }),
+  };
+}
+
+/* The token strip. Painted from telemetry, like the throughput strip above
+ * it, and only into the value lines: the labels are markup, so no state of
+ * the server can leave a figure without its name. */
+function paintTokens() {
+  const m = liveMetrics || {};
+  const t = m.tokens || {};
+  const rows = [
+    ["tkIn", tokenCell(t, "input", m.prompt_stats)],
+    ["tkOut", tokenCell(t, "output", m.gen_stats)],
+    ["tkCache", cacheCell(t)],
+  ];
+  rows.forEach(function (row) {
+    const id = row[0], c = row[1];
+    const n = $(id);
+    if (n) { n.textContent = c.value; n.className = "n mono" + (c.na ? " na" : ""); }
+    set(id + "S", c.since);
+    set(id + "W", c.win);
+    if (c.per !== undefined) set(id + "R", c.per);
   });
 }
 
@@ -963,6 +1095,7 @@ function paintTelemetry(t) {
 
   paintRequestStats();
   paintThroughput();
+  paintTokens();
   paintServingMeta();
   spark();
 }
