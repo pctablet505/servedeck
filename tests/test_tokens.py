@@ -19,8 +19,6 @@ import re
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 from servedeck import metrics, tokens
 
 _FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -39,6 +37,13 @@ _FLASHNEXT_START = 1.78901026252e09
 #: them from the prefix cache -- vllm:prompt_tokens_cached_total is a real 0.0.
 _QWEN27B = (_FIXTURES / "metrics_27b_live_cached_zero.txt").read_text()
 _QWEN27B_START = 1.78909218635e09
+
+#: The same server RESTARTING, caught live (metrics_27b_live_restart.json): the
+#: process above went away, 85 scrapes failed, and a new process came up with
+#: every token counter at 0.0.
+_RESTART = json.loads((_FIXTURES / "metrics_27b_live_restart.json").read_text())
+_QWEN27B_RESTARTED = (_FIXTURES / _RESTART["after"]["file"]).read_text()
+_QWEN27B_RESTARTED_START = 1.78909259294e09
 
 
 # --------------------------------------------------------------------------
@@ -273,6 +278,33 @@ def test_a_restart_hidden_behind_failed_scrapes_is_still_a_restart() -> None:
     assert got[1]["reachable"] is False and got[2]["reachable"] is False
     assert got[3]["input"]["state"] == "reset", got[3]["input"]
     assert got[3]["input"]["total"] == 39_529
+
+
+def test_the_restart_recorded_live_resets_and_then_measures_the_new_process() -> None:
+    """The real sequence, at the recorded times: the old process's last scrape,
+    85 failed scrapes, the new process's first two. Its counters are all 0.0 --
+    lower than the old ones -- and its start time moved, so it is a restart
+    twice over; the next scrape measures a window of the NEW process only."""
+    before, after = _RESTART["before"], _RESTART["after"]
+    n_fail = _RESTART["failed_scrapes_between"]
+    script = [_QWEN27B, *[ConnectionError("down")] * n_fail, _QWEN27B_RESTARTED, _QWEN27B_RESTARTED]
+    step = (after["mono_s"] - before["mono_s"]) / (n_fail + 1)
+    clock = [before["mono_s"] + step * i for i in range(n_fail + 1)]
+    clock += [after["mono_s"], after["next_mono_s"]]
+    got = _scrape(script, clock, wall=after["wall_s"])
+
+    first, second = got[-2], got[-1]
+    assert got[-3]["reachable"] is False
+    for key in ("input", "output"):
+        assert first[key]["total"] == 0, "the new process's own total, not the old one's"
+        assert first[key]["state"] == "reset", first[key]
+    assert first["started_ago_s"] == int(after["wall_s"] - _QWEN27B_RESTARTED_START) == 169
+    assert first["cached"]["share"] is None
+    assert first["cached"]["share_reason"] == tokens.NO_INPUT_YET
+
+    assert second["window_s"] == 2.0
+    for key in ("input", "output"):
+        assert second[key]["state"] == "idle" and second[key]["window"] == 0, second[key]
 
 
 def test_the_same_process_after_an_outage_is_not_called_a_restart() -> None:

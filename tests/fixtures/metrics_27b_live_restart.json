@@ -1,0 +1,16 @@
+{
+  "_": "A restart of the Qwen3.8-27B-NVFP4 server on http://127.0.0.1:8004, caught by a GET-only recorder polling /metrics every 2 s on 2026-09-11. Unmodified exposition text. mono_s is the recorder's monotonic clock; wall_s its time.time().",
+  "before": {
+    "file": "metrics_27b_live_cached_zero.txt",
+    "mono_s": 2449.142,
+    "note": "The last successful scrape of the process that started at 1.78909218635e+09 (07:33:06 local). Its token counters are identical to this file's, which was fetched by hand minutes earlier: 39,529 prompt / 0 cached / 4,111 generated."
+  },
+  "failed_scrapes_between": 85,
+  "after": {
+    "file": "metrics_27b_live_restarted.txt",
+    "mono_s": 2621.149,
+    "wall_s": 1789092762.774,
+    "next_mono_s": 2623.149,
+    "note": "The first successful scrape of the NEW process (process_start_time_seconds 1.78909259294e+09, 07:39:52 local): every token counter 0.0. The next scrape, 2.0 s later, carried identical counters."
+  }
+}

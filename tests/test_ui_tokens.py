@@ -24,7 +24,9 @@ from servedeck import metrics, reqstats, tokens
 from .test_tokens import (
     _FLASHNEXT_START,
     _QWEN27B,
+    _QWEN27B_RESTARTED,
     _QWEN27B_START,
+    _RESTART,
     _WIN_DT,
     _WIN_T1,
     _WIN_T2,
@@ -33,7 +35,6 @@ from .test_tokens import (
     _Client,
     _bump,
     _drop,
-    _set,
 )
 from .test_ui import APP_JS, INDEX_HTML, _PRELUDE, _fn_body, _rendered_text, _run_js
 
@@ -130,8 +131,9 @@ def _busy() -> dict:
 
 
 def _fresh() -> str:
-    t = _set(_QWEN27B, metrics.PROMPT_TOK_TOTAL, 0)
-    return _set(t, metrics.GEN_TOK_TOTAL, 0)
+    """A server that has served nothing yet: the 27B's first scrape after the
+    restart recorded live, every token counter 0.0."""
+    return _QWEN27B_RESTARTED
 
 
 def _states() -> dict[str, dict]:
@@ -145,7 +147,7 @@ def _states() -> dict[str, dict]:
         "restart / switch of model": _last([_WIN_T2, _QWEN27B], [0.0, 2.0],
                                            wall=_QWEN27B_START + 300),
         "fresh server, nothing served": _last([_fresh(), _fresh()], [0.0, 2.0],
-                                              wall=_QWEN27B_START + 5),
+                                              wall=_RESTART["after"]["wall_s"]),
         "nothing cached yet (live 27B)": _last([_QWEN27B], [0.0], wall=_QWEN27B_START + 300),
         "older build": _last([old_build], [0.0]),
         "nothing serving": metrics.unreachable_snapshot(),
