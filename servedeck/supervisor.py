@@ -548,6 +548,12 @@ def shell_extra_args(backend: str | None) -> str:
     Guarded on ``BACKEND``: ``.config`` describes ONE backend at a time, and
     handing GLM's extra flags to a Qwen launcher is worse than handing it
     none. Never raises -- an unreadable ``.config`` means "no extra args".
+
+    start() does not use this. It launches with the value
+    Supervisor._sync_shell_config() returns, because that sync is what keeps
+    BACKEND and EXTRA_ARGS matched in the first place. That matters because
+    this guard trusts BACKEND, and BACKEND can be rewritten without
+    EXTRA_ARGS.
     """
     if not backend:
         return ""
@@ -558,6 +564,84 @@ def shell_extra_args(backend: str | None) -> str:
     if (cfg.get("BACKEND") or "").strip() != backend:
         return ""
     return (cfg.get("EXTRA_ARGS") or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# state/extra_args.json -- whose flags .config's EXTRA_ARGS holds
+# ---------------------------------------------------------------------------
+#
+# EXTRA_ARGS holds one backend's flags, but .config stores it in a single
+# global key. Anything that switches BACKEND without also switching EXTRA_ARGS
+# makes the file hand one backend's flags to another. For the 27B the file
+# is what counts: bin/qwen-server-run.sh sources .config after its defaults,
+# so the file's EXTRA_ARGS beats anything in the environment. So
+# _sync_shell_config() switches the two together. When the backend changes it
+# moves the outgoing backend's flags into this record and writes the incoming
+# backend's flags back, so Flash-Next's tuned flags come back on switch-back.
+# The record also stores the (backend, EXTRA_ARGS) pair Servedeck last left in
+# the file. That pair, not the file's BACKEND, says who owns the flags, because
+# BACKEND can be rewritten on its own (codex-qwen.sh set-config BACKEND ...).
+
+EXTRA_ARGS_RECORD_FILENAME = "extra_args.json"
+
+#: Stash key for flags found in a .config that names no BACKEND. They are
+#: kept for the operator and never restored to any backend.
+EXTRA_ARGS_UNATTRIBUTED = "(unattributed)"
+
+
+def load_extra_args_record(state_dir: Path | None = None) -> dict[str, Any]:
+    """``{"written": {"backend", "extra_args"} | None, "stash": {backend: flags}}``.
+
+    A missing or unreadable record is the same as no record. Ownership then
+    falls back to .config's own BACKEND, the rule shell_extra_args() has always
+    used.
+    """
+    state_dir = state_dir or paths.STATE_DIR
+    try:
+        raw = json.loads((state_dir / EXTRA_ARGS_RECORD_FILENAME).read_text())
+    except (OSError, json.JSONDecodeError):
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    written = raw.get("written")
+    if not (isinstance(written, dict) and isinstance(written.get("extra_args"), str)):
+        written = None
+    else:
+        backend = written.get("backend")
+        written = {
+            "backend": backend if isinstance(backend, str) else None,
+            "extra_args": written["extra_args"],
+        }
+    stash_raw = raw.get("stash")
+    stash = (
+        {k: v for k, v in stash_raw.items() if isinstance(k, str) and isinstance(v, str)}
+        if isinstance(stash_raw, dict) else {}
+    )
+    return {"written": written, "stash": stash}
+
+
+def save_extra_args_record(record: Mapping[str, Any], state_dir: Path | None = None) -> None:
+    state_dir = state_dir or paths.STATE_DIR
+    _atomic_write_json(
+        state_dir / EXTRA_ARGS_RECORD_FILENAME,
+        {"version": 1, "written": record.get("written"), "stash": dict(record.get("stash") or {}),
+         "updated_at": now_iso()},
+    )
+
+
+def extra_args_owner(cfg: Mapping[str, str], record: Mapping[str, Any]) -> str | None:
+    """Which backend .config's current EXTRA_ARGS belongs to (None = none).
+
+    If the value is still the one Servedeck last wrote, it belongs to the
+    backend Servedeck wrote it for, whatever BACKEND says now. That covers a
+    BACKEND-only rewrite by another writer. If the value changed, someone else
+    wrote it, and the file's own BACKEND is the best evidence of whose it is.
+    """
+    current = (cfg.get("EXTRA_ARGS") or "").strip()
+    written = record.get("written")
+    if written is not None and (written.get("extra_args") or "").strip() == current:
+        return written.get("backend")
+    return (cfg.get("BACKEND") or "").strip() or None
 
 
 def _reject_settings(
@@ -838,19 +922,16 @@ class Supervisor:
         save_desired(d, self.state_dir)
         self._write_flat_desired_state_file()
 
-        # Read EXTRA_ARGS BEFORE _sync_shell_config() rewrites BACKEND.
-        # shell_extra_args() refuses to hand one backend's flags to another by
-        # comparing .config's BACKEND against the backend being started -- and
-        # _sync_shell_config() writes the NEW backend into that very key one
-        # step earlier, so the guard was comparing the new backend against
-        # itself and always passed. On 2026-09-10 that put Flash-Next's
-        # `--prefix-match-unit 208` on the 27B's launcher and killed the engine
-        # 205 s into the boot. The value that matters is the file's state
-        # before we touched it.
-        extra_args = shell_extra_args(backend)
-
+        # The flags this backend launches with come from the config sync
+        # itself. The sync is the one place that switches BACKEND and
+        # EXTRA_ARGS together. Reading EXTRA_ARGS before the sync (the first
+        # F1 fix) only fixed the environment, and only for the first start.
+        # The 27B's launcher sources .config, so it still read Flash-Next's
+        # flags out of the file. The next start or restart then found
+        # BACKEND=inline beside Flash-Next's flags, and the guard passed them.
+        extra_args: str | None = None
         try:
-            self._sync_shell_config(repo_id=repo_id, backend=backend, served_name=served_name, port=port, util=util, max_model_len=max_model_len, max_num_seqs=max_num_seqs)
+            extra_args = self._sync_shell_config(repo_id=repo_id, backend=backend, served_name=served_name, port=port, util=util, max_model_len=max_model_len, max_num_seqs=max_num_seqs)
         except (shellconfig.ShellConfigError, shellconfig.ServerRunningError, ValueError, OSError) as exc:
             # ValueError/OSError included deliberately: shellconfig's own
             # validators raise ValueError, and an uncaught one left
@@ -1100,7 +1181,7 @@ class Supervisor:
     def _sync_shell_config(
         self, *, repo_id: str, backend: str, served_name: str | None, port: int,
         util: float | None, max_model_len: int | None, max_num_seqs: int | None,
-    ) -> None:
+    ) -> str:
         """"Restart sequence is always: stop -> write config -> start."
         Called only once actual_state has passed PREFLIGHT (i.e. we already
         know nothing is up), so `server_up=False` is trusted directly
@@ -1111,7 +1192,34 @@ class Supervisor:
         because codex-qwen.sh's own status/deaths/base-url logic reads it
         regardless of which backend is live (SPEC.md §9(d)'s use_systemd()
         gate, in particular, depends on .config's BACKEND being accurate).
+
+        EXTRA_ARGS is switched together with BACKEND; see the
+        state/extra_args.json notes above load_extra_args_record(). The order
+        of the writes matters. When the backend changes, the outgoing flags
+        are saved to the record first, then EXTRA_ARGS is cleared to "",
+        then BACKEND is written, and only then are the incoming backend's
+        flags restored. "" is safe for every backend, so a failure between
+        any two of these writes leaves .config degraded at worst. It never
+        leaves one backend's flags under another backend's name.
+
+        Returns the EXTRA_ARGS `backend` launches with, which is the value
+        .config now holds for it.
         """
+        cfg = shellconfig.read_config()
+        record = load_extra_args_record(self.state_dir)
+        current = (cfg.get(shellconfig.EXTRA_ARGS_KEY) or "").strip()
+        owner = extra_args_owner(cfg, record)
+        switching = owner != backend
+        if switching:
+            if owner is not None or current:
+                record["stash"][owner or EXTRA_ARGS_UNATTRIBUTED] = current
+            # The outgoing flags must be on disk before .config loses them.
+            save_extra_args_record(record, self.state_dir)
+            if current:
+                shellconfig.set_extra_args("")
+                record["written"] = {"backend": None, "extra_args": ""}
+                save_extra_args_record(record, self.state_dir)
+
         for key, value in (
             ("BACKEND", backend),
             ("MODEL_REPO", repo_id),
@@ -1122,8 +1230,21 @@ class Supervisor:
         ):
             if value is not None:
                 shellconfig.set_key(key, value)
+
+        if switching:
+            incoming = record["stash"].get(backend, "")
+            if incoming:
+                shellconfig.set_extra_args(incoming)
+            record["stash"].pop(backend, None)
+            established = incoming
+        else:
+            established = current
+        record["written"] = {"backend": backend, "extra_args": established}
+        save_extra_args_record(record, self.state_dir)
+
         if util is not None:
             shellconfig.set_util(util, server_up=False)
+        return established
 
     def _build_launch(
         self, *, backend: str, repo_id: str, served_name: str, port: int,
@@ -1162,10 +1283,10 @@ class Supervisor:
             "max_num_seqs": str(max_num_seqs or ""),
             "served_name": served_name,
             "kv_dtype": "auto",
-            # Passed in by start(), which reads it before .config is
-            # rewritten; recomputed here only for callers that do not (tests,
-            # and any future caller that builds a command line without a
-            # config sync in front of it).
+            # start() passes the value _sync_shell_config() just put in
+            # .config for this backend. It is recomputed here only for
+            # callers with no config sync in front of them (tests, capacity
+            # previews).
             "extra_args": shell_extra_args(backend) if extra_args is None else extra_args,
         }
         env = {

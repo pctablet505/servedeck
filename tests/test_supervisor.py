@@ -182,60 +182,8 @@ def test_adopted_server_monitor_notices_the_process_exiting(tmp_path: Path, monk
 # --------------------------------------------------------------------------
 # Phase-1 sweep regressions (2026-09-10, driven against the live 27B)
 # --------------------------------------------------------------------------
-def _launch_recorder(s: supervisor.Supervisor) -> list[tuple[list, dict]]:
-    """Replace the fake launcher with one that records env as well as argv."""
-    seen: list[tuple[list, dict]] = []
-
-    def rec(argv, env, cwd, log_path):
-        seen.append((list(argv), dict(env)))
-        return procctl.ServerHandle(
-            pid=9000 + len(seen), pgid=9000 + len(seen), argv=list(argv),
-            cwd="/tmp", log_path="/tmp/fake.log", started_at=0.0,
-        )
-
-    s._launch_fn = rec  # type: ignore[assignment]
-    return seen
-
-
-def test_extra_args_are_read_before_servedeck_rewrites_backend(tmp_path, monkeypatch) -> None:
-    """F1 (BLOCKER): the 27B was launched with Flash-Next's EXTRA_ARGS.
-
-    ``shell_extra_args()`` refuses to hand one backend's flags to another by
-    comparing ``.config``'s BACKEND against the backend being started. But
-    ``start()`` calls ``_sync_shell_config()`` -- which WRITES the new
-    BACKEND into ``.config`` -- before ``_build_launch()`` reads it, so the
-    guard compared the new backend against itself and always passed.
-
-    Observed 2026-09-10 22:54: the inline (27B) launcher received Flash-Next's
-    ``--prefix-match-unit 208`` and the engine died 205 s in with
-    "Invalid prefix_match_unit=208".
-    """
-    from servedeck import shellconfig
-
-    s, _ = _fake_supervisor(tmp_path, monkeypatch)
-    launches = _launch_recorder(s)
-
-    # .config as shipped: it describes Flash-Next, and carries Flash-Next's flags.
-    cfg = {"BACKEND": "flashnext", "EXTRA_ARGS": "--prefix-match-unit 208"}
-    monkeypatch.setattr(shellconfig, "read_config", lambda: dict(cfg))
-
-    # The real _sync_shell_config writes BACKEND first; model that exactly.
-    def sync(self, **kw):  # noqa: ANN001
-        cfg["BACKEND"] = kw["backend"]
-
-    s._sync_shell_config = types.MethodType(sync, s)  # type: ignore[assignment]
-
-    asyncio.run(s.start(**{**_CFG, "backend": "inline", "port": 8004,
-                           "repo_id": "RadixArk/Qwen3.8-27B-NVFP4",
-                           "served_name": "Qwen3.8-27B-NVFP4"}))
-
-    assert launches, "the start should have launched something"
-    env = launches[0][1]
-    assert "208" not in env.get("EXTRA_ARGS", ""), (
-        "the inline backend was handed Flash-Next's EXTRA_ARGS "
-        f"({env.get('EXTRA_ARGS')!r}) -- servedeck rewrote .config's BACKEND "
-        "one step before the guard that reads it"
-    )
+# F1 (Flash-Next's EXTRA_ARGS reaching the 27B) is covered end to end, with
+# the real config sync writing a real file, in tests/test_extra_args_ownership.py.
 
 
 def test_restart_waits_for_the_old_engine_to_exit(tmp_path, monkeypatch) -> None:

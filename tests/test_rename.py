@@ -302,6 +302,9 @@ _ALLOWED = {
     "servedeck/shellconfig.py": "names the external .config contract in a comment",
     "tests/test_rename.py": "this file",
     "tests/test_launch_contract.py": "asserts the deprecated alias still resolves",
+    "tests/test_extra_args_ownership.py": "its stand-in codex-qwen.sh copies the real "
+                                          "CONFIG_ALLOWED_KEYS, and its fixture copies this "
+                                          "box's .config, which still has COLDSTART_URL",
     "tests/test_kvcalc.py": "reads the fork's measurements as a real-data fixture",
     "tests/conftest.py": "turns the compatibility read off for the suite",
     "servedeck/config.py": "docstring names the deprecated COLDSTART_* env prefix",
