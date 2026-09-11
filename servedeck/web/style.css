@@ -383,6 +383,9 @@ input[type=range]:focus-visible{outline:2px solid var(--accent);outline-offset:3
   border-top:1px dotted var(--line)
 }
 .lk .tu{text-transform:none;letter-spacing:0;font-weight:400;opacity:.75}
+/* The token strip sits directly under the throughput strip and reads as its
+   second row: rates above, counts below. */
+.status .tok{margin-top:8px}
 /* One segment of the serving line ("prefill 1,240 tok/s"). Each is atomic:
    the line wraps BETWEEN segments and never inside one, so a number can never
    end up on a different line from the word that says which number it is. */
