@@ -744,3 +744,243 @@ def test_the_disk_payload_agrees_with_the_live_kernel() -> None:
     assert abs(d["used_bytes"] - (s.f_blocks - s.f_bfree) * frsize) < tol
     capp.rt._models_cache = None
     capp.rt._models_cache_at = 0.0
+
+
+# --------------------------------------------------------------------------
+# Phase-1 sweep regressions: the control plane the browser actually drives
+# --------------------------------------------------------------------------
+import asyncio  # noqa: E402
+import types  # noqa: E402
+
+
+class _FakeSup:
+    """A supervisor stand-in that records the calls the endpoints make."""
+
+    def __init__(self, actual_state: str = "STOPPED", last_error: str | None = None):
+        self.actual_state = actual_state
+        self.last_error = last_error
+        self.desired = _sup.DesiredState(
+            desired_state="RUNNING", repo_id="RadixArk/Qwen3.8-27B-NVFP4",
+            backend="inline", served_name="Qwen3.8-27B-NVFP4", port=8004,
+            util=0.47, max_model_len=262144, max_num_seqs=16,
+        )
+        self.calls: list = []
+
+    async def start(self, **kw):
+        self.calls.append(("start", kw))
+
+    async def restart(self, **kw):
+        self.calls.append(("restart", kw))
+
+    def snapshot(self):
+        return {"actual_state": self.actual_state, "last_error": self.last_error}
+
+
+def _wire(monkeypatch, s):
+    monkeypatch.setattr(capp, "_need_sup", lambda: s)
+    monkeypatch.setattr(capp, "sup", lambda: s)
+    monkeypatch.setattr(capp, "_state", lambda: {})
+    return s
+
+
+def _run(coro_fn):
+    async def go():
+        result = await coro_fn()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        return result
+
+    return asyncio.run(go())
+
+
+def test_apply_on_a_running_server_is_not_reported_as_success(monkeypatch) -> None:
+    """F3 SEVERE: the UI's only config control silently did nothing.
+
+    With the 27B READY at ctx 262144 / seqs 16, POSTing the Apply body with
+    ctx 131072 / seqs 8 returned 202 {"accepted": true} and SSE said "start
+    completed" — while .config, /proc/<pid>/cmdline, the pid and desired.json
+    were all unchanged. supervisor.start() returns at its first statement when
+    actual_state is READY/STARTING/PREFLIGHT/STOPPING, and
+    POST /api/server/restart — the only endpoint that relaunches — is
+    referenced nowhere in the page.
+    """
+    s = _wire(monkeypatch, _FakeSup(actual_state="READY"))
+
+    resp = _run(lambda: capp.api_start(
+        {"repo_id": "RadixArk/Qwen3.8-27B-NVFP4", "backend": "inline",
+         "util": 0.47, "ctx": 131072, "max_num_seqs": 8}
+    ))
+
+    assert resp.status_code == 409, (
+        f"a start that the supervisor will ignore was reported as {resp.status_code} "
+        "accepted; the page reports the attempt as a success and nothing changes"
+    )
+    assert not s.calls, "the no-op start was dispatched anyway"
+
+
+def test_the_restart_endpoint_applies_the_settings_it_is_given(monkeypatch) -> None:
+    """F3, the other half: restart() could only replay the OLD settings.
+
+    'Apply & restart' has to be able to change context length, max_num_seqs
+    and utilization on a running server. Routing Apply to restart is only a
+    fix if restart carries the new values.
+    """
+    s = _wire(monkeypatch, _FakeSup(actual_state="READY"))
+
+    _run(lambda: capp.api_restart(
+        {"mode": "immediate", "repo_id": "RadixArk/Qwen3.8-27B-NVFP4",
+         "backend": "inline", "util": 0.47, "ctx": 131072, "max_num_seqs": 8}
+    ))
+
+    assert s.calls, "restart was never dispatched"
+    kind, kw = s.calls[0]
+    assert kind == "restart"
+    assert kw.get("max_model_len") == 131072, kw
+    assert kw.get("max_num_seqs") == 8, kw
+    assert kw.get("util") == 0.47, kw
+
+
+def test_a_failed_action_is_not_announced_as_completed(monkeypatch) -> None:
+    """F7 MODERATE: every control action reported success regardless.
+
+    Seven _run_and_report notices in the sweep, all level "info", all
+    '<action> completed' — including the start PORT_IN_USE refused, two starts
+    that did nothing, and the loser of two concurrent starts. The only
+    error-level notice in the whole pass escaped as an exception.
+    """
+    s = _wire(monkeypatch, _FakeSup(
+        actual_state="FAILED",
+        last_error="PORT_IN_USE: pid 2922 is already listening on :8000.",
+    ))
+    seen: list = []
+    monkeypatch.setattr(capp.hub, "publish", lambda kind, payload: seen.append((kind, payload)))
+
+    async def noop():
+        return None
+
+    asyncio.run(capp._run_and_report(noop(), "start"))
+
+    notices = [p for k, p in seen if k == "notice"]
+    assert notices, "no notice was published at all"
+    assert notices[0]["level"] == "error", (
+        f"a start the supervisor refused was announced as {notices[0]!r}"
+    )
+    assert "PORT_IN_USE" in notices[0]["body"], notices[0]
+
+
+def test_a_boot_publishes_state_events_not_only_telemetry(monkeypatch) -> None:
+    """F2 SEVERE: the whole boot panel is dead in the browser.
+
+    Across two real boots (205 s failure + 174 s success) /api/events carried
+    237 telemetry events and 3 state events — each of the 3 published by a
+    control-action POST returning, none by the poll loop. app.js paints the
+    phase strip, the elapsed counter and the ETA only from `state`
+    (app.js:1676 -> paintState -> paintBoot), and the deliberate 5 s
+    /api/state poll was removed in favour of that stream, so none of it ever
+    rendered while a boot was running.
+    """
+    seen: list = []
+    monkeypatch.setattr(capp.hub, "publish", lambda kind, payload: seen.append((kind, payload)))
+    monkeypatch.setattr(capp, "_state", lambda: {"boot": {"phase": "loading_weights"}})
+    monkeypatch.setattr(capp, "_snap", lambda: {
+        "actual_state": "STARTING", "desired_state": "RUNNING",
+        "phase": "loading_weights", "reached_ready": False, "last_error": None,
+        "unmanaged_pid": None, "run_elapsed_s": 31.0,
+    })
+    monkeypatch.setattr(capp, "_running_max_model_len", lambda: None)
+    monkeypatch.setattr(capp.gpu, "gpu_summary", lambda: None)
+    monkeypatch.setattr(capp.rt, "retarget", lambda: False, raising=False)
+    monkeypatch.setattr(capp.rt, "client", object(), raising=False)
+
+    async def _no_recover():
+        return None
+
+    monkeypatch.setattr(capp, "_recover_if_server_returned", _no_recover)
+
+    class _Poller:
+        ceiling_tokens = None
+
+        async def scrape(self, client):  # noqa: ANN001
+            return types.SimpleNamespace(to_dict=lambda: {"reachable": False}, reachable=False)
+
+    monkeypatch.setattr(capp.rt, "poller", _Poller(), raising=False)
+
+    async def go():
+        task = asyncio.create_task(capp._poll_loop())
+        for _ in range(50):
+            await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(go())
+
+    kinds = [k for k, _ in seen]
+    assert "telemetry" in kinds, [p for k, p in seen if k == "notice"]
+    assert "state" in kinds, (
+        "a boot in progress produced only telemetry events; the phase strip, "
+        "the elapsed counter and the ETA are painted from `state` alone"
+    )
+
+
+def _publishes(monkeypatch, snap: dict, polls: int = 3) -> int:
+    """How many `state` events `polls` ticks of the poll loop publish for an
+    unchanging supervisor snapshot."""
+    seen: list = []
+    monkeypatch.setattr(capp.hub, "publish", lambda kind, payload: seen.append(kind))
+    monkeypatch.setattr(capp, "_state", lambda: {})
+    monkeypatch.setattr(capp, "_snap", lambda: dict(snap))
+    monkeypatch.setattr(capp, "_LAST_STATE_SIG", None)
+    for _ in range(polls):
+        capp._publish_state_if_changed()
+    return seen.count("state")
+
+
+def test_a_stopped_server_with_a_stale_phase_is_not_republished_every_poll(monkeypatch) -> None:
+    """After a Stop the finished run still reads phase "ready". Before the
+    READY latch its reached_ready also went back to False. The poll loop
+    treated that as a boot in progress and republished the full state every
+    2 s for as long as the server stayed stopped (seen live on 2026-09-11,
+    07:43:53 onwards). Publishing on change is the rule; every-poll is only for
+    a boot that is actually running."""
+    stale = {"actual_state": "STOPPED", "desired_state": "STOPPED", "phase": "ready",
+             "reached_ready": False, "last_error": None, "unmanaged_pid": None}
+    assert _publishes(monkeypatch, stale) == 1, "an unchanged STOPPED state is republished every poll"
+    failed = dict(stale, actual_state="FAILED", phase="cuda_graphs")
+    assert _publishes(monkeypatch, failed) == 1, "an unchanged FAILED state is republished every poll"
+
+
+def test_a_running_boot_is_still_published_every_poll(monkeypatch) -> None:
+    """Over-correction guard: the elapsed clock is in the payload, so a boot in
+    progress must still reach the page on every tick."""
+    booting = {"actual_state": "STARTING", "desired_state": "RUNNING", "phase": "compiling",
+               "reached_ready": False, "last_error": None, "unmanaged_pid": None}
+    assert _publishes(monkeypatch, booting) == 3
+
+
+def test_an_unrelated_listeners_uptime_is_not_reported_as_the_models(monkeypatch) -> None:
+    """F5, the half that survives the ordering fix.
+
+    server_uptime_s is the uptime of whatever pid holds the port — with no
+    check that the pid is a vLLM server at all. On 2026-09-10 that put
+    ats-optimizer's 105,114 s (29.2 h) on the dashboard as the model server's
+    uptime while the 27B was not running. desired.json is no longer written
+    before preflight, so that particular route is closed, but the shell
+    config's PORT can name someone else's port just as easily.
+    """
+    from servedeck import procctl
+
+    monkeypatch.setattr(capp, "_listener_pid_now", lambda: 2922)
+    monkeypatch.setattr(procctl, "process_uptime_s", lambda pid: 105114)
+
+    monkeypatch.setattr(procctl, "is_attributable", lambda pid: False)
+    assert capp._server_uptime_s() is None, (
+        "an unrelated service's uptime is being reported as the model server's"
+    )
+
+    # Over-correction guard: a listener that IS a vLLM api-server still
+    # reports its uptime — this must not blank the figure for every server.
+    monkeypatch.setattr(procctl, "is_attributable", lambda pid: True)
+    assert capp._server_uptime_s() == 105114

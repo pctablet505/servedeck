@@ -451,3 +451,58 @@ def test_the_empty_window_publishes_the_fine_key_too() -> None:
     it makes the plot read undefined.bins and white-screen the panel."""
     assert "fine" in reqstats.EMPTY_STATS
     assert reqstats.EMPTY_STATS["fine"] == {"step": 0, "bins": []}
+
+
+# --------------------------------------------------------------------------
+# Phase-1 sweep, F8: figures from a dead process survived a restart
+# --------------------------------------------------------------------------
+def test_a_restart_seen_as_a_scrape_outage_still_clears_the_window() -> None:
+    """The counter-reset check was defeated by the outage that precedes it.
+
+    A restart makes /metrics unreachable for a while, and every failed scrape
+    calls drop_baseline(), which throws away the previous cumulative vector.
+    The new engine's first successful scrape therefore arrived with
+    ``self._prev is None`` -- the "first scrape is a baseline only" path -- so
+    the backwards-counter check never ran and the old process's requests stayed
+    in the window forever.
+
+    Observed 2026-09-10: one /api/state payload reported vllm.requests_succeeded
+    0 and avg_prompt_tokens 0 (correctly reset from the NEW engine) alongside
+    sizing.window.n 5 and a parallel-agent recommendation captioned "p90 of the
+    last 5 requests" -- requests served by a pid that no longer existed. The
+    panel's own footer says "Figures are never carried over from a different
+    model".
+    """
+    w = RequestWindow()
+    feed(w, {1000.0: 5})
+    assert len(w) == 5, "five requests should be in the window to begin with"
+
+    # The engine restarts: several scrapes fail while it boots.
+    w.drop_baseline()
+    w.drop_baseline()
+
+    # The new engine's first successful scrape: its counters start at zero.
+    w.observe(cumulative({}), hist_sum=0.0, hist_count=0.0)
+
+    assert len(w) == 0, (
+        f"{len(w)} request(s) served by the PREVIOUS process are still in the "
+        "window, and the panel captions them as the last N requests"
+    )
+
+
+def test_a_transient_scrape_failure_does_not_clear_the_window() -> None:
+    """The over-correction guard: an outage is not a restart.
+
+    Requests the engine finished while Servedeck could not reach it are lost
+    (nothing observed them), but the ones already in the window were served by
+    the SAME process and must stay -- otherwise a two-second network blip
+    empties a panel that was correct.
+    """
+    w = RequestWindow()
+    feed(w, {1000.0: 5})
+    assert len(w) == 5
+
+    w.drop_baseline()                                   # one failed scrape
+    w.observe(cumulative({1000.0: 5}), hist_sum=5 * 1000.0, hist_count=5.0)
+
+    assert len(w) == 5, "a transient failure emptied a window the engine never reset"

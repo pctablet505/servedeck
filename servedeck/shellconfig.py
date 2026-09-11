@@ -5,7 +5,10 @@ line-preserving semantics and codex-qwen.sh's own validators — see that
 script's save_config_kv() docstring: an earlier naive `echo ... >
 $CONFIG_FILE` clobbered the whole file). Every mutation in this module goes
 through `codex-qwen.sh set-mem|set-subagents|set-config` as a subprocess,
-exactly as a human running that script by hand would.
+exactly as a human running that script by hand would. There is one
+exception: `set_extra_args()`. codex-qwen.sh will not write EXTRA_ARGS, but
+Servedeck must keep that key matched to BACKEND, so it writes the key itself
+using save_config_kv()'s rule. Its docstring explains why.
 
 The one hard rule this module enforces on Servedeck's behalf (SPEC.md §1):
 `set_mem()` in codex-qwen.sh auto-restarts the server as a side effect when
@@ -17,8 +20,12 @@ codex-qwen.sh's implicit restart race Servedeck's own supervisor loop.
 
 from __future__ import annotations
 
+import contextlib
+import os
 import re
+import stat
 import subprocess
+import tempfile
 import urllib.error
 import urllib.request
 from typing import Mapping
@@ -211,3 +218,75 @@ def set_key(key: str, value: str) -> subprocess.CompletedProcess[str]:
     if key not in ALLOWED_SET_KEYS:
         raise ValueError(f"unknown config key {key!r}; allowed: {sorted(ALLOWED_SET_KEYS)}")
     return _run_codex_qwen("set-config", key, str(value))
+
+
+#: The one key this module writes itself instead of through codex-qwen.sh.
+EXTRA_ARGS_KEY = "EXTRA_ARGS"
+
+#: Characters an EXTRA_ARGS value may not contain. `"`: every line reader of
+#: this file (`llm`'s read_config_file, _KV_LINE_RE above, serve-model.sh's
+#: sed) accepts only KEY="value" with no double quote inside, and `llm` skips
+#: any other line. `$`, backquote and backslash: bin/qwen-server-run.sh SOURCES
+#: the file as shell, which expands them inside double quotes, so the 27B's
+#: launcher would read a different value from every line reader. Newlines:
+#: one assignment is one line.
+_UNWRITABLE_CHARS = frozenset('"$`\\\n\r')
+
+
+def set_extra_args(value: str) -> None:
+    """Persist EXTRA_ARGS using exactly codex-qwen.sh's save_config_kv() rule.
+
+    The rule: drop every line that starts with ``EXTRA_ARGS=`` and append
+    ``EXTRA_ARGS="value"``. Every other line is kept byte for byte. Every
+    reader takes the last assignment, so the appended line is the one they
+    all see.
+
+    This is the one write that does not go through codex-qwen.sh, because
+    its ``set-config`` allow list does not include EXTRA_ARGS. Servedeck
+    still has to write it. EXTRA_ARGS holds one backend's flags, and
+    ``bin/qwen-server-run.sh`` (the 27B's launcher) sources ``.config`` after
+    its defaults, so the value in the FILE beats anything Servedeck passes in
+    the environment. Rewriting BACKEND without rewriting EXTRA_ARGS is how
+    the 27B got Flash-Next's ``--prefix-match-unit 208`` on 2026-09-10 22:54
+    and again at the 2026-09-11 06:59 reboot, and died both times with
+    "Invalid prefix_match_unit=208".
+
+    The file is replaced atomically (temp file in the same directory, then
+    os.replace) and keeps its mode (``.config`` is 0600). Raises ValueError
+    for a value no reader could read back the same way.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"EXTRA_ARGS must be a string, got {type(value).__name__}")
+    bad = sorted({ch for ch in value if ch in _UNWRITABLE_CHARS})
+    if bad:
+        raise ValueError(
+            f"EXTRA_ARGS cannot be written to {paths.CONFIG_FILE}: it contains {bad!r}, "
+            "which `llm` skips and bin/qwen-server-run.sh (which sources the file) "
+            "would expand, so the two would launch different servers. "
+            f"Value: {value!r}"
+        )
+    path = paths.CONFIG_FILE
+    try:
+        text = path.read_text()
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        text, mode = "", 0o600
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()                       # the file's own trailing newline
+    kept = [ln for ln in lines if not ln.startswith(f"{EXTRA_ARGS_KEY}=")]
+    kept.append(f'{EXTRA_ARGS_KEY}="{value}"')
+    body = "\n".join(kept) + "\n"
+
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.servedeck-")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(body)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise

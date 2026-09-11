@@ -1022,6 +1022,20 @@ function paintRequestStats() {
   // the plot instead of here.
   set("pctP90", pct(w.p90));
 
+  // Is that p90 a measurement or a bucket edge? A percentile over
+  // bucket-bounded observations is an interval, rendered as one by pct()
+  // just above; the recommendation divides by its UPPER edge (the
+  // conservative end), and both places that quoted that number stated it as
+  // an equality -- a histogram bucket edge printed as a measurement, on the
+  // same panel that had just said 20,001-50,000. Declared out here, not
+  // inside `if (rec)`, because the over-subscription banner below reads it
+  // too and a const is block-scoped.
+  const p90Exact = !!(w.p90 && (w.p90.exact || w.p90.lo === w.p90.hi));
+  // The p99 line has the same problem. at_p99 is sized on the UPPER edge of
+  // the p99 interval, so it is also a bucket edge unless every observation at
+  // that rank was exact.
+  const p99Exact = !!(w.p99 && (w.p99.exact || w.p99.lo === w.p99.hi));
+
   // The window's own honesty line, as short as it can be; see winSpan().
   set("winMeta", winSpan(w));
   reqHist(w);
@@ -1033,7 +1047,8 @@ function paintRequestStats() {
       ur.disabled = false;
       ur.title = `write ${rec.n} into the Parallel agents field`;
     }
-    set("recBasis", `${rec.basis} = ${fmt(rec.prompt_tokens)} prompt tokens`);
+    set("recBasis",
+      `${rec.basis} ${p90Exact ? "=" : "\u2264"} ${fmt(rec.prompt_tokens)} prompt tokens`);
     // The arithmetic, in full. pool / cost gives the raw fit; the headroom
     // factor keeps the last admitted sequence off the preemption edge; the
     // clamp is max_num_seqs, which the scheduler enforces whatever the KV says.
@@ -1047,7 +1062,9 @@ function paintRequestStats() {
     const where = rec.extrapolated
       ? " · cost extrapolated beyond the measured range"
       : (rec.segment ? ` · cost interpolated between ${fmt(rec.segment[0])} and ${fmt(rec.segment[1])} tok` : "");
-    set("recP99", (alt ? `at p99 (${fmt(alt.prompt_tokens)} tok) it would be ${alt.n}` : "") + where);
+    set("recP99", (alt
+      ? `at p99 (${p99Exact ? "" : "\u2264 "}${fmt(alt.prompt_tokens)} tok) it would be ${alt.n}`
+      : "") + where);
   } else {
     set("recN", "—");
     set("recBasis", sz.reason || "—");
@@ -1068,7 +1085,8 @@ function paintRequestStats() {
   if (rec && sz.over_subscribed) {
     os.className = "oversub on";
     os.innerHTML = `<b>Over-subscribed: ${sz.running} requests in flight, `
-      + `${rec.n} recommended</b> at a p90 of ${fmt(rec.prompt_tokens)} prompt tokens. `
+      + `${rec.n} recommended</b> at a p90 of ${p90Exact ? "" : "at most "}`
+      + `${fmt(rec.prompt_tokens)} prompt tokens. `
       + (pre ? `${pre} preemptions since this server started — that is vLLM `
              + `evicting and recomputing KV, i.e. work already paid for being thrown away.`
              : `No preemptions yet; <span class="mono">vllm:num_preemptions_total</span> `
@@ -1245,9 +1263,16 @@ function durTxt(sec) {
 
 /* Is a boot in progress? Only then is the bar drawn: once the server is READY
  * the phase history is a post-mortem, not progress, and a dead widget above the
- * controls every time the page opens is worse than no widget. */
+ * controls every time the page opens is worse than no widget.
+ *
+ * The supervisor state gates it too. A run that has ended still carries its
+ * last phase: "ready" after a Stop, or the phase a failed boot died in. Gating
+ * on phase alone painted those as boots in progress, with the elapsed clock
+ * counting beside "Not reachable" ("elapsed 4m 38s", 2026-09-11). The server
+ * applies the same gate (app.py _boot_in_progress). */
+const BOOTING_STATES = ["PREFLIGHT", "STARTING"];
 function bootActive(b) {
-  return !!(b && b.phase && !b.reached_ready);
+  return !!(b && b.phase && !b.reached_ready && BOOTING_STATES.indexOf(b.actual_state) >= 0);
 }
 
 /* The ETA line, with its provenance. history.py decides whether the figure is a
@@ -1546,8 +1571,19 @@ function wireControls() {
           `The server will be unavailable for several minutes.`;
       if (!confirm(msg)) return;
       apply.disabled = true;
+      // "Apply & restart" means RESTART when something is already serving.
+      // /api/server/start is idempotent on the supervisor's side -- it returns
+      // early when the server is READY -- so posting a new context length at a
+      // running server returned 202 "accepted" and changed nothing at all:
+      // same pid, same cmdline, same .config, and a success in the log.
+      // /api/server/restart is the only endpoint that relaunches, and it
+      // carries the same settings body.
+      const sv = (lastState && lastState.supervisor) || {};
+      const upNow = !!(lastState && lastState.upstream && lastState.upstream.up);
+      const path = (upNow || sv.actual_state === "READY")
+        ? "/api/server/restart" : "/api/server/start";
       try {
-        await post("/api/server/start", {
+        await post(path, {
           repo_id: m.repo_id, backend: m.backend, util, ctx, max_num_seqs: agents,
         });
         log(`applying ${m.name} …`, "g");

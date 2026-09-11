@@ -86,6 +86,12 @@ MONITOR_POLL_S = 1.0
 DEATH_RECORD_TIMEOUT_S = 15.0
 STOP_RESULT_GRACE_S = 3.0
 
+#: How long restart() waits for the previous engine to actually exit before
+#: launching its replacement. procctl.stop()'s own budget is 60 s of SIGTERM
+#: plus a SIGKILL wait, so anything shorter would routinely give up on a
+#: process that was about to die.
+STOP_JOIN_TIMEOUT_S = 90.0
+
 _DESIRED_VERSION = 1
 
 
@@ -542,6 +548,12 @@ def shell_extra_args(backend: str | None) -> str:
     Guarded on ``BACKEND``: ``.config`` describes ONE backend at a time, and
     handing GLM's extra flags to a Qwen launcher is worse than handing it
     none. Never raises -- an unreadable ``.config`` means "no extra args".
+
+    start() does not use this. It launches with the value
+    Supervisor._sync_shell_config() returns, because that sync is what keeps
+    BACKEND and EXTRA_ARGS matched in the first place. That matters because
+    this guard trusts BACKEND, and BACKEND can be rewritten without
+    EXTRA_ARGS.
     """
     if not backend:
         return ""
@@ -552,6 +564,118 @@ def shell_extra_args(backend: str | None) -> str:
     if (cfg.get("BACKEND") or "").strip() != backend:
         return ""
     return (cfg.get("EXTRA_ARGS") or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# state/extra_args.json -- whose flags .config's EXTRA_ARGS holds
+# ---------------------------------------------------------------------------
+#
+# EXTRA_ARGS holds one backend's flags, but .config stores it in a single
+# global key. Anything that switches BACKEND without also switching EXTRA_ARGS
+# makes the file hand one backend's flags to another. For the 27B the file
+# is what counts: bin/qwen-server-run.sh sources .config after its defaults,
+# so the file's EXTRA_ARGS beats anything in the environment. So
+# _sync_shell_config() switches the two together. When the backend changes it
+# moves the outgoing backend's flags into this record and writes the incoming
+# backend's flags back, so Flash-Next's tuned flags come back on switch-back.
+# The record also stores the (backend, EXTRA_ARGS) pair Servedeck last left in
+# the file. That pair, not the file's BACKEND, says who owns the flags, because
+# BACKEND can be rewritten on its own (codex-qwen.sh set-config BACKEND ...).
+
+EXTRA_ARGS_RECORD_FILENAME = "extra_args.json"
+
+#: Stash key for flags found in a .config that names no BACKEND. They are
+#: kept for the operator and never restored to any backend.
+EXTRA_ARGS_UNATTRIBUTED = "(unattributed)"
+
+
+def load_extra_args_record(state_dir: Path | None = None) -> dict[str, Any]:
+    """``{"written": {"backend", "extra_args"} | None, "stash": {backend: flags}}``.
+
+    A missing or unreadable record is the same as no record. Ownership then
+    falls back to .config's own BACKEND, the rule shell_extra_args() has always
+    used.
+    """
+    state_dir = state_dir or paths.STATE_DIR
+    try:
+        raw = json.loads((state_dir / EXTRA_ARGS_RECORD_FILENAME).read_text())
+    except (OSError, json.JSONDecodeError):
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    written = raw.get("written")
+    if not (isinstance(written, dict) and isinstance(written.get("extra_args"), str)):
+        written = None
+    else:
+        backend = written.get("backend")
+        written = {
+            "backend": backend if isinstance(backend, str) else None,
+            "extra_args": written["extra_args"],
+        }
+    stash_raw = raw.get("stash")
+    stash = (
+        {k: v for k, v in stash_raw.items() if isinstance(k, str) and isinstance(v, str)}
+        if isinstance(stash_raw, dict) else {}
+    )
+    return {"written": written, "stash": stash}
+
+
+def save_extra_args_record(record: Mapping[str, Any], state_dir: Path | None = None) -> None:
+    state_dir = state_dir or paths.STATE_DIR
+    _atomic_write_json(
+        state_dir / EXTRA_ARGS_RECORD_FILENAME,
+        {"version": 1, "written": record.get("written"), "stash": dict(record.get("stash") or {}),
+         "updated_at": now_iso()},
+    )
+
+
+def extra_args_owner(cfg: Mapping[str, str], record: Mapping[str, Any]) -> str | None:
+    """Which backend .config's current EXTRA_ARGS belongs to (None = none).
+
+    If the value is still the one Servedeck last wrote, it belongs to the
+    backend Servedeck wrote it for, whatever BACKEND says now. That covers a
+    BACKEND-only rewrite by another writer. If the value changed, someone else
+    wrote it, and the file's own BACKEND is the best evidence of whose it is.
+    """
+    current = (cfg.get("EXTRA_ARGS") or "").strip()
+    written = record.get("written")
+    if written is not None and (written.get("extra_args") or "").strip() == current:
+        return written.get("backend")
+    return (cfg.get("BACKEND") or "").strip() or None
+
+
+def _reject_settings(
+    *, util: float | None, max_model_len: int | None, max_num_seqs: int | None
+) -> str | None:
+    """The reason these settings cannot be started, or None.
+
+    Deliberately only the values whose ranges are FACTS rather than opinions:
+    ``--gpu-memory-utilization`` is a fraction of one card, and a context
+    length or a sequence count below 1 is not a configuration. Anything that
+    merely looks large (ctx 999,999,999) is left to the engine, which refuses
+    it safely and legibly; guessing a ceiling here would refuse launches that
+    would have worked.
+    """
+    if util is not None:
+        try:
+            u = float(util)
+        except (TypeError, ValueError):
+            return f"util must be a number in (0, 1], got {util!r}"
+        if not (0 < u <= 1):
+            return (
+                f"util must be a fraction of the GPU in (0, 1], got {util}. "
+                "(0.47 means 47% of the card, not 47.)"
+            )
+    for name, value in (("ctx (max_model_len)", max_model_len), ("max_num_seqs", max_num_seqs)):
+        if value is None:
+            continue
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            return f"{name} must be a positive integer, got {value!r}"
+        if n < 1:
+            return f"{name} must be a positive integer, got {value}"
+    return None
 
 
 def _default_log_paths(
@@ -629,6 +753,9 @@ class Supervisor:
         self._stopping_deliberately = False
         self._last_stop_result: procctl.StopResult | None = None
         self._unmanaged_pid: int | None = None
+        #: The in-flight ``_run_stop_signal`` task, so restart() can wait for
+        #: the process to actually be GONE before launching its replacement.
+        self._stop_task: "asyncio.Task[None] | None" = None
 
     # ----------------------------------------------------------------- #
     # Startup reconciliation — SPEC.md §6, all five cases
@@ -753,6 +880,38 @@ class Supervisor:
             )
             return
 
+        # Every value is checked BEFORE anything is persisted or written.
+        # util=5.0 used to be accepted here, persisted into desired.json, and
+        # written into .config key by key until shellconfig.set_util() raised
+        # ValueError half way through -- leaving .config describing a
+        # configuration nobody asked for and the supervisor stuck in
+        # PREFLIGHT, which disables every control on the page.
+        rejected = _reject_settings(util=util, max_model_len=max_model_len, max_num_seqs=max_num_seqs)
+        if rejected is not None:
+            self.actual_state = "FAILED"
+            self.last_error = rejected
+            return
+
+        self.actual_state = "PREFLIGHT"
+        checks = preflight.run_preflight(
+            backend=backend, actual_state=self.actual_state, port=port
+        )
+        failures = preflight.blocking_failures(checks)
+        if failures:
+            self.actual_state = "FAILED"
+            self.last_error = "; ".join(f"{c.id}: {c.detail}" for c in failures)
+            self._record_boot_failure_before_launch(
+                reason="preflight_blocked", repo_id=repo_id, backend=backend
+            )
+            return
+
+        # Intent is persisted only once the start is going ahead. Writing it
+        # first meant a start that PREFLIGHT refused still published its port:
+        # updetect ranks desired.json's port, found the unrelated listener the
+        # preflight had just refused (:8000, ats-optimizer, pid 2922), followed
+        # it, labelled it with this backend's name, reported its 29 h uptime as
+        # the model server's -- and app.py's catch_all proxied every /v1
+        # request into it.
         d = self.desired
         d.desired_state = "RUNNING"
         d.repo_id, d.backend, d.served_name, d.port = repo_id, backend, served_name, port
@@ -763,20 +922,23 @@ class Supervisor:
         save_desired(d, self.state_dir)
         self._write_flat_desired_state_file()
 
-        self.actual_state = "PREFLIGHT"
-        checks = preflight.run_preflight(
-            backend=backend, actual_state=self.actual_state, port=port
-        )
-        failures = preflight.blocking_failures(checks)
-        if failures:
-            self.actual_state = "FAILED"
-            self.last_error = "; ".join(f"{c.id}: {c.detail}" for c in failures)
-            self._record_boot_failure_before_launch(reason="preflight_blocked")
-            return
-
+        # The flags this backend launches with come from the config sync
+        # itself. The sync is the one place that switches BACKEND and
+        # EXTRA_ARGS together. Reading EXTRA_ARGS before the sync (the first
+        # F1 fix) only fixed the environment, and only for the first start.
+        # The 27B's launcher sources .config, so it still read Flash-Next's
+        # flags out of the file. The next start or restart then found
+        # BACKEND=inline beside Flash-Next's flags, and the guard passed them.
+        extra_args: str | None = None
         try:
-            self._sync_shell_config(repo_id=repo_id, backend=backend, served_name=served_name, port=port, util=util, max_model_len=max_model_len, max_num_seqs=max_num_seqs)
-        except (shellconfig.ShellConfigError, shellconfig.ServerRunningError) as exc:
+            extra_args = self._sync_shell_config(repo_id=repo_id, backend=backend, served_name=served_name, port=port, util=util, max_model_len=max_model_len, max_num_seqs=max_num_seqs)
+        except (shellconfig.ShellConfigError, shellconfig.ServerRunningError, ValueError, OSError) as exc:
+            # ValueError/OSError included deliberately: shellconfig's own
+            # validators raise ValueError, and an uncaught one left
+            # actual_state at "PREFLIGHT" -- a state start()'s idempotence
+            # guard returns early on, so every later start silently did
+            # nothing and only Stop (disabled by that same state in the UI)
+            # could clear it.
             self.actual_state = "FAILED"
             self.last_error = f"failed to write local_llm/.config: {exc}"
             self._record_boot_failure_before_launch(reason="config_write_failed")
@@ -795,6 +957,7 @@ class Supervisor:
             backend=backend, repo_id=repo_id, served_name=served_name or repo_id,
             port=port, util=util,
             max_model_len=max_model_len, max_num_seqs=max_num_seqs,
+            extra_args=extra_args,
         )
         try:
             handle = self._launch_fn(argv, env, cwd, log_paths[0])
@@ -817,10 +980,32 @@ class Supervisor:
         save_desired(d, self.state_dir)
         self._write_flat_desired_state_file()
         self._stopping_deliberately = True
+        # Forget the previous stop's task before this one decides whether to
+        # create a new one: restart() waits on _stop_task, and waiting on a
+        # task that finished two stops ago would be a wait that proves nothing.
+        self._stop_task = None
         self._cancel_pending_restart()
 
         if self._handle is None:
+            # No handle does NOT mean nothing is running. A superseded
+            # handle's _on_exit() used to clear the current one, and a server
+            # started outside Servedeck never had one -- in both cases this
+            # branch reported "STOPPED", i.e. the GPU is free, while an engine
+            # went on holding 44 GiB and answering on the port. Ask the socket
+            # table before making that claim.
+            orphan = self._listener_pid(self.desired.port)
+            if orphan is not None:
+                self._unmanaged_pid = orphan
+                self.actual_state = "UNMANAGED"
+                self.last_error = (
+                    f"stop: nothing to signal — Servedeck holds no process handle, but "
+                    f"pid {orphan} is still listening on :{self.desired.port} and still "
+                    "holds its GPU memory. Adopt it (\"Manage running server\") and stop "
+                    "it again, or kill that pid by hand."
+                )
+                return
             self.actual_state = "STOPPED"
+            self.last_error = None
             return
 
         self.actual_state = "STOPPING"
@@ -832,13 +1017,66 @@ class Supervisor:
         # procctl.stop()'s own timeout) and does the actual bookkeeping via
         # _on_exit(). Awaiting it here would block every other request
         # this single-process server is handling for up to 70s.
-        asyncio.create_task(self._run_stop_signal(handle))
+        self._stop_task = asyncio.create_task(self._run_stop_signal(handle))
+
+    def _listener_pid(self, port: int | None) -> int | None:
+        """Which pid, if any, is listening on `port` right now. Never raises:
+        a socket table we cannot read must not break a stop."""
+        if not port:
+            return None
+        try:
+            return procctl.listener_pid(port)
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _await_stop_complete(self, timeout_s: float = STOP_JOIN_TIMEOUT_S) -> None:
+        """Wait for the stop signalled by stop() to finish.
+
+        `self._stop_fn` (procctl.stop) returns only once the process group is
+        actually gone -- it waits out SIGTERM and escalates to SIGKILL -- and
+        it runs in an executor, so awaiting it here blocks nothing else. This
+        is what keeps restart() from putting a second engine on the card
+        beside one that is still dying: a vLLM parent mid-boot takes tens of
+        seconds to exit, and the PORT_IN_USE preflight cannot see it because
+        vLLM binds its port only after loading weights.
+        """
+        task = self._stop_task
+        if task is None:
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            self.last_error = (
+                f"stop did not complete within {timeout_s:.0f}s; starting anyway — "
+                "if the port is still held the preflight will refuse"
+            )
+        except Exception:  # noqa: BLE001 - a failed stop is reported by stop() itself
+            pass
 
     async def _run_stop_signal(self, handle: procctl.ServerHandle) -> None:
         loop = asyncio.get_running_loop()
         self._last_stop_result = await loop.run_in_executor(None, self._stop_fn, handle)
 
-    async def restart(self, *, mode: str = "immediate") -> None:
+    async def restart(
+        self,
+        *,
+        mode: str = "immediate",
+        repo_id: str | None = None,
+        backend: str | None = None,
+        served_name: str | None = None,
+        port: int | None = None,
+        util: float | None = None,
+        max_model_len: int | None = None,
+        max_num_seqs: int | None = None,
+    ) -> None:
+        """Stop, then start again — optionally at NEW settings.
+
+        The settings arguments are what makes the dashboard's "Apply &
+        restart" possible at all. start() is idempotent by design (it returns
+        immediately when the server is READY), so a config change POSTed at a
+        running server did nothing at all while the page reported success.
+        Anything left None keeps the value the current desired state carries.
+        """
         if mode == "blue_green":
             raise NotImplementedError(
                 "blue-green execution is a v1 non-goal (SPEC.md §10); use mode='immediate' or 'drain'."
@@ -846,12 +1084,23 @@ class Supervisor:
         if mode not in ("immediate", "drain"):
             raise ValueError(f"unknown restart mode {mode!r}")
 
+        # Refuse an impossible configuration BEFORE stopping anything: a
+        # server the operator is happily using must not be taken down for a
+        # start we already know we will reject.
+        rejected = _reject_settings(util=util, max_model_len=max_model_len, max_num_seqs=max_num_seqs)
+        if rejected is not None:
+            raise ValueError(rejected)
+
         d = self.desired
         if mode == "drain" and d.port:
             self.actual_state = "DRAINING"
             await self._drain(d.port)
 
         await self.stop()
+        # Wait for the old process to be GONE, not merely signalled. Without
+        # this, restart-during-boot ran two vLLM engines on the same card at
+        # once (2026-09-10 23:16, pids 3780019 + 3783809).
+        await self._await_stop_complete()
         # stop() leaves actual_state == "STOPPING", and start()'s idempotence
         # guard returns early on any non-STOPPED state -- so without settling
         # to STOPPED here, restart() silently degrades into a plain stop
@@ -866,8 +1115,13 @@ class Supervisor:
         # before start()'s preflight runs.
         await asyncio.sleep(0.2)
         await self.start(
-            repo_id=d.repo_id, backend=d.backend, served_name=d.served_name, port=d.port,
-            util=d.util, max_model_len=d.max_model_len, max_num_seqs=d.max_num_seqs,
+            repo_id=repo_id if repo_id is not None else d.repo_id,
+            backend=backend if backend is not None else d.backend,
+            served_name=served_name if served_name is not None else d.served_name,
+            port=port if port is not None else d.port,
+            util=util if util is not None else d.util,
+            max_model_len=max_model_len if max_model_len is not None else d.max_model_len,
+            max_num_seqs=max_num_seqs if max_num_seqs is not None else d.max_num_seqs,
         )
 
     async def _drain(self, port: int, timeout_s: float = 120.0) -> None:
@@ -927,7 +1181,7 @@ class Supervisor:
     def _sync_shell_config(
         self, *, repo_id: str, backend: str, served_name: str | None, port: int,
         util: float | None, max_model_len: int | None, max_num_seqs: int | None,
-    ) -> None:
+    ) -> str:
         """"Restart sequence is always: stop -> write config -> start."
         Called only once actual_state has passed PREFLIGHT (i.e. we already
         know nothing is up), so `server_up=False` is trusted directly
@@ -938,7 +1192,34 @@ class Supervisor:
         because codex-qwen.sh's own status/deaths/base-url logic reads it
         regardless of which backend is live (SPEC.md §9(d)'s use_systemd()
         gate, in particular, depends on .config's BACKEND being accurate).
+
+        EXTRA_ARGS is switched together with BACKEND; see the
+        state/extra_args.json notes above load_extra_args_record(). The order
+        of the writes matters. When the backend changes, the outgoing flags
+        are saved to the record first, then EXTRA_ARGS is cleared to "",
+        then BACKEND is written, and only then are the incoming backend's
+        flags restored. "" is safe for every backend, so a failure between
+        any two of these writes leaves .config degraded at worst. It never
+        leaves one backend's flags under another backend's name.
+
+        Returns the EXTRA_ARGS `backend` launches with, which is the value
+        .config now holds for it.
         """
+        cfg = shellconfig.read_config()
+        record = load_extra_args_record(self.state_dir)
+        current = (cfg.get(shellconfig.EXTRA_ARGS_KEY) or "").strip()
+        owner = extra_args_owner(cfg, record)
+        switching = owner != backend
+        if switching:
+            if owner is not None or current:
+                record["stash"][owner or EXTRA_ARGS_UNATTRIBUTED] = current
+            # The outgoing flags must be on disk before .config loses them.
+            save_extra_args_record(record, self.state_dir)
+            if current:
+                shellconfig.set_extra_args("")
+                record["written"] = {"backend": None, "extra_args": ""}
+                save_extra_args_record(record, self.state_dir)
+
         for key, value in (
             ("BACKEND", backend),
             ("MODEL_REPO", repo_id),
@@ -949,12 +1230,26 @@ class Supervisor:
         ):
             if value is not None:
                 shellconfig.set_key(key, value)
+
+        if switching:
+            incoming = record["stash"].get(backend, "")
+            if incoming:
+                shellconfig.set_extra_args(incoming)
+            record["stash"].pop(backend, None)
+            established = incoming
+        else:
+            established = current
+        record["written"] = {"backend": backend, "extra_args": established}
+        save_extra_args_record(record, self.state_dir)
+
         if util is not None:
             shellconfig.set_util(util, server_up=False)
+        return established
 
     def _build_launch(
         self, *, backend: str, repo_id: str, served_name: str, port: int,
         util: float | None, max_model_len: int | None, max_num_seqs: int | None,
+        extra_args: str | None = None,
     ) -> tuple[list[str], dict[str, str], str, list[str]]:
         """Returns (argv, env, cwd, log_paths). `log_paths[0]` is what gets
         passed to launch_fn() as the process's own stdout/stderr sink;
@@ -988,7 +1283,11 @@ class Supervisor:
             "max_num_seqs": str(max_num_seqs or ""),
             "served_name": served_name,
             "kv_dtype": "auto",
-            "extra_args": shell_extra_args(backend),
+            # start() passes the value _sync_shell_config() just put in
+            # .config for this backend. It is recomputed here only for
+            # callers with no config sync in front of them (tests, capacity
+            # previews).
+            "extra_args": shell_extra_args(backend) if extra_args is None else extra_args,
         }
         env = {
             var: settings[key]
@@ -1120,6 +1419,14 @@ class Supervisor:
     # ----------------------------------------------------------------- #
 
     async def _on_exit(self, handle: procctl.ServerHandle, *, reaped_status: int | None) -> None:
+        # A monitor belonging to a SUPERSEDED run must never write over the
+        # current one. restart() (and any start after a boot that was killed
+        # mid-flight) installs a new handle while the old process is still
+        # dying; its exit then arrived here and cleared self._handle, which
+        # orphaned the live engine -- Stop became inert, and /api/state
+        # reported FAILED, then STOPPED, while 44 GiB stayed allocated.
+        if self._handle is not None and self._handle is not handle:
+            return
         reached_ready = bool(self._tracker and self._tracker.reached_ready)
         now = self._clock()
         deliberate = self._stopping_deliberately
@@ -1259,7 +1566,9 @@ class Supervisor:
             return msg
         return "boot never reached READY (no specific error line matched)."
 
-    def _record_boot_failure_before_launch(self, *, reason: str) -> None:
+    def _record_boot_failure_before_launch(
+        self, *, reason: str, repo_id: str | None = None, backend: str | None = None
+    ) -> None:
         """A preflight/config-write/launch-exec failure — never even got a
         PID, so there is nothing to death-watch, but it is still a boot
         attempt that belongs in history (SPEC.md §4: "written ... after a
@@ -1267,8 +1576,11 @@ class Supervisor:
         principle that a failed attempt is itself data, not noise)."""
         now = self._clock()
         record = {
-            "repo_id": self.desired.repo_id,
-            "backend": self.desired.backend,
+            # Explicit, because a preflight failure is now recorded BEFORE the
+            # attempt is persisted into desired -- reading it back off desired
+            # would file the attempt under the PREVIOUS model.
+            "repo_id": repo_id if repo_id is not None else self.desired.repo_id,
+            "backend": backend if backend is not None else self.desired.backend,
             "started_at": _iso(now),
             "reached_ready": False,
             "cold": False,
