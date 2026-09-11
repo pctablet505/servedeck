@@ -301,6 +301,57 @@ def test_a_backend_that_is_down_shows_no_totals_not_its_last_ones() -> None:
     assert down["started_ago_s"] is None and down["started_reason"] == tokens.UNREACHABLE
 
 
+def test_the_per_request_figures_do_not_outlive_the_process_that_served_them() -> None:
+    """The token strip prints per-request p50/p90/max beside the totals, from
+    the request windows. Those windows were emptied only when their OWN bucket
+    counters went backwards -- and a restart hides behind failed scrapes, which
+    drop the windows' baseline, so the new process's first scrape was taken as
+    a fresh baseline and the old process's requests stayed in the window.
+
+    Recorded: Flash-Next finishes one 69,134-token request, the backend goes
+    away, the 27B comes up. The strip then read "39,529 tokens" beside
+    "per request p50 69,134" -- a request the 27B never served.
+    """
+    lag = _WINDOWS["prefill_lag"]
+    t1 = (_FIXTURES / lag["t1"]).read_text()
+    t2 = (_FIXTURES / lag["t2"]).read_text()
+    ticks = iter([0.0, float(lag["dt_s"]), 12.0, 300.0])
+    poller = metrics.MetricsPoller("http://127.0.0.1:8001", monotonic=lambda: next(ticks))
+    client = _Client([t1, t2, ConnectionError("restarting"), _QWEN27B])
+
+    async def run() -> list[dict]:
+        return [(await poller.scrape(client)).to_dict() for _ in range(4)]  # type: ignore[arg-type]
+
+    snaps = asyncio.run(run())
+    assert snaps[1]["prompt_stats"]["n"] == 1, "fixture: one request finished"
+    assert snaps[1]["gen_stats"]["n"] == 1
+    new = snaps[3]
+    assert new["tokens"]["input"]["state"] == "reset"
+    assert new["prompt_stats"]["n"] == 0, (
+        f"the new process shows the old one's requests: {new['prompt_stats']['p90']}"
+    )
+    assert new["gen_stats"]["n"] == 0
+
+
+def test_the_request_windows_survive_an_outage_of_the_same_process() -> None:
+    """Over-correction guard: a /metrics timeout on a server that never went
+    away must not throw its request history away."""
+    lag = _WINDOWS["prefill_lag"]
+    t1 = (_FIXTURES / lag["t1"]).read_text()
+    t2 = (_FIXTURES / lag["t2"]).read_text()
+    t3 = _bump(t2, metrics.GEN_TOK_TOTAL, 100)
+    ticks = iter([0.0, 10.0, 12.0, 14.0])
+    poller = metrics.MetricsPoller("http://127.0.0.1:8001", monotonic=lambda: next(ticks))
+    client = _Client([t1, t2, ConnectionError("timeout"), t3])
+
+    async def run() -> list[dict]:
+        return [(await poller.scrape(client)).to_dict() for _ in range(4)]  # type: ignore[arg-type]
+
+    snaps = asyncio.run(run())
+    assert snaps[3]["prompt_stats"]["n"] == 1
+    assert snaps[3]["tokens"]["input"]["state"] == "no_baseline"
+
+
 # --------------------------------------------------------------------------
 # The cached share: 0 cached, 0 input, absent family -- no NaN, no Infinity
 # --------------------------------------------------------------------------

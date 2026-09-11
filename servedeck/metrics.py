@@ -571,6 +571,24 @@ class MetricsPoller:
         snap.prompt_token_count = int(count)
         snap.avg_prompt_tokens = (total / count) if count else 0.0
 
+        # Is this a different PROCESS from the last one seen? The token ledger
+        # can tell -- by the start time, or by a counter that went down -- even
+        # across the failed scrapes a restart causes. The request windows below
+        # cannot: a failed scrape drops their baseline, so a new process's first
+        # scrape is taken as a fresh baseline and the dead process's requests
+        # stay in the "last 100", where the token strip prints them beside the
+        # new server's totals. Empty them before they are fed.
+        tok_sample = _TokenSample(
+            ts=now,
+            prompt=_total(p, PROMPT_TOK_TOTAL),
+            cached=_total(p, PROMPT_TOK_CACHED_TOTAL),
+            gen=_total(p, GEN_TOK_TOTAL),
+            started=_gauge(p, PROCESS_START),
+        )
+        if self.tokens.is_new_process(tok_sample):
+            self.prompt_window.clear()
+            self.gen_window.clear()
+
         # Feed the rolling windows the delta of this scrape's histograms. Done
         # BEFORE the counter-reset check below on purpose: the window does its
         # own reset detection over the bucket vector, which catches a restart
@@ -686,14 +704,6 @@ class MetricsPoller:
 
         # Input / output token totals and their window, off the same clock
         # read as every other window figure on this snapshot.
-        snap.tokens = self.tokens.observe(
-            _TokenSample(
-                ts=now,
-                prompt=_total(p, PROMPT_TOK_TOTAL),
-                cached=_total(p, PROMPT_TOK_CACHED_TOTAL),
-                gen=_total(p, GEN_TOK_TOTAL),
-                started=_gauge(p, PROCESS_START),
-            )
-        )
+        snap.tokens = self.tokens.observe(tok_sample)
         self._remember(snap, now)
         return snap
