@@ -189,16 +189,22 @@
         </div>
 
         <div class="field frow">
-          <span class="k">Context / agent</span>
-          <!-- A slider, not a fixed ladder. Its ceiling is the smaller of two
-               real numbers: the model's own max_position_embeddings, and what
-               the KV budget can hold for the agent count above. The ladder
-               offered lengths this machine cannot serve, and the engine only
-               said so minutes into a boot. -->
-          <input type="range" id="ctx" min="8192" max="262144" step="4096" value="262144" aria-label="Context per agent" aria-describedby="ctxV ctxBound">
+          <span class="k" title="--max-model-len: the longest context ONE request may use. The KV pool is shared; vLLM admits what fits and queues the rest.">Max context</span>
+          <!-- A slider, not a fixed ladder. It defaults to the model's own
+               max_position_embeddings and its ceiling is lower only when the
+               KV budget cannot hold even ONE request of that length. It is
+               per request, not per agent: it used to be the pool divided by
+               the agent count above, which launched the 27B at 110,592 on a
+               1.6M-token pool and failed the next longer prompt. -->
+          <input type="range" id="ctx" min="8192" max="262144" step="4096" value="262144" aria-label="Maximum context per request" aria-describedby="ctxV ctxBound ctxNote">
           <span class="v mono" id="ctxV">—</span>
           <span class="s mono" id="ctxBound">—</span>
         </div>
+        <!-- Why the context is below the model's own, whenever it is: the
+             pool cannot hold one full-length request, the running server was
+             started lower, or the operator lowered it. Empty at full native
+             context. -->
+        <div class="ctxnote" id="ctxNote" role="status"></div>
 
         <div class="field">
           <!-- One derived figure, not three. The other two cells were echoes:
@@ -299,6 +305,15 @@
              than trusted. -->
         <div class="lsub mono" id="recMath">—</div>
         <div class="lsub" id="recP99">—</div>
+        <!-- Long and short requests sharing the live pool: how many at the
+             running server's full --max-model-len fit at once, and how many
+             at the recent p50/p90 fit beside 1-3 of them. Two or three long
+             agents and many short ones is how this box is used; one "context
+             per agent" figure could not describe that. -->
+        <div class="lk mixk">Long + short at once <span class="tb">live pool</span></div>
+        <div class="lsub mono" id="mixFull">—</div>
+        <table class="mix mono" id="mixTbl" aria-label="Smaller requests that fit beside one, two or three full-length ones"></table>
+        <div class="lsub" id="mixNote"></div>
         <div class="hint" id="recCal">—</div>
         <!-- The disabled "Set subagents" input, its button and a two-line hint
              about max_concurrent_threads_per_session were deleted: Servedeck has

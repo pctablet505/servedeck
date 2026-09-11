@@ -38,7 +38,6 @@ one. When the running engine publishes its own resolved capacity — as
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -308,10 +307,3 @@ def summarise(geo: KvGeometry, ctx: int) -> dict[str, Any]:
 
 def tokens_at(geo: KvGeometry, kv_gib: float, ctx: int) -> int:
     return geo.tokens_for(kv_gib * float(1 << 30), ctx)
-
-
-def ceil_ctx_for_agents(kv_tokens: int, agents: int) -> int:
-    """Largest per-agent context `agents` of them can hold at once."""
-    if agents < 1:
-        raise ValueError(f"agents must be >= 1, got {agents!r}")
-    return max(0, math.floor(kv_tokens / agents))

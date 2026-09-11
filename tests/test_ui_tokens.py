@@ -330,7 +330,8 @@ def test_telemetry_paints_the_token_strip() -> None:
     fns = ("agoTxt", "secsTxt", "rateTxt", "windowFigure", "lifeTxt", "uptimeTxt",
            "busyPhase", "resolutionNote", "resolutionDetail", "paintThroughput",
            "paintServingMeta", "winSpan", "durTxt", "histData", "markRows",
-           "reqHist", "paintRequestStats", "spark", "paintTelemetry", *_TOKEN_FNS)
+           "reqHist", "mixModel", "paintMix", "paintRequestStats", "spark",
+           "paintTelemetry", *_TOKEN_FNS)
     payload = _states()["decoding, no new input"]
     src = [
         *_js_fns(fns),

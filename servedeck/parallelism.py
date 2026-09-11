@@ -230,6 +230,127 @@ def recommend(
     )
 
 
+#: How many "large request" rows the mixed view lays out. The owner's
+#: workload is "2-3 primary agents have large context and the rest smaller",
+#: so the rows are 1, 2 and 3 large requests -- fewer when fewer fit.
+MIXED_BIG_ROWS = 3
+
+
+@dataclass(frozen=True)
+class MixedCapacity:
+    """The shared KV pool split between large and small requests.
+
+    WHY THIS EXISTS
+    ---------------
+    ``--max-model-len`` is a per-REQUEST ceiling. The pool is shared, and
+    vLLM's scheduler admits whatever fits and queues the rest. The dashboard
+    used to divide the pool by the agent count and treat the quotient as the
+    longest any request could be, which is the wrong model for how this box is
+    used ("only 2-3 primary agents have large context and rest smaller"): it
+    capped the 27B at 110,592 and the next long prompt failed outright.
+
+    So the question is not "context per agent" but "how many long requests
+    fit at once, and how many short ones fit beside them". Each figure is the
+    same arithmetic as :func:`recommend` -- the calibrated per-request cost
+    (fixed per-sequence page included) against the headroom-discounted pool --
+    so the row with no large requests is exactly the recommendation.
+    """
+
+    pool_tokens: int
+    #: The longest request: the running engine's own --max-model-len.
+    full_ctx: int
+    full_cost_tokens: float
+    headroom: float
+    #: pool / cost(full_ctx), before headroom.
+    full_fit: float
+    #: floor(full_fit * headroom), and never below 1: one request longer
+    #: than the pool still runs, alone (vLLM chunks its prefill).
+    full_n: int
+    #: label -> (prompt tokens, exact?) for each smaller size, e.g. p50/p90.
+    sizes: tuple[tuple[str, int, bool], ...]
+    #: (large requests, {label: smaller requests that fit beside them}).
+    rows: tuple[tuple[int, dict[str, int]], ...]
+    max_num_seqs: int | None
+    #: labels whose count in some row was cut by --max-num-seqs.
+    clamped: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "pool_tokens": self.pool_tokens,
+            "full_ctx": self.full_ctx,
+            "full_cost_tokens": int(round(self.full_cost_tokens)),
+            "fixed_cost_tokens": FIXED_COST_TOKENS,
+            "headroom": self.headroom,
+            "full_fit": round(self.full_fit, 2),
+            "full_n": self.full_n,
+            "sizes": [
+                {"label": lab, "prompt_tokens": tok, "exact": exact,
+                 "cost_tokens": int(round(kv_cost_tokens(tok)))}
+                for lab, tok, exact in self.sizes
+            ],
+            "rows": [{"big": big, "alongside": dict(al)} for big, al in self.rows],
+            "max_num_seqs": self.max_num_seqs,
+            "clamped": list(self.clamped),
+        }
+
+
+def mixed_capacity(
+    *,
+    pool_tokens: int,
+    full_ctx: int,
+    sizes: dict[str, tuple[float, bool]] | None = None,
+    max_num_seqs: int | None = None,
+    headroom: float = HEADROOM,
+    big_rows: int = MIXED_BIG_ROWS,
+) -> MixedCapacity:
+    """How many full-length requests fit at once, and what fits beside them.
+
+    ``pool_tokens`` must be the LIVE pool, for the same reason as in
+    :func:`recommend`. ``sizes`` maps a label ("p50", "p90") to the prompt
+    size to plan the small requests at and whether that size is exact or a
+    bucket's upper edge.
+
+    For k large requests the smaller ones get what the headroom-discounted
+    pool has left::
+
+        floor((pool * headroom - k * cost(full_ctx)) / cost(size))
+
+    With k = 0 that is exactly recommend()'s n_before_clamp, so the two
+    panels cannot disagree. ``--max-num-seqs`` still caps the total: the
+    scheduler runs no more sequences than that whatever the KV says.
+    """
+    full = recommend(pool_tokens=pool_tokens, prompt_tokens=full_ctx, headroom=headroom)
+    cost_full = kv_cost_tokens(full_ctx)
+    usable = pool_tokens * headroom
+    ordered = tuple(
+        (label, int(round(tok)), bool(exact)) for label, (tok, exact) in (sizes or {}).items()
+    )
+    rows: list[tuple[int, dict[str, int]]] = []
+    clamped: set[str] = set()
+    for big in range(1, min(full.n_before_clamp, big_rows) + 1):
+        left = usable - big * cost_full
+        alongside: dict[str, int] = {}
+        for label, tok, _exact in ordered:
+            n = max(0, int(math.floor(left / kv_cost_tokens(tok)))) if left > 0 else 0
+            if max_num_seqs is not None and max_num_seqs > 0 and big + n > max_num_seqs:
+                n = max(0, max_num_seqs - big)
+                clamped.add(label)
+            alongside[label] = n
+        rows.append((big, alongside))
+    return MixedCapacity(
+        pool_tokens=int(pool_tokens),
+        full_ctx=int(full_ctx),
+        full_cost_tokens=cost_full,
+        headroom=headroom,
+        full_fit=full.fit_n,
+        full_n=full.n_before_clamp,
+        sizes=ordered,
+        rows=tuple(rows),
+        max_num_seqs=max_num_seqs,
+        clamped=tuple(sorted(clamped)),
+    )
+
+
 def calibration_note(served_model: str | None) -> str:
     """The provenance sentence the panel prints under the recommendation.
 

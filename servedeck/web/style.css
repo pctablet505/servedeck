@@ -215,10 +215,14 @@ h1,h2,h3{margin:0;text-wrap:balance}
 .frow input[type=range]{flex:1 1 auto;min-width:0;width:auto}
 .frow .v{flex:0 0 auto;min-width:52px;text-align:right;font-size:14px;font-weight:600}
 .frow .s{flex:0 0 auto;font-size:10.5px;color:var(--muted);white-space:nowrap}
-/* The field says one agent count and the KV budget holds fewer. Quiet grey
-   made "KV fits 1" read as a caption of the field rather than a contradiction
-   of it, next to a field showing 16. */
-.frow .s.overfit{color:var(--warn);font-weight:600}
+/* The reason the context sits below the model's own, under the slider it
+   explains and aligned with it (the label column is 118px + an 11px gap).
+   Hidden when there is nothing to explain; amber when nobody on this page
+   chose the lower value. */
+.ctxnote{display:none;font-size:11px;line-height:1.35;color:var(--muted);margin:-3px 0 9px 129px}
+.ctxnote.on{display:block}
+.ctxnote.warn{color:var(--warn);font-weight:600}
+@media(max-width:520px){.ctxnote{margin-left:0}}
 input[type=number].num{
   flex:0 0 76px;width:76px;padding:5px 8px;border-radius:6px;
   border:1px solid var(--line-strong);background:var(--surface);color:var(--ink);
@@ -305,6 +309,15 @@ input[type=range]:focus-visible{outline:2px solid var(--accent);outline-offset:3
    #oversub, which fires on the condition rather than the cumulative count, so
    this stays in normal ink and only carries the number. */
 .lrow .n.bad{color:var(--ink)}
+
+/* Long + short requests sharing the pool. A small table because the question
+   has two axes -- how many long ones, and what fits beside them -- and a
+   sentence per cell read as noise. */
+.mixk{margin-top:11px}
+.mix{border-collapse:collapse;font-size:11px;margin-top:3px;color:var(--ink-2)}
+.mix th,.mix td{padding:1px 10px 1px 0;text-align:right;font-weight:400;white-space:nowrap}
+.mix th{color:var(--muted);font-size:10px}
+.mix th:first-child,.mix td:first-child{text-align:left}
 
 .hint{font-size:10.5px;color:var(--muted);margin-top:6px;line-height:1.4}
 

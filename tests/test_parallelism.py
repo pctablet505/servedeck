@@ -215,3 +215,103 @@ def test_calibration_note_warns_when_a_different_model_is_serving() -> None:
     note = parallelism.calibration_note("llama-3-70b")
     assert "llama-3-70b" in note
     assert "upper bound" in note
+
+
+# --------------------------------------------------------------------------
+# Long and short requests sharing the pool (mixed_capacity)
+# --------------------------------------------------------------------------
+#: The live 27B on this box: vLLM 0.29.0, util 0.95, kv_cache_size_tokens.
+POOL_27B = 1_595_321
+NATIVE = 262_144
+
+
+def test_mixed_capacity_reproduces_the_hand_computed_split() -> None:
+    """How many full-length requests the live 27B pool holds at once, and how
+    many smaller ones fit beside 1, 2 or 3 of them -- worked by hand from the
+    four calibration anchors (pool 280,813) with no call into the module:
+
+      cost(8,102)   = 0.105 x 280,813                               =  29,485.4
+      cost(30,116)  = 0.233 x 280,813                               =  65,429.4
+      cost(262,144) = 0.67 x 280,813 + (262,144 - 105,108) x slope  = 445,115.0
+                      slope = (188,144.7 - 65,429.4) / (105,108 - 30,116)
+                            = 1.636378 pool tokens per prompt token
+      usable        = 1,595,321 x 0.94                              = 1,499,601.7
+
+      full at once  = floor(1,499,601.7 / 445,115.0) = floor(3.369) = 3
+      beside 1: 1,054,486.7 / 29,485.4 = 35.76 -> 35 ; / 65,429.4 = 16.12 -> 16
+      beside 2:   609,371.7 / 29,485.4 = 20.67 -> 20 ; / 65,429.4 =  9.31 ->  9
+      beside 3:   164,256.7 / 29,485.4 =  5.57 ->  5 ; / 65,429.4 =  2.51 ->  2
+
+    vLLM's own pool / length says 6.1 full-length requests fit. That division
+    has no fixed per-sequence cost, which is the error the calibrated curve
+    exists to remove (see test_the_naive_pool_over_prompt_formula...).
+    """
+    mx = parallelism.mixed_capacity(
+        pool_tokens=POOL_27B, full_ctx=NATIVE,
+        sizes={"p50": (8_102, True), "p90": (30_116, True)},
+    )
+    assert mx.full_n == 3
+    assert round(mx.full_cost_tokens) == 445_115
+    assert mx.rows == (
+        (1, {"p50": 35, "p90": 16}),
+        (2, {"p50": 20, "p90": 9}),
+        (3, {"p50": 5, "p90": 2}),
+    )
+    assert mx.clamped == ()
+
+
+def test_mixed_capacity_at_the_live_windows_request_size() -> None:
+    """The live window during the 2026-09-11 stress run: p50 and p90 both at
+    the 100,000 bucket edge. cost(100,000) = 65,429.4 + 122,715.3 x 69,884 /
+    74,992 = 179,786.1, so beside 1, 2, 3 full-length requests: 1,054,486.7 /
+    179,786.1 = 5.87 -> 5, 609,371.7 / 179,786.1 = 3.39 -> 3, and 164,256.7 /
+    179,786.1 = 0.91 -> 0 -- three full-length requests leave no room for a
+    fourth that size."""
+    mx = parallelism.mixed_capacity(
+        pool_tokens=POOL_27B, full_ctx=NATIVE, sizes={"p90": (100_000, False)},
+    )
+    assert [row[1]["p90"] for row in mx.rows] == [5, 3, 0]
+    d = mx.to_dict()
+    assert d["sizes"] == [{"label": "p90", "prompt_tokens": 100_000, "exact": False,
+                           "cost_tokens": 179_786}]
+
+
+def test_mixed_capacity_with_no_long_requests_is_the_recommendation() -> None:
+    """The two panels cannot disagree: the split with zero full-length
+    requests is exactly recommend()'s count before the clamp, so the mixed rows
+    start at one long request and never restate it."""
+    for size in (615, 8_102, 30_116, 100_000):
+        rec = recommend(pool_tokens=POOL_27B, prompt_tokens=size)
+        mx = parallelism.mixed_capacity(
+            pool_tokens=POOL_27B, full_ctx=size, sizes={"x": (size, True)},
+        )
+        assert mx.full_n == rec.n_before_clamp, size
+        assert [row[0] for row in mx.rows] == list(range(1, min(mx.full_n, 3) + 1))
+
+
+def test_mixed_capacity_respects_the_schedulers_ceiling() -> None:
+    """--max-num-seqs caps the total whatever the KV says: beside one long
+    request at most 15 more run under --max-num-seqs 16. Rows under the cap
+    are left alone (2 + 9 = 11, 3 + 5 = 8)."""
+    mx = parallelism.mixed_capacity(
+        pool_tokens=POOL_27B, full_ctx=NATIVE,
+        sizes={"p50": (8_102, True), "p90": (30_116, True)}, max_num_seqs=16,
+    )
+    assert mx.rows == (
+        (1, {"p50": 15, "p90": 15}),
+        (2, {"p50": 14, "p90": 9}),
+        (3, {"p50": 5, "p90": 2}),
+    )
+    assert mx.clamped == ("p50", "p90")
+
+
+def test_a_full_length_request_bigger_than_the_pool_still_runs_alone() -> None:
+    """Flash-Next's own pool (280,813) is smaller than the calibrated cost of a
+    262,144-token request (445,115): 0.63 of one. The count is never zero --
+    vLLM chunks the prefill and runs it alone, the 245k row of the measured
+    table -- and nothing fits beside it."""
+    mx = parallelism.mixed_capacity(
+        pool_tokens=POOL, full_ctx=NATIVE, sizes={"p90": (8_102, True)},
+    )
+    assert mx.full_n == 1
+    assert mx.rows == ((1, {"p90": 0}),)

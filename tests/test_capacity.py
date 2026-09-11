@@ -831,24 +831,46 @@ def test_ctx_ceiling_is_the_model_ceiling_when_the_budget_is_generous() -> None:
     assert r.kv_tokens > 262144
 
 
-def test_ctx_ceiling_falls_when_the_agents_have_to_share() -> None:
-    """The same budget split four ways cannot give each agent the model's full
-    context. The old control offered it anyway; the engine then loads weights
-    for minutes and refuses."""
-    one = compute(NVFP4_27B, util=0.47, ctx=262144, max_num_seqs=1)
-    four = compute(NVFP4_27B, util=0.47, ctx=262144, max_num_seqs=4)
-    assert four.ctx_max_fit == min(262144, one.kv_tokens // 4)
-    assert four.ctx_max_fit < four.ctx_max_model, (
-        "with four agents the KV budget, not the checkpoint, is the binding limit"
+@pytest.mark.parametrize("agents", [1, 4, 16])
+def test_the_agent_count_never_lowers_the_context_ceiling(agents: int) -> None:
+    """--max-model-len is a per-REQUEST ceiling. The KV pool is shared and
+    vLLM's scheduler admits what fits and queues the rest, so the number of
+    agents says nothing about how long one request may be.
+
+    ctx_max_fit used to be kv_tokens // max_num_seqs. With the 27B at util 0.47
+    (~530k tokens) and 4 agents that is ~132k, and on the live box (a pool of
+    1,595,321 at util 0.95, 16 agents) it launched the server at 110,592 --
+    and the next 110,593-token prompt failed outright. The model's own
+    262,144 fits one request here, so that is the ceiling at every agent count.
+    """
+    r = compute(NVFP4_27B, util=0.47, ctx=262144, max_num_seqs=agents)
+    assert r.kv_tokens > 262144, "precondition: one full-length request fits"
+    assert r.ctx_max_fit == 262144, (
+        f"with {agents} agents the context ceiling is {r.ctx_max_fit:,}: the pool "
+        "was divided by the agent count again"
     )
 
 
-def test_ctx_ceiling_is_what_fits_when_the_budget_is_the_smaller_limit() -> None:
-    """Flash-Next at util 0.95 holds ~272k tokens for one agent — just over its
-    262,144 ceiling. Two agents cannot each have that."""
+def test_ctx_ceiling_is_what_one_request_can_hold_when_the_budget_is_smaller() -> None:
+    """The only thing the KV budget may lower the ceiling for: a pool that
+    cannot hold ONE request of the model's full length.
+
+    Flash-Next at util 0.94: budget 0.94 x 95.5928 = 89.8572 GiB, minus 78.47
+    weights and 4.47 overhead leaves 6.9172 GiB = 7,253,217 KiB, at 30.39
+    KiB/token 238,671 tokens -- under its 262,144. One request can use all of
+    them, and two agents do not halve that."""
+    for agents in (1, 2):
+        r = compute(FLASHNEXT, util=0.94, ctx=262144, max_num_seqs=agents)
+        assert r.kv_tokens == 238_671, r.kv_tokens
+        assert r.ctx_max_fit == 238_671, (agents, r.ctx_max_fit)
+
+
+def test_ctx_ceiling_stays_at_the_model_when_one_request_just_fits() -> None:
+    """Over-correction guard. Flash-Next at util 0.95 holds ~272k tokens, just
+    over its 262,144: the model's own length is the ceiling, not the pool."""
     r = compute(FLASHNEXT, util=0.95, ctx=262144, max_num_seqs=2)
-    assert r.ctx_max_fit == r.kv_tokens // 2
-    assert r.ctx_max_fit < 262144
+    assert r.kv_tokens > 262144
+    assert r.ctx_max_fit == 262144
 
 
 def test_unservable_model_offers_no_context_at_all() -> None:
@@ -858,3 +880,74 @@ def test_unservable_model_offers_no_context_at_all() -> None:
     )
     r = compute(m, util=0.9, ctx=262144, max_num_seqs=1)
     assert r.ctx_max_fit == 0
+
+
+# ---------------------------------------------------------------------------
+# The context a launch defaults to: the longest ONE request can use
+# ---------------------------------------------------------------------------
+def _hybrid_pool(kv_bytes: int, attn: int, state: int):
+    """Tokens of KV a hybrid server holds when configured for context L.
+
+    A per-sequence recurrent state of `state` bytes is spread over the context,
+    so each token costs attn + state / L and the pool shrinks as L shrinks
+    (kvcalc.KvGeometry.bytes_per_token). Integer arithmetic, so the oracle
+    below is exact."""
+    return lambda length: (kv_bytes * length) // (attn * length + state)
+
+
+def test_the_single_request_fit_is_the_longest_length_that_holds_one_request() -> None:
+    """8 GiB of KV, 32 KiB of attention per token, a 1 GiB state per sequence.
+
+    One request of L tokens needs 32768 * L + 2^30 bytes, so the longest that
+    fits in 2^33 is (2^33 - 2^30) / 32768 = 229,376 exactly. Taking the pool at
+    the model's 262,144 instead says 233,016 -- which does NOT fit (it needs
+    233,016 * 32768 + 2^30 = 8,709,210,112 bytes of 8,589,934,592) and is the
+    default this module's own KV_TOO_SMALL_FOR_ONE_CTX, or the engine, would
+    refuse."""
+    from servedeck.capacity import single_request_fit
+
+    pool = _hybrid_pool(8 * 2**30, 32768, 2**30)
+    assert pool(262_144) == 233_016, "precondition: the naive answer"
+    assert single_request_fit(262_144, pool) == 229_376
+
+
+def test_the_single_request_fit_keeps_the_model_length_when_it_fits() -> None:
+    """Over-correction guard: nothing is lowered when one request fits, not
+    even by a step."""
+    from servedeck.capacity import single_request_fit
+
+    assert single_request_fit(262_144, lambda length: 1_595_321) == 262_144
+    assert single_request_fit(262_144, lambda length: 262_144) == 262_144
+
+
+def test_the_single_request_fit_of_a_constant_rate_is_the_pool() -> None:
+    """A measured observation carries one rate, so the pool does not move with
+    the length and the answer is simply the pool."""
+    from servedeck.capacity import single_request_fit
+
+    assert single_request_fit(262_144, lambda length: 238_671) == 238_671
+    assert single_request_fit(262_144, lambda length: 0) == 0
+
+
+def test_the_reason_for_a_lowered_default_names_the_numbers() -> None:
+    from servedeck.capacity import ctx_fit_reason
+
+    why = ctx_fit_reason(model_max_ctx=262_144, pool_at_max=238_671, fit=238_671,
+                         util=0.94, kv_source="measured")
+    assert why is not None
+    for part in ("262,144", "0.94", "238,671", "measured", "Raise GPU utilization"):
+        assert part in why, (part, why)
+    # No reason when nothing was lowered, or when nothing is known.
+    assert ctx_fit_reason(model_max_ctx=262_144, pool_at_max=1_595_321, fit=262_144,
+                          util=0.95, kv_source="measured") is None
+    assert ctx_fit_reason(model_max_ctx=262_144, pool_at_max=0, fit=0,
+                          util=0.95, kv_source="unknown") is None
+    assert "estimated" in ctx_fit_reason(model_max_ctx=262_144, pool_at_max=1000,
+                                         fit=1000, util=0.5, kv_source="estimated")
+    # A fit below the quoted pool is explained, not left as a contradiction
+    # (Flash-Next at util 0.94 on this box: 238,657 at full length, 207,150
+    # fits, because the rate at a shorter context is higher).
+    assert "shorter context costs more KV per token" in ctx_fit_reason(
+        model_max_ctx=262_144, pool_at_max=238_657, fit=207_150, util=0.94,
+        kv_source="measured")
+    assert "shorter context" not in why

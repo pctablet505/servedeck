@@ -136,11 +136,20 @@ for it.
 ## How capacity is computed
 
 ```
-budget    = util × total_vram
-kv        = budget − weights − overhead
-kv_tokens = kv ÷ bytes_per_token
-agents    = kv_tokens ÷ context_per_agent
+budget      = util × total_vram
+kv          = budget − weights − overhead
+kv_tokens   = kv ÷ bytes_per_token
+max context = max_position_embeddings, unless one request of it needs more than kv_tokens
 ```
+
+**The context is per request, not per agent.** `--max-model-len` caps one
+request; the KV pool is shared, and vLLM admits what fits and queues the rest.
+So a launch defaults to the model's own `max_position_embeddings` (read from
+its local `config.json`) and is lowered only when the pool cannot hold even one
+request of that length — the page says so when it does. How long and short
+requests share the pool ("3 at 262,144 at once, plus N at the recent p90
+beside them") is shown as advice, on the calibrated per-request cost in
+`parallelism.py`, never as a cap on the context.
 
 Two things that trip people up, both handled:
 

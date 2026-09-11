@@ -325,7 +325,8 @@ function trustTag(trust) {
   return '<span class="tag est">estimated</span>';
 }
 
-/* The context control.
+/* The context control: --max-model-len, the longest context ONE request may
+ * use.
  *
  * It used to be a fixed ladder of buttons, which is wrong in two directions
  * at once. It offered lengths the KV budget cannot hold — the engine loads
@@ -335,10 +336,19 @@ function trustTag(trust) {
  *
  * The slider's bounds are two real numbers the backend computes:
  *   ctx_max_model — the checkpoint's own max_position_embeddings
- *   ctx_max_fit   — (KV tokens the budget buys) / (parallel agents)
- * and the smaller of the two is the ceiling. Both move when the utilization
- * slider, the agent count or the selected model moves, so the control is
- * redrawn on every estimate rather than once at load.
+ *   ctx_max_fit   — the longest context ONE request can use on this KV
+ *                   budget (0 when the budget is not known)
+ * and it defaults to the top of that range: the model's full native context,
+ * lowered only when the pool cannot hold even one request of it, and then the
+ * reason is printed under the control.
+ *
+ * The agent count is NOT a bound. ctx_max_fit used to be the pool divided by
+ * it, and the control treated the quotient as the longest any request could
+ * be: 1,595,321 / 16 on the 27B, so the server came up at --max-model-len
+ * 110,592 and the next longer prompt failed with "This model's maximum
+ * context length is 110592 tokens". The pool is shared; vLLM admits what fits
+ * and queues the rest. How long and short requests share it is shown beside
+ * the agents field and in the live panel, as advice.
  */
 const MIN_CTX = 8192;
 const CTX_STEP = 4096;
@@ -366,91 +376,173 @@ function ctxTop(ceiling) {
   return MIN_CTX + Math.max(0, steps) * CTX_STEP;
 }
 
-/* Redraw the context slider against the bounds in an estimate.
+/* The slider's range: {min, max, ceiling, binding}.
+ *
+ *   binding "model"   — the top is the model's own max_position_embeddings
+ *                       (one request of it fits, or the budget is unknown);
+ *           "kv"      — one request of the model's max does not fit, so the
+ *                       top is the longest that does;
+ *           "running" — a server runs this model at a length the estimate
+ *                       says does not fit. It is running, so it does.
+ *
+ * A native (or running) top must be reachable EXACTLY. A range input's thumb
+ * only rests on min + k*step, and a model declaring 202,752 (GLM-4.7) is off
+ * the 8,192 + k*4,096 grid: snapping it down would launch it at 200,704,
+ * below its native context, which is the one thing this control must not do
+ * by default. So that grid is anchored at the top instead, which moves the
+ * minimum up by less than one step. A KV-bound top is an estimate and is
+ * snapped DOWN onto the ordinary grid (ctxTop), which never exceeds it.
+ * Pure, so the test engine executes it.
+ */
+function ctxRange(modelMax, fit, running) {
+  const kvTop = fit > 0 ? Math.min(modelMax, fit) : modelMax;
+  let ceiling = kvTop;
+  let binding = kvTop < modelMax ? "kv" : "model";
+  if (running > kvTop) {
+    ceiling = running;
+    binding = running === modelMax ? "model" : "running";
+  }
+  if (binding === "kv") return {min: MIN_CTX, max: ctxTop(ceiling), ceiling: ceiling, binding: binding};
+  if (ceiling <= MIN_CTX) return {min: ceiling, max: ceiling, ceiling: ceiling, binding: binding};
+  const min = ceiling - Math.floor((ceiling - MIN_CTX) / CTX_STEP) * CTX_STEP;
+  return {min: min, max: ceiling, ceiling: ceiling, binding: binding};
+}
+
+/* The value the control holds, and why: {value, source}.
+ *
+ *   "operator" — the operator moved the slider: a deliberate trade of context
+ *                for concurrency. Honoured as set, only ever lowered to the top
+ *                of the range, never raised back to it.
+ *   "running"  — the selected model is the one serving, so the value is that
+ *                server's real --max-model-len. The page shows what runs, and a
+ *                later Apply cannot silently send a stale slider value.
+ *   "default"  — the top of the range: the model's full native context unless
+ *                one request of it cannot fit.
+ * A lowered value is therefore always either the operator's own choice, the
+ * running server's, or the pool's — and each of those says so under the
+ * control (ctxNoteOf). Pure, so the test engine executes it.
+ */
+function ctxChoice(range, running, picked) {
+  if (typeof picked === "number" && isFinite(picked) && picked > 0) {
+    return {value: Math.max(range.min, Math.min(range.max, Math.round(picked))), source: "operator"};
+  }
+  if (typeof running === "number" && running > 0) return {value: running, source: "running"};
+  return {value: range.max, source: "default"};
+}
+
+/* The visible line under the context control: {text, warn}.
+ *
+ * Empty at the model's full native context. Otherwise it says why not, in the
+ * page rather than in a tooltip: a lowered context whose reason nobody can see
+ * is the defect this control was rebuilt to remove. `fitReason` is the
+ * backend's sentence (capacity.ctx_fit_reason) for a pool that cannot hold one
+ * full-length request.
+ */
+function ctxNoteOf(choice, range, modelMax, fitReason) {
+  const v = choice.value;
+  if (v >= modelMax) return {text: "", warn: false};
+  const kvWhy = fitReason ||
+    `One request at this model's ${fmt(modelMax)} tokens does not fit the KV budget; ` +
+    `${fmt(range.max)} is the longest that does.`;
+  if (choice.source === "running") {
+    return {warn: true, text: `The running server was started at ${fmt(v)} tokens, below this ` +
+      `model's ${fmt(modelMax)}. ` + (range.max >= modelMax
+        ? "Drag the slider to its right end to relaunch at the full context." : kvWhy)};
+  }
+  if (choice.source === "operator" && v < range.max) {
+    return {warn: false, text: `Lowered by hand to ${fmt(v)} tokens. One request can use up to ` +
+      `${fmt(range.max)} here.`};
+  }
+  return {warn: true, text: kvWhy + (choice.source === "default" ? ` Set to ${fmt(v)}.` : "")};
+}
+
+/* The agents field's capacity line: {text, title}.
+ *
+ * How many requests of the configured length the KV pool holds at once, on the
+ * calibrated per-request cost (parallelism.recommend, fixed per-sequence page
+ * included) — the backend's `full_at_once`. It used to read "KV fits 1" beside
+ * "16" and turn amber: the page treating every agent as permanently holding a
+ * full-length context. That is not how the pool works (vLLM admits what fits
+ * and queues the rest) nor how it is used here (two or three long agents, the
+ * rest short), so more agents than full-length fits is normal, not over budget.
+ * The number stays, as a fact about long requests; the live panel shows what
+ * fits beside them. Pure, so the test engine executes it.
+ */
+function agentsFitNote(full, ctxLen) {
+  if (!full || !full.n) {
+    return {text: "—", title: "the KV budget for this configuration is not known yet"};
+  }
+  return {
+    text: `${full.n} at ${ctxLabel(ctxLen)} at once`,
+    title: `${fmt(full.pool_tokens)} KV ÷ ${fmt(full.cost_tokens)} per ${fmt(ctxLen)}-token ` +
+      `request = ${full.fit_n} × ${full.headroom} headroom = ${full.n} full-length at once ` +
+      `(calibrated per-request cost, fixed per-sequence page included). Shorter requests ` +
+      `run beside them, and vLLM queues what does not fit — this is advice, not a cap on ` +
+      `the agent count or on the context.`,
+  };
+}
+
+/* Redraw the context control against the bounds in an estimate.
  *
  * `d` is the /api/capacity/estimate payload, or null before the first one has
  * come back — in which case the only bound known is the selected model's
  * ceiling, and the fit bound is left blank rather than guessed at.
  */
-/* What the agents field's constraint line says, and how loud it is.
- *
- * Painted beside the field rather than only in the live panel because it is a
- * limit ON that field, and a limit nobody can see while typing into the box is
- * not a limit: the field read "16" next to "KV fits 1" with nothing connecting
- * the two. Pure so the test engine can execute the comparison — the contradiction
- * is the whole content, and a grep assertion passes unchanged when `fitN <
- * agents` is flipped to `fitN > agents`.
- */
-function agentsFitNote(fitN, want, ctxLen) {
-  if (!fitN) {
-    return {text: "—", overfit: false,
-            title: "the KV budget for this configuration is not known yet"};
-  }
-  const over = fitN < want;
-  return {
-    text: "KV fits " + fitN,
-    overfit: over,
-    title: `at ${fmt(ctxLen)} context the KV budget holds ${fitN} agent`
-      + `${fitN === 1 ? "" : "s"} — the field above asks for ${want}`
-      + (over ? " and is over budget" : ""),
-  };
-}
-
 function renderCtx(d) {
   const el = $("ctx");
   if (!el) return;
   const modelMax = Number((d && d.ctx_max_model) || MODELS[sel]?.model_max_ctx) || DEFAULT_MAX_CTX;
+  // A zero fit means the budget is unknown or holds nothing at this
+  // utilization: keep the model ceiling as the range so the slider still
+  // moves, and let the blocking finding explain why.
   const fit = d ? Number(d.ctx_max_fit) || 0 : 0;
-  // The ceiling is whichever real limit binds first. A zero fit means the
-  // budget holds nothing at this utilization: keep the model ceiling as the
-  // range so the slider still moves, and let the blocker explain why.
-  const ceiling = Math.max(MIN_CTX, fit > 0 ? Math.min(modelMax, fit) : modelMax);
-  // The ceiling is snapped DOWN onto the step grid, and the reason is a lie the
-  // slider otherwise tells: a range input's thumb can only rest on
-  // min + k*step, so with min 8192 / step 4096 a max of 19,100 leaves the thumb
-  // at 16,384 while the readout beside it says 19,100 -- the control and its own
-  // value disagreeing, which is the defect class this page is full of tests for.
-  // Snapping keeps thumb, readout and the value sent to the backend identical.
-  // It never raises the ceiling, so the KV budget is still respected.
-  const top = ctxTop(ceiling);
-  el.min = String(MIN_CTX);
-  el.max = String(top);
+  // The running server's length describes that server, at ITS utilization.
+  // A relaunch planned at another utilization is another KV budget, so there
+  // the default rules: at util 0.30 the page kept a running 262,144 that no
+  // longer fit one request instead of dropping to what does.
+  const ue = (liveFacts || {}).util_effective;
+  const running = ctxSource === "running" && (!ue || Math.abs(ue - util) <= 0.002)
+    ? ctxRun : null;
+  const r = ctxRange(modelMax, fit, running);
+  const c = ctxChoice(r, running, ctxSource === "operator" ? ctx : null);
+  ctx = c.value;
+  el.min = String(r.min);
+  el.max = String(r.max);
   el.step = String(CTX_STEP);
-  if (ctx > top) ctx = top;
-  if (ctx < MIN_CTX) ctx = MIN_CTX;
   el.value = String(ctx);
 
   set("ctxV", fmt(ctx));
-  // Name which of the two limits is binding, so a ceiling that moves when the
-  // agent count changes is not mistaken for the model's own limit. The range
-  // itself is in the slider's title; the tick row that used to spell it out
-  // cost a line per field.
-  set("ctxBound", fit > 0 && fit < modelMax
+  // Name which limit is binding. The range itself is in the slider's title;
+  // the tick row that used to spell it out cost a line per field.
+  set("ctxBound", r.binding === "kv"
     ? "KV fits " + ctxLabel(fit)
+    : r.binding === "running" ? "running " + ctxLabel(r.ceiling)
     : "model " + ctxLabel(modelMax));
   const bound = $("ctxBound");
-  if (bound) bound.title = fit > 0 && fit < modelMax
-    ? `the KV budget holds ${fmt(fit)} tokens per agent at this utilization`
+  if (bound) bound.title = r.binding === "kv"
+    ? `one request can use at most ${fmt(fit)} tokens of this KV budget; the model allows ${fmt(modelMax)}`
     : `the checkpoint's own max_position_embeddings is ${fmt(modelMax)}`;
-  const cx = $("ctx");
-  if (cx) cx.title = `${ctxLabel(MIN_CTX)} to ${ctxLabel(ceiling)} — ${
-    fit > 0 && fit < modelMax ? "limited by the KV budget" : "limited by the model"
-  }`;
-  // The agents field's own constraint. Painted here rather than only in the
-  // live panel because it is a limit ON that field; see agentsFitNote().
-  const fitNote = agentsFitNote(d && d.agents_at_ctx, agents, ctx);
+  el.title = `${ctxLabel(r.min)} to ${ctxLabel(r.max)} per request — ${
+    r.binding === "kv" ? "limited by what one request's KV needs" : "limited by the model"
+  }. The KV pool is shared: vLLM admits what fits and queues the rest.`;
+  const note = ctxNoteOf(c, r, modelMax, d && d.ctx_fit_reason);
+  const cn = $("ctxNote");
+  if (cn) cn.className = "ctxnote" + (note.text ? " on" : "") + (note.warn ? " warn" : "");
+  set("ctxNote", note.text);
+  // The agents field's capacity line; see agentsFitNote().
+  const fitNote = agentsFitNote(d && d.full_at_once, ctx);
   const af = $("agentsFit");
-  if (af) {
-    af.classList.toggle("overfit", fitNote.overfit);
-    af.title = fitNote.title;
-  }
+  if (af) af.title = fitNote.title;
   set("agentsFit", fitNote.text);
 }
 let MODELS = [];
 let sel = 0;
 let util = 0.95;   // overwritten from the running server via /api/state
-let ctx = 262144;
-let agents = 1;   // parallel agents the context is being sized for
+let ctx = DEFAULT_MAX_CTX;   // replaced by the model's own default in renderCtx()
+let ctxSource = "default";   // "default" | "running" | "operator"; see ctxChoice()
+let ctxRun = null;           // the serving model's real --max-model-len, when it is selected
+let lastRunSig = null;       // which server ctxRun was read from; see runCtxOf()
+let agents = 1;   // --max-num-seqs: the scheduler's ceiling on concurrent sequences
 let lastEstimate = null;
 let controlEnabled = false;
 let liveFacts = {};      // the RUNNING engine's own numbers, from /api/state
@@ -562,6 +654,12 @@ function renderModels() {
       b.onclick = () => {
         sel = i;
         userPicked = true;
+        // A different model is a new context decision: its own default, or
+        // the running server's value if this is the model it serves. The last
+        // estimate described the previous model, so it bounds nothing now.
+        ctxSource = "default";
+        lastEstimate = null;
+        syncRunCtx(lastState);
         renderModels();
         renderCtx(null);   // a different model has a different ceiling
         estimate();
@@ -694,9 +792,16 @@ function badgeOf(confidence) {
 }
 
 function paintEstimate(d) {
-  // The bounds move with util, agents and model, so redraw them here rather
-  // than once at load.
+  // The bounds move with util and model, so redraw them here rather than
+  // once at load. When that moves the context itself -- the pool cannot hold
+  // one request of the model's length, so the default drops to what fits --
+  // this estimate describes a length the control no longer holds, and its
+  // findings (a KV_TOO_SMALL_FOR_ONE_CTX block, say) would refuse an Apply of
+  // the length that does fit. Ask again at the new one; the bound does not
+  // depend on the slider, so the second answer leaves it where it is.
+  const asked = ctx;
   renderCtx(d);
+  if (ctx !== asked) estimate();
   const kv = $("dKv");
   if (kv) {
     kv.innerHTML = (typeof d.kv_gib === "number")
@@ -729,12 +834,11 @@ function paintEstimate(d) {
           `${g.factor_note})`
         : "";
   }
-  // d.agents_at_ctx — how many agents the KV budget holds at this context — is
-  // not painted here. It is painted on the agents control itself, where the
-  // number is a constraint on a field rather than a fourth readout; see
-  // renderCtx()'s agentsFit. Painting it in both places was the defect: the
-  // derived cell restated the input above it, and the badge over it claimed the
-  // division had been measured.
+  // How many full-length requests fit at once is not painted here. It is
+  // painted beside the agents control (renderCtx()'s agentsFit), as advice;
+  // painting it in both places was a defect once already: the derived cell
+  // restated the input above it, and the badge over it claimed the division
+  // had been measured.
   const badge = $("dBadge");
   if (badge) {
     const b = badgeOf(d.confidence);
@@ -1135,10 +1239,74 @@ function winSpan(w) {
   return `${w.n}/${w.capacity} requests${age}${ex}`;
 }
 
+/* The mixed-load table, as text: {head, title, cols, rows, note}.
+ *
+ * How the LIVE pool splits between full-length requests and smaller ones: how
+ * many requests at the running server's own --max-model-len fit at once, and
+ * how many at the window's p50 / p90 fit beside 1, 2 or 3 of them. That is how
+ * this box is used ("2-3 primary agents have large context and rest
+ * smaller"), and it replaces the old "context per agent" framing, which
+ * divided the pool by the agent count and capped every request at the
+ * quotient.
+ *
+ * Every number comes from parallelism.mixed_capacity() on the calibrated
+ * per-request cost; this only formats. A size taken from a bucket's upper
+ * edge is written "≤", like the recommendation's basis line. Pure, so the test
+ * engine executes it.
+ */
+function mixModel(mx, reason) {
+  if (!mx) return {head: reason || "—", title: "", cols: [], rows: [], note: ""};
+  const full = fmt(mx.full_ctx);
+  const alone = mx.full_fit * mx.headroom < 1;
+  const cols = (mx.sizes || []).map((z) =>
+    `+ ${z.label} ${z.exact ? "" : "≤ "}${fmt(z.prompt_tokens)}`);
+  const rows = (mx.rows || []).map((r) =>
+    [`${r.big} at ${full}`].concat((mx.sizes || []).map((z) => "+ " + r.alongside[z.label])));
+  const notes = [];
+  if (!cols.length) notes.push("what fits beside them appears once requests have been observed");
+  if (alone) notes.push(`a ${full}-token request needs more than the pool: it runs alone`);
+  if ((mx.clamped || []).length) notes.push(`capped by --max-num-seqs ${mx.max_num_seqs}`);
+  return {
+    head: `${mx.full_n} at ${full} at once`,
+    title: `${fmt(mx.pool_tokens)} KV ÷ ${fmt(mx.full_cost_tokens)} per ${full}-token request ` +
+      `= ${mx.full_fit} × ${mx.headroom} headroom = ${mx.full_n}. Beside k of them each ` +
+      `smaller request gets (${fmt(mx.pool_tokens)} × ${mx.headroom} − k × ` +
+      `${fmt(mx.full_cost_tokens)}) ÷ its own cost. Costs include the ` +
+      `${fmt(mx.fixed_cost_tokens)}-token fixed per-sequence page.`,
+    cols: cols,
+    rows: rows,
+    note: notes.join(" · "),
+  };
+}
+
+function paintMix(sz) {
+  const m = mixModel(sz.mixed, sz.mixed_reason);
+  set("mixFull", m.head);
+  const head = $("mixFull");
+  if (head) head.title = m.title;
+  set("mixNote", m.note);
+  const t = $("mixTbl");
+  if (!t) return;
+  t.textContent = "";
+  if (!m.cols.length || !m.rows.length) return;
+  const line = (cells, tag) => {
+    const tr = document.createElement("tr");
+    cells.forEach((c) => {
+      const td = document.createElement(tag);
+      td.textContent = c;
+      tr.appendChild(td);
+    });
+    t.appendChild(tr);
+  };
+  line(["long"].concat(m.cols), "th");
+  m.rows.forEach((r) => line(r, "td"));
+}
+
 function paintRequestStats() {
   const sz = liveSizing || {};
   const w = sz.window || {};
   const rec = sz.recommended;
+  paintMix(sz);
 
   // A percentile over bucket-bounded observations IS an interval. Render it as
   // one -- "20,001–50,000", not a midpoint nothing measured. Only when every
@@ -1226,7 +1394,10 @@ function paintRequestStats() {
              + `climbing is what confirms it.`);
   } else if (liveMetrics.waiting_capacity > 0) {
     os.className = "oversub on";
-    os.innerHTML = `<b>KV-bound right now.</b> ${liveMetrics.waiting_capacity} request(s) waiting on capacity. Reduce agents, lower per-agent context, or raise utilization.`;
+    // Not "lower the context": --max-model-len is a per-request ceiling, so
+    // lowering it frees nothing the requests in flight hold -- it only makes
+    // the long ones fail outright.
+    os.innerHTML = `<b>KV-bound right now.</b> ${liveMetrics.waiting_capacity} request(s) waiting on capacity. Reduce agents, or raise utilization.`;
   } else if (pre > 8) {
     os.className = "oversub on";
     os.innerHTML = `<b>${pre} preemptions since restart.</b> vLLM is evicting and recomputing KV — real work is being thrown away. This is the empirical signal that the agent count is too high.`;
@@ -1517,13 +1688,59 @@ function dirtyBits(facts, sizing, want) {
   return bits;
 }
 
-function paintDirty(upIsUp) {
+function paintDirty(upIsUp, runCtx) {
   const d = $("dirty");
   if (!d) return;
   if (!upIsUp) { d.classList.remove("on"); d.textContent = "unsaved changes"; return; }
-  const diff = dirtyBits(liveFacts || {}, liveSizing || {}, { util: util, ctx: ctx, agents: agents });
+  // The context the server RUNS is its own --max-model-len. liveFacts.ctx is
+  // read off a boot log, which a hand-launched server does not have, and then
+  // a changed context was never marked unsaved at all.
+  const facts = Object.assign({}, liveFacts || {});
+  if (runCtx) facts.ctx = runCtx;
+  const diff = dirtyBits(facts, liveSizing || {}, { util: util, ctx: ctx, agents: agents });
   d.classList.toggle("on", diff.length > 0);
   d.textContent = diff.length ? `unsaved: ${diff.join(", ")}` : "unsaved changes";
+}
+
+/* The running server's context, for the control: {run, sig, fresh}.
+ *
+ *   run   — the live process's own --max-model-len (upstream.max_model_len)
+ *           when the selected model is the one it serves, else null. Never
+ *           desired config: for an adopted server that need not be what runs.
+ *   sig   — which server that is: listener pid, model, length.
+ *   fresh — a different server from the last one seen. A start or restart,
+ *           from this page or from anywhere else, makes the running value the
+ *           truth again: an earlier pick was sent or abandoned, and keeping it
+ *           would let a later Apply silently send a number nothing runs.
+ * While the upstream is down nothing is known, so the previous signature is
+ * kept and nothing is fresh. Pure, so the test engine executes it.
+ */
+function runCtxOf(s, selServing, prevSig) {
+  const up = (s && s.upstream) || {};
+  if (!up.up) return {run: null, sig: prevSig, fresh: false};
+  const sig = [(up.resolution || {}).pid, up.model_id, up.max_model_len].join("|");
+  return {
+    run: selServing && up.max_model_len > 0 ? up.max_model_len : null,
+    sig: sig,
+    fresh: prevSig != null && sig !== prevSig,
+  };
+}
+
+/* Point the context control at the running server when it serves the selected
+ * model. The value itself is decided by ctxChoice() in renderCtx(). */
+function syncRunCtx(s) {
+  const sv = (s && s.supervisor) || {};
+  const up = (s && s.upstream) || {};
+  const rc = runCtxOf(s, !!(MODELS[sel] && MODELS[sel].serving), lastRunSig);
+  if (rc.fresh && ctxSource === "operator") ctxSource = "default";
+  lastRunSig = rc.sig;
+  if (up.up) ctxRun = rc.run;
+  // Down and not coming back (stopped, failed): nothing runs, so nothing is
+  // read back. Mid-transition, or a READY server whose /metrics missed one
+  // poll under load, keeps the last value rather than flicker to the default.
+  else if (!busyPhase(sv) && sv.actual_state !== "READY") ctxRun = null;
+  if (ctxRun && ctxSource !== "operator") ctxSource = "running";
+  if (!ctxRun && ctxSource === "running") ctxSource = "default";
 }
 
 function paintState(s) {
@@ -1555,7 +1772,6 @@ function paintState(s) {
     if (a) a.value = String(agents);
     estimate();
   }
-  paintDirty(!!up.up);
   const sv = s.supervisor || {};
   const phase = busyPhase(sv);
   const pill = $("pill"), pillTxt = $("pillTxt");
@@ -1641,9 +1857,24 @@ function paintState(s) {
     }
     // Select what is ACTUALLY running, not whatever sorted first. Otherwise
     // every panel describes a model the user is not using.
-    if (servingIdx >= 0 && !userPicked) { sel = servingIdx; renderCtx(null); estimate(); }
+    if (servingIdx >= 0 && !userPicked && sel !== servingIdx) {
+      sel = servingIdx;
+      ctxSource = "default";
+      lastEstimate = null;   // it described the previously selected model
+      renderCtx(null);
+      estimate();
+    }
     renderModels();
   }
+
+  // The context control reads back the running server's real --max-model-len
+  // (see runCtxOf). Without this it kept whatever the slider last said: 32,768
+  // on screen against a server running 262,144, and an Apply sent the former.
+  const before = ctx;
+  syncRunCtx(s);
+  renderCtx(lastEstimate);
+  if (ctx !== before) estimate();
+  paintDirty(!!up.up, up.max_model_len);
 }
 
 /* ------------------------------------------------------------ control --- */
@@ -1772,6 +2003,9 @@ async function init() {
       // sprang back and how the Apply confirmation could quote a util the
       // operator had already changed.
       userPicked = true;
+      // An explicit choice, and the only way the context goes below the
+      // default without the pool or the running server saying so.
+      ctxSource = "operator";
       ctx = +e.target.value;
       const v = $("ctxV");
       if (v) v.textContent = fmt(ctx);   // move the readout with the thumb

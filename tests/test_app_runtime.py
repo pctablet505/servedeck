@@ -454,11 +454,18 @@ def _window(p90: int, p99: int | None = None, n: int = 100) -> dict:
 
 @pytest.fixture
 def _sizing(monkeypatch: pytest.MonkeyPatch):
-    """Drive _sizing_payload off a scripted metrics snapshot and cmdline."""
-    def go(metrics: dict, *, max_num_seqs: int | None = 16, model: str | None = None):
+    """Drive _sizing_payload off a scripted metrics snapshot and cmdline.
+
+    Both command-line reads are scripted. Left alone, _running_max_model_len()
+    asks the socket table who listens on rt.port and reads that process's argv
+    -- on this box, the live server's -- and the payload would depend on what
+    happens to be serving when the suite runs."""
+    def go(metrics: dict, *, max_num_seqs: int | None = 16, model: str | None = None,
+           max_model_len: int | None = None):
         monkeypatch.setattr(capp.rt, "metrics", metrics, raising=False)
         monkeypatch.setattr(capp.rt, "serving_model", model, raising=False)
         monkeypatch.setattr(capp, "_running_max_num_seqs", lambda: max_num_seqs)
+        monkeypatch.setattr(capp, "_running_max_model_len", lambda: max_model_len)
         return capp._sizing_payload()
     return go
 
@@ -593,6 +600,60 @@ def test_sizing_names_the_model_the_cost_curve_was_calibrated_on(_sizing) -> Non
     )
     assert "llama-3-70b" in out["calibration_note"]
     assert "upper bound" in out["calibration_note"]
+
+
+def _pct(v: int, exact: bool = True) -> dict:
+    return {"lo": v, "hi": v, "exact": exact}
+
+
+def test_sizing_splits_the_live_pool_between_long_and_short_requests(_sizing) -> None:
+    """The mixed view, end to end through the payload the page reads: the LIVE
+    pool, the running server's own --max-model-len as the full length, and the
+    window's p50/p90 as the smaller sizes. Figures worked by hand in
+    test_parallelism.test_mixed_capacity_reproduces_the_hand_computed_split."""
+    window = {**_window(30_116), "p50": _pct(8_102), "p90": _pct(30_116)}
+    out = _sizing(
+        {"reachable": True, "kv_cache_size_tokens": 1_595_321, "running": 3,
+         "prompt_stats": window},
+        max_num_seqs=None, max_model_len=262_144,
+    )
+    mx = out["mixed"]
+    assert mx["pool_tokens"] == 1_595_321 and mx["full_ctx"] == 262_144
+    assert mx["full_n"] == 3
+    assert [(r["big"], r["alongside"]) for r in mx["rows"]] == [
+        (1, {"p50": 35, "p90": 16}), (2, {"p50": 20, "p90": 9}), (3, {"p50": 5, "p90": 2}),
+    ]
+    # And the recommendation beside it is unchanged: advice, not a cap.
+    assert out["recommended"]["n"] == 22
+
+
+def test_sizing_counts_full_length_requests_before_any_are_observed(_sizing) -> None:
+    """How many full-length requests fit needs no request history, so it is
+    there from the first poll; what fits beside them waits for the window."""
+    from servedeck import reqstats
+
+    out = _sizing(
+        {"reachable": True, "kv_cache_size_tokens": 1_595_321,
+         "prompt_stats": dict(reqstats.EMPTY_STATS)},
+        max_model_len=262_144,
+    )
+    assert out["recommended"] is None
+    assert out["mixed"]["full_n"] == 3
+    assert out["mixed"]["sizes"] == []
+
+
+def test_sizing_does_not_guess_the_full_length(_sizing) -> None:
+    """The full length is the running process's own --max-model-len. With none
+    on its command line the split is not computed, and the page is told why
+    rather than handed a split at some assumed length."""
+    out = _sizing(
+        {"reachable": True, "kv_cache_size_tokens": 1_595_321,
+         "prompt_stats": _window(30_116)},
+        max_model_len=None,
+    )
+    assert out["mixed"] is None
+    assert "--max-model-len" in out["mixed_reason"]
+    assert out["recommended"] is not None, "the recommendation does not need it"
 
 
 def test_max_num_seqs_comes_from_the_live_command_line(monkeypatch) -> None:
