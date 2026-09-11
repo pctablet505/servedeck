@@ -925,6 +925,41 @@ def test_a_boot_publishes_state_events_not_only_telemetry(monkeypatch) -> None:
     )
 
 
+def _publishes(monkeypatch, snap: dict, polls: int = 3) -> int:
+    """How many `state` events `polls` ticks of the poll loop publish for an
+    unchanging supervisor snapshot."""
+    seen: list = []
+    monkeypatch.setattr(capp.hub, "publish", lambda kind, payload: seen.append(kind))
+    monkeypatch.setattr(capp, "_state", lambda: {})
+    monkeypatch.setattr(capp, "_snap", lambda: dict(snap))
+    monkeypatch.setattr(capp, "_LAST_STATE_SIG", None)
+    for _ in range(polls):
+        capp._publish_state_if_changed()
+    return seen.count("state")
+
+
+def test_a_stopped_server_with_a_stale_phase_is_not_republished_every_poll(monkeypatch) -> None:
+    """After a Stop the finished run still reads phase "ready". Before the
+    READY latch its reached_ready also went back to False. The poll loop
+    treated that as a boot in progress and republished the full state every
+    2 s for as long as the server stayed stopped (seen live on 2026-09-11,
+    07:43:53 onwards). Publishing on change is the rule; every-poll is only for
+    a boot that is actually running."""
+    stale = {"actual_state": "STOPPED", "desired_state": "STOPPED", "phase": "ready",
+             "reached_ready": False, "last_error": None, "unmanaged_pid": None}
+    assert _publishes(monkeypatch, stale) == 1, "an unchanged STOPPED state is republished every poll"
+    failed = dict(stale, actual_state="FAILED", phase="cuda_graphs")
+    assert _publishes(monkeypatch, failed) == 1, "an unchanged FAILED state is republished every poll"
+
+
+def test_a_running_boot_is_still_published_every_poll(monkeypatch) -> None:
+    """Over-correction guard: the elapsed clock is in the payload, so a boot in
+    progress must still reach the page on every tick."""
+    booting = {"actual_state": "STARTING", "desired_state": "RUNNING", "phase": "compiling",
+               "reached_ready": False, "last_error": None, "unmanaged_pid": None}
+    assert _publishes(monkeypatch, booting) == 3
+
+
 def test_an_unrelated_listeners_uptime_is_not_reported_as_the_models(monkeypatch) -> None:
     """F5, the half that survives the ordering fix.
 

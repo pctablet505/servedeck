@@ -360,3 +360,120 @@ def test_a_config_write_that_raises_does_not_wedge_the_supervisor(tmp_path, monk
     s._sync_shell_config = types.MethodType(lambda self, **kw: None, s)  # type: ignore[assignment]
     asyncio.run(s.start(**_CFG))
     assert len(launches) == 1, "the supervisor was wedged: a valid start did nothing"
+
+
+# --------------------------------------------------------------------------
+# reached_ready is a fact about the run, not a liveness reading (F11d, and
+# the stale boot panel that the F2 fix made visible)
+# --------------------------------------------------------------------------
+def test_reached_ready_survives_the_probe_failing_during_shutdown() -> None:
+    """The monitor keeps probing /v1/models after READY, and the probe fails
+    as soon as the server starts shutting down. reached_ready used to be
+    recomputed from the latest probe, so it went back to False on every stop."""
+    t = phases.PhaseTracker()
+    t.feed("INFO:     Application startup complete.")
+    assert t.set_http_probe_ok(True) is not None, "READY must be announced once"
+    assert t.reached_ready is True
+
+    assert t.set_http_probe_ok(False) is None      # shutting down
+    assert t.reached_ready is True, "a failing probe un-latched READY"
+    assert t.phase is phases.Phase.READY
+    assert t.set_http_probe_ok(True) is None, "READY must not be announced twice"
+
+
+def test_a_boot_that_never_served_is_still_not_ready() -> None:
+    """Over-correction guard: the latch must not make READY easier to reach.
+    Each criterion alone, in either order, is not READY."""
+    probe_only = phases.PhaseTracker()
+    assert probe_only.set_http_probe_ok(True) is None
+    assert probe_only.reached_ready is False
+
+    log_only = phases.PhaseTracker()
+    log_only.feed("INFO:     Application startup complete.")
+    assert log_only.set_http_probe_ok(False) is None
+    assert log_only.reached_ready is False
+
+    # Criteria that were both true only at different moments never latch.
+    flaky = phases.PhaseTracker()
+    flaky.set_http_probe_ok(True)
+    flaky.set_http_probe_ok(False)
+    flaky.feed("INFO:     Application startup complete.")
+    assert flaky.reached_ready is False
+
+
+def test_a_boot_that_served_and_was_stopped_is_recorded_as_having_reached_ready(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The real monitor, end to end. The boot reaches READY, the operator
+    stops it, the /v1/models probe fails while it shuts down, and only then
+    does the process exit. Every history record written on 2026-09-11 said
+    reached_ready: false, including runs that had served for minutes, so
+    history.py never had a boot to learn an ETA from (F10/F11d)."""
+    import time as _time
+
+    from servedeck import paths
+
+    monkeypatch.setattr(paths, "RUN_DIR", tmp_path / "run")
+    monkeypatch.setattr(supervisor, "MONITOR_POLL_S", 0.01)
+    monkeypatch.setattr(preflight, "run_preflight", lambda **kw: [])
+    monkeypatch.setattr(preflight, "blocking_failures", lambda checks: [])
+
+    boot_logs: list[str] = []
+
+    def launch(argv, env, cwd, log_path):  # noqa: ANN001
+        boot_logs.append(log_path)          # what the monitor tails
+        return procctl.ServerHandle(pid=4242, pgid=4242, argv=list(argv), cwd="/tmp",
+                                    log_path=log_path, started_at=_time.time())
+
+    hist = tmp_path / "history.jsonl"
+    s = supervisor.Supervisor(
+        state_dir=tmp_path / "state", clock=_time.time, launch_fn=launch,
+        stop_fn=lambda h, **kw: procctl.StopResult(True, "sigterm", 0.1, "exited after SIGTERM"),
+        death_exec_fn=lambda env: None, history_path=hist,
+    )
+    s._sync_shell_config = types.MethodType(lambda self, **kw: None, s)  # type: ignore[assignment]
+    alive = [True]
+    answering = [False]
+    s._try_reap = types.MethodType(lambda self, pid: None, s)          # type: ignore[assignment]
+    s._pid_alive = types.MethodType(lambda self, pid: alive[0], s)     # type: ignore[assignment]
+
+    async def probe(self, client, port):  # noqa: ANN001
+        return answering[0]
+
+    s._probe_ready = types.MethodType(probe, s)                         # type: ignore[assignment]
+
+    async def until(cond, what):  # noqa: ANN001
+        for _ in range(500):
+            if cond():
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError(f"timed out waiting for {what}")
+
+    async def scenario() -> None:
+        await s.start(**_CFG)
+        with open(boot_logs[0], "a") as fh:
+            fh.write("INFO:     Application startup complete.\n")
+        answering[0] = True
+        await until(lambda: s.actual_state == "READY", "READY")
+
+        await s.stop()
+        answering[0] = False               # the server stops answering first ...
+        await asyncio.sleep(0.1)           # ... for several monitor ticks ...
+        alive[0] = False                   # ... and only then does the process exit
+        await until(lambda: s.actual_state == "STOPPED" and s._handle is None, "the exit")
+
+    asyncio.run(scenario())
+
+    import json
+
+    records = [json.loads(line) for line in hist.read_text().splitlines() if line.strip()]
+    assert len(records) == 1, records
+    rec = records[0]
+    assert rec["outcome"] == "stopped_by_user", rec
+    assert rec["reached_ready"] is True, (
+        "a boot that served and was then stopped is recorded as never having "
+        f"reached READY: {rec}"
+    )
+    assert rec["total_s"] is not None, "a READY boot must record its boot time"
+    snap = s.snapshot()
+    assert snap["reached_ready"] is True and snap["phase"] == "ready", snap

@@ -757,6 +757,27 @@ def _const_line(name: str) -> str:
     return APP_JS[i : APP_JS.index("\n", i)]
 
 
+def _optional_const_line(name: str) -> str:
+    """_const_line, or nothing when app.js has no such const. The harness then
+    still loads an older app.js, so a test fails on its assertion rather than
+    on a missing name."""
+    return _const_line(name) if f"const {name} = " in APP_JS else ""
+
+
+def _const_block(name: str) -> str:
+    """A top-level `const name = { ... };` spanning several lines, verbatim."""
+    start = APP_JS.index(f"const {name} = ")
+    depth, i = 0, APP_JS.index("{", start)
+    for j in range(i, len(APP_JS)):
+        if APP_JS[j] == "{":
+            depth += 1
+        elif APP_JS[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return APP_JS[start : APP_JS.index(";", j) + 1]
+    raise AssertionError(f"unbalanced braces in const {name}")
+
+
 def _element_ids() -> list[str]:
     return sorted(set(re.findall(r'id="([A-Za-z0-9_]+)"', INDEX_HTML)))
 
@@ -1402,6 +1423,7 @@ def _exec(names: tuple[str, ...], expr: str) -> object:
         _const_line("MIN_CTX"),
         _const_line("CTX_STEP"),
         _const_line("DEFAULT_MAX_CTX"),
+        _optional_const_line("BOOTING_STATES"),
         *[_fn_body(n) for n in dict.fromkeys((*helpers, *names))],
         f"JSON.stringify({expr});",
     ]
@@ -1506,16 +1528,160 @@ def test_the_boot_bar_is_drawn_only_while_a_boot_is_running() -> None:
 
     order = ["init", "loading_weights", "compiling", "kv_cache", "cuda_graphs",
              "http_start", "ready"]
-    assert active({"phases": order, "phase": "loading_weights", "reached_ready": False})
-    assert not active({"phases": order, "phase": "ready", "reached_ready": True}), (
+    booting = {"phases": order, "actual_state": "STARTING"}
+    assert active({**booting, "phase": "loading_weights", "reached_ready": False})
+    assert not active({**booting, "phase": "ready", "reached_ready": True}), (
         "the bar stays up after the server is ready"
     )
-    assert not active({"phases": order, "phase": None, "reached_ready": False}), (
+    assert not active({**booting, "phase": None, "reached_ready": False}), (
         "the bar claims a boot before one has started"
     )
-    # A boot that FAILED at a phase still shows the bar: that is the moment the
-    # operator most needs to see where it stopped.
-    assert active({"phases": order, "phase": "kv_cache", "reached_ready": False})
+    # This used to assert the opposite: a boot that FAILED kept the bar up, "so
+    # the operator can see where it stopped". What that bar actually showed was
+    # a boot still in progress. The phase pulsed as current and the elapsed
+    # clock kept counting. Main showed the 06:59 failure on 2026-09-11 as
+    # "cuda_graphs, elapsed 1641 s" for an engine that had died 30 s into its
+    # boot. A finished run is not a boot in progress. last_error says why it
+    # failed.
+    assert not active({"phases": order, "actual_state": "FAILED",
+                       "phase": "kv_cache", "reached_ready": False})
+
+
+def _paint_boot(snap: dict, monkeypatch) -> dict:
+    """Build the boot payload with the REAL server-side _boot_payload() from a
+    supervisor snapshot, paint it with the REAL paintBoot(), and return what
+    landed in the panel's elements."""
+    monkeypatch.setattr(_app, "_snap", lambda: dict(snap))
+    payload = _app._boot_payload()
+    ids = _element_ids()
+    src = [
+        *_PRELUDE,
+        _const_block("PHASE_LABELS"),
+        _optional_const_line("BOOTING_STATES"),
+        *[_fn_body(n) for n in ("durTxt", "bootActive", "bootNote", "paintBoot")],
+        f"__mk({json.dumps(ids)});",
+        f"paintBoot({json.dumps(payload)});",
+        f"__dump({json.dumps(['phases', 'elapsed', 'pnote'])});",
+    ]
+    return _run_js("\n".join(src))
+
+
+_PHASE_TIMES = {"init": 13.1, "loading_weights": 17.1, "compiling": 33.2, "kv_cache": 115.8,
+                "cuda_graphs": 155.9, "http_start": 169.0, "ready": 170.0}
+
+
+@pytest.mark.parametrize("snap", [
+    # 07:43:53 on 2026-09-11, after a clean Stop of a boot that had served:
+    # the finished run still reads phase "ready", and before the latch in
+    # PhaseTracker its reached_ready had gone back to False.
+    {"actual_state": "STOPPED", "desired_state": "STOPPED", "phase": "ready",
+     "reached_ready": False, "phase_times": _PHASE_TIMES, "run_elapsed_s": 278.0,
+     "repo_id": "RadixArk/Qwen3.8-27B-NVFP4", "backend": "inline"},
+    # 06:59 the same day: a boot that died at cuda_graphs, shown on main as
+    # "elapsed 1641 s" long after the engine was gone.
+    {"actual_state": "FAILED", "desired_state": "RUNNING", "phase": "cuda_graphs",
+     "reached_ready": False, "phase_times": {"init": 14.1, "cuda_graphs": 30.1},
+     "run_elapsed_s": 1641.5, "repo_id": "RadixArk/Qwen3.8-27B-NVFP4", "backend": "inline"},
+    # A restart during a boot: the old engine is being stopped, not booted.
+    {"actual_state": "STOPPING", "desired_state": "STOPPED", "phase": "cuda_graphs",
+     "reached_ready": False, "phase_times": {"init": 13.0}, "run_elapsed_s": 62.0,
+     "repo_id": "RadixArk/Qwen3.8-27B-NVFP4", "backend": "inline"},
+], ids=["stopped-with-stale-ready", "failed-at-cuda-graphs", "stopping-mid-boot"])
+def test_a_finished_run_never_repaints_as_a_boot(snap, monkeypatch) -> None:
+    """After a Stop the page kept the boot panel on with the elapsed clock
+    counting ("elapsed 4m 38s") beside "Not reachable". The supervisor's phase
+    outlives its run. Only a supervisor that is actually booting may light
+    the panel."""
+    got = _paint_boot(snap, monkeypatch)
+    assert got["phases"]["cls"] == "phases", (
+        f"{snap['actual_state']} with phase {snap['phase']!r} painted the boot panel "
+        f"as a boot in progress: {got}"
+    )
+
+
+def test_a_running_boot_still_lights_the_panel(monkeypatch) -> None:
+    """Over-correction guard: the gate must not switch the panel off for the
+    boots it exists for."""
+    got = _paint_boot({
+        "actual_state": "STARTING", "desired_state": "RUNNING", "phase": "loading_weights",
+        "reached_ready": False, "phase_times": {"init": 13.1, "loading_weights": 17.1},
+        "run_elapsed_s": 31.0, "repo_id": "RadixArk/Qwen3.8-27B-NVFP4", "backend": "inline",
+    }, monkeypatch)
+    assert got["phases"]["cls"] == "phases on", got
+    assert got["elapsed"]["text"] == "31 s", got
+
+
+def _paint_request_stats(sizing: dict) -> dict:
+    """Paint the request-statistics panel with the REAL paintRequestStats()
+    and return what landed in its elements."""
+    ids = _element_ids()
+    helpers = ("bytesTxt", "secsTxt", "agoTxt", "uptimeTxt", "durTxt", "ctxLabel")
+    src = [
+        *_PRELUDE,
+        _const_line("BUSY_PHASES"),
+        *[_fn_body(n) for n in (*helpers, "set", "winSpan", "histData", "reqHist",
+                                "paintRequestStats")],
+        f"__mk({json.dumps(ids)});",
+        f"var liveSizing = {json.dumps(sizing)};",
+        "paintRequestStats();",
+        f"__dump({json.dumps(['recBasis', 'recP99', 'pctP90', 'recN'])});",
+    ]
+    return _run_js("\n".join(src))
+
+
+def _sizing_from_requests(monkeypatch, polls: list[list[float]]) -> dict:
+    """The REAL sizing payload (_app._sizing_payload over a real
+    reqstats.RequestWindow) after the engine served the given requests, one
+    list per poll. Several requests finishing within one poll are known only
+    to a bucket; one alone is known exactly (its size is the _sum delta)."""
+    from servedeck import reqstats
+
+    edges = [1000.0, 5000.0, 10000.0, 50000.0, math.inf]
+    win = reqstats.RequestWindow()
+    seen: list[float] = []
+
+    def scrape():
+        cum = [(e, float(sum(1 for v in seen if v <= e))) for e in edges]
+        win.observe(cum, hist_sum=float(sum(seen)), hist_count=float(len(seen)))
+
+    scrape()                                   # the baseline scrape
+    for batch in polls:
+        seen.extend(batch)
+        scrape()
+    stats = win.stats().to_dict()
+    monkeypatch.setattr(_app.rt, "metrics", {
+        "reachable": True, "kv_cache_size_tokens": 561_944, "running": 0,
+        "preemptions": 0, "prompt_stats": stats, "gen_stats": dict(reqstats.EMPTY_STATS),
+    }, raising=False)
+    monkeypatch.setattr(_app, "_running_max_num_seqs", lambda: 16)
+    return _app._sizing_payload()
+
+
+def test_the_p99_line_does_not_state_a_bucket_edge_as_a_measurement(monkeypatch) -> None:
+    """F9, second half. The live panel on 2026-09-11 read "p90 of the last 5
+    requests <= 10,000 prompt tokens" and then "at p99 (10,000 tok) it would be
+    16". The prompts were 117 tokens once and 9,853 four times. 10,000 is a
+    bucket edge, and the p99 line stated it as a measurement."""
+    # The live case: one small request alone (exact), four together (bucket).
+    sizing = _sizing_from_requests(monkeypatch, [[117.0], [9853.0] * 4])
+    assert sizing["at_p99"] is not None and sizing["window"]["p99"]["exact"] is False, sizing
+    got = _paint_request_stats(sizing)
+    p99 = got["recP99"]["text"]
+    assert "(≤ 10,000 tok)" in p99, (
+        f"the p99 line states the bucket edge 10,000 as a measured p99: {p99!r}"
+    )
+    assert "≤ 10,000" in got["recBasis"]["text"], got
+
+
+def test_an_exact_p99_is_still_stated_as_one(monkeypatch) -> None:
+    """Over-correction guard: when every observation at that rank was exact,
+    the number IS the measurement and must not be hedged."""
+    sizing = _sizing_from_requests(monkeypatch, [[9853.0], [9853.0], [117.0]])
+    assert sizing["window"]["p99"]["exact"] is True, sizing["window"]["p99"]
+    got = _paint_request_stats(sizing)
+    p99 = got["recP99"]["text"]
+    assert "≤" not in p99, f"an exact p99 is hedged as a bound: {p99!r}"
+    assert f"at p99 ({sizing['at_p99']['prompt_tokens']:,} tok)" in p99, p99
 
 
 def test_the_boot_eta_names_its_source_and_says_when_it_is_beaten() -> None:

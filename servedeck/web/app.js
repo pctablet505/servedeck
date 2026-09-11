@@ -1031,6 +1031,10 @@ function paintRequestStats() {
   // inside `if (rec)`, because the over-subscription banner below reads it
   // too and a const is block-scoped.
   const p90Exact = !!(w.p90 && (w.p90.exact || w.p90.lo === w.p90.hi));
+  // The p99 line has the same problem. at_p99 is sized on the UPPER edge of
+  // the p99 interval, so it is also a bucket edge unless every observation at
+  // that rank was exact.
+  const p99Exact = !!(w.p99 && (w.p99.exact || w.p99.lo === w.p99.hi));
 
   // The window's own honesty line, as short as it can be; see winSpan().
   set("winMeta", winSpan(w));
@@ -1058,7 +1062,9 @@ function paintRequestStats() {
     const where = rec.extrapolated
       ? " · cost extrapolated beyond the measured range"
       : (rec.segment ? ` · cost interpolated between ${fmt(rec.segment[0])} and ${fmt(rec.segment[1])} tok` : "");
-    set("recP99", (alt ? `at p99 (${fmt(alt.prompt_tokens)} tok) it would be ${alt.n}` : "") + where);
+    set("recP99", (alt
+      ? `at p99 (${p99Exact ? "" : "\u2264 "}${fmt(alt.prompt_tokens)} tok) it would be ${alt.n}`
+      : "") + where);
   } else {
     set("recN", "—");
     set("recBasis", sz.reason || "—");
@@ -1257,9 +1263,16 @@ function durTxt(sec) {
 
 /* Is a boot in progress? Only then is the bar drawn: once the server is READY
  * the phase history is a post-mortem, not progress, and a dead widget above the
- * controls every time the page opens is worse than no widget. */
+ * controls every time the page opens is worse than no widget.
+ *
+ * The supervisor state gates it too. A run that has ended still carries its
+ * last phase: "ready" after a Stop, or the phase a failed boot died in. Gating
+ * on phase alone painted those as boots in progress, with the elapsed clock
+ * counting beside "Not reachable" ("elapsed 4m 38s", 2026-09-11). The server
+ * applies the same gate (app.py _boot_in_progress). */
+const BOOTING_STATES = ["PREFLIGHT", "STARTING"];
 function bootActive(b) {
-  return !!(b && b.phase && !b.reached_ready);
+  return !!(b && b.phase && !b.reached_ready && BOOTING_STATES.indexOf(b.actual_state) >= 0);
 }
 
 /* The ETA line, with its provenance. history.py decides whether the figure is a

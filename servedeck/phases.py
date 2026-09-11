@@ -171,6 +171,7 @@ class PhaseTracker:
         self.compile_exits: list[float] = []
         self._startup_complete_seen = False
         self._http_probe_ok = False
+        self._ready_latched = False
 
     @property
     def phase_index(self) -> int:
@@ -178,8 +179,27 @@ class PhaseTracker:
 
     @property
     def reached_ready(self) -> bool:
-        """True the instant BOTH READY criteria are satisfied."""
-        return self._startup_complete_seen and self._http_probe_ok
+        """True from the instant BOTH READY criteria are first satisfied, and
+        for the rest of this run.
+
+        This is a fact about the run's history ("did this boot ever serve"),
+        not a liveness reading. The monitor keeps probing /v1/models after
+        READY, and those probes fail as soon as the server starts shutting
+        down. This flag used to be recomputed from the latest probe, so every
+        stop turned it back to False. Every history record then said
+        reached_ready: false, including runs that served for minutes (F11d),
+        and the stopped server's stale "ready" phase painted as a boot in
+        progress.
+        """
+        return self._ready_latched
+
+    def _latch_if_ready(self) -> bool:
+        """Latch READY once both criteria hold. True only on the call that
+        latches it."""
+        if not self._ready_latched and self._startup_complete_seen and self._http_probe_ok:
+            self._ready_latched = True
+            return True
+        return False
 
     def mark_adopted_ready(self) -> None:
         """Declare READY for a server that was already serving when adopted.
@@ -192,17 +212,18 @@ class PhaseTracker:
         """
         self._startup_complete_seen = True
         self._http_probe_ok = True
+        self._ready_latched = True
         self.phase = Phase.READY
 
     def set_http_probe_ok(self, ok: bool) -> PhaseEvent | None:
         """Record the result of an external GET /v1/models probe.
 
         Not log-derived, so it lives outside feed(). Returns a PhaseEvent iff
-        this call is the one that completes the READY criteria.
+        this call is the one that completes the READY criteria. A failing
+        probe after that point does not undo READY (see reached_ready).
         """
-        was_ready = self.reached_ready
         self._http_probe_ok = ok
-        if ok and not was_ready and self.reached_ready:
+        if ok and self._latch_if_ready():
             self.phase = Phase.READY
             return PhaseEvent(phase=Phase.READY, line="", kind="ready", advanced=True)
         return None
@@ -295,6 +316,7 @@ class PhaseTracker:
         if RE_STARTUP_COMPLETE.search(line):
             self._startup_complete_seen = True
             advanced = False
+            self._latch_if_ready()
             if self.reached_ready:
                 advanced = self._advance(Phase.READY)
             events.append(PhaseEvent(Phase.READY, line, "startup_complete", advanced))

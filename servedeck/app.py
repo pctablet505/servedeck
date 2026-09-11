@@ -390,6 +390,29 @@ async def _poll_loop() -> None:
 #: idle box does not re-broadcast an unchanged payload every 2 s.
 _LAST_STATE_SIG: tuple[Any, ...] | None = None
 
+#: The supervisor states in which a boot is actually running. app.js keeps its
+#: own copy (BOOTING_STATES) because the page applies the same gate.
+_BOOTING_STATES = ("PREFLIGHT", "STARTING")
+
+
+def _boot_in_progress(snap: dict[str, Any]) -> bool:
+    """Is a boot running right now, as opposed to a phase left over from a run
+    that has ended?
+
+    Phase and reached_ready alone could not tell those apart. After a stop, the
+    finished run still reads phase "ready". Before the latch in
+    phases.PhaseTracker, its reached_ready also went back to False. A boot
+    that failed keeps the phase it died in. In every such case the boot panel
+    stayed on with its elapsed clock counting beside "Not reachable" (seen on
+    2026-09-11 at 07:44, "elapsed 4m 38s"), and this loop republished the state
+    every 2 s indefinitely.
+    """
+    return (
+        snap.get("actual_state") in _BOOTING_STATES
+        and snap.get("phase") is not None
+        and not snap.get("reached_ready")
+    )
+
 
 def _publish_state_if_changed() -> None:
     """Publish a `state` event when the state a human can see has moved.
@@ -409,7 +432,7 @@ def _publish_state_if_changed() -> None:
     """
     global _LAST_STATE_SIG
     snap = _snap()
-    booting = snap.get("phase") is not None and not snap.get("reached_ready")
+    booting = _boot_in_progress(snap)
     sig = (
         snap.get("actual_state"),
         snap.get("desired_state"),
@@ -625,6 +648,9 @@ def _boot_payload() -> dict[str, Any]:
         "phase_times": snap.get("phase_times") or {},
         "elapsed_s": snap.get("run_elapsed_s"),
         "reached_ready": bool(snap.get("reached_ready")),
+        # The page gates the panel on this as well (app.js bootActive), so a
+        # stale phase from a finished run can never be painted as a boot.
+        "actual_state": snap.get("actual_state"),
         "eta_s": None,
         "eta_p90_s": None,
         "eta_source": None,
@@ -632,7 +658,7 @@ def _boot_payload() -> dict[str, Any]:
         "cold": None,
     }
     repo_id = snap.get("repo_id") or rt.serving_model
-    booting = out["phase"] is not None and not out["reached_ready"]
+    booting = _boot_in_progress(snap)
     if not booting or not repo_id:
         return out
     backend = snap.get("backend") or rt.config().get("BACKEND") or ""

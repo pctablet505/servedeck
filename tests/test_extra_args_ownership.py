@@ -295,6 +295,44 @@ def test_a_backend_only_rewrite_by_another_writer_does_not_reattribute_the_flags
     assert not _leaked(launches[1].sees), launches[1].config
 
 
+_REAL_CONFIG = Path("~/Projects/local_llm/.config").expanduser()
+
+
+@pytest.mark.parametrize("source", ["fixture", "this-box"])
+def test_a_missing_sidecar_means_the_current_flags_belong_to_the_current_backend(
+    source: str, box: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """The state main is in right after the merge: .config has Flash-Next's
+    flags under BACKEND="flashnext", and there is NO state/extra_args.json.
+    That must read as "these flags are Flash-Next's". Reading it as "no
+    flags" would lose them on the first switch. The first switch to the 27B
+    must save them, and the switch back must restore them."""
+    if source == "this-box":
+        if not _REAL_CONFIG.is_file():
+            pytest.skip("local_llm/.config is not on this machine")
+        text = _REAL_CONFIG.read_text()          # read only; the copy is what gets written
+        if 'BACKEND="flashnext"' not in text or FLASHNEXT_EXTRA_ARGS not in text:
+            pytest.skip("this box's .config is not currently in the Flash-Next state")
+        box.write_text(text)
+        box.chmod(0o600)
+    record_file = tmp_path / "state" / supervisor.EXTRA_ARGS_RECORD_FILENAME
+    assert not record_file.exists()
+    s, launches = _supervisor(tmp_path, monkeypatch)
+
+    asyncio.run(s.start(**INLINE))
+    saved = supervisor.load_extra_args_record(tmp_path / "state")
+    assert saved["stash"].get("flashnext") == FLASHNEXT_EXTRA_ARGS, (
+        f"the first switch away did not save Flash-Next's flags: {saved}"
+    )
+    assert shellconfig.read_config()["EXTRA_ARGS"] == ""
+    assert not _leaked(launches[0].sees), launches[0].config
+
+    _exited(s)
+    asyncio.run(s.start(**FLASHNEXT))
+    assert launches[1].sees == FLASHNEXT_EXTRA_ARGS, launches[1]
+    assert shellconfig.read_config()["EXTRA_ARGS"] == FLASHNEXT_EXTRA_ARGS
+
+
 # --------------------------------------------------------------------------
 # Over-correction guards: nothing that already belongs to the backend moves
 # --------------------------------------------------------------------------
