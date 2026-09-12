@@ -1,492 +1,504 @@
-"""Servedeck gateway — SPEC.md §7, corrected by the 2026-08-27 addendum
-(C2, C7, C8 specifically).
+"""The one normalising gateway — REDESIGN-2026-09-12 §1 (R3), §2.3, §2.7.
 
-This module is a transparent reverse proxy from Servedeck's own listener
-(127.0.0.1:8010, bound by whoever owns app.py/run.sh — not this file) to
-whichever upstream vLLM server is currently configured — the `port` of the
-active `[backends.<name>]` in servedeck.toml, never a port named here. Two
-things make it more than a dumb proxy:
+``http://127.0.0.1:8010/v1`` becomes the only URL any client is ever
+configured with.  The gateway resolves the request's ``model`` (id, alias, or
+effort preset) to a live model's port, applies that route's policies, and
+streams the exchange through in both directions.
 
-1. Two endpoints — POST /v1/chat/completions and POST /v1/responses — may
-   be *held* ("parked") for up to ``hold_max_s`` while the backend is
-   mid-restart, so a Codex turn issued during a reboot doesn't just fail;
-   it waits and then proceeds once the backend is READY. Every other path
-   is plain, unconditional pass-through: connect now, 503 if that fails.
-   This split is corrections addendum C2, and it OVERRIDES the plain
-   text of SPEC §7, which said to park all of ``/v1/*`` — that would hang
-   ``codex-qwen.sh``'s ``is_server_up()`` (an un-timed ``curl`` against
-   GET /v1/models) forever. See ``_HOLD_ELIGIBLE_SUBPATHS`` below.
-2. THE HARD RULE (SPEC §7, restated by C7): once any upstream byte has
-   reached the client, this module never retries internally, and it
-   propagates a client disconnect to the upstream connection (vLLM's
-   ``/v1/responses`` wraps generation in ``with_cancellation`` — closing
-   the *upstream* socket is what actually aborts an in-flight generation,
-   which matters a great deal at ``--max-num-seqs 1``: one leaked
-   generation holds the only sequence slot and starves every other
-   request). See ``_stream_proxy``'s ``try/finally: await upstream.aclose()``
-   for how that propagation happens — Starlette cancels the streaming
-   task when it detects the downstream client is gone, which raises
-   inside our body generator at whatever await it is suspended on, and
-   the ``finally`` runs from there.
+Why this file replaces three things
+-----------------------------------
+R3, the third of the five root causes the redesign removes: *normalisation
+lived in per-model side proxies, not in the gateway*.  ``:8005`` mirrored the
+reasoning field for Flash-Next, ``:8003`` injected reasoning effort for GLM,
+``:8006`` did the same for the 27B — each fronting one **fixed** upstream port,
+so a port swap broke a proxy and clients had to know which port was "safe" for
+which model.  Meanwhile the real gateway forwarded raw bytes and was unusable
+for VS Code.  All three proxies' transforms now live in ``policies.py`` and are
+selected per route, by the registry, here.
 
---------------------------------------------------------------------------
-INTEGRATION CONTRACT — read this if you are wiring app.py / supervisor.py
---------------------------------------------------------------------------
-servedeck/supervisor.py (SPEC §6) is owned by a different agent and did
-not exist yet when this file was written. Rather than import it (and
-either break at import time or freeze this file to a guess at its
-exact shape), this module depends on it only *structurally*, through the
-``SupervisorView`` Protocol below. Anything — a class instance, or a bare
-module (``import servedeck.supervisor as supervisor_mod``; modules satisfy
-Protocols too, since this is duck typing) — that exposes:
+What was dropped on purpose
+---------------------------
+The previous ``gateway.py`` was dead code (nothing imported it) built around
+*parking*: holding a request for up to 240 s while the backend restarted, with
+a 64-slot queue, shed responses and ETA-derived ``Retry-After`` values.  None
+of it was ever exercised against a live boot.  It is replaced by an immediate
+``503`` + ``Retry-After: 15`` naming what is actually in the main slot — the
+honest answer, and one a client can act on.  Parking can come back later, on
+top of a gateway that is tested, if a real client turns out to need it.
 
-  desired_state()      -> "STOPPED" | "RUNNING"
-  actual_state()        -> "STOPPED"|"PREFLIGHT"|"STARTING"|"READY"|
-                            "DRAINING"|"STOPPING"|"FAILED"|"UNMANAGED"
-  upstream_base_url()   -> str, e.g. "http://127.0.0.1:8001" (no path)
-  ready_event            : asyncio.Event, set exactly while actual_state
-                            == "READY" (supervisor's job to keep this in
-                            sync with its own state transitions)
-  hold_status()          -> HoldStatus  (best-effort; used only to build
-                            the human-readable / machine-readable parts
-                            of a park-timeout or shed error body)
-  failure_code()         -> str | None  (set when actual_state == FAILED;
-                            SPEC §5's Failure.code, e.g. "KV_TOO_SMALL")
-  failure_detail()       -> str | None
-
-...can be passed to :func:`build_gateway_router` / :func:`mount_gateway`.
-``failure_code``/``failure_detail``/``hold_status`` are consulted only for
-error-message cosmetics and are wrapped in ``_safe()`` — a supervisor
-that hasn't implemented them yet (or raises) still gets correct 503/park/
-stream routing, just a plainer error body.
-
-Two numeric choices in the 503 bodies are NOT specified anywhere in
-SPEC.md and are flagged here rather than silently invented as fact:
-  - Retry-After for the park-timeout and FAILED cases (SPEC gives an
-    exact value, 5s, only for the desired==STOPPED case). This module
-    uses 30s for FAILED and a 5-60s ETA-derived value for park-timeout.
-  - The "queue_full" error code/message for the max_parked=64 shed case
-    (SPEC says only "immediate 503 + Retry-After", no code name).
-Both are marked ``# UNSPECIFIED IN SPEC`` at their definition.
+Two rules this file does not bend
+---------------------------------
+1. **Neither body is ever buffered when it does not have to be.**  The request
+   body is read only far enough to resolve ``model`` (``policies.scan_model``)
+   and the remainder is streamed; the response is streamed chunk by chunk.
+   A body is held in full only when a policy must rewrite it — and every
+   policy is off by default.  ``app.py``'s ``catch_all``, which this replaces,
+   buffers every request including megabyte base64 images.
+2. **A client disconnect reaches the upstream socket.**  Starlette cancels the
+   streaming task when the downstream client goes away; that cancellation
+   lands inside the body generator and its ``finally`` closes the upstream
+   response.  Closing that socket is what actually aborts an in-flight vLLM
+   generation, which matters a great deal at small ``--max-num-seqs``: one
+   leaked generation holds a sequence slot and starves every other request.
 """
 
 from __future__ import annotations
 
-import asyncio
 import time
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import httpx
-from fastapi import APIRouter, FastAPI, Request, Response
+from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
-# ---------------------------------------------------------------------------
-# State constants — the exact strings from SPEC.md §6. Gateway does not own
-# these enums (supervisor.py does); it only compares against the literal
-# values, so it has no import-time dependency on however supervisor.py ends
-# up spelling them (str enum, plain str constants, whatever).
-# ---------------------------------------------------------------------------
-
-DESIRED_STOPPED = "STOPPED"
-DESIRED_RUNNING = "RUNNING"
-
-ACTUAL_STOPPED = "STOPPED"
-ACTUAL_PREFLIGHT = "PREFLIGHT"
-ACTUAL_STARTING = "STARTING"
-ACTUAL_READY = "READY"
-ACTUAL_DRAINING = "DRAINING"
-ACTUAL_STOPPING = "STOPPING"
-ACTUAL_FAILED = "FAILED"
-ACTUAL_UNMANAGED = "UNMANAGED"
-
-# The only two paths that are ever held (SPEC corrections addendum C2).
-# Matched against the tail of the path *after* the "/v1/" prefix the route
-# below already consumes, e.g. "chat/completions" for "/v1/chat/completions".
-_HOLD_ELIGIBLE_SUBPATHS = frozenset({"chat/completions", "responses"})
-
-# RFC 7230 §6.1 hop-by-hop headers, stripped in both directions — carrying
-# these across a proxy hop is always wrong. "host" is stripped only on the
-# request side (httpx sets it correctly from the target URL itself).
-_HOP_BY_HOP_HEADERS = frozenset(
-    {
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailer",
-        "trailers",
-        "transfer-encoding",
-        "upgrade",
-    }
-)
-_REQUEST_STRIP_HEADERS = _HOP_BY_HOP_HEADERS | {"host"}
-
-_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
-
-# Exact-path pass-through endpoints from SPEC §7 (everything except the
-# "/v1/*" family, which gets its own path-parameter route so it can single
-# out the two hold-eligible sub-paths).
-_FIXED_PASSTHROUGH_PATHS = (
-    "/health",
-    "/ping",
-    "/metrics",
-    "/tokenize",
-    "/detokenize",
-    "/invocations",
-    "/generative_scoring",
-)
-
+from servedeck import policies
 
 # ---------------------------------------------------------------------------
-# Supervisor contract
+# The route table contract — implemented by the registry (P1/P3), not here
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class HoldStatus:
-    """Best-effort description of "what's happening right now", used only
-    to fill in the ``servedeck`` block of a 503 body while a request is
-    parked or being shed. Never consulted for routing decisions."""
+class RoutePolicies:
+    """Which normalisations this model's traffic needs.  All off by default.
 
-    phase_code: str  # e.g. "loading_weights" (phases.Phase value) or a
-    #                  lowercased actual_state for non-boot holds like
-    #                  "draining" / "stopping"
-    phase_label: str  # human label, e.g. "Loading weights"
-    eta_s: int | None  # remaining-seconds estimate, or None if unknown
-    attempt: int  # current restart/boot attempt number (0 if not a restart)
+    ``mirror_reasoning``
+        Copy ``reasoning`` into ``reasoning_content`` (and the reverse) in the
+        JSON body and in every SSE delta, so a chat-completions client can
+        store the thinking and echo it back next turn.  Registry field
+        ``reasoning.mirror_content``.
+    ``effort_overlay``
+        ``chat_template_kwargs`` entries an effort *preset* carries, merged
+        with ``setdefault`` so an explicit caller value always wins — e.g.
+        ``{"reasoning_effort": "high"}`` for ``glm53-flash-high``.
+    ``min_output_tokens``
+        Raise an explicitly-small output budget to this floor, clamped to
+        ``ctx``.  Never lowers one, never invents one.
+    ``ctx``
+        The model's context length.  Reported as ``max_model_len`` by
+        ``/v1/models`` and used as the clamp for ``min_output_tokens``.
+    """
+
+    mirror_reasoning: bool = False
+    effort_overlay: Mapping[str, Any] | None = None
+    min_output_tokens: int | None = None
+    ctx: int = 0
+
+
+@dataclass(frozen=True)
+class Route:
+    """One model, as the gateway needs to see it.
+
+    ``aliases`` and ``presets`` are what ``GET /v1/models`` publishes alongside
+    ``model_id``; ``resolve()`` must accept every one of those names.  They are
+    kept apart because a preset is not a synonym — ``glm53-flash-high`` is the
+    same weights with a different request overlay — and the distinction is
+    worth keeping visible in the table even though ``/v1/models`` lists both.
+    """
+
+    model_id: str
+    port: int
+    live: bool = False
+    policies: RoutePolicies = field(default_factory=RoutePolicies)
+    aliases: tuple[str, ...] = ()
+    presets: tuple[str, ...] = ()
+    host: str = "127.0.0.1"
+
+    def served_names(self) -> tuple[str, ...]:
+        """Every name this route answers to, id first."""
+        return (self.model_id, *self.aliases, *self.presets)
+
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
 
 
 @runtime_checkable
-class SupervisorView(Protocol):
-    """Structural contract this module needs from servedeck.supervisor.
-    See the module docstring's INTEGRATION CONTRACT section."""
+class RouteTable(Protocol):
+    """What the gateway needs from the registry.  Structural, so anything —
+    a class instance or a bare module — that exposes these four methods can be
+    passed to :func:`build_router`.
 
-    def desired_state(self) -> str: ...
-    def actual_state(self) -> str: ...
-    def upstream_base_url(self) -> str: ...
-    ready_event: asyncio.Event
-    def hold_status(self) -> HoldStatus: ...
-    def failure_code(self) -> str | None: ...
-    def failure_detail(self) -> str | None: ...
+    ``resolve`` must accept an id, an alias **and** a preset name, and must
+    return routes that are not currently running too (that is what separates a
+    503 "not running" from a 404 "no such model" — collapsing the two would
+    tell a client to reconfigure itself when all it had to do was wait).
+    """
 
+    def resolve(self, name: str) -> Route | None:
+        """Route serving ``name`` (id, alias or preset), live or not."""
 
-def _safe(fn):
-    """Call a best-effort supervisor accessor; None on any failure so a
-    supervisor that's missing/broken on one of the cosmetic methods never
-    takes the gateway down with it."""
-    try:
-        return fn()
-    except Exception:
-        return None
+    def live_routes(self) -> list[Route]:
+        """Every route whose model is up right now, for ``GET /v1/models``."""
+
+    def main(self) -> Route | None:
+        """The route occupying the exclusive main GPU slot, or None."""
+
+    def known_names(self) -> list[str]:
+        """Every name ``resolve`` would accept, for the 404 body."""
 
 
 # ---------------------------------------------------------------------------
-# Parked-request bookkeeping (SPEC §7 max_parked=64; SPEC §8's "3 agent
-# requests held · oldest 2m14s" queue-visibility line reads this too).
+# Constants
+# ---------------------------------------------------------------------------
+
+_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
+
+#: Passthrough endpoints outside ``/v1``.  They carry no ``model`` (except
+#: ``/tokenize`` and ``/detokenize``, which do), so without one they go to the
+#: main slot — which is what "is the server up" probes mean by them anyway.
+_EXTRA_PATHS = ("/health", "/metrics", "/tokenize", "/detokenize")
+
+#: Methods whose body can carry a ``model``.  Everything else routes to main.
+_BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
+
+#: Ceiling on how much of a request body is read looking for ``model``.  Not a
+#: correctness bound — a body that hides ``model`` past this point simply
+#: routes to the main slot — but a memory bound, so a hostile or malformed
+#: body cannot make the gateway accumulate without limit.
+_MODEL_SCAN_LIMIT = 8 * 1024 * 1024
+
+#: Cheap pre-filter before the structural scan.  ``scan_model`` is a
+#: byte-at-a-time Python loop; running it over a megabyte of base64 image on
+#: every chunk would cost more than the request.  If these bytes are not
+#: present at all there is no ``model`` key to find, and ``bytes.__contains__``
+#: settles that at C speed.
+_MODEL_MARK = b'"model"'
+
+#: Connect fast (upstream is always 127.0.0.1, so a slow connect means it is
+#: not there), read slowly (a generation can legitimately run for an hour).
+_TIMEOUT = httpx.Timeout(connect=10.0, read=3600.0, write=3600.0, pool=10.0)
+
+#: How long a client should wait before retrying a model that is starting.  A
+#: cold boot of the main slot is minutes, but a 15 s poll is what makes a
+#: client's own retry loop feel like "it came back" rather than "it failed".
+_RETRY_AFTER_S = 15
+
+#: The one path that is routed but otherwise left completely alone: Codex
+#: speaks the responses API, where reasoning is already a first-class output
+#: item, so mirroring there would add a field to a shape that never lacked it.
+_RESPONSES_PATH = "/v1/responses"
+
+
+# ---------------------------------------------------------------------------
+# Error envelopes — OpenAI-shaped, because every client already parses that
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class GatewayRuntime:
-    """Live gateway state exposed for introspection (e.g. by the SSE
-    ``gateway`` event in api.py, which is not owned by this file — this
-    class is the read surface it's expected to poll, via
-    ``app.state.gateway``)."""
+def _error(
+    message: str, *, type_: str, code: str, status: int, headers: dict[str, str] | None = None
+) -> JSONResponse:
+    return JSONResponse(
+        {"error": {"message": message, "type": type_, "code": code}},
+        status_code=status,
+        headers=headers,
+    )
 
-    max_parked: int = 64
-    parked_count: int = 0
-    _park_started_at: list[float] = field(default_factory=list, repr=False)
 
-    def try_enter_park(self) -> bool:
-        """Reserve one parking slot. False means "shed" (SPEC §7:
-        "max_parked=64 -> beyond that immediate 503 + Retry-After")."""
-        if self.parked_count >= self.max_parked:
-            return False
-        self.parked_count += 1
-        self._park_started_at.append(time.monotonic())
+def unknown_model_response(name: str, known: list[str]) -> JSONResponse:
+    """404. The name is not in the registry at all — the client is misconfigured
+    and no amount of waiting will help, so list what it could have said."""
+    listed = ", ".join(known) if known else "none"
+    return JSONResponse(
+        {
+            "error": {
+                "message": f"The model '{name}' does not exist. Known models: {listed}",
+                "type": "invalid_request_error",
+                "param": "model",
+                "code": "model_not_found",
+            }
+        },
+        status_code=404,
+    )
+
+
+def _main_slot_description(route: Route | None, main: Route | None) -> str:
+    if main is None:
+        return "empty"
+    if route is not None and main.model_id == route.model_id:
+        return f"{main.model_id}, still starting"
+    return main.model_id
+
+
+def not_running_response(route: Route | None, main: Route | None) -> JSONResponse:
+    """503 + Retry-After. The model is registered but not up: either it is
+    booting or something else holds the exclusive main slot.  Naming what *is*
+    in the slot is the difference between a client that waits and a user who
+    goes looking for a config file."""
+    slot = _main_slot_description(route, main)
+    message = (
+        f"{route.model_id} is not running (main slot: {slot})"
+        if route is not None
+        else f"no model is running (main slot: {slot})"
+    )
+    return _error(
+        message,
+        type_="model_not_running",
+        code="not_running",
+        status=503,
+        headers={"Retry-After": str(_RETRY_AFTER_S)},
+    )
+
+
+def upstream_unavailable_response(route: Route, exc: BaseException) -> JSONResponse:
+    """502. The registry says this model is live and the socket says otherwise.
+    That is a disagreement between servedeck and reality, not a client error,
+    and it must not be dressed up as a 503 the client will silently retry."""
+    return _error(
+        f"upstream {route.base_url()} for {route.model_id} is unreachable: "
+        f"{type(exc).__name__}: {exc}",
+        type_="upstream_unavailable",
+        code="upstream_unavailable",
+        status=502,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Request plumbing
+# ---------------------------------------------------------------------------
+
+
+def _declares_a_body(request: Request) -> bool:
+    if request.headers.get("transfer-encoding"):
         return True
-
-    def leave_park(self) -> None:
-        self.parked_count = max(0, self.parked_count - 1)
-        if self._park_started_at:
-            # FIFO-ish; exact ordering under concurrent leaves isn't
-            # load-bearing — this list only ever backs a UX gauge, never a
-            # routing or safety decision.
-            self._park_started_at.pop(0)
-
-    def oldest_parked_age_s(self) -> float | None:
-        if not self._park_started_at:
-            return None
-        return time.monotonic() - self._park_started_at[0]
+    try:
+        return int(request.headers.get("content-length", "0")) > 0
+    except ValueError:
+        return False
 
 
-# ---------------------------------------------------------------------------
-# Header / URL helpers
-# ---------------------------------------------------------------------------
+async def _peek_model(request: Request) -> tuple[str | None, bytes, AsyncIterator[bytes] | None]:
+    """Read just enough of the request body to learn its ``model``.
 
+    Returns ``(model, bytes_read, unread_remainder)``.  ``unread_remainder`` is
+    ``None`` only when the body ended while we were still reading; otherwise it
+    is the live client stream, suspended wherever the scan stopped, and the
+    caller must forward it (``policies.chain_body``) or drain it.
 
-def _filter_headers(items, strip: frozenset[str]) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for k, v in items:
-        if k.lower() in strip:
+    The scan is re-run as the buffer grows, but only on a doubling schedule
+    (and only when the bytes ``"model"`` are present at all), which bounds the
+    total scanning work at roughly twice the body size instead of the O(n²) a
+    naive rescan-per-chunk would cost on a chunked upload.
+    """
+    if request.method not in _BODY_METHODS:
+        # A body on GET/DELETE/HEAD is unusual but legal, and dropping one
+        # silently is the kind of bug that only shows up as a confusing
+        # upstream 400.  It is forwarded unread: these methods carry no
+        # ``model``, so they route to the main slot either way.
+        return None, b"", (request.stream() if _declares_a_body(request) else None)
+
+    stream = request.stream()
+    buf = bytearray()
+    model: str | None = None
+    exhausted = True
+    scanned_len = -1
+    next_scan_at = 0
+
+    async for chunk in stream:
+        if not chunk:
             continue
-        out[k] = v
+        buf += chunk
+        # The cheap test runs on every chunk; only the byte-at-a-time
+        # structural scan is put on the doubling schedule.
+        if _MODEL_MARK not in buf:
+            continue
+        if len(buf) < next_scan_at:
+            continue
+        scanned_len = len(buf)
+        scan = policies.scan_model(bytes(buf))
+        if scan.complete:
+            model = scan.model
+            exhausted = False
+            break
+        next_scan_at = len(buf) * 2
+        if len(buf) >= _MODEL_SCAN_LIMIT:
+            exhausted = False
+            break
+
+    if model is None and len(buf) != scanned_len and _MODEL_MARK in buf:
+        # The body ended (or hit the ceiling) between scheduled scans; one last
+        # look, so a small body split across chunks is not mis-routed to main.
+        model = policies.scan_model(bytes(buf)).model
+
+    return model, bytes(buf), (None if exhausted else stream)
+
+
+def _forward_headers(request: Request) -> list[tuple[bytes, bytes]]:
+    """Client headers minus the hop-by-hop set, with encoding forced to
+    identity so upstream's bytes are the bytes we relay."""
+    out = [
+        (k, v)
+        for k, v in request.headers.raw
+        if k.decode("latin-1").lower() not in policies.DROP_REQUEST_HEADERS
+    ]
+    out.append((b"accept-encoding", b"identity"))
     return out
 
 
-def _build_target_url(base_url: str, request: Request) -> str:
-    url = base_url.rstrip("/") + request.url.path
-    if request.url.query:
-        url += "?" + request.url.query
-    return url
-
-
-def _format_duration(seconds: float | int) -> str:
-    """190 -> "3m10s"; 45 -> "45s" — matches SPEC §7's error-body example
-    ("~3m10s remaining" for eta_s=190) exactly."""
-    total = max(0, int(round(seconds)))
-    minutes, secs = divmod(total, 60)
-    if minutes:
-        return f"{minutes}m{secs:02d}s"
-    return f"{secs}s"
-
-
-# ---------------------------------------------------------------------------
-# Error envelope — SPEC §7, OpenAI-compatible
-# ---------------------------------------------------------------------------
-
-
-def _error_body(
-    *,
-    message: str,
-    code: str,
-    phase: str | None = None,
-    eta_s: int | None = None,
-    parked: int = 0,
-    attempt: int = 0,
-) -> dict:
+def _response_headers(upstream: httpx.Response) -> dict[str, str]:
     return {
-        "error": {
-            "message": message,
-            "type": "servedeck_upstream_unavailable",
-            "code": code,
-            "servedeck": {
-                "phase": phase,
-                "eta_s": eta_s,
-                "parked": parked,
-                "attempt": attempt,
-            },
-        }
+        k: v
+        for k, v in upstream.headers.items()
+        if k.lower() not in policies.DROP_RESPONSE_HEADERS
     }
 
 
-def _json_503(body: dict, *, retry_after: int) -> JSONResponse:
-    return JSONResponse(body, status_code=503, headers={"Retry-After": str(retry_after)})
-
-
-def _stopped_response() -> JSONResponse:
-    body = _error_body(message="Servedeck: backend is stopped.", code="stopped")
-    return _json_503(body, retry_after=5)  # SPEC §7: exact value given
-
-
-def _failed_response(supervisor: SupervisorView) -> JSONResponse:
-    code = _safe(supervisor.failure_code) or "failed"
-    detail = _safe(supervisor.failure_detail)
-    message = f"Servedeck: backend failed to start — {detail or code}"
-    body = _error_body(message=message, code=str(code).lower())
-    return _json_503(body, retry_after=30)  # UNSPECIFIED IN SPEC
-
-
-def _shed_response(runtime: GatewayRuntime, supervisor: SupervisorView) -> JSONResponse:
-    hold = _safe(supervisor.hold_status)
-    message = (
-        f"Servedeck: too many requests waiting for the backend to become "
-        f"ready ({runtime.max_parked} already parked)."
-    )
-    body = _error_body(
-        message=message,
-        code="queue_full",  # UNSPECIFIED IN SPEC (name only; the 503+Retry-After behavior is specified)
-        phase=hold.phase_code if hold else None,
-        eta_s=hold.eta_s if hold else None,
-        parked=runtime.max_parked,
-        attempt=hold.attempt if hold else 0,
-    )
-    return _json_503(body, retry_after=5)  # UNSPECIFIED IN SPEC
-
-
-def _timeout_response(supervisor: SupervisorView, runtime: GatewayRuntime) -> JSONResponse:
-    hold = _safe(supervisor.hold_status)
-    phase_label = hold.phase_label if hold else "starting"
-    phase_code = hold.phase_code if hold else None
-    eta_s = hold.eta_s if hold else None
-    attempt = hold.attempt if hold else 0
-    eta_str = _format_duration(eta_s) if eta_s is not None else "an unknown time"
-    message = f"Servedeck: backend restarting — phase '{phase_label}', ~{eta_str} remaining"
-    body = _error_body(
-        message=message,
-        code="restarting",
-        phase=phase_code,
-        eta_s=eta_s,
-        parked=runtime.parked_count,
-        attempt=attempt,
-    )
-    retry_after = max(5, min(int(eta_s) if eta_s is not None else 30, 60))  # UNSPECIFIED IN SPEC
-    return _json_503(body, retry_after=retry_after)
-
-
-def _unreachable_response(exc: BaseException) -> JSONResponse:
-    body = _error_body(message=f"Servedeck: upstream unreachable — {exc}", code="upstream_unreachable")
-    return _json_503(body, retry_after=5)  # UNSPECIFIED IN SPEC
+async def _drain(rest: AsyncIterator[bytes] | None) -> bytes:
+    if rest is None:
+        return b""
+    out = bytearray()
+    async for chunk in rest:
+        if chunk:
+            out += chunk
+    return bytes(out)
 
 
 # ---------------------------------------------------------------------------
-# The actual proxy — transparent stream, no buffering either direction
+# The proxy
 # ---------------------------------------------------------------------------
 
 
-async def _stream_proxy(client: httpx.AsyncClient, base_url: str, request: Request) -> Response:
-    """READY / UNMANAGED behavior, and every plain-pass-through path: open
-    the upstream request with the client's own body stream as content
-    (never buffered — SPEC §7: "body NOT buffered (TCP backpressure)"),
-    grab status+headers as soon as they arrive, then hand back a
-    StreamingResponse that lazily pulls raw bytes from upstream.
+async def _proxy(
+    request: Request, route: Route, client: httpx.AsyncClient, prefix: bytes,
+    rest: AsyncIterator[bytes] | None, *, rewrite_model_to: str | None,
+) -> Response:
+    pol = route.policies
+    is_responses = request.url.path == _RESPONSES_PATH
 
-    C7 (client-disconnect propagation): Starlette's StreamingResponse
-    races its body-streaming task against a disconnect listener and
-    cancels the streaming task the moment the client goes away. That
-    cancellation lands inside ``body()`` below, at whatever
-    ``upstream.aiter_raw()`` await it's suspended on, and the
-    ``try/finally`` ensures ``upstream.aclose()`` still runs — which is
-    what actually closes the socket vLLM's ``with_cancellation`` is
-    watching. THE HARD RULE this satisfies: once a chunk has been yielded
-    here, this function makes no further decision that could re-issue the
-    request — a disconnect after that point only ever tears the one
-    upstream connection down, never retries it.
-    """
-    target = _build_target_url(base_url, request)
-    headers = _filter_headers(request.headers.items(), _REQUEST_STRIP_HEADERS)
-    req = client.build_request(request.method, target, headers=headers, content=request.stream())
+    needs_body = (
+        rewrite_model_to is not None
+        or bool(pol.effort_overlay)
+        or bool(pol.min_output_tokens)
+    )
+    content: Any
+    if needs_body and request.method in _BODY_METHODS:
+        raw = prefix + await _drain(rest)
+        content = policies.apply_request_policies(
+            raw,
+            model_id=rewrite_model_to,
+            overlay=pol.effort_overlay,
+            floor=pol.min_output_tokens,
+            ctx=pol.ctx,
+        )
+    elif prefix or rest is not None:
+        content = policies.chain_body(prefix, rest)
+    else:
+        content = None
 
+    url = route.base_url() + request.url.path
+    if request.url.query:
+        url = f"{url}?{request.url.query}"
+
+    upstream_request = client.build_request(
+        request.method, url, headers=_forward_headers(request), content=content
+    )
     try:
-        upstream = await client.send(req, stream=True)
-    except httpx.HTTPError as exc:
-        return _unreachable_response(exc)
+        upstream = await client.send(upstream_request, stream=True)
+    except Exception as exc:  # noqa: BLE001 — any transport failure is a 502
+        return upstream_unavailable_response(route, exc)
 
-    response_headers = _filter_headers(upstream.headers.items(), _HOP_BY_HOP_HEADERS)
+    headers = _response_headers(upstream)
+    media = upstream.headers.get("content-type", "")
+    # Whether a response is transformed is decided by its **upstream
+    # Content-Type**, never by whether the request said stream=true: the proxy
+    # then never has to guess, and a server that answers a streaming request
+    # with a JSON error is handled by the JSON path automatically.
+    mirror = pol.mirror_reasoning and not is_responses
 
-    async def body() -> AsyncIterator[bytes]:
+    if media.startswith("text/event-stream"):
+        source = policies.sse_stream(upstream.aiter_bytes()) if mirror else upstream.aiter_bytes()
+
+        async def sse_body() -> AsyncIterator[bytes]:
+            try:
+                async for chunk in source:
+                    yield chunk
+            finally:
+                await upstream.aclose()
+
+        return StreamingResponse(
+            sse_body(), status_code=upstream.status_code, headers=headers, media_type=media
+        )
+
+    if mirror and (media.startswith("application/json") or media.startswith("application/vnd")):
+        # The only place a response body is held in full, and only because a
+        # complete JSON object cannot be mirrored a chunk at a time.
         try:
-            async for chunk in upstream.aiter_raw():
+            payload = await upstream.aread()
+        finally:
+            await upstream.aclose()
+        return Response(
+            content=policies.transform_json_body(payload),
+            status_code=upstream.status_code,
+            headers=headers,
+            media_type=media or None,
+        )
+
+    async def raw_body() -> AsyncIterator[bytes]:
+        try:
+            async for chunk in upstream.aiter_bytes():
                 yield chunk
         finally:
             await upstream.aclose()
 
-    return StreamingResponse(body(), status_code=upstream.status_code, headers=response_headers)
+    return StreamingResponse(
+        raw_body(), status_code=upstream.status_code, headers=headers, media_type=media or None
+    )
 
 
-async def _park(supervisor: SupervisorView, hold_max_s: float, poll_s: float) -> str:
-    """Wait for supervisor.ready_event, bounded at hold_max_s total, but
-    polled at poll_s granularity so a transition to FAILED or a
-    desired_state flip to STOPPED *during* the hold is noticed promptly
-    instead of only once the full 240s elapses (corrections addendum C8:
-    "Never hold when reached_ready was false" — a boot that has already
-    failed must stop blocking this request well before the outer ceiling).
+async def _dispatch(request: Request, routes: RouteTable, client: httpx.AsyncClient) -> Response:
+    model, prefix, rest = await _peek_model(request)
 
-    Returns one of "ready" | "failed" | "stopped" | "timeout".
+    if model is None:
+        # No model named: a GET probe, or a POST that left it out.  The main
+        # slot is what "the local model" means to a client that did not say.
+        main = routes.main()
+        if main is None or not main.live:
+            await _drain(rest)
+            return not_running_response(main, main)
+        route = main
+    else:
+        resolved = routes.resolve(model)
+        if resolved is None:
+            await _drain(rest)
+            return unknown_model_response(model, routes.known_names())
+        if not resolved.live:
+            await _drain(rest)
+            return not_running_response(resolved, routes.main())
+        route = resolved
+
+    # The requested name is an alias or a preset, not the name vLLM was started
+    # with: rewrite it, or upstream answers 404 for a model it is serving.
+    rewrite = route.model_id if (model is not None and model != route.model_id) else None
+    return await _proxy(request, route, client, prefix, rest, rewrite_model_to=rewrite)
+
+
+def models_payload(routes: RouteTable, *, created: int | None = None) -> dict:
+    """``GET /v1/models``: one entry per served name of every live route.
+
+    Every name a client has ever been configured with appears, so the 404 class
+    of bug ("model does not exist" after a rename) is gone by construction; and
+    every entry carries ``max_model_len``, so a client can size its context
+    from the same place it learned the name instead of a second config file.
+    ``root`` is the model id, which is what tells a client that three of these
+    entries are the same weights.
     """
-    deadline = time.monotonic() + hold_max_s
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return "timeout"
-        wait_s = min(poll_s, remaining)
-        try:
-            await asyncio.wait_for(supervisor.ready_event.wait(), timeout=wait_s)
-        except TimeoutError:
-            pass
-        else:
-            return "ready"
-        if _safe(supervisor.actual_state) == ACTUAL_FAILED:
-            return "failed"
-        if _safe(supervisor.desired_state) == DESIRED_STOPPED:
-            return "stopped"
-
-
-async def _handle_hold_eligible(
-    request: Request,
-    supervisor: SupervisorView,
-    client: httpx.AsyncClient,
-    runtime: GatewayRuntime,
-    hold_max_s: float,
-    park_poll_s: float,
-) -> Response:
-    """POST /v1/chat/completions and POST /v1/responses only (C2). Every
-    other path goes through :func:`_handle_pass_through` instead, which
-    never parks and never consults state at all.
-
-    Ordering below matters and is deliberate:
-    desired==STOPPED is checked first because it is an unconditional
-    "never park" per SPEC §7, independent of whatever actual_state
-    happens to still read as mid-race (supervisor.stop() sets
-    desired_state=STOPPED *before* signalling, per SPEC §6, so a request
-    can legitimately arrive with actual_state still READY for one more
-    tick while desired is already STOPPED — SPEC's intent is clearly not
-    to start a brand-new generation against a server that a human just
-    told to stop).
-    """
-    desired = supervisor.desired_state()
-    actual = supervisor.actual_state()
-
-    if desired == DESIRED_STOPPED:
-        return _stopped_response()
-
-    if actual == ACTUAL_FAILED:
-        return _failed_response(supervisor)
-
-    if actual in (ACTUAL_READY, ACTUAL_UNMANAGED):
-        return await _stream_proxy(client, supervisor.upstream_base_url(), request)
-
-    # STARTING / PREFLIGHT / DRAINING / STOPPING (desired==RUNNING, per the
-    # STOPPED check above) — and, defensively, any other actual_state this
-    # module doesn't otherwise recognize while desired==RUNNING: SPEC §6's
-    # startup reconciliation means such a state is transient (about to
-    # become PREFLIGHT/STARTING), so parking is the correct call rather
-    # than either an indefinite hold (hold_max_s bounds it regardless) or
-    # a spurious immediate 503.
-    if not runtime.try_enter_park():
-        return _shed_response(runtime, supervisor)
-
-    try:
-        outcome = await _park(supervisor, hold_max_s, park_poll_s)
-    finally:
-        runtime.leave_park()
-
-    if outcome == "ready":
-        return await _stream_proxy(client, supervisor.upstream_base_url(), request)
-    if outcome == "failed":
-        return _failed_response(supervisor)
-    if outcome == "stopped":
-        return _stopped_response()
-    return _timeout_response(supervisor, runtime)  # outcome == "timeout"
-
-
-async def _handle_pass_through(request: Request, supervisor: SupervisorView, client: httpx.AsyncClient) -> Response:
-    """Every path except the two hold-eligible ones (C2): GET /v1/models,
-    GET/POST /health, /ping, /metrics, /tokenize, /detokenize,
-    /invocations, /generative_scoring, and anything else under /v1/*.
-    Deliberately consults NO supervisor state — "pass through; 503 when
-    down" means literally attempt the connection now and translate a
-    connect/transport failure into 503; never hold, never synthesize a
-    200 (C2's explicit warning: faking GET /v1/models as 200 would make
-    ``is_server_up()`` believe a dead server is alive and nothing would
-    ever restart it).
-    """
-    base_url = _safe(supervisor.upstream_base_url)
-    if not base_url:
-        return _unreachable_response(RuntimeError("no upstream configured"))
-    return await _stream_proxy(client, base_url, request)
+    stamp = int(time.time()) if created is None else created
+    data = []
+    for route in routes.live_routes():
+        for name in route.served_names():
+            data.append(
+                {
+                    "id": name,
+                    "object": "model",
+                    "created": stamp,
+                    "owned_by": "servedeck",
+                    "root": route.model_id,
+                    "parent": None,
+                    "max_model_len": route.policies.ctx,
+                }
+            )
+    return {"object": "list", "data": data}
 
 
 # ---------------------------------------------------------------------------
@@ -494,87 +506,56 @@ async def _handle_pass_through(request: Request, supervisor: SupervisorView, cli
 # ---------------------------------------------------------------------------
 
 
-def build_gateway_router(
-    supervisor: SupervisorView,
+def build_router(
+    routes: RouteTable,
     *,
+    client: httpx.AsyncClient | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
-    hold_max_s: float = 240.0,
-    max_parked: int = 64,
-    park_poll_s: float = 0.5,
-) -> tuple[APIRouter, httpx.AsyncClient, GatewayRuntime]:
-    """Build the gateway's routes against one supervisor. Returns the
-    router plus the httpx client and runtime-info object it owns, so a
-    caller (production: :func:`mount_gateway`; tests: directly) controls
-    the client's lifecycle explicitly rather than this module reaching
-    for a hidden global.
+) -> APIRouter:
+    """Build the gateway's ``/v1/*`` routes against one route table.
 
-    `transport` lets tests substitute `httpx.MockTransport` for the real
-    network — production callers leave it None and get a real
-    `httpx.AsyncClient`. No read timeout is set (`read=None`): a
-    generation can legitimately run for minutes, and the only thing that
-    should ever end a stream early is the client disconnecting (C7) — not
-    a server-side clock. `connect` stays short since upstream is always
-    127.0.0.1.
+    ``client`` / ``transport`` exist so tests can substitute
+    ``httpx.MockTransport`` for the network.  When neither is given the router
+    owns a real client and stashes it at ``router.gateway_client`` — the caller
+    that mounts the router is responsible for closing it at shutdown, because
+    a module-level client would outlive the app it belongs to and is exactly
+    the kind of hidden global this rewrite exists to remove.
     """
-    timeout = httpx.Timeout(connect=10.0, read=None, write=None, pool=None)
-    client = httpx.AsyncClient(transport=transport, timeout=timeout)
-    runtime = GatewayRuntime(max_parked=max_parked)
+    owned = client is None
+    if client is None:
+        client = httpx.AsyncClient(transport=transport, timeout=_TIMEOUT, follow_redirects=False)
     router = APIRouter()
+    # Not an APIRouter field; attached deliberately so the owner can close it.
+    router.gateway_client = client  # type: ignore[attr-defined]
+    router.gateway_owns_client = owned  # type: ignore[attr-defined]
 
-    @router.api_route("/v1/{full_path:path}", methods=_METHODS)
-    async def v1_dispatch(full_path: str, request: Request) -> Response:
-        if request.method == "POST" and full_path in _HOLD_ELIGIBLE_SUBPATHS:
-            return await _handle_hold_eligible(request, supervisor, client, runtime, hold_max_s, park_poll_s)
-        return await _handle_pass_through(request, supervisor, client)
+    @router.get("/v1/models")
+    async def list_models() -> JSONResponse:
+        return JSONResponse(models_payload(routes))
 
-    def _make_fixed_handler():
-        async def _handler(request: Request) -> Response:
-            return await _handle_pass_through(request, supervisor, client)
+    @router.api_route("/v1/{path:path}", methods=_METHODS)
+    async def v1(path: str, request: Request) -> Response:
+        return await _dispatch(request, routes, client)
 
-        return _handler
+    def _make_handler():
+        async def handler(request: Request) -> Response:
+            return await _dispatch(request, routes, client)
 
-    for fixed_path in _FIXED_PASSTHROUGH_PATHS:
-        router.add_api_route(fixed_path, _make_fixed_handler(), methods=_METHODS)
+        return handler
 
-    return router, client, runtime
+    for extra in _EXTRA_PATHS:
+        router.add_api_route(extra, _make_handler(), methods=_METHODS)
+
+    return router
 
 
-def mount_gateway(
-    app: FastAPI,
-    supervisor: SupervisorView,
-    *,
-    transport: httpx.AsyncBaseTransport | None = None,
-    hold_max_s: float = 240.0,
-    max_parked: int = 64,
-    park_poll_s: float = 0.5,
-) -> GatewayRuntime:
-    """Convenience for whoever owns app.py: mounts the gateway routes on
-    `app`, wires the owned httpx client's shutdown into the app lifecycle,
-    and stashes the runtime-info object at ``app.state.gateway`` (read by
-    the SSE ``gateway`` event, SPEC §8) before returning it too.
-
-    Shutdown wiring uses ``app.router.add_event_handler`` (FastAPI's own
-    backward-compat shim over Starlette's removed on_shutdown list; NOT
-    ``app.add_event_handler``, which this FastAPI version no longer has).
-    That shim only fires if app.py leaves FastAPI's *default* lifespan in
-    place. If app.py instead supplies its own ``lifespan=`` context
-    manager, on_shutdown handlers registered this way are never called —
-    in that case, close ``app.state.gateway_client`` (stashed here
-    specifically as a fallback) from within that lifespan's teardown.
-    """
-    router, client, runtime = build_gateway_router(
-        supervisor,
-        transport=transport,
-        hold_max_s=hold_max_s,
-        max_parked=max_parked,
-        park_poll_s=park_poll_s,
-    )
-    app.include_router(router)
-    app.state.gateway = runtime
-    app.state.gateway_client = client  # fallback close target — see docstring
-
-    async def _close_client() -> None:
-        await client.aclose()
-
-    app.router.add_event_handler("shutdown", _close_client)
-    return runtime
+__all__ = [
+    "Route",
+    "RoutePolicies",
+    "RouteTable",
+    "build_router",
+    "models_payload",
+    "not_running_response",
+    "unknown_model_response",
+    "upstream_unavailable_response",
+]

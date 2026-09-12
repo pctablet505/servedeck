@@ -1,0 +1,1 @@
+{"model":"qwen38-flash-next","messages":[{"role":"user","content":"What is 17*23?"},{"role":"assistant","content":"391","reasoning_content":"SECRET_PRIOR_THOUGHT: 17*23=391"},{"role":"user","content":"Now multiply that by 2."}],"max_tokens":512,"temperature":0.0}
