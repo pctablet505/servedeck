@@ -1,0 +1,36 @@
+data: {"id":"chatcmpl-a26f1244cf23adf6","object":"chat.completion.chunk","created":1788979160,"model":"qwen38-flash-next","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}],"prompt_token_ids":null,"prompt_text":null}
+
+data: {"id":"chatcmpl-a26f1244cf23adf6","object":"chat.completion.chunk","created":1788979160,"model":"qwen38-flash-next","choices":[{"index":0,"delta":{"reasoning":"We"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-a26f1244cf23adf6","object":"chat.completion.chunk","created":1788979160,"model":"qwen38-flash-next","choices":[{"index":0,"delta":{"reasoning":" need answer user:"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-a26f1244cf23adf6","object":"chat.completion.chunk","created":1788979160,"model":"qwen38-flash-next","choices":[{"index":0,"delta":{"reasoning":" \"What is "},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-a26f1244cf23adf6","object":"chat.completion.chunk","created":1788979160,"model":"qwen38-flash-next","choices":[{"index":0,"delta":{"reasoning":"17*2"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-a26f1244cf23adf6","object":"chat.completion.chunk","created":1788979160,"model":"qwen38-flash-next","choices":[{"index":0,"delta":{"reasoning":"3? Think briefly"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-a26f1244cf23adf6","object":"chat.completion.chunk","created":1788979160,"model":"qwen38-flash-next","choices":[{"index":0,"delta":{"reasoning":", then answer.\""},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-a26f1244cf23adf6","object":"chat.completion.chunk","created":1788979160,"model":"qwen38-flash-next","choices":[{"index":0,"delta":{"reasoning":" Need final concise."},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-a26f1244cf23adf6","object":"chat.completion.chunk","created":1788979160,"model":"qwen38-flash-next","choices":[{"index":0,"delta":{"reasoning":" Compute 17"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-a26f1244cf23adf6","object":"chat.completion.chunk","created":1788979160,"model":"qwen38-flash-next","choices":[{"index":0,"delta":{"reasoning":"*23 ="},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-a26f1244cf23adf6","object":"chat.completion.chunk","created":1788979160,"model":"qwen38-flash-next","choices":[{"index":0,"delta":{"reasoning":" 3"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-a26f1244cf23adf6","object":"chat.completion.chunk","created":1788979160,"model":"qwen38-flash-next","choices":[{"index":0,"delta":{"reasoning":"91. Could"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-a26f1244cf23adf6","object":"chat.completion.chunk","created":1788979160,"model":"qwen38-flash-next","choices":[{"index":0,"delta":{"reasoning":" include"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-a26f1244cf23adf6","object":"chat.completion.chunk","created":1788979160,"model":"qwen38-flash-next","choices":[{"index":0,"delta":{"reasoning":" brief.\n"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-a26f1244cf23adf6","object":"chat.completion.chunk","created":1788979160,"model":"qwen38-flash-next","choices":[{"index":0,"delta":{"content":"\n\n3"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-a26f1244cf23adf6","object":"chat.completion.chunk","created":1788979160,"model":"qwen38-flash-next","choices":[{"index":0,"delta":{"content":"91"},"logprobs":null,"finish_reason":"stop","stop_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-a26f1244cf23adf6","object":"chat.completion.chunk","created":1788979160,"model":"qwen38-flash-next","choices":[],"usage":{"prompt_tokens":67,"total_tokens":116,"completion_tokens":49,"completion_tokens_details":{"reasoning_tokens":43}},"system_fingerprint":"vllm-0.29.0.dev0+qwen38next-79646177"}
+
+data: [DONE]
+
