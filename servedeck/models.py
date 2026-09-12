@@ -9,17 +9,21 @@ Design notes, so a later packet does not have to re-derive them:
 
 * ``load()`` merges ``[defaults.env]`` into every model's own ``env`` at LOAD time
   (the model's own keys win on conflict), so ``render_env()`` only needs the model
-  — no registry-level merge step downstream.
+  plus its resolved ``Build`` — no registry-level merge step downstream.
 * ``render_argv()`` takes ``util``/``ctx_tokens``/``port`` as already-resolved
   values, not the registry or the hub cache: it never does I/O, which is what makes
   the golden test (``tests/test_models_golden.py``) able to compare it byte-for-byte
   against a legacy launcher's dry-run output. Resolving ``ctx="native"`` to an int is
   a separate step (``native_ctx()``), because that DOES need the hub cache.
+* Utilisation arithmetic (``compute_util``/``floor2``) lives in
+  ``servedeck.control`` (decision 4 of REDESIGN §2.1), not here — this module
+  used to carry its own ``main_util``/``resident_util``, and two implementations
+  of the same rule is exactly the kind of divergence that rule exists to avoid.
 """
 
 from __future__ import annotations
 
-import math
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,20 +36,31 @@ __all__ = [
     "Reasoning",
     "Tools",
     "Model",
+    "Build",
     "GPU",
     "Registry",
     "Resolved",
     "load",
     "render_argv",
     "render_env",
-    "main_util",
-    "resident_util",
     "native_ctx",
 ]
 
 #: Ports that belong to the gateway (:8010) and to the unrelated ats-optimizer.service
 #: (:8000) — REDESIGN-2026-09-12.md §2.1 "ports unique and never 8000 or 8010".
 RESERVED_PORTS: frozenset[int] = frozenset({8000, 8010})
+
+#: Registry keys become unit names (``model-<key>``, servedeck.units._NAME_RE
+#: only allows ``[a-z0-9-]+`` after that prefix) — enforced here too, so a bad
+#: key is a load-time RegistryError instead of a refusal three modules later.
+_KEY_RE = re.compile(r"^[a-z0-9-]+$")
+
+#: Standard system dirs appended to a model's PATH after its venv/CUDA bins —
+#: REDESIGN-2026-09-12.md launch-environment-completeness fix: a transient
+#: systemd unit inherits the user manager's environment, never the invoking
+#: shell's, so anything a model's own tooling shells out to (env, sh, coreutils)
+#: must be reachable from an explicit, self-sufficient PATH.
+_SYSTEM_PATH_DIRS = ("/usr/local/bin", "/usr/bin", "/bin")
 
 
 class RegistryError(Exception):
@@ -108,6 +123,25 @@ class Model:
 
 
 @dataclass(frozen=True)
+class Build:
+    """One ``[builds.<name>]`` table: the vLLM venv a model launches from, and
+    the CUDA toolkit directory that ships inside it.
+
+    Every legacy launcher exports ``CUDA_HOME=<venv>/lib/python3.13/site-packages/
+    nvidia/cu13`` and prepends ``<venv>/bin:$CUDA_HOME/bin`` to ``PATH``
+    (``qwen-server-run.sh:267-268``, ``serve.sh:63,72``, ``serve-opt.sh:168,177``)
+    — nvcc/ptxas live there and FlashInfer's JIT needs them at request time, not
+    just at process start. ``cuda_home`` is carried explicitly rather than
+    derived by string-gluing a python version onto ``venv`` in code, because the
+    python version is a fact about how the venv was built, not a constant this
+    module should assume.
+    """
+
+    venv: str
+    cuda_home: str
+
+
+@dataclass(frozen=True)
 class GPU:
     total_mib: int
     margin_mib: int
@@ -119,7 +153,7 @@ class Registry:
 
     models: dict[str, Model]  # TOML key -> Model, insertion order preserved
     gpu: GPU
-    builds: dict[str, str]
+    builds: dict[str, Build]
     defaults_env: dict[str, str]
 
     def resolve(self, name: str) -> Resolved | None:
@@ -231,7 +265,31 @@ def _load_model(key: str, raw: dict[str, Any], defaults_env: dict[str, str]) -> 
     )
 
 
-def _validate(models: dict[str, Model], gpu: GPU, builds: dict[str, str]) -> None:
+def _load_builds(raw: dict[str, Any]) -> dict[str, Build]:
+    builds: dict[str, Build] = {}
+    for name, table in raw.items():
+        if not isinstance(table, dict):
+            raise RegistryError(
+                f"builds.{name} must be a table with 'venv' and 'cuda_home', "
+                f"got {table!r}"
+            )
+        for required in ("venv", "cuda_home"):
+            if not table.get(required):
+                raise RegistryError(f"builds.{name}: missing {required!r}")
+        builds[name] = Build(venv=table["venv"], cuda_home=table["cuda_home"])
+    return builds
+
+
+def _validate(models: dict[str, Model], gpu: GPU, builds: dict[str, Build]) -> None:
+    # -- registry keys become unit names (`model-<key>`): restrict the shape
+    # here rather than let a bad key surface as a systemd refusal later.
+    for key in models:
+        if not _KEY_RE.match(key):
+            raise RegistryError(
+                f"models.{key}: key must match {_KEY_RE.pattern!r} (it becomes "
+                f"the unit name model-{key})"
+            )
+
     # -- names: id/alias/preset unique across the whole file, and a preset must
     # not shadow an id/alias (its own model's, or any other model's).
     owners: dict[str, tuple[str, str]] = {}  # name -> (model_key, kind)
@@ -310,7 +368,7 @@ def load(path: str | Path) -> Registry:
         raise RegistryError("[gpu] table with total_mib and margin_mib is required")
     gpu = GPU(total_mib=int(gpu_raw["total_mib"]), margin_mib=int(gpu_raw["margin_mib"]))
 
-    builds = dict(data.get("builds") or {})
+    builds = _load_builds(data.get("builds") or {})
     defaults_env = dict((data.get("defaults") or {}).get("env") or {})
 
     models_raw = data.get("models") or {}
@@ -324,35 +382,6 @@ def load(path: str | Path) -> Registry:
     _validate(models, gpu, builds)
 
     return Registry(models=models, gpu=gpu, builds=builds, defaults_env=defaults_env)
-
-
-# --------------------------------------------------------------------------- #
-# Utilisation arithmetic (REDESIGN §2.1: "computed at launch", never hand-tuned)
-# --------------------------------------------------------------------------- #
-
-
-def _floor_2dp(x: float) -> float:
-    """Round DOWN to 2 decimals. Never round up: an over-estimated utilisation is
-    a refused/OOM boot, an under-estimated one is merely a little headroom left
-    on the table."""
-    return math.floor(x * 100.0) / 100.0
-
-
-def main_util(free_mib: float, total_mib: float, margin_mib: float) -> float:
-    """A `main`-slot model's ``--gpu-memory-utilization``: everything free, minus
-    the margin, as a fraction of the card — REDESIGN §2.1's "everything that is
-    free" rule. Rounded down to 2 decimals (vLLM's own CLI precision)."""
-    if total_mib <= 0:
-        raise ValueError(f"total_mib must be positive, got {total_mib!r}")
-    return _floor_2dp((free_mib - margin_mib) / total_mib)
-
-
-def resident_util(vram_mib: float, total_mib: float) -> float:
-    """A resident model's ``--gpu-memory-utilization``: its fixed budget as a
-    fraction of the card. Rounded down to 2 decimals."""
-    if total_mib <= 0:
-        raise ValueError(f"total_mib must be positive, got {total_mib!r}")
-    return _floor_2dp(vram_mib / total_mib)
 
 
 # --------------------------------------------------------------------------- #
@@ -422,7 +451,23 @@ def render_argv(
     return argv
 
 
-def render_env(model: Model) -> dict[str, str]:
-    """A model's fully-resolved launch environment (``[defaults.env]`` already
-    merged in by :func:`load`)."""
-    return dict(model.env)
+def render_env(model: Model, build: Build) -> dict[str, str]:
+    """A model's COMPLETE launch environment: ``[defaults.env]`` and the
+    model's own ``env`` (merged in by :func:`load`), plus ``CUDA_HOME`` and a
+    full ``PATH`` derived from ``build``.
+
+    Every legacy launcher exports these two (see :class:`Build`'s docstring for
+    citations) and none of them relies on an inherited ``PATH`` doing the job —
+    which matters here even more than it did for a shell script: a
+    ``systemd-run --user`` transient unit inherits the USER MANAGER's
+    environment, never the caller's shell, so a model launched without an
+    explicit ``PATH`` would not even find ``env``/``sh``. ``venv``/``cuda_home``
+    are expanded here (not left as ``~...``): a real ``CUDA_HOME`` environment
+    variable is read literally by nvcc/torch, which do not expand ``~``.
+    """
+    env = dict(model.env)
+    venv = str(Path(build.venv).expanduser())
+    cuda_home = str(Path(build.cuda_home).expanduser())
+    env["CUDA_HOME"] = cuda_home
+    env["PATH"] = ":".join((f"{venv}/bin", f"{cuda_home}/bin", *_SYSTEM_PATH_DIRS))
+    return env

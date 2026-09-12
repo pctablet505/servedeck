@@ -11,12 +11,24 @@ editor an hour later." Four kinds of check, each yielding one or more
 3. for each model in the registry, its own port either answers ``/v1/models``
    with that model's id (or an alias) in the list, or is not listening at all
    — a THIRD state (a different model answering) is the one real failure.
-4. a known systemd user unit exists for the model (best-effort: only
-   ``qwen27b`` and ``lfm2`` have one today — see ``KNOWN_UNIT_NAMES``).
+4. which registry models currently have a live ``model-<key>`` transient unit
+   (:func:`servedeck.units.list_units`), and whether any live ``model-*`` unit
+   belongs to a key the registry does not know. A model with NO unit is not a
+   failure — most registry models are not running most of the time (`main` is
+   exclusive, `resident`s are opt-in) — only a STRAY unit (something running
+   under a key this ``models.toml`` has never heard of) is.
+
+   This deliberately does NOT look at ``~/.config/systemd/user/*.service``:
+   v2's models run as ``systemd-run --user`` TRANSIENT units, which live in
+   ``/run/user/<uid>/systemd/transient`` and are enumerated with
+   ``systemctl --user list-units``, never as files in that directory — a
+   file-existence check there can never pass after the cutover.
 
 All network access is a plain ``httpx.get`` with a 2 s timeout, injectable via
 ``http_get`` so tests never need a real server — except the two tests that are
 explicitly allowed to hit the box's own live, read-only ``:8007`` and ``:8010``.
+Unit listing is a plain :class:`servedeck.units.Runner`, injectable the same
+way (see ``servedeck.units``'s own test suite for the convention).
 """
 
 from __future__ import annotations
@@ -30,16 +42,16 @@ from typing import NamedTuple
 import httpx
 
 from . import models as _models
+from . import units as _units
 from . import wire as _wire
 
 __all__ = [
     "CheckResult",
     "Unreachable",
-    "KNOWN_UNIT_NAMES",
     "check_registry",
     "check_client_config",
     "check_port",
-    "check_systemd_units",
+    "check_model_units",
     "run_doctor",
     "all_ok",
     "format_table",
@@ -233,31 +245,46 @@ def check_port(model: _models.Model, *, timeout: float = 2.0, http_get: HttpGet 
 
 
 # --------------------------------------------------------------------------- #
-# 4. systemd units
+# 4. model units (transient systemd-run --user units — servedeck.units)
 # --------------------------------------------------------------------------- #
 
-#: Unit filenames for models that already run under systemd TODAY (confirmed
-#: by listing ~/.config/systemd/user/ on 2026-09-12). Flash-Next and GLM have
-#: no unit yet — REDESIGN §1 R4, "dashboards get started from terminals" — so
-#: they fall back to the FUTURE `model-<key>.service` name P3/P4's
-#: systemd-run supervisor is expected to use; this check starts passing for
-#: them automatically once that lands, with no edit needed here.
-KNOWN_UNIT_NAMES: dict[str, str] = {
-    "qwen27b": "qwen-vllm.service",
-    "lfm2": "lfm2-350m.service",
-}
 
+def check_model_units(
+    registry: _models.Registry, *, run: _units.Runner | None = None
+) -> list[CheckResult]:
+    """Which registry models have a live ``model-<key>`` unit right now, via
+    ``systemctl --user list-units 'model-*'`` (:func:`servedeck.units.list_units`)
+    — never a directory listing: transient units are not files.
 
-def check_systemd_units(registry: _models.Registry, systemd_dir: str | Path | None = None) -> list[CheckResult]:
-    d = Path(systemd_dir) if systemd_dir is not None else (Path.home() / ".config" / "systemd" / "user")
-    results = []
+    Not having a unit is NOT a failure — a `main`-slot model that lost the
+    exclusive slot, or a `resident` nobody has started yet, both correctly
+    report "not running". The one real failure this surfaces: a live
+    ``model-*`` unit whose key this ``models.toml`` does not know at all (a
+    stray — started by a since-removed registry entry, or a typo'd key).
+    """
+    try:
+        live = set(_units.list_model_units(run=run))
+    except _units.UnitError as e:
+        return [CheckResult("model units", False, f"could not list model-* units: {e}")]
+
+    results: list[CheckResult] = []
     for key in registry.models:
-        expected = KNOWN_UNIT_NAMES.get(key, f"model-{key}.service")
-        path = d / expected
-        if path.is_file():
-            results.append(CheckResult(f"systemd unit ({key})", True, f"{expected} exists"))
+        unit = f"model-{key}"
+        if unit in live:
+            results.append(CheckResult(f"unit (model-{key})", True, "running"))
         else:
-            results.append(CheckResult(f"systemd unit ({key})", False, f"{expected} not found in {d}"))
+            results.append(CheckResult(f"unit (model-{key})", True, "not running"))
+
+    known_units = {f"model-{key}" for key in registry.models}
+    for stray in sorted(live - known_units):
+        stray_key = stray[len("model-") :]
+        results.append(
+            CheckResult(
+                f"unit ({stray})",
+                False,
+                f"{stray} is a live unit, but models.toml has no model with key {stray_key!r}",
+            )
+        )
     return results
 
 
@@ -270,7 +297,7 @@ def run_doctor(
     models_path: str | Path,
     *,
     client_files: dict[str, Path] | None = None,
-    systemd_dir: str | Path | None = None,
+    unit_run: _units.Runner | None = None,
     timeout: float = 2.0,
     http_get: HttpGet | None = None,
 ) -> list[CheckResult]:
@@ -295,7 +322,7 @@ def run_doctor(
     for m in registry.models.values():
         results.append(check_port(m, timeout=timeout, http_get=http_get))
 
-    results.extend(check_systemd_units(registry, systemd_dir))
+    results.extend(check_model_units(registry, run=unit_run))
     return results
 
 

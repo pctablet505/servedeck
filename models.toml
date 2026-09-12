@@ -28,10 +28,22 @@ margin_mib = 1024          # never handed to any model
 [defaults.env]
 VLLM_USE_FLASHINFER_SAMPLER = "0"
 
-[builds]
-stock      = "~/Projects/local_llm/.venv-llm-029"
-qwen38next = "~/Projects/vllm-qwen38next/.venv-next"
-glm53      = "~/Projects/vllm-glm53/.venv-glm53"
+# Every legacy launcher also exports CUDA_HOME=<venv>/lib/python3.13/site-packages/
+# nvidia/cu13 and prepends <venv>/bin:$CUDA_HOME/bin to PATH — nvcc/ptxas live
+# there and FlashInfer's JIT needs them (qwen-server-run.sh:267-268, serve.sh:63,72,
+# serve-opt.sh:168,177). Both paths below were verified to exist on this box,
+# read-only, on 2026-09-12 (`ls -d <venv>/lib/python3.13/site-packages/nvidia/cu13`).
+[builds.stock]
+venv      = "~/Projects/local_llm/.venv-llm-029"
+cuda_home = "~/Projects/local_llm/.venv-llm-029/lib/python3.13/site-packages/nvidia/cu13"
+
+[builds.qwen38next]
+venv      = "~/Projects/vllm-qwen38next/.venv-next"
+cuda_home = "~/Projects/vllm-qwen38next/.venv-next/lib/python3.13/site-packages/nvidia/cu13"
+
+[builds.glm53]
+venv      = "~/Projects/vllm-glm53/.venv-glm53"
+cuda_home = "~/Projects/vllm-glm53/.venv-glm53/lib/python3.13/site-packages/nvidia/cu13"
 
 # --------------------------------------------------------------------------------
 # Qwen3.8-27B-NVFP4 ("inline") — ~/Projects/local_llm/bin/qwen-server-run.sh
@@ -189,7 +201,9 @@ slot     = "resident"
 vram_mib = 3300
 port     = 8007
 build    = "stock"
-ctx      = 32768
+ctx      = 32768                   # not native (128,000): lfm2-350m.service sizes this
+                                    # resident's whole VRAM budget (vram_mib above) around
+                                    # a 32768 KV cache, not the checkpoint's native ceiling
 vision   = false
 max_output_tokens = 4096
 # No reasoning: LFM2.5 has no thinking mode, so there is no `reasoning` field to
