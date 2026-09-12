@@ -25,7 +25,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -162,7 +162,7 @@ def test_start_transient_really_starts_a_unit_and_stop_really_removes_it(stub_un
     state = units.show(stub_unit)
     assert state.main_pid > 0
     assert state.sub_state == "running" and state.result == "success"
-    assert units.exists(stub_unit)
+    assert not units.gone(stub_unit)
 
     ids = wait_until(lambda: control.http_probe(STUB_PORT), 20)
     assert ids == [STUB_MODEL]
@@ -171,7 +171,7 @@ def test_start_transient_really_starts_a_unit_and_stop_really_removes_it(stub_un
     # `--collect` unloads the unit as soon as it is inactive: gone, not merely
     # inactive. That is what makes the name reusable for the next start
     # without a `reset-failed` dance.
-    assert units.exists(stub_unit) is False
+    assert units.gone(stub_unit) is True
     assert stub_unit not in units.list_units("sd-test-*")
     assert control.http_probe(STUB_PORT) is None
 
@@ -222,6 +222,50 @@ def test_the_units_main_pid_is_a_child_of_systemd_not_of_the_test(stub_unit) -> 
     assert len(ancestors(pid)) < len(ancestors(os.getpid()))
 
 
+def test_the_start_limit_properties_are_really_set_on_the_unit(stub_unit) -> None:
+    """Note the asymmetry: the property is WRITTEN as `StartLimitIntervalSec`
+    and READ back as `StartLimitIntervalUSec`. Asserting on the name we wrote
+    would silently read a default and pass, which is why this reads the name
+    systemd actually reports."""
+    props = units.properties(
+        stub_unit, ("StartLimitIntervalUSec", "StartLimitBurst", "RestartUSec")
+    )
+    assert props["StartLimitIntervalUSec"] == "5min"
+    assert props["StartLimitBurst"] == "3"
+
+
+def test_a_unit_that_cannot_boot_stops_restarting_instead_of_looping_forever() -> None:
+    """The crash loop actually terminates — the whole point of item 1.
+
+    With systemd's defaults (5 starts per 10 s) and RestartSec=10 every retry
+    lands outside the window, the counter resets, and a model that cannot boot
+    restarts every ten seconds for as long as the machine is up. Here the
+    command fails immediately and restart_sec is compressed to 1 s so the
+    ceiling is reached in about three seconds instead of thirty; the property
+    under test — that there IS a ceiling — is the same.
+    """
+    unit = "sd-test-doomed"
+    try:
+        units.start_transient(
+            unit,
+            ["/bin/false"],
+            {},
+            cwd="/tmp",
+            restart="on-failure",
+            restart_sec=1,
+            start_limit_interval_sec=300,
+            start_limit_burst=3,
+        )
+        # It gives up and (with --collect) is removed. If the limit could not
+        # fire, this unit would still be here, restarting, when the timeout
+        # expires.
+        assert wait_until(lambda: units.gone(unit, attempts=2, delay_s=0.2), 30), (
+            f"still alive after 30s: {units.properties(unit, ('ActiveState', 'NRestarts'))}"
+        )
+    finally:
+        units.stop(unit, timeout_s=30)
+
+
 def test_a_transient_unit_does_not_inherit_the_callers_environment() -> None:
     """Measured, and the reason ModelSpec.render_env() must be COMPLETE.
 
@@ -250,6 +294,103 @@ def test_a_transient_unit_does_not_inherit_the_callers_environment() -> None:
     finally:
         os.environ.pop("SD_TEST_SHELL_ONLY", None)
         units.stop(unit, timeout_s=30)
+
+
+@pytest.fixture
+def manager_canary():
+    """Put a harmless secret-shaped variable into the REAL user manager.
+
+    `systemctl --user set-environment` is how a login session's exports get
+    into the manager in the first place, so this reproduces the actual leak
+    path rather than simulating it. Removed again in the finaliser whatever
+    happens; the name is unique to this suite and matches nothing else.
+    """
+    name, value = "SD_TEST_SECRET", "canary-value-123"
+    subprocess.run(["systemctl", "--user", "set-environment", f"{name}={value}"], check=True)
+    try:
+        assert name in units.manager_environment_names()
+        yield name, value
+    finally:
+        subprocess.run(["systemctl", "--user", "unset-environment", name], check=False)
+        assert name not in units.manager_environment_names()
+
+
+def _env_lines_of(unit: str) -> list[str]:
+    """What /usr/bin/env printed to the journal for this unit."""
+    return wait_until(
+        lambda: [ln for ln in units.journal_tail(unit, 300) if ln.startswith("SD_TEST_")] or None,
+        20,
+    ) or []
+
+
+def test_without_the_property_the_managers_secrets_really_do_leak(manager_canary) -> None:
+    """The control that gives the next two tests their power.
+
+    If this ever stops leaking, `UnsetEnvironment=` has stopped being the thing
+    that makes the difference and the tests below are passing for free.
+    """
+    name, value = manager_canary
+    unit = "sd-test-leak"
+    try:
+        units.start_transient(unit, ["/usr/bin/env"], {}, cwd="/tmp", restart="no")
+        lines = _env_lines_of(unit)
+        assert f"{name}={value}" in lines, lines
+    finally:
+        units.stop(unit, timeout_s=30)
+
+
+def test_unset_env_keeps_the_managers_secrets_out_of_the_unit(manager_canary) -> None:
+    """The fix, against real systemd: the property is honoured, the variable is
+    absent from what the process itself can read, and nothing innocent went
+    with it."""
+    name, value = manager_canary
+    unit = "sd-test-unset"
+    try:
+        units.start_transient(unit, ["/usr/bin/env"], {"SD_TEST_KEPT": "yes"},
+                              cwd="/tmp", restart="no", unset_env=[name])
+        assert units.properties(unit, ("UnsetEnvironment",))["UnsetEnvironment"] == name
+        lines = _env_lines_of(unit)
+        assert "SD_TEST_KEPT=yes" in lines, lines
+        assert not any(ln.startswith(f"{name}=") for ln in lines), lines
+        assert value not in "\n".join(units.journal_tail(unit, 300))
+    finally:
+        units.stop(unit, timeout_s=30)
+
+
+def test_a_model_started_through_control_cannot_read_the_managers_secrets(manager_canary) -> None:
+    """End to end through `control.start`, checking the one place that cannot
+    be argued with: the live process's own `/proc/<pid>/environ`.
+
+    The stub is a stand-in for vLLM here, but the path is identical — the
+    redaction list is computed from the real `systemctl --user
+    show-environment` and reaches the real unit.
+    """
+    name, value = manager_canary
+    spec = _StubSpec()
+    ctl = Control(
+        _OneModelRegistry(spec),
+        unit_prefix="sd-test-",
+        desired_path=Path(os.environ["PYTEST_TMP"]) / "desired.json",
+        total_mib=97887,
+        free_mib=lambda: 97887,
+    )
+    assert name in ctl.secret_env_names()
+
+    result = ctl.start("stub", timeout_s=90)
+    try:
+        assert not isinstance(result, Refusal), result
+        assert result.ready, result.failure
+        pid = units.show(STUB_UNIT).main_pid
+        assert pid > 0
+        environ = Path(f"/proc/{pid}/environ").read_bytes().decode("utf-8", "replace")
+        entries = [e for e in environ.split("\0") if e]
+        assert not any(e.startswith(f"{name}=") for e in entries), "the canary reached the model"
+        assert value not in environ
+        # The unit is genuinely populated, so the absence above means something.
+        assert any(e.startswith("HOME=") for e in entries)
+        assert "PYTHONUNBUFFERED=1" in entries
+    finally:
+        ctl.stop("stub")
 
 
 def test_wait_ready_sees_real_journal_markers_in_order() -> None:
@@ -286,7 +427,7 @@ def test_wait_ready_sees_real_journal_markers_in_order() -> None:
         assert seen[-1].kind == "ready"
     finally:
         ctl.stop("stub")
-    assert units.exists(unit) is False
+    assert units.gone(unit) is True
 
 
 @dataclass
@@ -297,10 +438,12 @@ class _StubSpec:
     id: str = STUB_MODEL
     slot: str = "resident"
     port: int = STUB_PORT
-    served_names: list[str] = field(default_factory=lambda: [STUB_MODEL])
     vram_mib: int | None = 2000
-    ctx_tokens: int | None = 4096
+    ctx_tokens: int = 4096
     venv_bin: str = str(Path(sys.executable).parent)
+
+    def served_names(self) -> list[str]:
+        return [STUB_MODEL]
 
     def render_argv(self, util: float, port: int) -> list[str]:
         return [
@@ -322,9 +465,6 @@ class _StubSpec:
 class _OneModelRegistry:
     def __init__(self, spec) -> None:
         self._spec = spec
-
-    def models(self):
-        return [self._spec]
 
     def get(self, key: str):
         if key != self._spec.key:
@@ -349,13 +489,15 @@ class _Lfm2Spec:
     id: str = "LFM2.5-350M"
     slot: str = "resident"
     port: int = LFM2_PORT
-    served_names: list[str] = field(default_factory=lambda: ["LFM2.5-350M"])
     #: 2000/97887 floors to 0.02 — the utilisation the packet specifies, but
     #: DERIVED from a budget rather than written down, so this is the same
     #: arithmetic a real resident goes through.
     vram_mib: int | None = 2000
-    ctx_tokens: int | None = 4096
+    ctx_tokens: int = 4096
     venv_bin: str = str(LFM2_VENV_BIN)
+
+    def served_names(self) -> list[str]:
+        return ["LFM2.5-350M"]
 
     def render_argv(self, util: float, port: int) -> list[str]:
         return [
@@ -367,7 +509,7 @@ class _Lfm2Spec:
             "--gpu-memory-utilization",
             str(util),
             "--max-model-len",
-            "4096",
+            str(self.ctx_tokens),  # never None: the Protocol requires a number
             "--max-num-seqs",
             "4",
             "--dtype",
@@ -473,7 +615,7 @@ def test_real_lfm2_boots_serves_and_gives_the_memory_back() -> None:
         f"after the stop, free VRAM was {gpu.free_mib()} MiB; expected >= {int(target)} "
         f"(was {stop_result.free_before_mib} with {held} MiB held)"
     )
-    assert units.exists(LFM2_UNIT) is False
+    assert units.gone(LFM2_UNIT) is True
     assert (gpu.free_mib() or 0) >= free_at_start - 256
 
 
