@@ -47,3 +47,6 @@ servedeck = ["py.typed", "web/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+  "slow: boots a real model on the GPU; skipped unless the card has room",
+]
