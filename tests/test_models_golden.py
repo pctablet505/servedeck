@@ -260,6 +260,10 @@ def test_glm53_argv_matches_serve_opt_sh_literal_text(registry):
     assert "MAX_BATCHED:-8192" in text and "--max-num-batched-tokens 8192" in flags_text
     assert 'MOE_BACKEND:-marlin' in text and '"moe_backend":"marlin"' in flags_text
     assert 'SPEC_TOKENS:-2' in text and '"num_speculative_tokens":2' in flags_text
-    # --kv-cache-memory-bytes is a documented, deliberate omission (it is
-    # derived from MAX_LEN at launch time; see models.toml's header comment).
-    assert "--kv-cache-memory-bytes" not in flags_text
+    # serve-opt.sh derives --kv-cache-memory-bytes as MAX_LEN * 17200 at launch
+    # time (serve-opt.sh:315-316); the registry pins ctx to the validated 327,680
+    # and carries the product literally, so the two must agree by arithmetic.
+    assert "KV_BYTES_PER_TOKEN:-17200" in text or "17200" in text
+    assert m.ctx == 327680, "GLM ctx is pinned to the validated VRAM ceiling, not native"
+    assert "--kv-cache-memory-bytes 5636096000" in flags_text
+    assert 327680 * 17200 == 5636096000

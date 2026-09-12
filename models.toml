@@ -12,9 +12,8 @@
 #     extraction from ~/.bashrc, or the ptrace_scope sudo relax — those are launcher
 #     *mechanics*, not model properties, and are out of scope for this registry (see
 #     the P1 report's "cannot express" list).
-#   * GLM's `--kv-cache-memory-bytes`, which vllm-glm53/serve-opt.sh:315 derives as
-#     `MAX_LEN * 17200` at launch time — a value that depends on the resolved context
-#     length, which this static file cannot compute. Left out; see the P1 report.
+#   * (GLM's --kv-cache-memory-bytes is now pinned in [models.glm53] together with ctx;
+#     serve-opt.sh:315 derived it as MAX_LEN * 17200 at launch time.)
 
 [gpu]
 total_mib  = 97887
@@ -122,7 +121,11 @@ repo    = "dealignai/GLM-5.3-Flash-ABLITERATED-NVFP4"
 slot    = "main"
 port    = 8002
 build   = "glm53"
-ctx     = "native"                 # config.json max_position_embeddings = 1048576
+# NOT native here, on purpose. config.json says 1,048,576, but GLM's context on this
+# card is bounded by VRAM headroom, not by the model: 327,680 is the validated ceiling
+# (held at 233k tokens only after cutting MoE hot slots; see the 2026-09 GLM notes),
+# and --kv-cache-memory-bytes below is sized for exactly that length. Raise both together.
+ctx     = 327680
 vision  = false
 max_output_tokens = 32768
 # The GLM thinking-budget floor (glm53-effort-proxy today): a small max_tokens
@@ -133,8 +136,10 @@ min_output_tokens = 8192
 # MOE_BACKEND=marlin, LOAD_FORMAT=auto, KV_DTYPE=auto, SPEC=1/SPEC_TOKENS=2, images
 # off, AUTOTUNE=1 i.e. no flag, ENFORCE_EAGER=0 i.e. no flag, BLOCK_SIZE unset i.e.
 # no flag, ATTN_BACKEND unset i.e. no flag).
-# NOT included: --kv-cache-memory-bytes (serve-opt.sh:315-316) — see the file header.
+# --kv-cache-memory-bytes = ctx * 17200 (serve-opt.sh:315-316), computed here for
+# ctx = 327680 because ctx is pinned above; it must change with ctx.
 flags = [
+    "--kv-cache-memory-bytes", "5636096000",
     "--tensor-parallel-size", "1",
     "--distributed-executor-backend", "mp",
     "--offload-backend", "uva",
