@@ -79,7 +79,7 @@ class FakeRouteTable:
         return list(self._by_name)
 
 
-def lfm2_route(*, port: int = 8007, live: bool = True, **policy_kwargs) -> Route:
+def lfm2_route(*, port: int = 8007, live: bool = True, ctx: int = 32768, **policy_kwargs) -> Route:
     """The live LFM2.5-350M resident, as the e2e suite and several unit tests
     describe it: one id, one alias, 32,768 tokens of context."""
     return Route(
@@ -87,5 +87,5 @@ def lfm2_route(*, port: int = 8007, live: bool = True, **policy_kwargs) -> Route
         port=port,
         live=live,
         aliases=("lfm2",),
-        policies=RoutePolicies(ctx=32768, **policy_kwargs),
+        policies=RoutePolicies(ctx=ctx, **policy_kwargs),
     )

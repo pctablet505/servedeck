@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import AsyncIterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 import httpx
@@ -79,12 +79,18 @@ class RoutePolicies:
     ``ctx``
         The model's context length.  Reported as ``max_model_len`` by
         ``/v1/models`` and used as the clamp for ``min_output_tokens``.
+
+    ``ctx`` has **no default**, and is first so it cannot have one.  A zero ctx
+    publishes ``max_model_len: 0`` to every client and makes the output floor
+    clamp to nothing — the GLM thinking-budget fix would read as configured and
+    do nothing at all.  A registry that cannot say how long a model's context
+    is has not finished loading that model.
     """
 
+    ctx: int
     mirror_reasoning: bool = False
     effort_overlay: Mapping[str, Any] | None = None
     min_output_tokens: int | None = None
-    ctx: int = 0
 
 
 @dataclass(frozen=True)
@@ -100,8 +106,8 @@ class Route:
 
     model_id: str
     port: int
+    policies: RoutePolicies
     live: bool = False
-    policies: RoutePolicies = field(default_factory=RoutePolicies)
     aliases: tuple[str, ...] = ()
     presets: tuple[str, ...] = ()
     host: str = "127.0.0.1"
@@ -148,7 +154,9 @@ _METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
 #: Passthrough endpoints outside ``/v1``.  They carry no ``model`` (except
 #: ``/tokenize`` and ``/detokenize``, which do), so without one they go to the
 #: main slot — which is what "is the server up" probes mean by them anyway.
-_EXTRA_PATHS = ("/health", "/metrics", "/tokenize", "/detokenize")
+#: ``/ping`` is here because the proxy this replaces forwarded it
+#: (``app.py:1783``'s ``_PROXY_PREFIXES``) and something is probing it.
+_EXTRA_PATHS = ("/health", "/ping", "/metrics", "/tokenize", "/detokenize")
 
 #: Methods whose body can carry a ``model``.  Everything else routes to main.
 _BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
@@ -156,8 +164,11 @@ _BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
 #: Ceiling on how much of a request body is read looking for ``model``.  Not a
 #: correctness bound — a body that hides ``model`` past this point simply
 #: routes to the main slot — but a memory bound, so a hostile or malformed
-#: body cannot make the gateway accumulate without limit.
-_MODEL_SCAN_LIMIT = 8 * 1024 * 1024
+#: body cannot make the gateway accumulate without limit.  2 MiB leaves room
+#: for a client that puts a ~1.5 MB base64 image ahead of ``model`` (the
+#: OpenAI SDK does not, but a hand-built body may) while keeping the worst
+#: case per in-flight request to something a dashboard can afford.
+_MODEL_SCAN_LIMIT = 2 * 1024 * 1024
 
 #: Cheap pre-filter before the structural scan.  ``scan_model`` is a
 #: byte-at-a-time Python loop; running it over a megabyte of base64 image on
@@ -175,10 +186,15 @@ _TIMEOUT = httpx.Timeout(connect=10.0, read=3600.0, write=3600.0, pool=10.0)
 #: client's own retry loop feel like "it came back" rather than "it failed".
 _RETRY_AFTER_S = 15
 
-#: The one path that is routed but otherwise left completely alone: Codex
-#: speaks the responses API, where reasoning is already a first-class output
+#: The responses API, matched as a prefix so ``/v1/responses/{id}`` (GET,
+#: DELETE, and the ``/cancel`` sub-path) is treated the same as the POST.
+#: Codex speaks this API, where reasoning is already a first-class output
 #: item, so mirroring there would add a field to a shape that never lacked it.
 _RESPONSES_PATH = "/v1/responses"
+
+
+def _is_responses_path(path: str) -> bool:
+    return path == _RESPONSES_PATH or path.startswith(_RESPONSES_PATH + "/")
 
 
 # ---------------------------------------------------------------------------
@@ -294,14 +310,29 @@ async def _peek_model(request: Request) -> tuple[str | None, bytes, AsyncIterato
     exhausted = True
     scanned_len = -1
     next_scan_at = 0
+    mark_seen = False
 
     async for chunk in stream:
         if not chunk:
             continue
+        previous = len(buf)
         buf += chunk
-        # The cheap test runs on every chunk; only the byte-at-a-time
-        # structural scan is put on the doubling schedule.
-        if _MODEL_MARK not in buf:
+        if len(buf) >= _MODEL_SCAN_LIMIT:
+            # Checked FIRST, before anything that could `continue`: a body that
+            # never mentions a model must stop accumulating here and stream the
+            # rest.  With this test below the mark test, such a body was read to
+            # EOF — exactly the unbounded buffering this rewrite removes.
+            exhausted = False
+            break
+        if not mark_seen:
+            # Sticky, and searched only over the newly arrived bytes plus an
+            # overlap of len(mark)-1 so a mark straddling a chunk boundary is
+            # still found.  Re-searching the whole buffer per chunk is O(n²)
+            # over the body — at C speed, but still quadratic, and on a
+            # multi-megabyte upload that is the dominant cost of the request.
+            tail = buf[max(0, previous - (len(_MODEL_MARK) - 1)) :]
+            mark_seen = _MODEL_MARK in tail
+        if not mark_seen:
             continue
         if len(buf) < next_scan_at:
             continue
@@ -312,11 +343,8 @@ async def _peek_model(request: Request) -> tuple[str | None, bytes, AsyncIterato
             exhausted = False
             break
         next_scan_at = len(buf) * 2
-        if len(buf) >= _MODEL_SCAN_LIMIT:
-            exhausted = False
-            break
 
-    if model is None and len(buf) != scanned_len and _MODEL_MARK in buf:
+    if model is None and mark_seen and len(buf) != scanned_len:
         # The body ended (or hit the ceiling) between scheduled scans; one last
         # look, so a small body split across chunks is not mis-routed to main.
         model = policies.scan_model(bytes(buf)).model
@@ -364,7 +392,14 @@ async def _proxy(
     rest: AsyncIterator[bytes] | None, *, rewrite_model_to: str | None,
 ) -> Response:
     pol = route.policies
-    is_responses = request.url.path == _RESPONSES_PATH
+    # /v1/responses: mirroring OFF (reasoning is already a first-class output
+    # item there, so there is no missing name to supply), effort overlay and
+    # output floor ON — glm53-effort-proxy/proxy.py:496-509 applies the
+    # alias → chat_template_kwargs.reasoning_effort mapping on this endpoint
+    # for exactly the reason the preset exists: Codex speaks wire_api
+    # "responses" only, so dropping the overlay here would rewrite
+    # `glm53-flash-high` to `glm53-flash` and silently deliver max effort.
+    is_responses = _is_responses_path(request.url.path)
 
     needs_body = (
         rewrite_model_to is not None
@@ -446,17 +481,30 @@ async def _proxy(
     )
 
 
+def _model_less_route(routes: RouteTable) -> Route | None:
+    """Where a request that named no model goes: the main slot if it is up,
+    otherwise any live route, otherwise nowhere."""
+    main = routes.main()
+    if main is not None and main.live:
+        return main
+    live = routes.live_routes()
+    return live[0] if live else None
+
+
 async def _dispatch(request: Request, routes: RouteTable, client: httpx.AsyncClient) -> Response:
     model, prefix, rest = await _peek_model(request)
 
     if model is None:
-        # No model named: a GET probe, or a POST that left it out.  The main
-        # slot is what "the local model" means to a client that did not say.
-        main = routes.main()
-        if main is None or not main.live:
+        # No model named: a GET probe (/health, /ping, /metrics), or a POST
+        # that left it out.  The main slot is what "the local model" means to
+        # a client that did not say — but a box with only residents up has no
+        # main slot and is not down, so any live route will answer for it.
+        # Reporting 503 there would make `doctor` and every is-server-up probe
+        # call a serving machine dead.
+        route = _model_less_route(routes)
+        if route is None:
             await _drain(rest)
-            return not_running_response(main, main)
-        route = main
+            return not_running_response(None, routes.main())
     else:
         resolved = routes.resolve(model)
         if resolved is None:
