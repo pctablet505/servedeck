@@ -6,12 +6,13 @@ the only two ports the hard rules allow this test suite to touch.
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import httpx
 import pytest
 
-from servedeck import doctor, models
+from servedeck import doctor, models, units
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -212,27 +213,73 @@ def test_check_port_not_listening_real_socket():
 
 
 # --------------------------------------------------------------------------- #
-# check_systemd_units
+# check_model_units — transient systemd-run --user units, never a directory
+# listing (see doctor.py's module docstring for why).
 # --------------------------------------------------------------------------- #
 
 
-def test_systemd_units_known_name_found(tmp_path):
-    (tmp_path / "qwen-vllm.service").write_text("[Unit]\n")
-    reg = models.load(REPO_ROOT / "models.toml")
-    results = doctor.check_systemd_units(reg, tmp_path)
-    by_name = {r.name: r for r in results}
-    assert by_name["systemd unit (qwen27b)"].ok is True
+def _units_run(stdout: str = "", returncode: int = 0) -> units.Runner:
+    def run(argv):
+        return subprocess.CompletedProcess(list(argv), returncode, stdout, "")
+
+    return run
 
 
-def test_systemd_units_missing_reports_expected_filename(tmp_path):
+def test_check_model_units_all_not_running_is_ok():
+    """No live model-* unit at all is the normal, expected state — most
+    registry models are not running most of the time."""
     reg = models.load(REPO_ROOT / "models.toml")
-    results = doctor.check_systemd_units(reg, tmp_path)
+    results = doctor.check_model_units(reg, run=_units_run(stdout=""))
     by_name = {r.name: r for r in results}
-    assert by_name["systemd unit (qwen27b)"].ok is False
-    assert "qwen-vllm.service" in by_name["systemd unit (qwen27b)"].detail
-    # flashnext/glm53 have no known live unit yet -> fall back to the future
-    # model-<key>.service name.
-    assert "model-flashnext.service" in by_name["systemd unit (flashnext)"].detail
+    for key in reg.models:
+        assert by_name[f"unit (model-{key})"].ok is True
+        assert by_name[f"unit (model-{key})"].detail == "not running"
+
+
+def test_check_model_units_reports_a_running_unit():
+    reg = models.load(REPO_ROOT / "models.toml")
+    stdout = "model-flashnext.service loaded active running Model flashnext\n"
+    results = doctor.check_model_units(reg, run=_units_run(stdout=stdout))
+    by_name = {r.name: r for r in results}
+    assert by_name["unit (model-flashnext)"].ok is True
+    assert by_name["unit (model-flashnext)"].detail == "running"
+    assert by_name["unit (model-qwen27b)"].detail == "not running"
+
+
+def test_check_model_units_flags_a_stray_unit_as_the_one_real_failure():
+    """A model-* unit whose key the registry does not know at all — never
+    'not running', which is always ok."""
+    reg = models.load(REPO_ROOT / "models.toml")
+    stdout = "model-ghost.service loaded active running Ghost\n"
+    results = doctor.check_model_units(reg, run=_units_run(stdout=stdout))
+    stray = [r for r in results if r.name == "unit (model-ghost)"]
+    assert len(stray) == 1
+    assert stray[0].ok is False
+    assert "no model with key 'ghost'" in stray[0].detail
+    # every registry-known model is still just "not running", not penalised by
+    # the stray.
+    assert all(r.ok for r in results if r.name != "unit (model-ghost)")
+
+
+def test_check_model_units_list_failure_is_reported_not_raised():
+    def raising_run(argv):
+        raise units.UnitError("systemctl: not found")
+
+    reg = models.load(REPO_ROOT / "models.toml")
+    results = doctor.check_model_units(reg, run=raising_run)
+    assert len(results) == 1
+    assert results[0].ok is False
+    assert "could not list model-* units" in results[0].detail
+
+
+def test_check_model_units_live_real_systemctl():
+    """Against the box's OWN systemctl --user (read-only `list-units`, never
+    start/stop/enable/disable — the same carve-out the live :8007/:8010 GETs
+    use). No model-* unit exists yet on this box (P1-P4's supervisor has never
+    launched one), so every registry model is expected 'not running'."""
+    reg = models.load(REPO_ROOT / "models.toml")
+    results = doctor.check_model_units(reg)
+    assert all(r.ok for r in results), results
 
 
 # --------------------------------------------------------------------------- #
@@ -262,15 +309,19 @@ def test_run_doctor_full_pass_with_stubbed_network(tmp_path):
             "codex": tmp_path / "codex.toml",
             "kimi": tmp_path / "kimi.toml",
         },
-        systemd_dir=tmp_path,
+        unit_run=_units_run(stdout=""),
         http_get=get,
     )
-    # Every port reports "not listening" (ok=True); missing client files and
-    # missing systemd units for flashnext/glm53 are also individually ok/fail,
-    # but nothing here should raise.
+    # Every port reports "not listening" (ok=True); every model reports "not
+    # running" (ok=True; no stray units in the stub); missing client files are
+    # also individually ok — nothing here should raise or fail.
     assert len(results) >= 1 + 3 + 4 + 4  # registry + 3 client files + 4 ports + 4 units
     port_results = [r for r in results if r.name.startswith("port ")]
     assert all(r.ok for r in port_results)
+    unit_results = [r for r in results if r.name.startswith("unit (")]
+    assert len(unit_results) == 4
+    assert all(r.ok for r in unit_results)
+    assert doctor.all_ok(results)
 
 
 def test_all_ok():

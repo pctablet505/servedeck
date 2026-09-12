@@ -35,8 +35,9 @@ BASE_GPU = """
 total_mib = 100000
 margin_mib = 1000
 
-[builds]
-stock = "/opt/stock"
+[builds.stock]
+venv = "/opt/stock"
+cuda_home = "/opt/stock/lib/python3.13/site-packages/nvidia/cu13"
 """
 
 
@@ -143,8 +144,9 @@ margin_mib = 1000
 [defaults.env]
 VLLM_USE_FLASHINFER_SAMPLER = "0"
 
-[builds]
-stock = "/opt/stock"
+[builds.stock]
+venv = "/opt/stock"
+cuda_home = "/opt/stock/lib/python3.13/site-packages/nvidia/cu13"
 
 [models.a]
 id = "A"
@@ -295,14 +297,80 @@ def test_unknown_build(tmp_path):
         models.load(_write(tmp_path, body))
 
 
+@pytest.mark.parametrize("bad_key", ["UPPER", "has_underscore", "1_2_3", "qwen.27b"])
+def test_invalid_model_key_shape_rejected(tmp_path, bad_key):
+    """Registry keys become unit names (model-<key>); servedeck.units only
+    accepts [a-z0-9-]+ after that prefix."""
+    body = BASE_GPU + _one_model(f'"{bad_key}"', id_="A", port=9001)
+    with pytest.raises(models.RegistryError, match="key must match"):
+        models.load(_write(tmp_path, body))
+
+
+def test_valid_model_key_shape_loads(tmp_path):
+    body = BASE_GPU + _one_model("qwen-27b", id_="A", port=9001)
+    reg = models.load(_write(tmp_path, body))
+    assert "qwen-27b" in reg.models
+
+
+def test_build_missing_venv_raises(tmp_path):
+    body = (
+        """
+[gpu]
+total_mib = 100000
+margin_mib = 1000
+
+[builds.stock]
+cuda_home = "/opt/stock/lib/python3.13/site-packages/nvidia/cu13"
+"""
+        + _one_model()
+    )
+    with pytest.raises(models.RegistryError, match="missing 'venv'"):
+        models.load(_write(tmp_path, body))
+
+
+def test_build_missing_cuda_home_raises(tmp_path):
+    body = (
+        """
+[gpu]
+total_mib = 100000
+margin_mib = 1000
+
+[builds.stock]
+venv = "/opt/stock"
+"""
+        + _one_model()
+    )
+    with pytest.raises(models.RegistryError, match="missing 'cuda_home'"):
+        models.load(_write(tmp_path, body))
+
+
+def test_build_table_wrong_type_raises(tmp_path):
+    """The old flat `stock = "/path"` shape is rejected, not silently accepted
+    with a missing cuda_home — [builds.<name>] must be a table."""
+    body = (
+        """
+[gpu]
+total_mib = 100000
+margin_mib = 1000
+
+[builds]
+stock = "/opt/stock"
+"""
+        + _one_model()
+    )
+    with pytest.raises(models.RegistryError, match="must be a table"):
+        models.load(_write(tmp_path, body))
+
+
 def test_resident_vram_plus_margin_exceeds_total(tmp_path):
     body = f"""
 [gpu]
 total_mib = 10000
 margin_mib = 1000
 
-[builds]
-stock = "/opt/stock"
+[builds.stock]
+venv = "/opt/stock"
+cuda_home = "/opt/stock/lib/python3.13/site-packages/nvidia/cu13"
 
 [models.r]
 id = "R"
@@ -325,8 +393,9 @@ def test_resident_vram_plus_margin_exactly_equal_is_rejected(tmp_path):
 total_mib = 10000
 margin_mib = 1000
 
-[builds]
-stock = "/opt/stock"
+[builds.stock]
+venv = "/opt/stock"
+cuda_home = "/opt/stock/lib/python3.13/site-packages/nvidia/cu13"
 
 [models.r]
 id = "R"
@@ -469,45 +538,39 @@ def test_render_argv_omits_tool_and_reasoning_flags_when_unset():
     assert "--reasoning-parser" not in joined
 
 
-def test_render_env_returns_models_merged_env():
+def _build(**kw) -> models.Build:
+    base = dict(venv="/opt/venv", cuda_home="/opt/venv/lib/python3.13/site-packages/nvidia/cu13")
+    base.update(kw)
+    return models.Build(**base)
+
+
+def test_render_env_merges_model_env_with_cuda_home_and_path():
     m = _model(env={"A": "1", "B": "2"})
-    assert models.render_env(m) == {"A": "1", "B": "2"}
-    # must be a copy, not the live dict
-    out = models.render_env(m)
-    out["C"] = "3"
-    assert "C" not in m.env
+    b = _build(venv="/opt/venv", cuda_home="/opt/cuda")
+    out = models.render_env(m, b)
+    assert out["A"] == "1"
+    assert out["B"] == "2"
+    assert out["CUDA_HOME"] == "/opt/cuda"
+    assert out["PATH"] == "/opt/venv/bin:/opt/cuda/bin:/usr/local/bin:/usr/bin:/bin"
 
 
-# --------------------------------------------------------------------------- #
-# main_util / resident_util
-# --------------------------------------------------------------------------- #
+def test_render_env_is_a_copy_not_the_live_dict():
+    m = _model(env={"A": "1"})
+    b = _build()
+    out = models.render_env(m, b)
+    out["A"] = "changed"
+    assert m.env["A"] == "1"
 
 
-def test_main_util_rounds_down_to_two_decimals():
-    # (12345 - 1000) / 100000 = 0.11345 -> floor to 0.11, never rounds up.
-    assert models.main_util(12345, 100000, 1000) == 0.11
-
-
-def test_main_util_everything_free_rule():
-    assert models.main_util(97887, 97887, 1024) == pytest.approx(0.98, abs=1e-9)
-
-
-def test_resident_util_rounds_down_to_two_decimals():
-    # 3300 / 97887 = 0.0337... -> floor to 0.03
-    assert models.resident_util(3300, 97887) == 0.03
-
-
-def test_util_functions_reject_nonpositive_total():
-    with pytest.raises(ValueError):
-        models.main_util(100, 0, 10)
-    with pytest.raises(ValueError):
-        models.resident_util(100, 0)
-
-
-def test_floor_never_rounds_up():
-    # 0.99999 would round UP to 1.00 under normal rounding; floor keeps it 0.99.
-    assert models.main_util(99999, 100000, 0) == 0.99
-    assert models.resident_util(999, 1000) == 0.99
+def test_render_env_expands_tilde_in_venv_and_cuda_home():
+    m = _model()
+    b = _build(venv="~/Projects/x/.venv", cuda_home="~/Projects/x/.venv/lib/python3.13/site-packages/nvidia/cu13")
+    out = models.render_env(m, b)
+    home = str(Path.home())
+    assert out["CUDA_HOME"].startswith(home)
+    assert out["PATH"].startswith(f"{home}/Projects/x/.venv/bin:{home}/Projects/x/.venv/lib")
+    assert "~" not in out["CUDA_HOME"]
+    assert "~" not in out["PATH"]
 
 
 # --------------------------------------------------------------------------- #

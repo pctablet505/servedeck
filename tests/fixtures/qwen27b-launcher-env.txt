@@ -1,0 +1,19 @@
+# Frozen snapshot of `qwen-server-run.sh` DRY_RUN=1 ENV output for the 27B.
+#
+# Captured 2026-09-12, same invocation/.config values as
+# qwen27b-launcher-argv.txt (see that file's header) — the two were captured
+# from the SAME run, so their RESOLVED line agreed (port=8004, util=0.91,
+# max_num_seqs=16, max_model_len=262144, venv=~/Projects/local_llm/.venv-llm-029).
+#
+# PATH's value below is THIS CAPTURE SESSION's own inherited shell PATH,
+# appended after the launcher's own venv/bin:CUDA_HOME/bin prefix — it is NOT
+# reproducible across machines or even across terminal sessions on this one,
+# so the always-run test compares only the venv/bin:CUDA_HOME/bin PREFIX of
+# this line, never the whole string. CUDA_HOME and
+# VLLM_USE_FLASHINFER_SAMPLER are compared exactly.
+#
+# Lines below are exactly the launcher's own "ENV NAME=value" dump lines.
+# Comment lines (this header) are ignored.
+ENV CUDA_HOME=/home/pctablet505/Projects/local_llm/.venv-llm-029/lib/python3.13/site-packages/nvidia/cu13
+ENV PATH=/home/pctablet505/Projects/local_llm/.venv-llm-029/bin:/home/pctablet505/Projects/local_llm/.venv-llm-029/lib/python3.13/site-packages/nvidia/cu13/bin:/home/pctablet505/.local/bin:/home/pctablet505/.local/bin:/home/pctablet505/.local/bin:/home/pctablet505/.kimi-code/bin:/home/pctablet505/.local/bin:/home/pctablet505/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/snap/bin
+ENV VLLM_USE_FLASHINFER_SAMPLER=0

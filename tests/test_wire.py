@@ -32,9 +32,9 @@ def registry() -> models.Registry:
 
 @pytest.fixture
 def resolve_ctx(registry):
-    return _fixed_resolver(
-        {"qwen27b": 262144, "flashnext": 262144, "glm53": 1048576}
-    )
+    # glm53.ctx is now a pinned int (327680, not "native" — see models.toml),
+    # so it needs no entry here: _fixed_resolver reads m.ctx directly for it.
+    return _fixed_resolver({"qwen27b": 262144, "flashnext": 262144})
 
 
 # --------------------------------------------------------------------------- #
@@ -290,14 +290,16 @@ def test_make_default_ctx_resolver_uses_hub_cache_for_native_ctx(tmp_path, monke
 
 
 def test_make_default_ctx_resolver_caches_per_model(tmp_path, monkeypatch, registry):
-    dirname = "models--" + registry.models["glm53"].repo.replace("/", "--")
+    # flashnext.ctx is "native" (glm53's is now a pinned int, so it would never
+    # touch the hub cache and couldn't exercise this path — see models.toml).
+    dirname = "models--" + registry.models["flashnext"].repo.replace("/", "--")
     snap = tmp_path / dirname / "snapshots" / "rev1"
     snap.mkdir(parents=True)
     (snap / "config.json").write_text(json.dumps({"max_position_embeddings": 12345}))
     monkeypatch.setenv("SERVEDECK_HF_HUB_DIR", str(tmp_path))
 
     resolver = wire.make_default_ctx_resolver(registry)
-    m = registry.models["glm53"]
+    m = registry.models["flashnext"]
     assert resolver(m) == 12345
     # Delete the config; a cached resolver must not need to re-read it.
     (snap / "config.json").unlink()
