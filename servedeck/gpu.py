@@ -167,6 +167,100 @@ def compute_apps() -> list[ComputeApp]:
 
 
 # ---------------------------------------------------------------------------
+# v2 accounting primitives — REDESIGN-2026-09-12.md §2.1/§2.2.
+#
+# The main slot's utilisation is COMPUTED at launch from free memory
+# ((free - margin) / total), and `switch` waits for a stopped model's memory to
+# actually come back before starting the next one. Both need a number, not a
+# GpuSummary, and both need "nvidia-smi is not here" to be distinguishable from
+# "zero bytes are free" — so these return None on failure where gpu_summary()
+# returns None and compute_apps() returns []. A caller that reads a None as 0
+# would compute a negative utilisation or conclude memory was released the
+# instant the tool broke; None forces the decision to be explicit.
+# ---------------------------------------------------------------------------
+
+
+def _query_gpu_scalar(field: str) -> int | None:
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", f"--query-gpu={field}", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=_NVIDIA_SMI_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            return int(line.split(",")[0].strip())
+        except ValueError:
+            return None
+    return None
+
+
+def free_mib() -> int | None:
+    """Free VRAM in MiB from `nvidia-smi --query-gpu=memory.free`, or None if
+    nvidia-smi is absent/failing/unparseable. Never raises.
+
+    This is the numerator of the main slot's utilisation and the thing
+    `control.switch` polls while waiting for a stopped model to let go."""
+    return _query_gpu_scalar("memory.free")
+
+
+def total_mib() -> int | None:
+    """Total VRAM in MiB, or None. Never raises."""
+    return _query_gpu_scalar("memory.total")
+
+
+def used_by_pids() -> dict[int, int] | None:
+    """`{pid: MiB}` from `nvidia-smi --query-compute-apps=pid,used_memory`, or
+    None if nvidia-smi is absent/failing. Never raises.
+
+    None and `{}` mean different things: None is "cannot tell", `{}` is "the
+    driver attributes GPU memory to nobody". `control.switch` captures this
+    BEFORE stopping a unit so it knows how much memory that unit's pid was
+    holding, and therefore how much must come back before the next model is
+    allowed to boot. Rows the driver reports with a non-numeric used_memory
+    (the '[N/A]' a MIG/permission-restricted process shows) are skipped rather
+    than counted as zero."""
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=pid,used_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_NVIDIA_SMI_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    out: dict[int, int] = {}
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 2:
+            continue
+        try:
+            out[int(parts[0])] = int(parts[1])
+        except ValueError:
+            continue
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Xid classification — bin/qwen-server-record-death.sh:54-69, read verbatim:
 #
 #   case "$code" in
