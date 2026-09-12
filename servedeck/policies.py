@@ -17,8 +17,8 @@ What lives here, and where it came from
   client that reads ``reasoning_content`` therefore sees no thinking, cannot
   store it, and cannot send it back — which is the measured mechanism behind
   multi-turn agent amnesia (restoring the round trip collapsed it ~33,000x).
-* ``apply_effort_overlay`` and ``apply_output_floor`` are ported from
-  ``glm53-effort-proxy/proxy.py``.  The overlay is how an effort *preset*
+* The effort overlay and the output floor inside ``apply_request_policies``
+  are ported from ``glm53-effort-proxy/proxy.py``.  The overlay is how a preset
   (``glm53-flash-high``) becomes a real request: neither VS Code's BYOK
   provider nor Codex lets a user set ``chat_template_kwargs``, but both let a
   user pick a model, so the preset name carries the parameter.  The floor
@@ -61,6 +61,17 @@ from typing import Any
 #: so what we read from upstream is what upstream wrote.  Without this a
 #: payload that needs no mirroring could arrive gzipped and could not be
 #: relayed as the same bytes.
+#:
+#: **Credentials are stripped, not relayed.**  ``authorization``, ``api-key``,
+#: ``x-api-key``, ``openai-organization`` and ``cookie`` carry a client's own
+#: secrets — a real OpenAI key a user left in a VS Code profile, a session
+#: cookie from a browser extension — and the models here run without
+#: ``--api-key``, so a model process has no use for any of them.  Forwarding
+#: them would copy a user's credentials into vLLM's memory and, on a bad
+#: request, into its logs.  If a route ever needs to authenticate to its
+#: upstream, the gateway must *inject* that route's own credential here rather
+#: than pass the client's through.
+#:
 #: The rest are RFC 7230 §6.1 hop-by-hop headers plus ``proxy-connection``.
 DROP_REQUEST_HEADERS = frozenset(
     {
@@ -74,6 +85,11 @@ DROP_REQUEST_HEADERS = frozenset(
         "trailer",
         "proxy-connection",
         "accept-encoding",
+        "authorization",
+        "api-key",
+        "x-api-key",
+        "openai-organization",
+        "cookie",
     }
 )
 
@@ -286,6 +302,15 @@ def _apply_floor(body: dict, floor: int | None, ctx: int) -> bool:
     """
     if not isinstance(floor, int) or isinstance(floor, bool) or floor <= 0:
         return False
+    if ctx <= 0:
+        # A floor with no context to clamp it against silently computes
+        # ``min(floor, 0 - prompt - 2048)`` <= 0 and therefore never raises
+        # anything — the GLM thinking-budget fix would be configured, reported
+        # as on, and do nothing.  A registry that sets a floor must set a ctx.
+        raise ValueError(
+            f"min_output_tokens={floor} requires a positive ctx, got {ctx}: "
+            "an unclamped floor is a silent no-op"
+        )
     approx: int | None = None
     changed = False
     for key in _OUTPUT_BUDGET_KEYS:
@@ -350,10 +375,10 @@ def apply_request_policies(
 ) -> bytes:
     """Apply every enabled request policy in **one** parse/serialise round trip.
 
-    The three policies below are also exposed individually (they are the names
-    the design document uses), but the gateway calls this: parsing a request
-    body that may carry a megabyte of base64 image three times over would be
-    three times the cost for the same answer.
+    This is the single entry point on purpose: parsing a request body that may
+    carry a megabyte of base64 image once per policy would be three times the
+    cost for the same answer, and three near-identical wrappers around it were
+    three places for the byte-identity contract to drift apart.
 
     Returns ``raw`` itself when no policy is enabled, when the body is not
     JSON, when it is not a JSON *object*, or when every enabled policy decided
@@ -375,21 +400,6 @@ def apply_request_policies(
     if _apply_floor(body, floor, ctx):
         changed = True
     return _dumps(body) if changed else raw
-
-
-def apply_effort_overlay(body_bytes: bytes, overlay: Mapping[str, Any] | None) -> bytes:
-    """An effort preset's ``chat_template_kwargs`` overlay, on its own."""
-    return apply_request_policies(body_bytes, overlay=overlay)
-
-
-def apply_output_floor(body_bytes: bytes, floor: int | None, ctx: int) -> bytes:
-    """The minimum-output-tokens floor, on its own."""
-    return apply_request_policies(body_bytes, floor=floor, ctx=ctx)
-
-
-def apply_model_rewrite(body_bytes: bytes, model_id: str | None) -> bytes:
-    """The alias/preset → upstream served-name rewrite, on its own."""
-    return apply_request_policies(body_bytes, model_id=model_id)
 
 
 # ---------------------------------------------------------------------------
@@ -541,9 +551,6 @@ __all__ = [
     "DROP_REQUEST_HEADERS",
     "DROP_RESPONSE_HEADERS",
     "ModelScan",
-    "apply_effort_overlay",
-    "apply_model_rewrite",
-    "apply_output_floor",
     "apply_request_policies",
     "chain_body",
     "mirror_reasoning",

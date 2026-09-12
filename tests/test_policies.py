@@ -24,9 +24,6 @@ import pytest
 from servedeck import policies
 from servedeck.policies import (
     ModelScan,
-    apply_effort_overlay,
-    apply_model_rewrite,
-    apply_output_floor,
     apply_request_policies,
     mirror_reasoning,
     scan_model,
@@ -298,13 +295,13 @@ def test_sse_line_passthrough_shapes():
 
 def test_overlay_is_byte_identical_when_there_is_nothing_to_apply():
     raw = json.dumps({"model": "m", "messages": []}).encode()
-    assert apply_effort_overlay(raw, None) is raw
-    assert apply_effort_overlay(raw, {}) is raw
+    assert apply_request_policies(raw, overlay=None) is raw
+    assert apply_request_policies(raw, overlay={}) is raw
 
 
 def test_overlay_injects_reasoning_effort():
     raw = json.dumps({"model": "glm53-flash-high", "messages": []}).encode()
-    got = json.loads(apply_effort_overlay(raw, {"reasoning_effort": "high"}))
+    got = json.loads(apply_request_policies(raw, overlay={"reasoning_effort": "high"}))
     assert got["chat_template_kwargs"] == {"reasoning_effort": "high"}
 
 
@@ -312,20 +309,20 @@ def test_overlay_only_fills_a_gap_an_explicit_caller_value_wins():
     raw = json.dumps(
         {"model": "x", "chat_template_kwargs": {"reasoning_effort": "low", "other": 1}}
     ).encode()
-    out = apply_effort_overlay(raw, {"reasoning_effort": "high"})
+    out = apply_request_policies(raw, overlay={"reasoning_effort": "high"})
     assert out is raw, "setdefault semantics must leave the body untouched"
     assert json.loads(out)["chat_template_kwargs"]["reasoning_effort"] == "low"
 
 
 def test_overlay_merges_alongside_existing_kwargs():
     raw = json.dumps({"model": "x", "chat_template_kwargs": {"other": 1}}).encode()
-    got = json.loads(apply_effort_overlay(raw, {"reasoning_effort": "high"}))
+    got = json.loads(apply_request_policies(raw, overlay={"reasoning_effort": "high"}))
     assert got["chat_template_kwargs"] == {"other": 1, "reasoning_effort": "high"}
 
 
 def test_overlay_survives_a_null_chat_template_kwargs():
     raw = json.dumps({"model": "x", "chat_template_kwargs": None}).encode()
-    got = json.loads(apply_effort_overlay(raw, {"reasoning_effort": "low"}))
+    got = json.loads(apply_request_policies(raw, overlay={"reasoning_effort": "low"}))
     assert got["chat_template_kwargs"] == {"reasoning_effort": "low"}
 
 
@@ -336,18 +333,18 @@ def test_overlay_survives_a_null_chat_template_kwargs():
 
 def test_floor_off_is_byte_identical():
     raw = json.dumps({"max_tokens": 64, "messages": []}).encode()
-    assert apply_output_floor(raw, 0, 262144) is raw
-    assert apply_output_floor(raw, None, 262144) is raw
+    assert apply_request_policies(raw, floor=0, ctx=262144) is raw
+    assert apply_request_policies(raw, floor=None, ctx=262144) is raw
 
 
 def test_floor_raises_an_explicitly_small_budget():
     raw = json.dumps({"max_tokens": 64, "messages": []}).encode()
-    assert json.loads(apply_output_floor(raw, 8192, 262144))["max_tokens"] == 8192
+    assert json.loads(apply_request_policies(raw, floor=8192, ctx=262144))["max_tokens"] == 8192
 
 
 def test_floor_never_lowers_a_large_budget():
     raw = json.dumps({"max_tokens": 30000, "messages": []}).encode()
-    assert apply_output_floor(raw, 8192, 262144) is raw
+    assert apply_request_policies(raw, floor=8192, ctx=262144) is raw
 
 
 def test_floor_never_invents_an_absent_budget():
@@ -355,14 +352,14 @@ def test_floor_never_invents_an_absent_budget():
     which is strictly more room than any floor.  Setting one here is how an
     earlier version of this CAPPED unbounded callers at 8k."""
     raw = json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode()
-    assert apply_output_floor(raw, 8192, 262144) is raw
-    assert "max_tokens" not in json.loads(apply_output_floor(raw, 8192, 262144))
+    assert apply_request_policies(raw, floor=8192, ctx=262144) is raw
+    assert "max_tokens" not in json.loads(apply_request_policies(raw, floor=8192, ctx=262144))
 
 
 def test_floor_applies_to_every_budget_spelling():
     for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
         raw = json.dumps({key: 16, "messages": []}).encode()
-        assert json.loads(apply_output_floor(raw, 4096, 262144))[key] == 4096
+        assert json.loads(apply_request_policies(raw, floor=4096, ctx=262144))[key] == 4096
 
 
 def test_floor_is_clamped_so_prompt_plus_budget_still_fits():
@@ -370,9 +367,9 @@ def test_floor_is_clamped_so_prompt_plus_budget_still_fits():
     all, so the small budget the caller sent is left exactly as it was."""
     prompt = "x" * 4000  # ~1000 tokens at 4 chars/token
     raw = json.dumps({"max_tokens": 64, "messages": [{"role": "user", "content": prompt}]}).encode()
-    assert apply_output_floor(raw, 8192, 1000) is raw
+    assert apply_request_policies(raw, floor=8192, ctx=1000) is raw
     # With room for some of the floor but not all of it, the clamp binds.
-    got = json.loads(apply_output_floor(raw, 8192, 6000))
+    got = json.loads(apply_request_policies(raw, floor=8192, ctx=6000))
     assert got["max_tokens"] == 6000 - 1000 - 2048
 
 
@@ -391,7 +388,7 @@ def test_floor_counts_multimodal_text_parts_not_image_bytes():
             }
         ],
     }
-    got = json.loads(apply_output_floor(json.dumps(body).encode(), 8192, 32768))
+    got = json.loads(apply_request_policies(json.dumps(body).encode(), floor=8192, ctx=32768))
     assert got["max_tokens"] == 8192
 
 
@@ -400,17 +397,29 @@ def test_floor_ignores_a_boolean_budget():
     raising it to 8192 would change a (nonsensical but harmless) field into a
     real token budget."""
     raw = json.dumps({"max_tokens": True, "messages": []}).encode()
-    assert apply_output_floor(raw, 8192, 262144) is raw
+    assert apply_request_policies(raw, floor=8192, ctx=262144) is raw
+
+
+def test_floor_without_a_context_refuses_rather_than_silently_doing_nothing():
+    """``ctx=0`` makes the clamp ``min(floor, -prompt-2048)`` <= 0, so the
+    floor would be configured, reported as on, and never raise anything — the
+    GLM thinking-budget fix switched off by a missing registry field.  That
+    must be loud."""
+    raw = json.dumps({"max_tokens": 64, "messages": []}).encode()
+    with pytest.raises(ValueError, match="requires a positive ctx"):
+        apply_request_policies(raw, floor=8192, ctx=0)
+    # ...but a route with no floor never consults ctx at all.
+    assert apply_request_policies(raw, floor=None, ctx=0) is raw
 
 
 def test_floor_leaves_a_null_budget_alone():
     raw = json.dumps({"max_tokens": None, "messages": []}).encode()
-    assert apply_output_floor(raw, 8192, 262144) is raw
+    assert apply_request_policies(raw, floor=8192, ctx=262144) is raw
 
 
 def test_floor_counts_the_responses_api_input_field():
     raw = json.dumps({"max_output_tokens": 64, "input": "y" * 8000}).encode()
-    got = json.loads(apply_output_floor(raw, 8192, 6000))
+    got = json.loads(apply_request_policies(raw, floor=8192, ctx=6000))
     assert got["max_output_tokens"] == 6000 - 2000 - 2048
 
 
@@ -421,18 +430,18 @@ def test_floor_counts_the_responses_api_input_field():
 
 def test_model_rewrite_is_byte_identical_when_the_name_already_matches():
     raw = json.dumps({"model": "LFM2.5-350M", "messages": []}).encode()
-    assert apply_model_rewrite(raw, "LFM2.5-350M") is raw
-    assert apply_model_rewrite(raw, None) is raw
+    assert apply_request_policies(raw, model_id="LFM2.5-350M") is raw
+    assert apply_request_policies(raw, model_id=None) is raw
 
 
 def test_model_rewrite_replaces_an_alias():
     raw = json.dumps({"model": "lfm2", "messages": []}).encode()
-    assert json.loads(apply_model_rewrite(raw, "LFM2.5-350M"))["model"] == "LFM2.5-350M"
+    assert json.loads(apply_request_policies(raw, model_id="LFM2.5-350M"))["model"] == "LFM2.5-350M"
 
 
 def test_model_rewrite_never_invents_a_model_field():
     raw = json.dumps({"messages": []}).encode()
-    assert apply_model_rewrite(raw, "LFM2.5-350M") is raw
+    assert apply_request_policies(raw, model_id="LFM2.5-350M") is raw
 
 
 def test_all_policies_compose_in_one_round_trip():
@@ -545,6 +554,17 @@ def test_scan_model_rejects_non_objects():
 def test_scan_model_rejects_a_non_string_model():
     assert scan_model(b'{"model": 7, "messages": []}') == ModelScan(None, True)
     assert scan_model(b'{"model": null}') == ModelScan(None, True)
+
+
+def test_credential_headers_are_on_the_drop_list():
+    """The models here run without ``--api-key``, so a client's own secrets —
+    a real OpenAI key left in a VS Code profile, a browser session cookie —
+    have no use downstream and must not be copied into a model process."""
+    for header in ("authorization", "api-key", "x-api-key", "openai-organization", "cookie"):
+        assert header in policies.DROP_REQUEST_HEADERS
+    # ...and they are a request-side concern only: stripping them from the
+    # response would be a different (and wrong) change.
+    assert not policies.DROP_RESPONSE_HEADERS & {"authorization", "cookie"}
 
 
 def test_scan_model_survives_utf8_split_mid_character():
