@@ -191,17 +191,25 @@ def test_doctor_command_fails_on_bad_registry(tmp_path, isolated_doctor_client_f
 
 
 # --------------------------------------------------------------------------- #
-# stub commands
+# the control commands are no longer stubs (P4)
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("command", cli.STUB_COMMANDS)
-def test_stub_commands_exit_2(command, capsys):
-    rc = cli.main([command])
-    assert rc == 2
-    err = capsys.readouterr().err
-    assert "not wired yet (P3/P4)" in err
-    assert command in err
+@pytest.mark.parametrize(
+    "command", ["status", "start", "stop", "switch", "log", "smoke", "adopt"]
+)
+def test_every_control_command_is_wired(command):
+    """P1 shipped these as stubs that printed "not wired yet (P3/P4)" and
+    exited 2. P4 is that packet; a stub surviving it would be a command an
+    operator runs, sees exit 2 from, and concludes is broken."""
+    parser = cli.build_parser()
+    action = next(
+        a for a in parser._subparsers._group_actions for _ in [0]  # noqa: SLF001
+    )
+    assert command in action.choices
+    handler = action.choices[command].get_default("func")
+    assert handler is not None
+    assert "not wired yet" not in (handler.__doc__ or "")
 
 
 def test_no_command_is_a_usage_error():

@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import registry as _registry
+from . import discovery as _discovery
 
 __all__ = [
     "RegistryError",
@@ -363,12 +363,12 @@ def resident_util(vram_mib: float, total_mib: float) -> float:
 def native_ctx(repo: str, hub_dir: str | Path | None = None) -> int:
     """A checkpoint's own ``max_position_embeddings`` (or the `text_config`
     equivalent for a multi-config checkpoint), read from its LOCAL hub cache
-    ``config.json`` — never fetched, per :func:`servedeck.registry.load_model_config`.
+    ``config.json`` — never fetched, per :func:`servedeck.discovery.load_model_config`.
 
     This is the "full native context, always" owner rule (REDESIGN §0): a
     model's ``ctx = "native"`` in ``models.toml`` resolves through here.
     """
-    cfg = _registry.load_model_config(repo, hub_dir)
+    cfg = _discovery.load_model_config(repo, hub_dir)
     if cfg is None:
         raise RegistryError(
             f"native_ctx({repo!r}): no config.json found in the local hub cache "

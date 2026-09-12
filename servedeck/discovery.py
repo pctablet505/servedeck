@@ -24,10 +24,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from . import config as _config
+from . import settings as _settings
 from . import disksize
 from . import kvcalc
-from . import legacy as _legacy
 
 # --------------------------------------------------------------------------- #
 # Constants (SPEC §4)
@@ -41,23 +40,17 @@ KNOWN_ARCHS: dict[str, str] = {
 }
 
 def arch_backends() -> dict[str, str]:
-    """architectures[0] -> backend, with servedeck.toml layered over the
-    built-in map.
+    """architectures[0] -> build name.
 
-    Declaring `architectures` on a `[backends.<name>]` section is the whole
-    supported way to teach Servedeck a new model family — no code change, and
-    no architecture name belonging to one person's box baked into a public
-    package. KNOWN_ARCHS remains the fallback for an install with no config.
+    v1 layered ``[backends.<name>].architectures`` from servedeck.toml over the
+    built-in map, so a new model family could be taught without a code change.
+    v2 has no ``[backends]``: a model declares its own ``build`` in models.toml
+    and is launched from it, so an architecture no longer has to be mapped to
+    anything before the model can run. This map now answers one question --
+    could servedeck serve this checkpoint sitting in the hub cache at all --
+    and KNOWN_ARCHS is the whole of it.
     """
-    merged = dict(KNOWN_ARCHS)
-    try:
-        backends = _config.get().backends
-    except Exception:  # noqa: BLE001 - an unreadable config must not hide models
-        return merged
-    for b in backends:
-        for arch in b.architectures:
-            merged[arch] = b.name
-    return merged
+    return dict(KNOWN_ARCHS)
 
 
 def _reverse_arch_backends() -> dict[str, str]:
@@ -454,10 +447,7 @@ def default_measurements_path() -> Path:
     every model simply reverts to "never booted" forever, because the boots
     are being recorded where nobody looks.
     """
-    try:
-        return _config.get().state_dir / MEASUREMENTS_FILENAME
-    except Exception:  # noqa: BLE001 - an unreadable config must not hide history
-        return Path(__file__).resolve().parent.parent / "state" / MEASUREMENTS_FILENAME
+    return _settings.get().state_dir / MEASUREMENTS_FILENAME
 
 
 def load_observations(path: Path | str | None = None) -> list[dict[str, Any]]:
@@ -467,14 +457,11 @@ def load_observations(path: Path | str | None = None) -> list[dict[str, Any]]:
         # store into it would make every caller that names a file -- tests
         # included -- read something off this machine that it never asked for.
         return _load_observation_file(Path(path))
-    p = default_measurements_path()
-    # Observations measured by the pre-rename `coldstart` tree come first --
-    # see legacy.py. Without this, renaming the project makes every model that
-    # HAS been booted and measured report "estimated" again, which is the one
-    # thing this store exists to stop.
-    data: list[dict[str, Any]] = list(_legacy.merge_json_list(p, MEASUREMENTS_FILENAME))
-    data.extend(_load_observation_file(p))
-    return _legacy.dedupe(data)
+    # v1 also merged in the pre-rename `coldstart` tree's store, so that
+    # renaming the project did not make every measured model report
+    # "estimated" again. That rename was two weeks ago, the merge has run, and
+    # legacy.py is gone: there is one store now, at $SERVEDECK_STATE_DIR.
+    return _load_observation_file(default_measurements_path())
 
 
 def _load_observation_file(p: Path) -> list[dict[str, Any]]:

@@ -26,7 +26,8 @@ from pathlib import Path
 
 import pytest
 
-from servedeck import kvcalc, paths, registry
+from servedeck import discovery as registry
+from servedeck import kvcalc
 
 GIB = 1 << 30
 HUB = Path.home() / ".cache" / "huggingface" / "hub"
@@ -180,18 +181,24 @@ def test_a_config_with_no_attention_geometry_refuses_rather_than_guesses() -> No
 # Integration: the defect the owner reported, end to end
 # --------------------------------------------------------------------------
 def _observations() -> list[dict]:
-    """The real observation store the running dashboard uses.
+    """The real observation store this box has accumulated.
 
-    That is the PRE-RENAME tree: the coldstart fork is what has been serving
-    :8010, so its state directory is where the measurements actually are.
-    Spelled through paths.LEGACY_COLDSTART_STATE_DIR rather than as a literal,
-    so this fixture follows the one constant the package resolves it by --
-    a second copy of the path is how the two silently stop agreeing.
+    Not `discovery.default_measurements_path()`: conftest points
+    $SERVEDECK_STATE_DIR at a tmp directory for every test, which is exactly
+    right for everything that WRITES and useless for the two tests below,
+    whose whole subject is the real measurements. Both candidate locations are
+    tried -- v2's own state dir and the pre-rename coldstart tree that was
+    serving :8010 until 09-12 -- and the test skips if neither exists, because
+    a machine without the store cannot have an opinion about it.
     """
-    p = paths.LEGACY_COLDSTART_STATE_DIR / registry.MEASUREMENTS_FILENAME
-    if not p.is_file():
-        pytest.skip("no observation store on this machine")
-    return json.loads(p.read_text())
+    for base in (
+        Path(__file__).resolve().parent.parent / "state",
+        Path.home() / "Projects" / "coldstart" / "state",
+    ):
+        candidate = base / registry.MEASUREMENTS_FILENAME
+        if candidate.is_file():
+            return json.loads(candidate.read_text())
+    pytest.skip("no observation store on this machine")
 
 
 def test_a_model_with_no_sibling_observation_still_gets_a_kv_rate() -> None:
@@ -228,28 +235,52 @@ def test_a_measured_observation_still_wins_over_the_calculator() -> None:
     assert ri.kv_kib_per_token == pytest.approx(37.99, abs=0.05)
 
 
-def test_the_estimate_uses_the_flags_this_box_actually_launches_with(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The cache-layout flags reach the calculator from the SAME place a
-    launch reads them: the backend's fixed env, then EXTRA_ARGS out of the
-    shell config, guarded on BACKEND so another backend's flags cannot leak
-    in. Without this the panel describes a server nobody starts -- the
-    delivered Flash-Next configuration carries
-    --mamba-ssm-cache-dtype bfloat16, worth 6.9% of its token count."""
-    from servedeck import app as capp
-    from servedeck import supervisor as _sup
+def test_a_models_cache_flags_have_exactly_one_source(tmp_path: Path) -> None:
+    """The flags that decide a model's KV layout must come from the same place
+    the launch reads them.
 
-    monkeypatch.setattr(
-        _sup,
-        "shell_extra_args",
-        lambda backend: (
-            "--language-model-only --mamba-ssm-cache-dtype bfloat16 --prefix-match-unit 208"
-            if backend == "flashnext"
-            else ""
-        ),
+    In v1 they came from two: a backend's fixed env in servedeck.toml, and
+    EXTRA_ARGS out of local_llm/.config -- a mutable bash file two control
+    planes both wrote (REDESIGN R2). When they disagreed the capacity panel
+    described a server nobody starts; the delivered Flash-Next configuration
+    carried --mamba-ssm-cache-dtype bfloat16, worth 6.9% of its token count,
+    and the panel did not know.
+
+    v2 has one source, `flags` in models.toml, and this pins that: whatever is
+    written there reaches the argv verbatim and in order, and no other flag
+    appears that the registry did not put there.
+    """
+    from servedeck import models as _models
+
+    toml = tmp_path / "models.toml"
+    toml.write_text(
+        """
+[gpu]
+total_mib = 100000
+margin_mib = 1000
+[builds]
+stock = "/opt/stock"
+[models.m]
+id = "M"
+repo = "org/m"
+slot = "main"
+port = 19001
+build = "stock"
+ctx = 4096
+flags = ["--mamba-ssm-cache-dtype", "bfloat16", "--language-model-only"]
+"""
     )
-    assert capp._cache_flags("flashnext") == (None, "bfloat16")
-    # A different backend must not inherit them.
-    assert capp._cache_flags("inline")[1] is None
-    assert capp._cache_flags(None) == (None, None)
+    model = _models.load(toml).models["m"]
+    argv = _models.render_argv(model, "/opt/stock/bin/vllm", 0.91, 4096, 19001)
+    assert argv[-3:] == ["--mamba-ssm-cache-dtype", "bfloat16", "--language-model-only"]
+    # Nothing else invented a flag: every `--x` in the argv is either one this
+    # module renders by contract or one the registry supplied.
+    rendered = {
+        "--served-model-name", "--host", "--max-model-len",
+        "--gpu-memory-utilization", "--port",
+    }
+    strays = [
+        a for a in argv
+        if a.startswith("--") and a not in rendered and a not in model.flags
+    ]
+    assert not strays, strays

@@ -64,9 +64,9 @@ class Desired:
 def default_path() -> Path:
     """``<project>/state/desired.json`` — the same filename v1 used, on
     purpose: one file per box, migrated in place, never two."""
-    from servedeck import paths
+    from servedeck import settings
 
-    return paths.STATE_DIR / "desired.json"
+    return settings.get().desired_path
 
 
 def _from_v1(raw: dict[str, object], source: str) -> Desired:

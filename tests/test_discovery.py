@@ -1,4 +1,4 @@
-"""Tests for servedeck.registry — SPEC.md §4.
+"""Tests for servedeck.discovery — SPEC.md §4.
 
 Two kinds of coverage:
   * Synthetic hub caches built under tmp_path, so discovery/servability/config
@@ -10,7 +10,7 @@ Two kinds of coverage:
     1 skipped stub (models--Qwen--Qwen3.8-27B).
 
 No number here is invented: the real-cache assertions were measured by
-running `python -m servedeck.registry --list` against the live cache before
+running `python -m servedeck.discovery --list` against the live cache before
 these tests were written.
 """
 
@@ -22,8 +22,8 @@ from pathlib import Path
 
 import pytest
 
-from servedeck import registry
-from servedeck.registry import (
+from servedeck import discovery as registry
+from servedeck.discovery import (
     KNOWN_ARCHS,
     ModelEntry,
     append_observation,
@@ -369,29 +369,23 @@ def test_known_archs_map_is_exactly_the_two_documented_entries() -> None:
     assert len(set(KNOWN_ARCHS.values())) == len(KNOWN_ARCHS), "map must stay 1:1"
 
 
-def test_configured_architectures_extend_the_built_in_map(config_path) -> None:
-    """Declaring `architectures` on a backend is the whole supported way to
-    teach Servedeck a new model family.
+def test_arch_map_is_the_built_in_map_and_nothing_layers_over_it() -> None:
+    """v1 let `[backends.<name>].architectures` in servedeck.toml extend this
+    map, because a model could not be launched until its architecture was
+    mapped to a backend.
 
-    It used to require editing KNOWN_ARCHS, i.e. shipping one machine's model
-    lineup inside a public package — and a user who could not edit the source
-    simply saw their model listed as "unknown architecture".
+    v2 has no `[backends]`: a model names its own `build` in models.toml and is
+    launched from it, so nothing has to be taught an architecture first. What
+    is left answers one much smaller question — could servedeck serve this
+    checkpoint sitting in the hub cache at all — and a config layer over it
+    would be a second place to look for an answer with one source.
     """
-    from servedeck import registry
-
-    config_path(
-        '''
-[backends.custom]
-launcher = "/bin/true"
-port = 9500
-architectures = ["SomeNewForConditionalGeneration"]
-'''
-    )
     got = registry.arch_backends()
-    assert got["SomeNewForConditionalGeneration"] == "custom"
-    # and the built-ins survive, so an install with a config is not a
-    # regression for the backends that never needed one
-    assert got["Qwen4ExpForConditionalGeneration"] == "flashnext"
+    assert got == dict(KNOWN_ARCHS)
+    # A returned copy, not the module's own dict: a caller that mutates the
+    # answer must not be editing the built-in map for the rest of the process.
+    got["Made-Up"] = "nowhere"
+    assert "Made-Up" not in registry.arch_backends()
 
 
 # --------------------------------------------------------------------------- #
@@ -812,7 +806,7 @@ def test_a_snapshot_whose_blobs_are_offline_says_so(tmp_path) -> None:
     "0 safetensors, no config.json" sends the operator to re-fetch ~180 GiB
     that is sitting on a disk they only have to plug back in.
     """
-    from servedeck.registry import _scan_snapshot_files
+    from servedeck.discovery import _scan_snapshot_files
 
     snap = tmp_path / "snapshots" / "abc"
     snap.mkdir(parents=True)
@@ -831,7 +825,7 @@ def test_a_healthy_snapshot_reports_no_dangling_symlinks(tmp_path) -> None:
     """The over-correction guard: a normal hub snapshot IS a directory of
     symlinks into blobs/, and every one of them resolves. Counting those as
     broken would label every cached model unloadable."""
-    from servedeck.registry import _scan_snapshot_files
+    from servedeck.discovery import _scan_snapshot_files
 
     blobs = tmp_path / "blobs"
     blobs.mkdir()
@@ -856,7 +850,7 @@ def test_the_observation_store_lives_in_the_configured_state_dir(
     unit with its own StateDirectory does — and boots are recorded in one
     place and read from another, so every model reads "never booted" forever
     while the measurements pile up unseen."""
-    from servedeck import config as _cfg
+    from servedeck import limits as _cfg
 
     store = tmp_path / "elsewhere"
     monkeypatch.setenv("SERVEDECK_STATE_DIR", str(store))
