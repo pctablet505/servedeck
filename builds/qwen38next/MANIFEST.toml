@@ -1,0 +1,69 @@
+# builds/qwen38next/MANIFEST.toml — captured 2026-09-12 (servedeck v2 packet P5).
+# Serves [models.flashnext] per models.toml [builds].qwen38next.
+
+[venv]
+path   = "~/Projects/vllm-qwen38next/.venv-next"
+python = "3.13.15"
+vllm   = "0.29.0.dev0+qwen38next.cu132"
+
+[packages]
+torch              = "2.13.0+cu130"
+transformers       = "5.16.1"
+flashinfer_python  = "0.6.16.post3"   # NOT the same version as the other two builds
+triton             = "3.7.1"
+numpy              = "2.4.6"
+
+[install]
+kind            = "editable-source"
+# from <venv>/lib/python3.13/site-packages/vllm-0.29.0.dev0+qwen38next.cu132.dist-info/direct_url.json
+editable_target = "/home/pctablet505/Projects/vllm-qwen38next/src"
+source = "uv pip install --python .venv-next/bin/python -e . --no-build-isolation --no-deps  (vllm-qwen38next/SETUP.md §8 'Build', and build.sh:110 verbatim)"
+
+[tree]
+checkout = "/home/pctablet505/Projects/vllm-qwen38next/src"
+remote   = "origin https://github.com/peakcrosser7/vllm.git"
+branch   = "release/qwen38next_offload"
+head     = "95dc96d1d012a25ff5c3823a1e77197c8dae4654"
+describe = "95dc96d1d"   # git describe --tags --always -- no tags in this checkout, falls back to the short SHA
+
+[base]
+anchor        = "undetermined"
+commits_ahead = "unknown"
+note = """
+`git tag` returns nothing in this checkout, so `describe` has no released tag \
+to count from and there is no local way to say how many commits this branch \
+carries over a released vLLM version. SETUP.md names PR #53899 on \
+vllm-project/vllm as the origin of this branch, but the PR's base commit is \
+not recorded anywhere in this checkout. \
+The local branch DOES track a remote: `git rev-parse @{u}` is \
+origin/release/qwen38next_offload, and `git branch -vv` on 2026-09-12 shows \
+it '[origin/release/qwen38next_offload: behind 2]' -- i.e. origin has moved 2 \
+commits past the SHA actually installed here. build.sh checks out the \
+recorded SHA explicitly, not the branch tip, so a rebuild does not silently \
+pick up those 2 commits.
+"""
+
+[patches]
+files = [
+    "working-tree-tracked.patch",
+    "working-tree-untracked.patch",
+]
+# Confirmed against this tree's live `git status --porcelain=v1` on 2026-09-12:
+# 4 modified tracked files (tests/entrypoints/openai/chat_completion/test_serving_chat.py,
+# tests/v1/core/test_kv_cache_utils.py, vllm/envs.py, vllm/models/qwen4_exp/nvidia/ple_layer.py)
+# and 2 new untracked files (tests/entrypoints/unit_tests/test_reasoning_field_chat_template_roundtrip.py,
+# tests/models/qwen4_exp/test_qsa_update_draft_decode_metadata.py). Both patch
+# files are required; there is nothing else uncommitted in this tree.
+excluded_branches = [
+    "branches/jit-warmup-and-template-errors/0001-*.patch, 0002-*.patch (2 commits over tree.head; local branch 'jit-warmup-and-template-errors', not merged into release/qwen38next_offload)",
+    "branches/mm-encoder-offload/0001-*.patch (1 commit over tree.head; local branch 'mm-encoder-offload', not merged)",
+    "branches/ple-fp8-conversion/0001-*.patch (1 commit over tree.head; local branch 'ple-fp8-conversion', not merged)",
+    "branches/prefix-match-unit-validation/0001-*.patch (1 commit over tree.head; local branch 'prefix-match-unit-validation', not merged)",
+]
+note = "The 4 excluded_branches entries are topic branches whose base IS tree.head (builds/patches/qwen38next/MANIFEST.txt: each recorded as 'N commit(s) over 95dc96d1d012a25ff5c3823a1e77197c8dae4654') but were never merged into release/qwen38next_offload. They describe work in flight, not what /v1 serves. build.sh must NOT apply them."
+
+[cuda]
+driver_header = "NVIDIA-SMI 595.84   Driver Version: 595.84   CUDA Version: 13.2"
+nvcc = "no system CUDA toolkit. This venv's own nvcc comes from pip nvidia-cuda-nvcc==13.2.86, pinned separately from torch's bundled cu130 runtime -- SETUP.md §6: driver 595.84 caps at CUDA 13.2, so a 13.3 build fails at first kernel launch ('unsupported toolchain') and a 13.0 build fails to compile on this host's glibc 2.43. All five nvidia-cuda-* packages must move together."
+flashinfer_sampler = "VLLM_USE_FLASHINFER_SAMPLER=0 (serve.sh:73; also models.toml [defaults.env]) -- no nvcc on the host PATH, so FlashInfer's JIT top-k/top-p sampler cannot compile."
+lib64_shim = "$CUDA_HOME/lib64 -> lib, created by serve.sh:66-71 ('[ -e \"$CUDA_HOME/lib64\" ] || ln -sfn lib \"$CUDA_HOME/lib64\"'). Present today: .venv-next/lib/python3.13/site-packages/nvidia/cu13/lib64 -> lib (checked 2026-09-12). Needed because FlashInfer's JIT hardcodes -L$CUDA_HOME/lib64 (flashinfer/jit/cpp_ext.py) but the pip CUDA wheels only ship lib/; without it the SM120 fused-MoE kernel fails to LINK at first forward pass ('ld: cannot find -lcudart/-lnvrtc'), which surfaces as the generic 'Ninja build failed' (SETUP.md Blocker 5)."

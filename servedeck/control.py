@@ -36,10 +36,11 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -62,6 +63,7 @@ __all__ = [
     "Progress",
     "Control",
     "READY_MARKERS",
+    "SECRET_NAME_RE",
     "UNIT_PREFIX",
     "DEFAULT_MARGIN_MIB",
     "floor2",
@@ -85,6 +87,25 @@ READY_MARKERS: tuple[str, ...] = (
 
 #: VRAM never handed to any model (models.toml ``[gpu] margin_mib``).
 DEFAULT_MARGIN_MIB = 1024
+
+#: Environment variable names that must never reach a model process.
+#:
+#: A transient unit inherits the user manager's environment, which on a
+#: workstation is the login session's — so an operator who exported an API key
+#: in their ~/.profile has put it in every model's environment. Measured on
+#: this box: ``KITE_API_KEY`` and ``KITE_API_SECRET`` are both in
+#: ``systemctl --user show-environment``. A model runs arbitrary prompts, logs
+#: freely, and can simply be asked to print its own environment, so the only
+#: safe amount of unrelated credential in it is none.
+#:
+#: The word must be a whole underscore-delimited component, which is what
+#: keeps ``MONKEY_BUSINESS``, ``KEYBOARD_LAYOUT`` and ``PASSTHROUGH`` out of
+#: the list while catching ``KITE_API_KEY``, ``GITHUB_TOKEN``, ``PASSWORD``
+#: and ``GOOGLE_APPLICATION_CREDENTIALS``. Over-redaction is not free: an
+#: unset variable a model needed is a boot failure with no message.
+SECRET_NAME_RE = re.compile(
+    r"(^|_)(KEY|SECRET|TOKEN|PASS|PASSWORD|CREDENTIALS?)($|_)", re.IGNORECASE
+)
 
 _PROBE_TIMEOUT_S = 2.0
 _TICK_S = 0.5
@@ -121,9 +142,6 @@ class ModelSpec(Protocol):
     #: The model's canonical public id, e.g. ``"LFM2.5-350M"``. This is what
     #: ``GET /v1/models`` must list for the model to count as ready.
     id: str
-    #: Every name vLLM is told to serve (``--served-model-name``): the id plus
-    #: every alias any client has ever used. Never renamed, only added to.
-    served_names: Sequence[str]
     #: ``"main"`` (exclusive GPU slot, one at a time) or ``"resident"``
     #: (co-resident, budgeted, always on).
     slot: str
@@ -133,14 +151,31 @@ class ModelSpec(Protocol):
     #: For a resident: its VRAM budget in MiB, from which its utilisation is
     #: derived. For a main model: None — a main model gets everything free.
     vram_mib: int | None
-    #: Context length in tokens, or None for "native" (vLLM decides).
-    ctx_tokens: int | None
+    #: Context length in tokens. REQUIRED, never None: "native" is resolved to
+    #: a number by the registry adapter before launch, and ``render_argv`` must
+    #: always emit ``--max-model-len``. Leaving it to vLLM means the dashboard
+    #: cannot size KV headroom and two callers disagree about the context a
+    #: client may ask for — R1 in miniature.
+    ctx_tokens: int
     #: Absolute path to the venv's ``bin`` DIRECTORY (e.g.
     #: ``/home/u/Projects/local_llm/.venv-llm-029/bin``). Control prepends it
     #: to ``PATH`` in the unit environment so every subprocess vLLM spawns
     #: resolves to the same interpreter. ``render_argv`` is still expected to
     #: return an absolute argv[0]; PATH is for vLLM's children, not for us.
     venv_bin: str
+
+    def served_names(self) -> Sequence[str]:
+        """Every name vLLM is told to serve (``--served-model-name``): the id
+        plus every alias any client has ever used. Never renamed, only added to.
+
+        A METHOD, not an attribute, and deliberately so: P1's real model object
+        already exposes it as a method, and a Protocol that declared it an
+        attribute would still pass ``isinstance`` against that object — then
+        blow up inside :meth:`Control.wait_ready` with "method object is not
+        iterable", at model-boot time, on the box. A conformance check that
+        accepts the shape it will later choke on is worse than none.
+        """
+        ...
 
     def render_argv(self, util: float, port: int) -> list[str]:
         """The full argv to exec, argv[0] absolute.
@@ -161,7 +196,14 @@ class ModelSpec(Protocol):
 
 @runtime_checkable
 class Registry(Protocol):
-    def models(self) -> Sequence[ModelSpec]: ...
+    """What the supervisor needs from the registry: one lookup.
+
+    There is no ``models()`` here. Nothing in this module ever enumerates the
+    registry — discovery is ``systemctl list-units`` plus a probe, and every
+    other entry point is given a key. A method declared but never called is a
+    contract P1 has to satisfy for nothing, and the first place a wrong
+    assumption about ordering or laziness would hide.
+    """
 
     def get(self, key: str) -> ModelSpec:
         """The spec for ``key``. Raises :class:`KeyError` if unknown."""
@@ -389,6 +431,31 @@ class Control:
         prefix = self.unit_prefix
         return unit[len(prefix) :] if unit.startswith(prefix) else unit
 
+    def secret_env_names(self, keep: Collection[str] = ()) -> list[str]:
+        """Names in the user manager's environment that a model must not see.
+
+        Computed at start time rather than written down, because the manager's
+        environment is whatever the login session put there and changes without
+        anyone editing this repo — a hardcoded deny-list would be correct on
+        the day it was written and quietly wrong afterwards.
+
+        ``keep`` is the model's own declared environment. The registry is the
+        single source of truth for what a model needs (R1), so a variable it
+        declares on purpose — an ``HF_TOKEN`` for a gated repo — is the
+        model's, not ambient leakage, and is left alone. Only what the model
+        never asked for is redacted.
+
+        Returns NAMES. No value is read, stored, returned or logged anywhere on
+        this path: :func:`units.manager_environment_names` discards the value
+        half before returning, so there is nothing here to leak.
+        """
+        keep = set(keep)
+        return [
+            name
+            for name in units.manager_environment_names(run=self._run)
+            if SECRET_NAME_RE.search(name) and name not in keep
+        ]
+
     def total_mib(self) -> int | None:
         if self._total_mib is not None:
             return self._total_mib
@@ -436,7 +503,7 @@ class Control:
                 )
                 continue
             ids = self._probe(spec.port) if state.active_state == "active" else None
-            names = {spec.id, *spec.served_names}
+            names = {spec.id, *spec.served_names()}
             ready = ids is not None and bool(names & set(ids))
             out.append(
                 LiveModel(
@@ -473,6 +540,18 @@ class Control:
         That is what makes "a resident can block a big-model boot" (R4)
         impossible — the resident's 3.3 GiB is simply not free any more, so it
         is not offered.
+
+        **The margin is not only a safety buffer; it is the launching worker's
+        CUDA-context cushion.** ``--gpu-memory-utilization`` is a fraction of
+        the card that vLLM will fill, but the process that fills it must first
+        create a CUDA context, load cuBLAS/cuDNN kernels and allocate NCCL
+        buffers — a few hundred MiB that are NOT counted in the fraction and
+        are taken while the allocation is in progress. Hand a model literally
+        everything free and its own startup overhead is what pushes it over.
+        Hence the post-condition
+        ``ceil(total * util) <= free - 700``, pinned by a test: whatever this
+        function returns, at least 700 MiB of the free pool is still there for
+        the worker that is about to claim it.
         """
         total = self.total_mib()
         if total is None or total <= 0:
@@ -504,6 +583,21 @@ class Control:
                 return Refusal(
                     reason="no_vram_budget",
                     message=f"resident {spec.key} has no vram_mib budget; utilisation is underived",
+                    key=spec.key,
+                )
+            # A resident's utilisation comes from its budget, so nothing in the
+            # arithmetic above notices that the budget does not fit. Without
+            # this check the unit launches, vLLM asks for 3.3 GiB of a card
+            # with 2 GiB free, and the failure arrives minutes later as a CUDA
+            # OOM in journald with no mention of the number that was wrong.
+            if spec.vram_mib > free - self.margin_mib:
+                return Refusal(
+                    reason="not_enough_vram",
+                    message=(
+                        f"resident {spec.key} budgets {spec.vram_mib} MiB but only "
+                        f"{free - self.margin_mib} MiB is available ({free} MiB free "
+                        f"less the {self.margin_mib} MiB margin)"
+                    ),
                     key=spec.key,
                 )
             util = floor2(spec.vram_mib / total)
@@ -569,6 +663,29 @@ class Control:
         env = dict(spec.render_env())
         env.setdefault("PATH", f"{spec.venv_bin}:/usr/local/bin:/usr/bin:/bin")
 
+        # Fail closed. If the manager's environment cannot be enumerated there
+        # is no way to know what to redact, and starting anyway would hand the
+        # model every ambient credential — the exact outcome this exists to
+        # prevent. Refusing is loud; leaking is silent.
+        try:
+            unset_env = self.secret_env_names(keep=env)
+        except UnitError as exc:
+            return Refusal(
+                reason="env_scan_failed",
+                message=(
+                    f"could not read the user manager's environment ({exc}); refusing to "
+                    f"start {key} rather than hand it whatever credentials are in it"
+                ),
+                key=key,
+            )
+        if unset_env:
+            log.info(
+                "%s: unsetting %d inherited variable(s) for the model: %s",
+                unit,
+                len(unset_env),
+                ", ".join(unset_env),  # names only; values are never read
+            )
+
         # Start the follower BEFORE the unit, from a timestamp a couple of
         # seconds in the past: journalctl --since has one-second granularity,
         # so anchoring at "now" can drop the first lines of a fast boot. Seeing
@@ -584,6 +701,7 @@ class Control:
                 restart=restart,
                 restart_sec=restart_sec,
                 description=f"servedeck model {spec.id} ({key})",
+                unset_env=unset_env,
                 run=self._run,
             )
         except UnitError as exc:
@@ -603,6 +721,25 @@ class Control:
                 self._save_desired(current_desired.with_main(key))
             else:
                 self._save_desired(current_desired.with_resident(key))
+            return result
+
+        # A start that did not come up must not be left behind. With
+        # Restart=on-failure the unit keeps retrying after we stop watching,
+        # holding the port and taking the GPU on each attempt — unattended,
+        # because the caller has already been handed a failure and moved on.
+        # That is R4's crash-loop with nobody watching, and it survives a
+        # timeout (where the unit is often perfectly healthy and just slow)
+        # just as much as a crash.
+        #
+        # units.stop, NOT self.stop: self.stop also REMOVES the key from
+        # desired state, and a start invoked by reconcile() is acting on an
+        # intent the operator already recorded. Erasing it because one boot
+        # attempt failed means the model is never retried and nothing says
+        # why. The unit is stopped; the intent is not.
+        try:
+            units.stop(unit, run=self._run)
+        except UnitError as exc:
+            log.warning("%s: failed start could not be cleaned up: %s", unit, exc)
         return result
 
     def wait_ready(
@@ -624,6 +761,12 @@ class Control:
         spec = self._spec(key)
         unit = self.unit_for(key)
         started_at = self._clock() if started_at is None else started_at
+        # "Never appeared" and "vanished after starting" are different faults
+        # with different fixes — a rejected unit definition or a refused
+        # transient name versus a model that crashed — and both would otherwise
+        # arrive as the same "--collect removed it" sentence, sending the
+        # reader to the journal of a unit that was never created.
+        appeared = not units.gone(unit, run=self._run, sleep=self._sleep)
         deadline = started_at + timeout_s
         markers: list[str] = []
         next_marker = 0
@@ -664,6 +807,14 @@ class Control:
                     emit("marker", line, next_marker)
                     next_marker += 1
 
+        if not appeared:
+            return finish(
+                False,
+                f"{unit} never appeared: systemd-run reported success but the unit "
+                f"is not loaded, so nothing was started under that name. Look at "
+                f"the unit definition, not at the model.",
+            )
+
         stream = units.journal_follow(unit, since, spawn=self._spawn)
         try:
             while True:
@@ -680,11 +831,18 @@ class Control:
                 now = self._clock()
                 if now - last_health >= _HEALTH_EVERY_S:
                     last_health = now
-                    if not units.exists(unit, run=self._run):
+                    # `gone`, not `exists`: one LoadState read is ~0.2%
+                    # unreliable (see units.exists), and at one health check
+                    # every 2s a five-minute boot takes ~150 of them — so
+                    # trusting a single negative would report a healthy model
+                    # dead about a quarter of the time, with a confident
+                    # message naming the wrong cause.
+                    if units.gone(unit, run=self._run, sleep=self._sleep):
                         return finish(
                             False,
-                            f"{unit} no longer exists: it failed and --collect removed it "
-                            f"(systemctl show would report inactive/success for it now)",
+                            f"{unit} vanished after starting: it failed and --collect "
+                            f"removed it (systemctl show would report inactive/success "
+                            f"for it now)",
                         )
                     state = units.show(unit, run=self._run)
                     if state.failed:
@@ -703,7 +861,7 @@ class Control:
                 if spec is not None and now - last_probe >= _PROBE_EVERY_S:
                     last_probe = now
                     ids = self._probe(spec.port)
-                    if ids is not None and ({spec.id, *spec.served_names} & set(ids)):
+                    if ids is not None and ({spec.id, *spec.served_names()} & set(ids)):
                         drain_until = self._clock() + _READY_DRAIN_S
                         while self._clock() < drain_until:
                             consume(stream.poll_lines(min(0.2, _READY_DRAIN_S)))
@@ -722,7 +880,9 @@ class Control:
         unit = self.unit_for(key)
         if not units.valid_unit_name(unit):
             return Refusal(reason="bad_key", message=f"{key!r} is not a usable model key", key=key)
-        was_live = units.exists(unit, run=self._run)
+        # Confirmed, because a false "not there" skips the VRAM accounting
+        # below and would let the next switch boot into an occupied card.
+        was_live = not units.gone(unit, run=self._run, sleep=self._sleep)
         free_before = self._free_mib()
         held = self._held_mib(unit) if was_live else 0
         try:
@@ -776,6 +936,13 @@ class Control:
         the stopped unit's cgroup held — not 100%, because the driver keeps
         some context allocated, and not a fixed sleep, because a fixed sleep is
         either wrong or slow.
+
+        When there is no number to aim at — ``used_by_pids()`` returned None,
+        or the driver attributed nothing to the unit's cgroup — the wait falls
+        back to a plateau: poll until ``free_mib()`` has stopped rising for
+        three consecutive reads. It never reports ``released=True`` for a wait
+        that did not happen, because "we did not check" and "the memory came
+        back" must not arrive at the caller as the same answer.
         """
         spec = self._spec(key)
         if spec is None:
@@ -798,12 +965,29 @@ class Control:
             if isinstance(result, Refusal):
                 return result
             stopped = result
-            released, waited, free_after = self._wait_for_release(
+            released, waited, free_after, reason = self._wait_for_release(
                 free_before=result.free_before_mib,
                 held_mib=result.held_mib,
                 timeout_s=release_timeout_s,
                 on_progress=on_progress,
             )
+            if reason == "vram_accounting_unavailable":
+                return SwitchResult(
+                    stopped=stopped,
+                    released=False,
+                    waited_s=waited,
+                    free_after_mib=free_after,
+                    started=Refusal(
+                        reason="vram_accounting_unavailable",
+                        message=(
+                            f"nvidia-smi cannot report free VRAM, so there is no way to tell "
+                            f"whether {result.unit} let go. Refusing to boot {key} on the "
+                            f"assumption that it did."
+                        ),
+                        key=key,
+                        live_key=holder.key,
+                    ),
+                )
             if not released:
                 return SwitchResult(
                     stopped=stopped,
@@ -844,26 +1028,89 @@ class Control:
         held_mib: int | None,
         timeout_s: float,
         on_progress: ProgressCallback | None = None,
-    ) -> tuple[bool, float, int | None]:
+    ) -> tuple[bool, float, int | None, str | None]:
+        """``(released, waited_s, free_after_mib, reason)``.
+
+        ``released=True`` is only ever returned by a wait that actually
+        observed something. There is no "nothing to wait for, call it done"
+        branch: that branch is indistinguishable, at the call site, from a
+        successful wait, and it fires precisely when the instrument is broken —
+        a measurement failing downward into a confident yes.
+        """
         started = self._clock()
-        if not held_mib or free_before is None:
-            # Nothing was attributed (a CPU-only unit) or nvidia-smi is mute:
-            # there is no number to wait for, so waiting would be theatre.
-            return True, 0.0, self._free_mib()
-        target = free_before + RELEASE_FRACTION * held_mib
-        free_now = self._free_mib()
+        if self._free_mib() is None:
+            # No instrument at all. Not "released", not "not released" — a
+            # distinct answer, because the caller must refuse rather than
+            # retry.
+            return False, 0.0, None, "vram_accounting_unavailable"
+
+        if held_mib and free_before is not None:
+            return self._wait_for_target(
+                free_before + RELEASE_FRACTION * held_mib, started, timeout_s, on_progress
+            )
+
+        # No attribution: nvidia-smi could not enumerate compute apps, or the
+        # driver credited this unit's cgroup with nothing. There is no target,
+        # but there is still a signal — memory comes back in steps and then
+        # stops. Waiting for the plateau is weaker than waiting for a number
+        # and much stronger than not waiting.
+        return self._wait_for_plateau(started, timeout_s, on_progress)
+
+    def _wait_for_target(
+        self,
+        target: float,
+        started: float,
+        timeout_s: float,
+        on_progress: ProgressCallback | None,
+    ) -> tuple[bool, float, int | None, str | None]:
         while True:
             free_now = self._free_mib()
             if free_now is not None and free_now >= target:
-                return True, self._clock() - started, free_now
+                return True, self._clock() - started, free_now, None
             waited = self._clock() - started
             if waited >= timeout_s:
-                return False, waited, free_now
+                return False, waited, free_now, "vram_not_released"
             if on_progress is not None:
                 on_progress(
                     Progress(
                         kind="line",
                         text=f"waiting for VRAM: {free_now} MiB free, need {int(target)} MiB",
+                        elapsed_s=waited,
+                    )
+                )
+            self._sleep(1.0)
+
+    def _wait_for_plateau(
+        self,
+        started: float,
+        timeout_s: float,
+        on_progress: ProgressCallback | None,
+        stable_reads: int = 3,
+    ) -> tuple[bool, float, int | None, str | None]:
+        best: int | None = None
+        stable = 0
+        while True:
+            free_now = self._free_mib()
+            if free_now is None:
+                return False, self._clock() - started, None, "vram_accounting_unavailable"
+            if best is None or free_now > best:
+                best = free_now
+                stable = 0
+            else:
+                stable += 1
+                if stable >= stable_reads:
+                    return True, self._clock() - started, free_now, None
+            waited = self._clock() - started
+            if waited >= timeout_s:
+                return False, waited, free_now, "vram_not_released"
+            if on_progress is not None:
+                on_progress(
+                    Progress(
+                        kind="line",
+                        text=(
+                            f"waiting for VRAM to settle (no per-process attribution): "
+                            f"{free_now} MiB free, stable for {stable}/{stable_reads} reads"
+                        ),
                         elapsed_s=waited,
                     )
                 )
@@ -914,6 +1161,13 @@ class Control:
         to restart (R4); and a model that is 40 seconds into a 90-second boot
         must not be killed by the dashboard coming up. Reconcile never stops
         anything and never writes desired state.
+
+        **This call BLOCKS for as long as the models take to boot** — minutes
+        for a 90 GiB model — so it must not be run from an ASGI lifespan
+        handler: uvicorn does not bind the socket until startup returns, and
+        servedeck would be unreachable for the whole boot, including to the
+        dashboard that is meant to be showing its progress. P4 runs it as a
+        task created after the bind.
         """
         want = self.load_desired() if desired is None else desired
         existing = {model.key: model for model in self.live()}

@@ -36,6 +36,31 @@ That is the property that actually matters to vLLM's argparse (it does not
 care about flag order) and it is the only comparison that could ever pass
 given the fixed-order design — this is the "intentional, named" difference
 the packet's instructions ask for.
+
+FROZEN SNAPSHOT, NOT A LIVE DEPENDENCY: the 27B comparison is split in two.
+``test_qwen27b_argv_and_env_match_frozen_snapshot`` is the one that ALWAYS
+RUNS — it reads ``tests/fixtures/qwen27b-launcher-{argv,env}.txt`` (captured
+2026-09-12; see those files' headers for exactly which ``.config`` values
+produced them) and never shells out, so it has no dependency on the live,
+mutable ``~/Projects/local_llm/.config`` that R2 (REDESIGN §1) is retiring.
+``test_qwen27b_snapshot_is_current`` is the live half: it re-runs the real
+launcher and asserts the snapshot has not gone stale — it skips cleanly (via
+``_run_dry_run_launcher``'s own guards) on a box without the launcher/.config,
+and it is the test to consult (and the fixture files to regenerate) if
+``.config`` or the script's own defaults change.
+
+ENV COMPARISON: v2 now renders ``CUDA_HOME``, ``PATH`` and
+``VLLM_USE_FLASHINFER_SAMPLER`` (``models.render_env``, launch-environment-
+completeness fix) — ALL THREE are compared, not just one. ``CUDA_HOME`` and
+``VLLM_USE_FLASHINFER_SAMPLER`` must match exactly. ``PATH`` does not: the
+legacy script prepends its venv/CUDA bins onto WHATEVER PATH the invoking
+shell happened to have, which is a property of the terminal that ran the
+capture, not of the model — v2 instead renders a fixed, minimal,
+self-sufficient PATH (a systemd transient unit inherits the user manager's
+environment, never the invoking shell's, so relying on an inherited PATH
+would not even find ``env``/``sh``). Only the ``<venv>/bin:<CUDA_HOME>/bin:``
+PREFIX of PATH is therefore compared — that prefix is the part that is
+actually a property of the model/build, and it is where the two ends agree.
 """
 
 from __future__ import annotations
@@ -49,9 +74,19 @@ import pytest
 from servedeck import models
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
+QWEN27B_ARGV_FIXTURE = FIXTURES_DIR / "qwen27b-launcher-argv.txt"
+QWEN27B_ENV_FIXTURE = FIXTURES_DIR / "qwen27b-launcher-env.txt"
+
 LOCAL_LLM = Path.home() / "Projects" / "local_llm"
 SERVER_RUN_SH = LOCAL_LLM / "bin" / "qwen-server-run.sh"
 LIVE_CONFIG = LOCAL_LLM / ".config"
+
+#: Every env var v2's registry renders for the 27B today (models.render_env).
+#: Requested from the live launcher too, both when the fixtures were captured
+#: and by the live "still current" check, so neither side can silently claim a
+#: var the other never mentions.
+QWEN27B_ENV_VARS = "CUDA_HOME PATH VLLM_USE_FLASHINFER_SAMPLER"
 
 VLLM_QWEN38NEXT = Path.home() / "Projects" / "vllm-qwen38next"
 SERVE_SH = VLLM_QWEN38NEXT / "serve.sh"
@@ -88,7 +123,9 @@ def _drop_normalized(parsed: dict[str, list[str] | None]) -> dict[str, list[str]
     return {k: v for k, v in parsed.items() if k not in NORMALIZED_FLAGS}
 
 
-def _run_dry_run_launcher(tmp_path: Path) -> tuple[list[str], dict[str, str]]:
+def _run_dry_run_launcher(
+    tmp_path: Path, dry_env_vars: str = QWEN27B_ENV_VARS
+) -> tuple[list[str], dict[str, str]]:
     """Copy the live .config to tmp_path, run qwen-server-run.sh DRY_RUN=1
     against that copy, and parse its ENV/ARGV dump lines."""
     if not SERVER_RUN_SH.is_file():
@@ -104,7 +141,7 @@ def _run_dry_run_launcher(tmp_path: Path) -> tuple[list[str], dict[str, str]]:
         {
             "DRY_RUN": "1",
             "CONFIG_FILE": str(tmp_config),
-            "DRY_ENV_VARS": "VLLM_USE_FLASHINFER_SAMPLER",
+            "DRY_ENV_VARS": dry_env_vars,
         }
     )
     proc = subprocess.run(
@@ -128,25 +165,54 @@ def _run_dry_run_launcher(tmp_path: Path) -> tuple[list[str], dict[str, str]]:
     return argv_out, env_out
 
 
+def _load_argv_fixture(path: Path) -> list[str]:
+    """One argv token per "ARGV <token>" line; comment/header lines ignored."""
+    return [
+        line[len("ARGV ") :] for line in path.read_text().splitlines() if line.startswith("ARGV ")
+    ]
+
+
+def _load_env_fixture(path: Path) -> dict[str, str]:
+    """{name: value} from "ENV NAME=value" lines; comment/header lines ignored."""
+    out: dict[str, str] = {}
+    for line in path.read_text().splitlines():
+        if line.startswith("ENV "):
+            name, _, value = line[len("ENV ") :].partition("=")
+            out[name] = value
+    return out
+
+
+def _assert_path_prefix_matches(label: str, path_value: str, expected_prefix: str) -> None:
+    assert path_value.startswith(expected_prefix), (
+        f"{label} PATH does not start with the expected <venv>/bin:<CUDA_HOME>/bin "
+        f"prefix {expected_prefix!r}: {path_value!r}"
+    )
+
+
 @pytest.fixture
 def registry() -> models.Registry:
     return models.load(REPO_ROOT / "models.toml")
 
 
-def test_qwen27b_argv_matches_legacy_launcher(tmp_path, registry):
-    legacy_argv, legacy_env = _run_dry_run_launcher(tmp_path)
+def test_qwen27b_argv_and_env_match_frozen_snapshot(registry):
+    """The always-run half of the golden test: reads the frozen fixtures, no
+    subprocess, no dependency on the live/mutable ~/Projects/local_llm/.config.
+    See the module docstring ("FROZEN SNAPSHOT...") and the fixture files'
+    headers for what this compares and why PATH is a named exception."""
+    legacy_argv = _load_argv_fixture(QWEN27B_ARGV_FIXTURE)
+    legacy_env = _load_env_fixture(QWEN27B_ENV_FIXTURE)
 
     m = registry.models["qwen27b"]
-    # The legacy launcher's own venv (VLLM_VENV default), matching models.toml's
-    # [builds] entry for build="stock".
-    vllm_bin = str(Path(registry.builds[m.build]).expanduser() / "bin" / "vllm")
+    build = registry.builds[m.build]
+    vllm_bin = str(Path(build.venv).expanduser() / "bin" / "vllm")
     ctx = models.native_ctx(m.repo)
-    assert ctx == 262144, "native ctx must equal the live MAX_MODEL_LEN for this comparison to be meaningful"
+    assert ctx == 262144, "native ctx must equal the snapshot's MAX_MODEL_LEN for this comparison to be meaningful"
     v2_argv = models.render_argv(m, vllm_bin, util=0.91, ctx_tokens=ctx, port=m.port)
+    v2_env = models.render_env(m, build)
 
     # argv[0] (the vllm binary) and the repo id must match EXACTLY, not just as
     # a flag/value mapping — these are positional, not flags.
-    assert legacy_argv[0] == vllm_bin, "the golden test's own [builds] path must match the live venv"
+    assert legacy_argv[0] == vllm_bin, "models.toml's [builds.stock].venv must match the snapshot's venv"
     assert legacy_argv[1] == "serve"
     assert legacy_argv[2] == m.repo
     assert v2_argv[0] == vllm_bin
@@ -157,7 +223,7 @@ def test_qwen27b_argv_matches_legacy_launcher(tmp_path, registry):
     v2_flags = _drop_normalized(_parse_argv(v2_argv[3:]))
 
     assert v2_flags == legacy_flags, (
-        f"registry-rendered flags differ from the live launcher's.\n"
+        f"registry-rendered flags differ from the snapshot's.\n"
         f"legacy only: { {k: v for k, v in legacy_flags.items() if k not in v2_flags} }\n"
         f"v2 only:     { {k: v for k, v in v2_flags.items() if k not in legacy_flags} }\n"
         f"value mismatches: "
@@ -171,19 +237,52 @@ def test_qwen27b_argv_matches_legacy_launcher(tmp_path, registry):
     v2_full = _parse_argv(v2_argv[3:])
     assert v2_full["--served-model-name"][0] == m.id
 
-    # VLLM_USE_FLASHINFER_SAMPLER=0 is a [defaults.env] entry — confirm it is
-    # actually what the live launcher exports too.
-    assert legacy_env.get("VLLM_USE_FLASHINFER_SAMPLER") == "0"
-    assert models.render_env(m)["VLLM_USE_FLASHINFER_SAMPLER"] == "0"
-
-
-def test_qwen27b_no_host_flag_in_legacy_output(tmp_path):
-    """Confirms the premise behind treating --host as normalized: the legacy
-    launcher truly never passes --host (qwen-server-run.sh only ever sets
-    --port), so v2 adding --host 127.0.0.1 is a deliberate, one-way addition,
-    not a value v2 merely recomputes."""
-    legacy_argv, _ = _run_dry_run_launcher(tmp_path)
+    # Confirms the premise behind treating --host as normalized: the legacy
+    # launcher truly never passes --host (qwen-server-run.sh only ever sets
+    # --port), so v2 adding --host 127.0.0.1 is a deliberate, one-way addition,
+    # not a value v2 merely recomputes.
     assert "--host" not in legacy_argv
+
+    # ENV: compare every var v2 renders (models.render_env) against the
+    # snapshot — not just one. CUDA_HOME and VLLM_USE_FLASHINFER_SAMPLER must
+    # match exactly; PATH only by its <venv>/bin:<CUDA_HOME>/bin prefix (the
+    # rest is the capturing shell's own PATH — see the env fixture's header).
+    assert set(legacy_env) == set(v2_env), (
+        f"env var set differs: snapshot only {set(legacy_env) - set(v2_env)}, "
+        f"v2 only {set(v2_env) - set(legacy_env)}"
+    )
+    assert legacy_env["CUDA_HOME"] == v2_env["CUDA_HOME"]
+    assert legacy_env["VLLM_USE_FLASHINFER_SAMPLER"] == v2_env["VLLM_USE_FLASHINFER_SAMPLER"] == "0"
+    expected_prefix = f"{vllm_bin.rsplit('/bin/vllm', 1)[0]}/bin:{v2_env['CUDA_HOME']}/bin:"
+    _assert_path_prefix_matches("snapshot", legacy_env["PATH"], expected_prefix)
+    _assert_path_prefix_matches("v2", v2_env["PATH"], expected_prefix)
+
+
+def test_qwen27b_snapshot_is_current(tmp_path):
+    """The skippable, live half: re-runs the REAL launcher (skips cleanly per
+    _run_dry_run_launcher's own guards if it or .config are not on this box)
+    and proves tests/fixtures/qwen27b-launcher-{argv,env}.txt have not gone
+    stale. A failure here means ~/Projects/local_llm/.config or
+    qwen-server-run.sh's own defaults changed — regenerate those two files."""
+    live_argv, live_env = _run_dry_run_launcher(tmp_path)
+    frozen_argv = _load_argv_fixture(QWEN27B_ARGV_FIXTURE)
+    frozen_env = _load_env_fixture(QWEN27B_ENV_FIXTURE)
+
+    assert live_argv == frozen_argv, (
+        "the live launcher's argv no longer matches the frozen snapshot — "
+        "regenerate tests/fixtures/qwen27b-launcher-argv.txt"
+    )
+    assert set(live_env) == set(frozen_env)
+    assert live_env["CUDA_HOME"] == frozen_env["CUDA_HOME"]
+    assert live_env["VLLM_USE_FLASHINFER_SAMPLER"] == frozen_env["VLLM_USE_FLASHINFER_SAMPLER"]
+    # Only the stable venv/bin:CUDA_HOME/bin prefix of PATH is expected to
+    # agree between two captures — the tail is the capturing shell's own PATH,
+    # which legitimately differs run to run (see the env fixture's header).
+    live_prefix = live_env["PATH"].split(":")[:2]
+    frozen_prefix = frozen_env["PATH"].split(":")[:2]
+    assert live_prefix == frozen_prefix, (
+        "the launcher's venv/CUDA_HOME prefix changed; regenerate the env snapshot"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -260,6 +359,10 @@ def test_glm53_argv_matches_serve_opt_sh_literal_text(registry):
     assert "MAX_BATCHED:-8192" in text and "--max-num-batched-tokens 8192" in flags_text
     assert 'MOE_BACKEND:-marlin' in text and '"moe_backend":"marlin"' in flags_text
     assert 'SPEC_TOKENS:-2' in text and '"num_speculative_tokens":2' in flags_text
-    # --kv-cache-memory-bytes is a documented, deliberate omission (it is
-    # derived from MAX_LEN at launch time; see models.toml's header comment).
-    assert "--kv-cache-memory-bytes" not in flags_text
+    # serve-opt.sh derives --kv-cache-memory-bytes as MAX_LEN * 17200 at launch
+    # time (serve-opt.sh:315-316); the registry pins ctx to the validated 327,680
+    # and carries the product literally, so the two must agree by arithmetic.
+    assert "KV_BYTES_PER_TOKEN:-17200" in text or "17200" in text
+    assert m.ctx == 327680, "GLM ctx is pinned to the validated VRAM ceiling, not native"
+    assert "--kv-cache-memory-bytes 5636096000" in flags_text
+    assert 327680 * 17200 == 5636096000

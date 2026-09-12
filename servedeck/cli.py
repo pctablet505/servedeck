@@ -151,7 +151,7 @@ def _cmd_wire(args: argparse.Namespace) -> int:
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
-    results = _doctor.run_doctor(args.models_toml, systemd_dir=args.systemd_dir)
+    results = _doctor.run_doctor(args.models_toml)
     print(_doctor.format_table(results))
     return 0 if _doctor.all_ok(results) else 1
 
@@ -592,12 +592,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_wire.set_defaults(func=_cmd_wire)
 
     p_doctor = sub.add_parser("doctor", parents=[common], help="check the registry against reality")
-    p_doctor.add_argument(
-        "--systemd-dir",
-        type=Path,
-        default=None,
-        help="override ~/.config/systemd/user (for tests / other machines)",
-    )
     p_doctor.set_defaults(func=_cmd_doctor)
 
     p_status = sub.add_parser("status", parents=[remote], help="what is live right now")

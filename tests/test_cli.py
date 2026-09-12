@@ -21,8 +21,9 @@ SAFE_TOML = """
 total_mib = 100000
 margin_mib = 1000
 
-[builds]
-stock = "/opt/stock"
+[builds.stock]
+venv = "/opt/stock"
+cuda_home = "/opt/stock/lib/python3.13/site-packages/nvidia/cu13"
 
 [models.a]
 id = "A"
@@ -168,16 +169,18 @@ def isolated_doctor_client_files(tmp_path, monkeypatch):
 
 
 def test_doctor_command_all_ok_with_safe_ports(safe_toml, isolated_doctor_client_files, tmp_path, capsys):
-    systemd_dir = tmp_path / "systemd"
-    systemd_dir.mkdir()
-    (systemd_dir / "model-a.service").write_text("[Unit]\n")
-    rc = cli.main(
-        ["doctor", "--models-toml", str(safe_toml), "--systemd-dir", str(systemd_dir)]
-    )
+    # No --systemd-dir override: check_model_units does a real, read-only
+    # `systemctl --user list-units 'model-*'` (never start/stop/enable —
+    # allowed by the hard rules the same way the live :8007/:8010 GETs are).
+    # There is no real model-a unit, so this is "not running" (ok), not a
+    # failure — confirmed empty by `systemctl --user list-units 'model-*'`.
+    rc = cli.main(["doctor", "--models-toml", str(safe_toml)])
     out = capsys.readouterr().out
     assert "registry loads" in out
     assert "port 19991" in out
-    # Port 19991 is not listening anywhere -> that is an OK state, not a failure.
+    assert "unit (model-a)" in out
+    # Port 19991 is not listening anywhere, and no model-a unit is running ->
+    # both are OK states, not failures.
     assert rc == 0, out
 
 

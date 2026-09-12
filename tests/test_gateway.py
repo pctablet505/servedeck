@@ -24,6 +24,7 @@ import json
 import httpx
 import pytest
 from fastapi import FastAPI
+from starlette.requests import Request
 
 from servedeck import gateway
 from servedeck.gateway import Route, RoutePolicies
@@ -157,7 +158,7 @@ def test_post_without_a_model_goes_to_the_main_slot_untouched():
     assert up.last.content == sent
 
 
-@pytest.mark.parametrize("path", ["/health", "/metrics", "/tokenize", "/detokenize"])
+@pytest.mark.parametrize("path", ["/health", "/ping", "/metrics", "/tokenize", "/detokenize"])
 def test_non_v1_paths_pass_through_to_the_routed_model(path):
     app, up = rig(two_model_table())
     call(app, "GET", path)
@@ -192,6 +193,121 @@ def test_model_named_late_in_a_large_body_still_routes_correctly():
     assert up.last.url.port == 8007
     assert len(up.last.content) > 1_000_000
     assert json.loads(up.last.content)["model"] == "LFM2.5-350M"
+
+
+# ---------------------------------------------------------------------------
+# The routing scan is bounded — the request body is never read to EOF
+# ---------------------------------------------------------------------------
+
+
+def _fake_request(method: str, path: str, chunks: list[bytes]) -> Request:
+    """A Starlette Request whose body arrives as exactly these chunks."""
+    pending = list(chunks)
+
+    async def receive():
+        if pending:
+            return {"type": "http.request", "body": pending.pop(0), "more_body": True}
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    return Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": method,
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": b"",
+            "root_path": "",
+            "headers": [(b"content-type", b"application/json")],
+            "server": ("127.0.0.1", 8010),
+            "client": ("127.0.0.1", 40000),
+        },
+        receive,
+    )
+
+
+def test_a_body_with_no_model_is_never_read_to_eof():
+    """The regression this pins: with the ceiling checked *after* the
+    ``"model"`` pre-filter, a body that never mentions a model fell through
+    ``continue`` on every chunk and accumulated to EOF — precisely the
+    unbounded buffering of ``app.py``'s ``catch_all`` that this replaces.
+
+    Three MiB in, at most ``_MODEL_SCAN_LIMIT`` (plus the chunk that crossed
+    it) ever held, and the unread remainder still available to forward.
+    """
+    chunk = b"x" * 65536
+    total = 3 * 1024 * 1024
+    body = b'{"messages":[{"role":"user","content":"' + b"x" * total + b'"}]}'
+    chunks = [body[i : i + len(chunk)] for i in range(0, len(body), len(chunk))]
+    assert len(body) > gateway._MODEL_SCAN_LIMIT, "raise the body size or lower the ceiling"
+
+    # One event loop for both halves: `asyncio.run` closes pending async
+    # generators on exit, so peeking and draining in two runs would leave the
+    # client's stream closed. In production both happen in one request task.
+    model, prefix, rest_bytes, had_rest = asyncio.run(
+        _peek_and_drain(_fake_request("POST", "/v1/chat/completions", chunks))
+    )
+
+    assert model is None
+    assert len(prefix) <= gateway._MODEL_SCAN_LIMIT + len(chunk)
+    assert had_rest, "the ceiling must stop the scan, not the body"
+    # And nothing is lost: prefix + remainder is the body the client sent.
+    assert prefix + rest_bytes == body
+
+
+async def _peek_and_drain(request) -> tuple[str | None, bytes, bytes, bool]:
+    model, prefix, rest = await gateway._peek_model(request)
+    remainder = b"".join([c async for c in rest]) if rest is not None else b""
+    return model, prefix, remainder, rest is not None
+
+
+def test_a_bounded_scan_still_forwards_the_whole_body():
+    """The same body, through the router: capped scanning must not truncate
+    what reaches the model."""
+    body = b'{"messages":[{"role":"user","content":"' + b"x" * (3 * 1024 * 1024) + b'"}]}'
+    app, up = rig(two_model_table())
+    call(app, "POST", "/v1/chat/completions", content=body,
+         headers={"content-type": "application/json"})
+    assert up.last.content == body
+    assert up.last.url.port == 8002  # no model named → the main slot
+
+
+def test_a_model_named_after_the_last_scheduled_rescan_is_still_found():
+    """The structural scan runs on a doubling schedule so its cost stays linear
+    in the body; a body can therefore end *between* two scheduled scans.  The
+    final scan after the loop is what catches that, and without it this body —
+    a tool schema that mentions ``model`` early, the real ``model`` last —
+    routes to the main slot instead of to the model the client asked for.
+    """
+    body = (
+        b'{"tools":[{"function":{"name":"f","parameters":{"type":"object","properties":'
+        b'{"city":{"type":"string"},"model":{"type":"string"}}}}}],'
+        b'"messages":[{"role":"user","content":"' + b"z" * 1300 + b'"}],'
+        b'"model":"lfm2"}'
+    )
+    # The first chunk carries the nested mark and triggers an incomplete scan,
+    # which schedules the next one at 2000 bytes — past the end of the body.
+    chunks = [body[:1000], body[1000:]]
+    assert 1000 < body.rindex(b'"model"') < 2000
+    model, prefix, remainder, _ = asyncio.run(
+        _peek_and_drain(_fake_request("POST", "/v1/chat/completions", chunks))
+    )
+    assert model == "lfm2"
+    assert prefix + remainder == body
+
+
+def test_a_model_key_straddling_a_chunk_boundary_is_still_found():
+    """The pre-filter searches only the newly arrived bytes plus an overlap of
+    ``len('"model"') - 1``.  Drop that overlap and a body whose ``"model"``
+    lands across a chunk boundary routes to the main slot instead."""
+    body = json.dumps({"messages": [], "model": "lfm2"}).encode()
+    split = body.index(b'"model"') + 3
+    model, prefix, remainder, _ = asyncio.run(
+        _peek_and_drain(_fake_request("POST", "/v1/chat/completions", [body[:split], body[split:]]))
+    )
+    assert model == "lfm2"
+    assert prefix + remainder == body
 
 
 # ---------------------------------------------------------------------------
@@ -237,8 +353,24 @@ def test_503_names_the_other_model_that_holds_the_slot():
     )
 
 
-def test_no_model_named_and_no_main_slot_is_503():
+def test_a_resident_only_box_answers_model_less_probes_rather_than_503():
+    """No main slot, one resident up. ``/health`` must not report a serving
+    machine as down: `doctor` and every is-server-up probe read it."""
     table = FakeRouteTable([lfm2_route()], main_name=None)
+    app, up = rig(table)
+    r = call(app, "GET", "/health")
+    assert r.status_code == 200
+    assert up.last.url.port == 8007
+
+
+def test_a_booting_main_slot_falls_back_to_a_live_resident_for_probes():
+    app, up = rig(two_model_table(flash_live=False))
+    call(app, "GET", "/health")
+    assert up.last.url.port == 8007
+
+
+def test_no_model_named_and_nothing_live_is_503():
+    table = FakeRouteTable([lfm2_route(live=False)], main_name=None)
     app, up = rig(table)
     r = call(app, "GET", "/health")
     assert r.status_code == 503
@@ -325,7 +457,11 @@ def test_request_header_hygiene():
         "/v1/chat/completions",
         json={"model": "lfm2"},
         headers={
-            "authorization": "Bearer secret",
+            "authorization": "Bearer sk-a-real-openai-key",
+            "api-key": "azure-secret",
+            "x-api-key": "anthropic-secret",
+            "openai-organization": "org-123",
+            "cookie": "session=deadbeef",
             "x-request-id": "abc",
             "accept-encoding": "gzip, br",
             "connection": "keep-alive",
@@ -334,8 +470,15 @@ def test_request_header_hygiene():
         },
     )
     sent = up.last.headers
+    # STRIPPED: the models run without --api-key, so a client's own credentials
+    # have no use downstream, and forwarding them copies a user's secrets into
+    # a model process's memory and — on a bad request — into its logs.  A route
+    # that ever needs to authenticate upstream gets the gateway's own
+    # credential injected here, not the client's passed through.
+    for secret in ("authorization", "api-key", "x-api-key", "openai-organization", "cookie"):
+        assert secret not in sent, f"{secret} reached the model"
+    assert b"sk-a-real-openai-key" not in bytes(str(sent.raw), "utf-8")
     # Forwarded untouched: anything the model or its logs might want.
-    assert sent["authorization"] == "Bearer secret"
     assert sent["x-request-id"] == "abc"
     # Forced, so what upstream writes is what we can relay byte-for-byte.
     assert sent["accept-encoding"] == "identity"
@@ -479,16 +622,35 @@ def test_mirror_is_decided_by_the_upstream_content_type(media):
     assert b"reasoning_content" not in r.content
 
 
-def test_responses_endpoint_is_never_mirrored():
+@pytest.mark.parametrize(
+    "path,method",
+    [
+        ("/v1/responses", "POST"),
+        ("/v1/responses/resp_abc123", "GET"),
+        ("/v1/responses/resp_abc123/cancel", "POST"),
+    ],
+)
+def test_responses_endpoint_is_never_mirrored(path, method):
     """Codex speaks /v1/responses, where reasoning is already a first-class
     output item: mirroring there would add a field to a shape that never
-    lacked it."""
+    lacked it.  The sub-paths return the same envelope as the POST, so the
+    match is a prefix, not an equality."""
     table = FakeRouteTable([lfm2_route(mirror_reasoning=True)], main_name="LFM2.5-350M")
     app, up = rig(table)
     up.body = load(NONSTREAM)
-    r = call(app, "POST", "/v1/responses", json={"model": "LFM2.5-350M"})
+    r = call(app, method, path, json={"model": "LFM2.5-350M"})
     assert r.content == load(NONSTREAM)
     assert "reasoning_content" not in r.text
+
+
+def test_a_path_merely_starting_with_responses_is_still_mirrored():
+    """``startswith("/v1/responses")`` alone would also silence mirroring on
+    ``/v1/responses_preview``; the match is on a whole path segment."""
+    table = FakeRouteTable([lfm2_route(mirror_reasoning=True)], main_name="LFM2.5-350M")
+    app, up = rig(table)
+    up.body = load(NONSTREAM)
+    r = call(app, "POST", "/v1/responses_preview", json={"model": "LFM2.5-350M"})
+    assert "reasoning_content" in r.text
 
 
 # ---------------------------------------------------------------------------

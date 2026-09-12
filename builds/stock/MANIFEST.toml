@@ -1,0 +1,51 @@
+# builds/stock/MANIFEST.toml — captured 2026-09-12 (servedeck v2 packet P5).
+# Serves [models.qwen27b] and [models.lfm2] per models.toml [builds].stock.
+#
+# This is a plain PyPI wheel install, not a fork: [tree] and [patches] are
+# empty on purpose (see builds/README.md "What 'stock' means").
+
+[venv]
+path   = "~/Projects/local_llm/.venv-llm-029"
+python = "3.13.15"          # <venv>/bin/python --version
+vllm   = "0.29.0"           # python -c "import vllm; print(vllm.__version__)"
+
+[packages]
+# python -m pip list --format=json is unavailable (no pip module in this
+# uv-created venv); read via importlib.metadata instead, 2026-09-12.
+torch              = "2.13.0+cu130"
+transformers       = "5.16.1"
+flashinfer_python  = "0.6.18"   # distribution name on PyPI is "flashinfer-python"
+triton             = "3.7.1"
+numpy              = "2.4.6"
+
+[install]
+kind            = "wheel"
+editable_target = ""
+# No direct_url.json under vllm-0.29.0.dist-info -- per PEP 610 that file is
+# only written for a direct URL/VCS/local/editable install, so its absence
+# here is itself the evidence this came from the ordinary PyPI index, not a
+# checkout. INSTALLER file says "uv".
+source = "uv pip install --python <venv>/bin/python vllm==0.29.0 (from PyPI, via the cu130 torch build's index -- see builds/stock/build.sh)"
+
+[tree]
+checkout = ""
+remote   = ""
+branch   = ""
+head     = ""
+describe = ""
+
+[base]
+anchor        = "n/a"
+commits_ahead = 0
+note = "stock is the released vllm==0.29.0 wheel; there is no fork tree to anchor against."
+
+[patches]
+files             = []
+excluded_branches = []
+note = "no patches; builds/patches/stock/ does not exist and is not expected to."
+
+[cuda]
+driver_header = "NVIDIA-SMI 595.84   Driver Version: 595.84   CUDA Version: 13.2"  # nvidia-smi header line, 2026-09-12
+nvcc = "no system CUDA toolkit (no nvcc on PATH). This venv nonetheless has its own nvidia/cu13/bin/nvcc (a transitive pip dependency of the cu130 torch wheel); nothing in this build's own launch path invokes it."
+flashinfer_sampler = "VLLM_USE_FLASHINFER_SAMPLER=0 is set for every model (models.toml [defaults.env]) because there is no nvcc on the host PATH, so FlashInfer's JIT top-k/top-p sampler cannot compile."
+lib64_shim = "<venv>/lib/python3.13/site-packages/nvidia/cu13/lib64 -> lib exists in this venv (checked 2026-09-12), same shim the two forks' serve scripts create explicitly (FlashInfer's JIT hardcodes -L$CUDA_HOME/lib64, but pip CUDA wheels only ship lib/). UNDETERMINED: nothing in qwen-server-run.sh or the lfm2 systemd unit creates it -- grepped both for 'lib64', no hits -- so either it was created by hand when this venv was set up, or by some other import path that was never traced. It is present and correct; its origin is not pinned down. See the packet report."

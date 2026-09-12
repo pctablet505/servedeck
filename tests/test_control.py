@@ -14,6 +14,7 @@ cannot be made to have exactly 1023 MiB free.
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 from dataclasses import dataclass, field
@@ -39,14 +40,17 @@ class FakeSpec:
     id: str
     slot: str
     port: int
-    served_names: list[str] = field(default_factory=list)
+    names: list[str] = field(default_factory=list)
     vram_mib: int | None = None
-    ctx_tokens: int | None = None
+    ctx_tokens: int = 4096
     venv_bin: str = "/opt/venv/bin"
 
     def __post_init__(self) -> None:
-        if not self.served_names:
-            self.served_names = [self.id]
+        if not self.names:
+            self.names = [self.id]
+
+    def served_names(self) -> list[str]:
+        return list(self.names)
 
     def render_argv(self, util: float, port: int) -> list[str]:
         return [
@@ -67,9 +71,6 @@ class FakeRegistry:
     def __init__(self, *specs: FakeSpec) -> None:
         self._by_key = {spec.key: spec for spec in specs}
 
-    def models(self) -> list[FakeSpec]:
-        return list(self._by_key.values())
-
     def get(self, key: str) -> FakeSpec:
         return self._by_key[key]
 
@@ -87,6 +88,16 @@ class FakeSystemd:
         self.journal: dict[str, list[str]] = {}
         self.calls: list[list[str]] = []
         self.started: list[list[str]] = []
+        # The user manager's environment as measured on this box: session
+        # variables plus two real credentials an operator exported at login.
+        self.environment: list[str] = [
+            "HOME=/home/pctablet505",
+            "PATH=/usr/bin:/bin",
+            "LANG=en_US.UTF-8",
+            "KITE_API_KEY=4eabvmt7jnne18w2",
+            "KITE_API_SECRET=v41zj8cxazl09fz8gniaffo3xeqhqmlh",
+        ]
+        self.env_query_fails = False
 
     def add(self, name, active_state="active", sub_state="running", result="success",
             n_restarts=0, main_pid=4242) -> None:
@@ -117,6 +128,10 @@ class FakeSystemd:
             self.started.append(argv)
             self.add(name)
             return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv == ["systemctl", "--user", "show-environment"]:
+            if self.env_query_fails:
+                return subprocess.CompletedProcess(argv, 1, "", "Failed to connect to bus.")
+            return subprocess.CompletedProcess(argv, 0, "\n".join(self.environment) + "\n", "")
         if argv[:3] == ["systemctl", "--user", "show"]:
             name, props = argv[5], argv[4].split(",")
             unit = self.units.get(name)
@@ -212,7 +227,11 @@ def make_control(systemd, registry, tmp_path, *, probe=None, free=(50000,),
         spawn=fake_spawn(BOOT_LINES if lines is None else lines),
         probe=probe if probe is not None else (lambda port: None),
         free_mib=free_mib,
-        used_by_pids=used if used is not None else (lambda: {}),
+        # NOT `{}`: an empty attribution sends every stop down the plateau
+        # fallback, so the default fixture would silently exercise the
+        # degraded path and the target-based wait — the one that actually runs
+        # on this box — would be tested only where a test opted in.
+        used_by_pids=used if used is not None else (lambda: {4242: 2000}),
         cgroup_pids=cgroup_pids or (lambda unit: [4242]),
         clock=FakeClock(),
         sleep=lambda _s: None,
@@ -221,7 +240,7 @@ def make_control(systemd, registry, tmp_path, *, probe=None, free=(50000,),
 
 LFM2 = FakeSpec(key="lfm2", id="LFM2.5-350M", slot="resident", port=8007, vram_mib=3300)
 FLASH = FakeSpec(key="flashnext", id="Qwen3.8-Flash-Next", slot="main", port=8001,
-                 served_names=["Qwen3.8-Flash-Next", "flashnext"])
+                 names=["Qwen3.8-Flash-Next", "flashnext"])
 BIG27 = FakeSpec(key="qwen27b", id="Qwen3.8-27B-NVFP4", slot="main", port=8004)
 
 
@@ -233,6 +252,52 @@ BIG27 = FakeSpec(key="qwen27b", id="Qwen3.8-27B-NVFP4", slot="main", port=8004)
 def test_fake_spec_satisfies_the_protocol() -> None:
     assert isinstance(LFM2, control.ModelSpec)
     assert isinstance(FakeRegistry(LFM2), control.Registry)
+
+
+def test_served_names_is_a_method_and_the_protocol_says_so() -> None:
+    """P1's real model object exposes served_names() as a method. A Protocol
+    that declared it an attribute would still pass isinstance against that
+    object — and then fail inside wait_ready with "method object is not
+    iterable", at model-boot time. So the contract must name the callable, and
+    control must call it.
+    """
+    assert callable(LFM2.served_names)
+    assert list(LFM2.served_names()) == ["LFM2.5-350M"]
+    assert list(FLASH.served_names()) == ["Qwen3.8-Flash-Next", "flashnext"]
+
+
+def test_a_spec_whose_served_names_is_a_bare_list_is_not_a_ModelSpec() -> None:
+    """The whole point of making it a method: the shape that would explode
+    later must fail the conformance check now."""
+
+    @dataclass
+    class ListSpec:
+        key: str = "x"
+        id: str = "X"
+        slot: str = "resident"
+        port: int = 8009
+        served_names: list[str] = field(default_factory=list)  # the wrong shape
+        vram_mib: int | None = 1000
+        ctx_tokens: int = 4096
+        venv_bin: str = "/opt/venv/bin"
+
+        def render_argv(self, util, port):
+            return []
+
+        def render_env(self):
+            return {}
+
+    # isinstance() on a runtime_checkable Protocol only checks that the
+    # attribute EXISTS, which is exactly why the docstring above matters: it
+    # passes here and breaks at boot. Pin the real discriminator instead.
+    assert not callable(ListSpec().served_names)
+
+
+def test_the_registry_protocol_asks_for_nothing_it_does_not_call() -> None:
+    """`models()` was in the contract and called by nothing. A method P1 must
+    implement for no reason is where a wrong assumption about ordering or
+    laziness hides."""
+    assert not hasattr(control.Registry, "models")
 
 
 # --------------------------------------------------------------------------
@@ -306,6 +371,59 @@ def test_resident_without_a_budget_is_refused(tmp_path) -> None:
     assert isinstance(ctl.compute_util(spec), Refusal)
 
 
+@pytest.mark.parametrize("free", [2000, 5000, 20000, 50000, 90000, 97887])
+@pytest.mark.parametrize("slot", ["main", "resident"])
+def test_the_margin_leaves_the_launching_worker_its_cuda_context(free, slot, tmp_path) -> None:
+    """`--gpu-memory-utilization` is a fraction vLLM will FILL; the process
+    filling it must first build a CUDA context and load cuBLAS/cuDNN — a few
+    hundred MiB that are not in the fraction and are taken while the
+    allocation is happening. Hand a model everything free and its own startup
+    is what pushes it over.
+
+    So whatever compute_util returns, at least 700 MiB of the free pool must
+    still be there for the worker about to claim it.
+    """
+    total = 97887
+    spec = FakeSpec(key="k", id="K", slot=slot, port=8009,
+                    vram_mib=(None if slot == "main" else 1500))
+    ctl = make_control(FakeSystemd(), FakeRegistry(spec), tmp_path,
+                       free=(free,), total=total, margin=1024)
+    util = ctl.compute_util(spec)
+    if isinstance(util, Refusal):
+        return  # refusing is always safe; this test is about what it hands out
+    assert math.ceil(total * util) <= free - 700, (
+        f"util {util} of {total} MiB is {math.ceil(total * util)} MiB out of {free} free"
+    )
+
+
+def test_a_resident_whose_budget_does_not_fit_is_refused(tmp_path) -> None:
+    """A resident's utilisation comes from its BUDGET, so nothing in the
+    arithmetic notices the budget does not fit. Without this the unit
+    launches, vLLM asks for 3.3 GiB of a card with 2 GiB free, and the failure
+    arrives minutes later as a CUDA OOM in journald with no mention of the
+    number that was wrong."""
+    ctl = make_control(FakeSystemd(), FakeRegistry(LFM2), tmp_path, free=(4000,), margin=1024)
+    refusal = ctl.compute_util(LFM2)  # budget 3300, available 4000-1024 = 2976
+    assert isinstance(refusal, Refusal) and refusal.reason == "not_enough_vram"
+    assert "3300" in refusal.message and "2976" in refusal.message
+
+
+def test_a_resident_that_exactly_fits_is_allowed(tmp_path) -> None:
+    """The boundary, so the guard is `>` and not `>=`: a budget equal to what
+    is available is fundable, and refusing it would make the margin count
+    twice."""
+    ctl = make_control(FakeSystemd(), FakeRegistry(LFM2), tmp_path,
+                       free=(3300 + 1024,), margin=1024)
+    assert ctl.compute_util(LFM2) == 0.03
+
+
+def test_start_refuses_a_resident_that_does_not_fit(tmp_path) -> None:
+    systemd = FakeSystemd()
+    ctl = make_control(systemd, FakeRegistry(LFM2), tmp_path, free=(4000,))
+    assert isinstance(ctl.start("lfm2"), Refusal)
+    assert systemd.started == []
+
+
 def test_floor2_truncates() -> None:
     assert control.floor2(0.98953) == 0.98
     assert control.floor2(0.9999) == 0.99
@@ -335,6 +453,113 @@ def test_start_builds_the_unit_from_the_registry_and_the_live_card(tmp_path) -> 
     assert command[command.index("--gpu-memory-utilization") + 1] == "0.95"
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        # Measured in this box's own user-manager environment.
+        "KITE_API_KEY", "KITE_API_SECRET",
+        "GITHUB_TOKEN", "HF_TOKEN", "OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY",
+        "PASSWORD", "DB_PASSWORD", "PASS", "SECRET", "TOKEN", "KEY",
+        "GOOGLE_APPLICATION_CREDENTIALS", "CREDENTIAL_FILE",
+        "api_key", "Secret_Thing",  # case-insensitive
+    ],
+)
+def test_secret_names_are_recognised(name: str) -> None:
+    assert control.SECRET_NAME_RE.search(name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        # Over-redaction is not free: an unset variable a model needed is a
+        # boot failure with no message, so the word must be a whole
+        # underscore-delimited component, not a substring.
+        "MONKEY_BUSINESS", "KEYBOARD_LAYOUT", "PASSTHROUGH", "TOKENIZERS_PARALLELISM",
+        "HOME", "PATH", "LANG", "DISPLAY", "XDG_RUNTIME_DIR", "SSH_AUTH_SOCK",
+        "HF_HOME", "VLLM_USE_FLASHINFER_SAMPLER", "CUDA_VISIBLE_DEVICES",
+        "KEYS_DIR", "LOW_PASSES",
+    ],
+)
+def test_innocent_names_are_left_alone(name: str) -> None:
+    assert not control.SECRET_NAME_RE.search(name)
+
+
+def test_secret_env_names_comes_from_the_live_manager_environment(tmp_path) -> None:
+    """Computed at start time, not written down: the manager's environment is
+    whatever the login session put there and changes without anyone editing
+    this repo, so a hardcoded deny-list would be correct once and quietly
+    wrong afterwards."""
+    systemd = FakeSystemd()
+    systemd.environment.append("NEWLY_EXPORTED_TOKEN=abc")
+    ctl = make_control(systemd, FakeRegistry(LFM2), tmp_path)
+    assert ctl.secret_env_names() == ["KITE_API_KEY", "KITE_API_SECRET", "NEWLY_EXPORTED_TOKEN"]
+
+
+def test_start_unsets_every_inherited_credential(tmp_path) -> None:
+    """The finding this closes: a transient unit inherits the USER MANAGER's
+    environment, and on this box that contains two live broker credentials. A
+    model process runs arbitrary prompts, logs freely and can be asked to print
+    its own environment, so the only safe amount of unrelated credential in it
+    is none."""
+    systemd = FakeSystemd()
+    ctl = make_control(systemd, FakeRegistry(LFM2), tmp_path, probe=lambda port: ["LFM2.5-350M"])
+    assert not isinstance(ctl.start("lfm2"), Refusal)
+    argv = systemd.started[0]
+    assert "UnsetEnvironment=KITE_API_KEY" in argv
+    assert "UnsetEnvironment=KITE_API_SECRET" in argv
+    # ...and nothing innocent was swept up with them.
+    unset = [a.split("=", 1)[1] for a in argv if a.startswith("UnsetEnvironment=")]
+    assert unset == ["KITE_API_KEY", "KITE_API_SECRET"]
+
+
+def test_a_variable_the_registry_declares_is_the_models_own_and_survives(tmp_path) -> None:
+    """The registry is the single source of truth for what a model needs (R1).
+    An HF_TOKEN declared in models.toml for a gated repo is a deliberate,
+    source-controlled decision, not ambient leakage — redacting it would break
+    the boot, and `units.start_transient` would refuse the contradiction
+    anyway."""
+    systemd = FakeSystemd()
+    systemd.environment.append("HF_TOKEN=from-the-session")
+
+    spec = FakeSpec(key="gated", id="Gated", slot="resident", port=8008, vram_mib=2000)
+    spec.render_env = lambda: {"HF_TOKEN": "from-the-registry"}  # type: ignore[method-assign]
+    ctl = make_control(systemd, FakeRegistry(spec), tmp_path, probe=lambda port: ["Gated"])
+
+    assert not isinstance(ctl.start("gated"), Refusal)
+    argv = systemd.started[0]
+    assert "--setenv=HF_TOKEN=from-the-registry" in argv
+    assert "UnsetEnvironment=HF_TOKEN" not in argv
+    assert "UnsetEnvironment=KITE_API_KEY" in argv
+
+
+def test_start_refuses_rather_than_leaking_when_the_environment_cannot_be_read(tmp_path) -> None:
+    """Fail closed. With no way to know what to redact, starting anyway would
+    hand the model every ambient credential — silently. Refusing is loud."""
+    systemd = FakeSystemd()
+    systemd.env_query_fails = True
+    ctl = make_control(systemd, FakeRegistry(LFM2), tmp_path, probe=lambda port: ["LFM2.5-350M"])
+    refusal = ctl.start("lfm2")
+    assert isinstance(refusal, Refusal) and refusal.reason == "env_scan_failed"
+    assert systemd.started == [], "nothing may launch when the redaction list is unknown"
+
+
+def test_no_secret_value_is_ever_read_logged_or_returned(tmp_path, caplog) -> None:
+    """Names in, values never. `units.manager_environment_names` discards the
+    value half before returning, so there is nothing on this path for a log
+    line, an exception or a Refusal message to leak."""
+    systemd = FakeSystemd()
+    secret = "v41zj8cxazl09fz8gniaffo3xeqhqmlh"
+    ctl = make_control(systemd, FakeRegistry(LFM2), tmp_path, probe=lambda port: ["LFM2.5-350M"])
+    with caplog.at_level("DEBUG"):
+        result = ctl.start("lfm2")
+    assert not isinstance(result, Refusal)
+    assert secret not in caplog.text
+    assert "KITE_API_SECRET" in caplog.text  # the NAME is reported, so it is auditable
+    # and the value does not travel in the argv, the result, or anything read back
+    assert not any(secret in arg for call in systemd.calls for arg in call)
+    assert secret not in repr(result)
+
+
 def test_start_records_intent_in_desired_state(tmp_path) -> None:
     systemd = FakeSystemd()
     ctl = make_control(systemd, FakeRegistry(LFM2), tmp_path,
@@ -352,6 +577,75 @@ def test_a_failed_start_does_not_become_desired(tmp_path) -> None:
     result = ctl.start("lfm2", timeout_s=3.0)
     assert not isinstance(result, Refusal) and not result.ready
     assert desired_mod.load(tmp_path / "desired.json") == Desired()
+
+
+@pytest.mark.parametrize(
+    "setup,why",
+    [
+        ("timeout", "a boot that never answered"),
+        ("crash_loop", "a unit restarting on failure"),
+    ],
+)
+def test_a_start_that_did_not_come_up_stops_the_unit(setup, why, tmp_path) -> None:
+    """Restart=on-failure keeps retrying after the caller has been handed a
+    failure and moved on: the unit holds the port and takes the GPU on every
+    attempt, unattended. That is R4's crash-loop with nobody watching, and it
+    follows a TIMEOUT (where the unit is often healthy, just slow) as surely
+    as a crash.
+    """
+    systemd = FakeSystemd()
+    if setup == "crash_loop":
+        original_add = systemd.add
+
+        def add_crashing(name, **kwargs):
+            original_add(name, active_state="activating", sub_state="auto-restart",
+                         n_restarts=3)
+
+        systemd.add = add_crashing  # the unit comes up already crash-looping
+    ctl = make_control(systemd, FakeRegistry(LFM2), tmp_path, probe=lambda port: None, lines=[])
+
+    result = ctl.start("lfm2", timeout_s=5.0)
+    assert not isinstance(result, Refusal)
+    assert not result.ready, why
+    assert ["systemctl", "--user", "stop", "model-lfm2"] in systemd.calls
+    assert "model-lfm2" not in systemd.units
+
+
+def test_cleaning_up_a_failed_start_does_not_erase_the_operators_intent(tmp_path) -> None:
+    """The cleanup stops the UNIT, not the intent.
+
+    `self.stop()` would also remove the key from desired state — and a start
+    invoked by reconcile() is acting on an intent the operator already
+    recorded. Erasing it because one boot attempt failed means the model is
+    never retried and nothing says why.
+    """
+    systemd = FakeSystemd()
+    desired_mod.save(Desired(residents=["lfm2"]), tmp_path / "desired.json")
+    ctl = make_control(systemd, FakeRegistry(LFM2), tmp_path, probe=lambda port: None, lines=[])
+
+    assert not ctl.start("lfm2", timeout_s=5.0).ready
+    assert ["systemctl", "--user", "stop", "model-lfm2"] in systemd.calls
+    assert desired_mod.load(tmp_path / "desired.json") == Desired(residents=["lfm2"])
+
+
+def test_a_successful_start_is_not_stopped(tmp_path) -> None:
+    systemd = FakeSystemd()
+    ctl = make_control(systemd, FakeRegistry(LFM2), tmp_path, probe=lambda port: ["LFM2.5-350M"])
+    assert ctl.start("lfm2").ready
+    assert ["systemctl", "--user", "stop", "model-lfm2"] not in systemd.calls
+
+
+def test_a_unit_that_never_appeared_says_so_instead_of_blaming_the_model(tmp_path) -> None:
+    """"Never appeared" and "vanished after starting" are different faults with
+    different fixes — a rejected unit definition versus a model that crashed —
+    and both would otherwise arrive as the same "--collect removed it"
+    sentence, sending the reader to the journal of a unit that never existed."""
+    systemd = FakeSystemd()
+    ctl = make_control(systemd, FakeRegistry(LFM2), tmp_path, probe=lambda port: None, lines=[])
+    result = ctl.wait_ready("lfm2", timeout_s=5.0)  # nothing was ever started
+    assert not result.ready
+    assert "never appeared" in (result.failure or "")
+    assert "vanished" not in (result.failure or "")
 
 
 def test_main_slot_is_exclusive(tmp_path) -> None:
@@ -515,12 +809,59 @@ def test_a_unit_that_vanished_is_a_failure_not_a_clean_stop(tmp_path) -> None:
     systemd = FakeSystemd()
     systemd.add("model-lfm2")
     systemd.journal["model-lfm2"] = ["ValueError: unsupported dtype", "engine core failed"]
-    systemd.collect("model-lfm2")
     ctl = make_control(systemd, FakeRegistry(LFM2), tmp_path, probe=lambda port: None, lines=[])
+
+    # Present when the wait starts, collected while it is running — a crash
+    # partway through the boot, which is what actually happens.
+    real_call = systemd.__call__
+    reads = []
+
+    def collect_mid_boot(argv):
+        argv = list(argv)
+        if argv[4:5] == ["LoadState"]:
+            reads.append(True)
+            if len(reads) > 1:
+                systemd.collect("model-lfm2")
+        return real_call(argv)
+
+    ctl._run = collect_mid_boot
     result = ctl.wait_ready("lfm2", timeout_s=60)
     assert not result.ready
-    assert "no longer exists" in (result.failure or "")
+    assert "vanished after starting" in (result.failure or "")
+    # ...and it confirmed before saying so, rather than trusting one read.
+    load_state_reads = [c for c in systemd.calls if c[4:5] == ["LoadState"]]
+    assert len(load_state_reads) >= 3
     assert result.journal == ["ValueError: unsupported dtype", "engine core failed"]
+
+
+def test_one_glitched_load_state_read_does_not_kill_a_healthy_boot(tmp_path) -> None:
+    """The measured 0.2% `LoadState=not-found` transient, at the level it
+    would have done damage: a model that is booting normally must not be
+    reported dead because one `systemctl show` hiccupped."""
+    systemd = FakeSystemd()
+    systemd.add("model-lfm2")
+    real_call = systemd.__call__
+    reads: list[int] = []
+    glitched = []
+
+    def glitchy(argv):
+        argv = list(argv)
+        if argv[4:5] == ["LoadState"]:
+            reads.append(1)
+            # The SECOND read, so the glitch lands in the in-loop health check
+            # rather than in the "did it appear at all" check before it. Both
+            # confirm, but only the loop's verdict ends the boot.
+            if len(reads) == 2:
+                glitched.append(True)
+                systemd.calls.append(argv)
+                return subprocess.CompletedProcess(argv, 0, "LoadState=not-found\n", "")
+        return real_call(argv)
+
+    ctl = make_control(systemd, FakeRegistry(LFM2), tmp_path, probe=lambda port: ["LFM2.5-350M"])
+    ctl._run = glitchy
+    result = ctl.wait_ready("lfm2", timeout_s=60)
+    assert glitched, "the test did not actually inject the glitch"
+    assert result.ready, result.failure
 
 
 def test_a_crash_loop_is_a_failure_not_a_slow_boot(tmp_path) -> None:
@@ -653,6 +994,105 @@ def test_switch_refuses_to_launch_when_the_memory_never_comes_back(tmp_path) -> 
     assert systemd.started == [], "nothing may boot into a card that is still occupied"
 
 
+def test_switch_never_reports_released_for_a_wait_it_did_not_do(tmp_path) -> None:
+    """The silent branch that was here before: with no per-process
+    attribution, `_wait_for_release` returned `True, 0.0` immediately. At the
+    call site that is indistinguishable from a successful wait — and it fires
+    exactly when the instrument is broken. A measurement failing downward into
+    a confident yes.
+
+    Now it waits for the plateau: free VRAM stops rising for three consecutive
+    reads. Weaker than a target, far stronger than nothing.
+    """
+    systemd = FakeSystemd()
+    systemd.add("model-qwen27b", main_pid=1000)
+    ctl = make_control(
+        systemd, FakeRegistry(BIG27, FLASH), tmp_path,
+        # rising, rising, then flat: the plateau is only declared on the third
+        # non-increasing read, so a single flat sample cannot end the wait.
+        free=(1344, 1344, 20000, 60000, 91000, 91000, 91000, 91000, 91000),
+        used=lambda: None,  # nvidia-smi could not enumerate compute apps
+        cgroup_pids=lambda unit: [1000],
+        probe=lambda port: ["Qwen3.8-Flash-Next"] if port == 8001 else None,
+    )
+    result = ctl.switch("flashnext")
+    assert not isinstance(result, Refusal)
+    assert result.stopped is not None and result.stopped.held_mib is None
+    assert result.released and result.waited_s > 0, "it must have actually waited"
+    assert result.free_after_mib == 91000
+    assert not isinstance(result.started, Refusal) and result.started.ready
+
+
+def test_the_plateau_wait_does_not_end_on_one_flat_reading(tmp_path) -> None:
+    """VRAM comes back in steps with pauses between them. Ending on the first
+    non-increasing read would call a pause a plateau and boot into a card that
+    is still emptying."""
+    systemd = FakeSystemd()
+    systemd.add("model-qwen27b", main_pid=1000)
+    # Three reads are consumed before the wait loop (switch's opening read,
+    # stop's free_before capture, the instrument check), then: a two-read
+    # PAUSE at 5000 — long enough to fool a 1-read rule, short of the 3-read
+    # rule — before the memory actually finishes coming back at 91000.
+    readings = [1000, 1000, 1000, 5000, 5000, 5000, 91000, 91000, 91000, 91000]
+    ctl = make_control(
+        systemd, FakeRegistry(BIG27, FLASH), tmp_path, free=tuple(readings),
+        used=lambda: None, cgroup_pids=lambda unit: [1000],
+        probe=lambda port: ["Qwen3.8-Flash-Next"] if port == 8001 else None,
+    )
+    result = ctl.switch("flashnext")
+    assert not isinstance(result, Refusal)
+    # Ending on the first flat read would have settled for 5000 MiB and booted
+    # a 90 GiB model into a card that was still emptying.
+    assert result.free_after_mib == 91000
+
+
+def test_switch_refuses_when_vram_cannot_be_measured_at_all(tmp_path) -> None:
+    """No instrument: not "released", not "not released", a distinct answer —
+    because the caller must refuse rather than retry.
+
+    The interesting case is nvidia-smi working when the model is stopped and
+    breaking during the wait: there IS a target (90 GiB must come back) and no
+    way to see it. Without the check at the top of the wait, that spends the
+    full 120 s timeout and then reports `vram_not_released` — blaming the
+    driver for a broken instrument, and sending the operator to look at a GPU
+    that is probably fine.
+    """
+    systemd = FakeSystemd()
+    systemd.add("model-qwen27b", main_pid=1000)
+    ctl = make_control(
+        systemd, FakeRegistry(BIG27, FLASH), tmp_path,
+        free=(1344, 1344, None),  # readable at stop time, then the tool breaks
+        used=lambda: {1000: 90000},
+        cgroup_pids=lambda unit: [1000],
+        probe=lambda port: ["Qwen3.8-Flash-Next"],
+    )
+    result = ctl.switch("flashnext")
+    assert not isinstance(result, Refusal)
+    assert result.stopped is not None and result.stopped.held_mib == 90000
+    assert result.released is False
+    assert isinstance(result.started, Refusal)
+    assert result.started.reason == "vram_accounting_unavailable"
+    assert result.waited_s == 0.0, "it must not burn the timeout on a broken instrument"
+    assert systemd.started == []
+
+
+def test_switch_refuses_when_vram_was_never_measurable(tmp_path) -> None:
+    systemd = FakeSystemd()
+    systemd.add("model-qwen27b", main_pid=1000)
+    ctl = make_control(
+        systemd, FakeRegistry(BIG27, FLASH), tmp_path,
+        probe=lambda port: ["Qwen3.8-Flash-Next"],
+        cgroup_pids=lambda unit: [1000],
+    )
+    ctl._free_mib = lambda: None
+    result = ctl.switch("flashnext")
+    assert not isinstance(result, Refusal)
+    assert result.released is False
+    assert isinstance(result.started, Refusal)
+    assert result.started.reason == "vram_accounting_unavailable"
+    assert systemd.started == []
+
+
 def test_switch_refuses_a_resident(tmp_path) -> None:
     ctl = make_control(FakeSystemd(), FakeRegistry(LFM2), tmp_path)
     refusal = ctl.switch("lfm2")
@@ -666,12 +1106,22 @@ def test_switch_leaves_residents_alone(tmp_path) -> None:
     systemd.add("model-qwen27b", main_pid=1000)
     systemd.add("model-lfm2", main_pid=999)
     ctl = make_control(
-        systemd, FakeRegistry(BIG27, FLASH, LFM2), tmp_path, free=(80000,),
+        systemd, FakeRegistry(BIG27, FLASH, LFM2), tmp_path,
+        # A RISING sequence. With a constant `free` the release wait can never
+        # be satisfied, so the switch bails out before it ever starts anything
+        # and the assertion below ("the resident was not stopped") would hold
+        # for a switch that did nothing at all.
+        free=(4000, 4000, 10000, 50000, 80000, 80000, 80000, 80000),
         used=lambda: {1000: 90000, 999: 3300},
         cgroup_pids=lambda unit: [1000] if unit == "model-qwen27b" else [999],
         probe=lambda port: {8001: ["Qwen3.8-Flash-Next"], 8007: ["LFM2.5-350M"]}.get(port),
     )
-    ctl.switch("flashnext")
+    result = ctl.switch("flashnext")
+    # The switch must actually have COMPLETED, or "the resident survived" is
+    # true of a switch that never ran.
+    assert not isinstance(result, Refusal)
+    assert result.released and not isinstance(result.started, Refusal)
+    assert result.started.ready
     assert "model-lfm2" in systemd.units
     assert ["systemctl", "--user", "stop", "model-lfm2"] not in systemd.calls
 
@@ -867,9 +1317,18 @@ def test_control_can_only_ever_name_model_units(tmp_path) -> None:
     ctl.start("lfm2")
     ctl.reconcile(Desired(residents=["lfm2"]))
 
+    # Exactly two calls are allowed to name no unit, both read-only and both
+    # manager-wide by necessity: discovery (scoped to the model-* glob) and
+    # reading the manager's environment to decide what to redact. Any THIRD
+    # unit-less call is a new way for this module to reach outside its
+    # namespace, and this test is where that has to be argued for.
+    manager_wide = (
+        ["systemctl", "--user", "list-units", "model-*"],
+        ["systemctl", "--user", "show-environment"],
+    )
     for call in systemd.calls:
         named = [a for a in call if a.startswith("model-") or a.startswith("--unit=model-")]
-        if call[:4] == ["systemctl", "--user", "list-units", "model-*"]:
+        if any(call[: len(allowed)] == allowed for allowed in manager_wide):
             continue
         assert named, f"a call that names no model unit: {call}"
         for name in named:

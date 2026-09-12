@@ -40,9 +40,13 @@ at :func:`show` will conclude "stopped normally" every single time a model
 dies. Broken measurements fail downward.
 
 The defence, used by :mod:`servedeck.control`: pair every :func:`show` with
-:func:`exists` (``LoadState``). *Unit vanished while we were waiting for it*
-is a failure, not a clean stop. The journal survives collection, so the
+:func:`gone` (``LoadState``, confirmed). *Unit vanished while we were waiting
+for it* is a failure, not a clean stop. The journal survives collection, so the
 diagnosis still comes from :func:`journal_tail`.
+
+...and ``LoadState`` itself needs confirming, because a single read of it is
+not reliable: see :func:`exists` for the measurement and :func:`gone` for the
+predicate to actually use.
 """
 
 from __future__ import annotations
@@ -51,6 +55,7 @@ import os
 import re
 import select
 import subprocess
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -66,11 +71,13 @@ __all__ = [
     "stop",
     "show",
     "exists",
+    "gone",
     "properties",
     "control_group",
     "list_model_units",
     "list_units",
     "list_units_argv",
+    "manager_environment_names",
     "journal_tail",
     "journal_follow",
     "start_transient_argv",
@@ -80,6 +87,10 @@ __all__ = [
     "journal_tail_argv",
     "journal_follow_argv",
     "SHOW_PROPERTIES",
+    "DEFAULT_RESTART",
+    "DEFAULT_RESTART_SEC",
+    "DEFAULT_START_LIMIT_INTERVAL_SEC",
+    "DEFAULT_START_LIMIT_BURST",
 ]
 
 # --------------------------------------------------------------------------
@@ -106,6 +117,22 @@ _NAME_RE = re.compile(r"^model-[a-z0-9-]+$|^sd-test-[a-z0-9-]+$")
 _RESTART_VALUES = frozenset(
     {"no", "always", "on-success", "on-failure", "on-abnormal", "on-abort", "on-watchdog"}
 )
+
+#: A POSIX environment variable name. Anything else in ``unset_env`` is a
+#: caller bug, and passing it through would make systemd reject the whole
+#: unit — i.e. turn a typo in a redaction list into a model that will not boot.
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+#: Launch defaults, declared ONCE. They were spelled out in both
+#: `start_transient_argv` and `start_transient`, which meant changing one left
+#: the other silently winning — the argv builder's value is dead, because the
+#: wrapper always passes its own. A drift that no test could see.
+DEFAULT_RESTART = "on-failure"
+DEFAULT_RESTART_SEC = 10
+#: See `start_transient_argv`: systemd's own 5-per-10s limit can never fire
+#: with a 10s restart delay, so a model that cannot boot restarts forever.
+DEFAULT_START_LIMIT_INTERVAL_SEC = 300
+DEFAULT_START_LIMIT_BURST = 3
 
 #: Exactly the properties :func:`show` asks for, in the documented order.
 SHOW_PROPERTIES = "ActiveState,SubState,Result,NRestarts,MainPID,ExecMainStartTimestamp"
@@ -214,9 +241,12 @@ def start_transient_argv(
     argv: Sequence[str],
     env: Mapping[str, str],
     cwd: str | os.PathLike[str],
-    restart: str = "on-failure",
-    restart_sec: int = 10,
+    restart: str = DEFAULT_RESTART,
+    restart_sec: int = DEFAULT_RESTART_SEC,
     description: str | None = None,
+    unset_env: Sequence[str] = (),
+    start_limit_interval_sec: int = DEFAULT_START_LIMIT_INTERVAL_SEC,
+    start_limit_burst: int = DEFAULT_START_LIMIT_BURST,
 ) -> list[str]:
     """The exact argv :func:`start_transient` runs. Shape::
 
@@ -226,13 +256,44 @@ def start_transient_argv(
                     --description=<description>
                     -p Restart=<restart>
                     -p RestartSec=<restart_sec>
+                    -p StartLimitIntervalSec=<start_limit_interval_sec>
+                    -p StartLimitBurst=<start_limit_burst>
                     -p WorkingDirectory=<cwd>
-                    --setenv=<K>=<V>          (one per var, keys sorted)
+                    -p UnsetEnvironment=<NAME>   (one per name, sorted)
+                    --setenv=<K>=<V>             (one per var, keys sorted)
                     --
                     <argv[0]> <argv[1]> ...
 
     ``--`` terminates option parsing so a model command may contain anything.
-    Env keys are sorted purely so the argv is deterministic and assertable.
+    Env keys and unset names are sorted purely so the argv is deterministic
+    and assertable.
+
+    **The start limit is not optional.** systemd's defaults are
+    ``StartLimitIntervalSec=10s`` with ``StartLimitBurst=5``, and
+    ``RestartSec=10`` puts each retry *outside* that 10-second window — so the
+    ceiling can never be reached and a model that cannot boot at all restarts
+    every ten seconds forever, unattended, holding a port and taking the GPU
+    each time. That is R4's "the unit crash-loops at boot" exactly. 3 attempts
+    per 300 s makes the unit reach ``failed`` after ~30 s of trying, which is
+    what lets :meth:`control.Control.wait_ready` report a real failure instead
+    of timing out against an eternally-restarting unit.
+
+    ``unset_env`` exists because a transient unit inherits the **user
+    manager's** environment, which on a workstation is the login session's —
+    and that is where an operator's exported API keys end up (measured on this
+    box: ``KITE_API_KEY`` and ``KITE_API_SECRET`` are in
+    ``systemctl --user show-environment``, so every transient unit would
+    inherit them). A model process has no business holding a credential for an
+    unrelated service: it runs arbitrary user prompts, it logs, and it can be
+    asked to print its own environment.
+
+    systemd applies ``UnsetEnvironment=`` **after** the environment is
+    assembled from the manager's, ``Environment=`` and ``--setenv``, so it
+    beats everything — which is why naming a variable in both ``env`` and
+    ``unset_env`` is refused here rather than silently resolved. Verified on
+    this box (systemd 259): with the property, the variable is absent from the
+    unit's ``/proc/<MainPID>/environ`` and from what ``/usr/bin/env`` logs to
+    the journal, while ``HOME`` is still there.
     """
     _require_name(name)
     if not argv:
@@ -245,6 +306,18 @@ def start_transient_argv(
     if restart_sec < 0:
         raise UnitError(f"{name}: RestartSec must not be negative, got {restart_sec}")
 
+    unset = sorted(set(unset_env))
+    for entry in unset:
+        if not _ENV_NAME_RE.match(entry):
+            raise UnitError(f"{name}: {entry!r} is not a usable environment variable name")
+    clash = sorted(set(unset) & set(env))
+    if clash:
+        raise UnitError(
+            f"{name}: {', '.join(clash)} appear in both env and unset_env. "
+            f"UnsetEnvironment= is applied last, so the unit would start WITHOUT "
+            f"them and nothing would say so — decide in the caller which wins."
+        )
+
     out = [
         "systemd-run",
         "--user",
@@ -256,8 +329,14 @@ def start_transient_argv(
         "-p",
         f"RestartSec={restart_sec}",
         "-p",
+        f"StartLimitIntervalSec={start_limit_interval_sec}",
+        "-p",
+        f"StartLimitBurst={start_limit_burst}",
+        "-p",
         f"WorkingDirectory={os.fspath(cwd)}",
     ]
+    for entry in unset:
+        out.extend(["-p", f"UnsetEnvironment={entry}"])
     for key in sorted(env):
         value = env[key]
         if "=" in key or "\n" in key or "\n" in value:
@@ -273,9 +352,12 @@ def start_transient(
     argv: Sequence[str],
     env: Mapping[str, str],
     cwd: str | os.PathLike[str],
-    restart: str = "on-failure",
-    restart_sec: int = 10,
+    restart: str = DEFAULT_RESTART,
+    restart_sec: int = DEFAULT_RESTART_SEC,
     description: str | None = None,
+    unset_env: Sequence[str] = (),
+    start_limit_interval_sec: int = DEFAULT_START_LIMIT_INTERVAL_SEC,
+    start_limit_burst: int = DEFAULT_START_LIMIT_BURST,
     run: Runner | None = None,
 ) -> None:
     """Launch ``argv`` as the transient user unit ``<name>.service``.
@@ -290,10 +372,25 @@ def start_transient(
     ``env`` is not a *supplement* to the caller's environment: a transient
     unit inherits the **user manager's** environment (``systemctl --user
     show-environment``), never the calling shell's. Anything the model needs
-    must be in ``env``.
+    must be in ``env`` — and anything ambient it must NOT see, such as an
+    operator's API keys, must be in ``unset_env``.
     """
     run = run or default_runner()
-    _checked(run, start_transient_argv(name, argv, env, cwd, restart, restart_sec, description))
+    _checked(
+        run,
+        start_transient_argv(
+            name,
+            argv,
+            env,
+            cwd,
+            restart,
+            restart_sec,
+            description,
+            unset_env,
+            start_limit_interval_sec,
+            start_limit_burst,
+        ),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -382,12 +479,51 @@ def properties(name: str, props: Sequence[str], run: Runner | None = None) -> di
 
 
 def exists(name: str, run: Runner | None = None) -> bool:
-    """True iff systemd still has the unit loaded (``LoadState=loaded``).
+    """ONE read of ``LoadState``. True iff it came back ``loaded``.
 
-    The companion to :func:`show`: False means the transient unit has been
-    garbage-collected, which after a start attempt means *it died*.
+    **This read is not reliable on its own.** Measured on this box (systemd
+    259, 2026-09-12): sampling a live, running transient unit every 20 ms,
+    ``systemctl --user show -p LoadState`` returned ``LoadState=not-found``
+    for 2 of ~1030 reads — exit status 0, empty stderr, unit perfectly
+    healthy before and after. Roughly 0.2%.
+
+    That rate is not negligible where it is used. A health check every 2 s
+    across a five-minute model boot is ~150 reads, so trusting a single
+    negative would declare a healthy 90 GiB boot dead about a quarter of the
+    time — and, because the honest failure text is "it failed and --collect
+    removed it", the report would be confident and wrong.
+
+    Use :func:`gone` to ask whether a unit is really absent. This function
+    stays a single honest read so the flakiness is visible rather than
+    smeared across a primitive that also sleeps.
     """
     return properties(name, ("LoadState",), run=run).get("LoadState") == "loaded"
+
+
+def gone(
+    name: str,
+    run: Runner | None = None,
+    attempts: int = 3,
+    delay_s: float = 0.3,
+    sleep: Callable[[float], None] = time.sleep,
+) -> bool:
+    """True iff the unit is really absent — ``attempts`` consecutive
+    ``LoadState != loaded`` reads.
+
+    Short-circuits: the first read that says ``loaded`` returns False
+    immediately, so the delay is only ever paid for a unit that is genuinely
+    gone (where nobody is waiting on latency) and never for a healthy one.
+
+    This is the predicate every caller actually wants; :func:`exists` is the
+    raw sample it is built from. See :func:`exists` for the measurement that
+    makes the confirmation necessary.
+    """
+    for attempt in range(attempts):
+        if exists(name, run=run):
+            return False
+        if attempt + 1 < attempts:
+            sleep(delay_s)
+    return True
 
 
 def control_group(name: str, run: Runner | None = None) -> str:
@@ -398,6 +534,33 @@ def control_group(name: str, run: Runner | None = None) -> str:
     a measurable fact.
     """
     return properties(name, ("ControlGroup",), run=run).get("ControlGroup", "")
+
+
+def manager_environment_names(run: Runner | None = None) -> list[str]:
+    """The NAMES of every variable in the user manager's environment, sorted.
+
+    argv: ``systemctl --user show-environment``.
+
+    Names only, and by construction: the value half of each line is discarded
+    inside this function and never returned, so no caller — and no log line,
+    exception message or debugger frame built from a caller's data — can leak
+    a credential that happens to be in the session environment. The one thing
+    a supervisor needs from this list is which names to redact, and that needs
+    no values at all.
+
+    Raises :class:`UnitError` if the manager cannot be asked. That is
+    deliberate: an empty list would read as "nothing to redact" and would
+    hand every ambient secret straight to the model.
+    """
+    run = run or default_runner()
+    proc = _checked(run, ["systemctl", "--user", "show-environment"])
+    names: list[str] = []
+    for line in (proc.stdout or "").splitlines():
+        name, sep, _value = line.partition("=")
+        name = name.strip()
+        if sep and _ENV_NAME_RE.match(name):
+            names.append(name)
+    return sorted(set(names))
 
 
 def list_units_argv(pattern: str) -> list[str]:
