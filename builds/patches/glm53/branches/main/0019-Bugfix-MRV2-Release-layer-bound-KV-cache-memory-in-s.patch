@@ -1,0 +1,141 @@
+From 96242aa50d196993735854f03bd717496e88b7c3 Mon Sep 17 00:00:00 2001
+From: Nick Hill <nickhill123@gmail.com>
+Date: Fri, 28 Aug 2026 14:27:09 -0700
+Subject: [PATCH 19/39] [Bugfix][MRV2] Release layer-bound KV cache memory in
+ shutdown() (#54246)
+
+Signed-off-by: Nick Hill <nickhill123@gmail.com>
+Co-authored-by: Kimi Code <noreply@moonshot.ai>
+---
+ tests/conftest.py                     |  6 ++++--
+ vllm/v1/worker/gpu/cudagraph_utils.py | 19 +++++++++----------
+ vllm/v1/worker/gpu/model_runner.py    |  9 ++++++++-
+ vllm/v1/worker/utils.py               | 21 +++++++++++++++++++++
+ 4 files changed, 42 insertions(+), 13 deletions(-)
+
+diff --git a/tests/conftest.py b/tests/conftest.py
+index a2d910c69..f9156a43e 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -1371,8 +1371,10 @@ class VllmRunner:
+             shutdown_timeout = 60.0 if current_platform.is_rocm() else None
+             self.llm.llm_engine.engine_core.shutdown(timeout=shutdown_timeout)
+         except Exception:
+-            # Ignore shutdown errors as cleanup will still proceed
+-            pass
++            # Don't fail the test on shutdown errors since cleanup will still
++            # proceed, but don't hide them either: a failure here usually
++            # means the engine's GPU memory was never released.
++            logger.exception("Engine core shutdown raised; GPU memory may leak")
+         del self.llm
+         torch._dynamo.reset()
+         cleanup_dist_env_and_memory()
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index 3c334ca31..4ea6c14e2 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -1,8 +1,9 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import gc
++import itertools
+ from collections import defaultdict
+-from collections.abc import Callable
++from collections.abc import Callable, Iterable
+ from dataclasses import dataclass
+ from itertools import groupby, product
+ from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+@@ -38,7 +39,7 @@ from vllm.v1.worker.gpu.block_table import BlockTables
+ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
+ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+ from vllm.v1.worker.gpu.model_states.interface import ModelState
+-from vllm.v1.worker.utils import AttentionGroup
++from vllm.v1.worker.utils import AttentionGroup, clear_layer_kv_caches
+ 
+ if TYPE_CHECKING:
+     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+@@ -872,14 +873,12 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
+     # capture_model() re-captures them.
+     if runner.model_state.supports_mm_inputs:
+         runner.model_state.encoder_runner.clear()
+-    # Detach profiling KV tensors held by attention layers.
+-    for layer in runner.compilation_config.static_forward_context.values():
+-        if hasattr(layer, "kv_cache"):
+-            kv_cache = layer.kv_cache
+-            layer.kv_cache = (
+-                torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
+-            )
+-            del kv_cache
++    # Detach profiling KV tensors held by attention layers. The layers live
++    # in the static forward context for compiled models.
++    layers: Iterable[Any] = runner.compilation_config.static_forward_context.values()
++    if (model := getattr(runner, "model", None)) is not None:
++        layers = itertools.chain(layers, model.modules())
++    clear_layer_kv_caches(layers)
+     runner.cache_config.num_gpu_blocks = None
+     runner.maybe_remove_all_loras(runner.lora_config)
+     gc.collect()
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 5ba4b97f3..6bce5061b 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -156,6 +156,7 @@ from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
+ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+ from vllm.v1.worker.utils import (
+     KVBlockZeroer,
++    clear_layer_kv_caches,
+     copy_kv_cache_blocks_inplace,
+     get_uniform_decode_token_count,
+ )
+@@ -2026,9 +2027,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         free_before_shutdown(self.vllm_config)
+         if hasattr(self, "model_state"):
+             del self.model_state
+-        if getattr(self, "speculator", None) is not None:
++        # Detach the layer-level KV/state cache tensors before dropping the
++        # models; the model objects can outlive this runner.
++        speculator = getattr(self, "speculator", None)
++        if speculator is not None:
++            if draft_model := getattr(speculator, "model", None):
++                clear_layer_kv_caches(draft_model.modules())
+             self.speculator = None
+         if hasattr(self, "model"):
++            clear_layer_kv_caches(self.model.modules())
+             del self.model
+ 
+         gc.collect()
+diff --git a/vllm/v1/worker/utils.py b/vllm/v1/worker/utils.py
+index 4c407f410..adf0127db 100644
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -622,6 +622,27 @@ def bind_kv_cache(
+         forward_context[layer_name].bind_kv_cache(kv_cache)
+ 
+ 
++def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
++    """Detach the KV/state cache tensors installed by bind_kv_cache().
++
++    The model object can outlive the runner (e.g. LLMEngine's finalizer keeps
++    it reachable until engine deletion), so dropping the runner's references
++    alone does not release the KV cache memory on teardown paths.
++    """
++    for layer in layers:
++        if not hasattr(layer, "kv_cache"):
++            continue
++        kv_cache = layer.kv_cache
++        layer.kv_cache = torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
++        # Clean up quantized KV cache scale views
++        # (int8_per_token_head, fp8_per_token_head)
++        if hasattr(layer, "impl"):
++            if hasattr(layer.impl, "_k_scale_cache"):
++                layer.impl._k_scale_cache = None
++            if hasattr(layer.impl, "_v_scale_cache"):
++                layer.impl._v_scale_cache = None
++
++
+ def copy_kv_cache_blocks_inplace(
+     kv_caches: Iterable[torch.Tensor],
+     num_blocks: int,
+-- 
+2.53.0
+

@@ -1,0 +1,71 @@
+From 06cccf8730a199817be58e2de576918fe7a46e1e Mon Sep 17 00:00:00 2001
+From: canlahlah <dranox2222@gmail.com>
+Date: Fri, 28 Aug 2026 13:23:36 -0700
+Subject: [PATCH 15/39] [Bugfix] Fix int32 token offset overflow in fused SiLU
+ block quant (#53409)
+
+Signed-off-by: Anni <dranox2222@gmail.com>
+Co-authored-by: OpenAI Codex <noreply@openai.com>
+Co-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>
+Co-authored-by: Yongye Zhu <zyy1102000@gmail.com>
+---
+ .../fused_silu_mul_block_quant.cu             |  2 +-
+ .../core/test_fused_silu_mul_block_quant.py   | 25 +++++++++++++++++++
+ 2 files changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/csrc/libtorch_stable/quantization/fused_kernels/fused_silu_mul_block_quant.cu b/csrc/libtorch_stable/quantization/fused_kernels/fused_silu_mul_block_quant.cu
+index b32a7bd27..bd50f43bf 100644
+--- a/csrc/libtorch_stable/quantization/fused_kernels/fused_silu_mul_block_quant.cu
++++ b/csrc/libtorch_stable/quantization/fused_kernels/fused_silu_mul_block_quant.cu
+@@ -26,7 +26,7 @@ __global__ void silu_and_mul_per_block_quant_kernel(
+                 "group_size must be a power of 2 for correct reduction");
+ 
+   // Grid: (num_tokens, num_groups)
+-  int const token_idx = blockIdx.x;
++  int64_t const token_idx = blockIdx.x;
+   int const group_idx = blockIdx.y;
+   int const tid = threadIdx.x;  // tid in [0, group_size)
+   int const num_tokens = gridDim.x;
+diff --git a/tests/kernels/core/test_fused_silu_mul_block_quant.py b/tests/kernels/core/test_fused_silu_mul_block_quant.py
+index 37b76056c..5d299e204 100644
+--- a/tests/kernels/core/test_fused_silu_mul_block_quant.py
++++ b/tests/kernels/core/test_fused_silu_mul_block_quant.py
+@@ -7,6 +7,7 @@ import torch.nn.functional as F
+ 
+ import vllm._custom_ops as ops
+ from tests.kernels.utils import opcheck
++from tests.utils import large_gpu_test
+ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+     per_token_group_quant_fp8,
+ )
+@@ -187,3 +188,27 @@ def test_silu_block_quant_edge_cases(
+     assert not torch.isnan(out.float()).any()
+     assert not torch.isnan(scales).any()
+     assert not torch.isinf(scales).any()
++
++
++@large_gpu_test(min_gb=24)
++@torch.inference_mode()
++def test_silu_block_quant_int32_offset_overflow(default_vllm_config):
++    """Token offsets beyond INT32_MAX must not wrap (issue #53390)."""
++    hidden_size = 16384
++    group_size = 128
++    quant_dtype = current_platform.fp8_dtype()
++    # Smallest batch whose last token's input offset (token_idx * 2 *
++    # hidden_size) exceeds INT32_MAX.
++    num_tokens = (2**31 - 1) // (2 * hidden_size) + 2
++
++    x = torch.randn(num_tokens, hidden_size * 2, dtype=torch.bfloat16, device="cuda")
++    out, scales = ops.silu_and_mul_per_block_quant(
++        x, group_size, quant_dtype, None, False
++    )
++    torch.accelerator.synchronize()
++
++    expected_out, expected_scales = ops.silu_and_mul_per_block_quant(
++        x[-1:].contiguous(), group_size, quant_dtype, None, False
++    )
++    assert torch.equal(scales[-1:], expected_scales)
++    assert torch.equal(out[-1:], expected_out)
+-- 
+2.53.0
+

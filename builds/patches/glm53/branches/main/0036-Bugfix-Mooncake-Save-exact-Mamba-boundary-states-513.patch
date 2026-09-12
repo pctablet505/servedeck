@@ -1,0 +1,2686 @@
+From 6b110badbb22d3f66c7218b71138f13b7a6b3419 Mon Sep 17 00:00:00 2001
+From: Yifan Qiao <yifanqiao@inferact.ai>
+Date: Fri, 28 Aug 2026 19:40:53 -0700
+Subject: [PATCH 36/39] [Bugfix][Mooncake] Save exact Mamba boundary states
+ (#51358)
+
+Signed-off-by: Yifan Qiao <yifanqiao@inferact.ai>
+Co-authored-by: Claude Fable 5 <noreply@anthropic.com>
+Co-authored-by: OpenAI Codex <codex@openai.com>
+Co-authored-by: Dao Le <daole@inferact.ai>
+---
+ .../test_partial_prefix_cache_hits.py         | 293 ++++++++++++++++--
+ .../core/test_single_type_kv_cache_manager.py |  32 ++
+ .../offloading_connector/test_scheduler.py    |  94 +++++-
+ .../unit/test_mooncake_store_connector.py     |  38 ++-
+ .../unit/test_mooncake_store_coordinator.py   |  21 ++
+ .../unit/test_mooncake_store_hma_e2e.py       |  11 +-
+ .../unit/test_mooncake_store_scheduler.py     | 284 ++++++++++++++++-
+ .../unit/test_mooncake_store_worker.py        | 289 +++++++++++++++--
+ .../unit/test_offloading_connector.py         |  19 +-
+ .../test_scheduler_kv_connector_override.py   |  17 +-
+ .../v1/mooncake/store/coordinator.py          |  20 ++
+ .../kv_connector/v1/mooncake/store/data.py    |  10 +-
+ .../v1/mooncake/store/scheduler.py            | 173 +++++++----
+ .../kv_connector/v1/mooncake/store/worker.py  | 196 ++++++++----
+ .../kv_connector/v1/offloading/scheduler.py   |  85 ++++-
+ vllm/v1/core/block_pool.py                    |   4 +
+ vllm/v1/core/kv_cache_manager.py              |  40 +--
+ vllm/v1/core/sched/output.py                  |  17 +-
+ vllm/v1/core/sched/scheduler.py               |  46 ++-
+ vllm/v1/core/single_type_kv_cache_manager.py  |  78 +++--
+ 20 files changed, 1494 insertions(+), 273 deletions(-)
+
+diff --git a/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py b/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
+index eff889b98..11f344522 100644
+--- a/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
++++ b/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
+@@ -69,6 +69,19 @@ def test_capable_connector_uses_divergent_partial_hit_lookup():
+     manager.get_computed_blocks.assert_not_called()
+ 
+ 
++def drain_boundary_state_offloads(manager):
++    """Drain exact boundary-state block ids offered to a connector."""
++    return manager.take_boundary_state_offloads()
++
++
++def _free_block_ids(manager):
++    """Block ids the pool would hand out to the next allocation."""
++    return {
++        block.block_id
++        for block in manager.block_pool.free_block_queue.get_all_free_blocks()
++    }
++
++
+ def make_full_mamba_manager(
+     *,
+     dcp_world_size: int,
+@@ -618,10 +631,9 @@ def test_external_mamba_hit_same_block_uses_running_cow_on_continue():
+     assert moved[0].block_id == cow_copy.dst_block_id
+ 
+ 
+-def test_take_partial_tail_offloads_returns_cow_target():
+-    """The connector offload hand-off exposes the mamba CoW *target* block Y
+-    (the durable boundary state), not the overwritten source X, and only at
+-    the CoW step."""
++def test_boundary_state_offloads_returns_cow_target():
++    """Boundary hand-offs expose aligned snapshots and the partial-tail CoW
++    target, never the overwritten CoW source."""
+     hash_block_size = 2
+     block_size = 2 * hash_block_size
+     kv_cache_config = KVCacheConfig(
+@@ -660,8 +672,18 @@ def test_take_partial_tail_offloads_returns_cow_target():
+     computed_blocks, num_computed, _ = manager.get_computed_blocks(req0)
+     assert manager.allocate_slots(req0, 6, num_computed, computed_blocks) is not None
+ 
+-    # Step A registered the partial tail but has not CoW'd yet: no offload.
+-    assert manager.take_partial_tail_offloads() == {}
++    # Step A offers the materialized aligned checkpoint immediately.
++    ((group_id, block_id, boundary_tokens),) = drain_boundary_state_offloads(manager)[
++        "0"
++    ]
++    assert group_id == 1
++    assert boundary_tokens == 4
++    aligned_hash = req0.block_hashes[4 // hash_block_size - 1]
++    aligned_block = manager.block_pool.get_cached_block(
++        aligned_hash, kv_cache_group_ids=[1]
++    )
++    assert aligned_block is not None
++    assert block_id == aligned_block[0].block_id
+ 
+     partial_mamba_hash = req0.block_hashes[6 // hash_block_size - 1]
+     source_block = manager.block_pool.get_cached_block(
+@@ -675,34 +697,27 @@ def test_take_partial_tail_offloads_returns_cow_target():
+     req0.append_output_token_ids([3])
+     assert manager.allocate_slots(req0, 1) is not None
+ 
+-    offloads = manager.take_partial_tail_offloads()
++    offloads = drain_boundary_state_offloads(manager)
+     assert list(offloads.keys()) == ["0"]
+     assert len(offloads["0"]) == 1
+     group_id, block_id, boundary_tokens = offloads["0"][0]
+     assert group_id == 1  # the mamba group
+     assert boundary_tokens == 6
+-    copies, _ = manager.take_kv_cache_block_copies()
++    copies, retained = manager.take_kv_cache_block_copies()
+     cow_copy = next(c for c in copies if c.src_block_id == source_block_id)
+     # The offload points at the durable CoW target Y, not the overwritten X.
+     assert block_id == cow_copy.dst_block_id
+     assert block_id != source_block_id
+     # Draining clears it.
+-    assert manager.take_partial_tail_offloads() == {}
++    assert manager.take_boundary_state_offloads() == {}
+ 
+-    # The hand-off pinned Y (its CoW retention is released after this step,
+-    # and Y is off the request block table); freeing the request unpins it.
+-    cow_block = manager.block_pool.blocks[block_id]
+-    pinned_ref = cow_block.ref_cnt
+-    assert pinned_ref >= 1
++    manager.block_pool.free_blocks(retained)
+     manager.free(req0)
+-    assert cow_block.ref_cnt == pinned_ref - 1
+ 
+ 
+-def test_partial_tail_pin_survives_released_cow_retention():
+-    """If the CoW retention is released before the hand-off is drained
+-    (immediate-free mode), the drain must rescue the cow block from the free
+-    queue: a raw ref increment would leave a ref>0 block allocatable, and the
+-    next allocation would pop it and assert."""
++def test_block_pool_touch_pins_released_cow_target():
++    """The connector can rescue an offered CoW target after its step-scoped
++    retention is released by using the bound BlockPool's touch method."""
+     hash_block_size = 2
+     block_size = 2 * hash_block_size
+     kv_cache_config = KVCacheConfig(
+@@ -746,13 +761,18 @@ def test_partial_tail_pin_survives_released_cow_retention():
+     _copies, retained = manager.take_kv_cache_block_copies()
+     manager.block_pool.free_blocks(retained)
+ 
+-    offloads = manager.take_partial_tail_offloads()
++    offloads = drain_boundary_state_offloads(manager)
+     ((_group_id, block_id, boundary_tokens),) = offloads["0"]
+     assert boundary_tokens == 6
+     cow_block = manager.block_pool.blocks[block_id]
++    assert cow_block.ref_cnt == 0
++    assert block_id in _free_block_ids(manager)
++
++    manager.block_pool.touch([cow_block])
+     assert cow_block.ref_cnt == 1
++    assert block_id not in _free_block_ids(manager)
+ 
+-    # The pinned block is out of the free queue: draining every free block
++    # The connector-pinned block is out of the free queue: draining every free block
+     # neither trips the allocator's ref_cnt assert nor hands it out.
+     new_blocks = manager.block_pool.get_new_blocks(
+         manager.block_pool.get_num_free_blocks()
+@@ -760,7 +780,7 @@ def test_partial_tail_pin_survives_released_cow_retention():
+     assert block_id not in {b.block_id for b in new_blocks}
+ 
+ 
+-def test_partial_tail_offload_dropped_when_request_freed_before_drain():
++def test_boundary_state_offload_dropped_when_request_freed_before_drain():
+     """A hand-off recorded in the same scheduling pass as the request's death
+     must not be drained: its release hook has already run, so draining would
+     leak a pinned block."""
+@@ -805,12 +825,12 @@ def test_partial_tail_offload_dropped_when_request_freed_before_drain():
+ 
+     # The request dies (preempt/abort) before the scheduler drains.
+     manager.block_pool.free_blocks(manager.pop_blocks_for_free(req0))
+-    assert manager.take_partial_tail_offloads() == {}
++    assert manager.take_boundary_state_offloads() == {}
+ 
+ 
+-def test_take_partial_tail_offloads_empty_without_partial_tail():
+-    """A prompt ending on a block boundary registers no partial tail, so there
+-    is nothing to offload."""
++def test_boundary_state_offloads_block_aligned_prompt():
++    """A prompt ending on a block boundary registers no CoW partial tail; its
++    boundary state block is handed off as a snapshot instead (once)."""
+     hash_block_size = 2
+     block_size = 2 * hash_block_size
+     kv_cache_config = KVCacheConfig(
+@@ -848,12 +868,17 @@ def test_take_partial_tail_offloads_empty_without_partial_tail():
+     req0 = make_request("0", [0, 0, 1, 1], hash_block_size, sha256)
+     computed_blocks, num_computed, _ = manager.get_computed_blocks(req0)
+     assert manager.allocate_slots(req0, 4, num_computed, computed_blocks) is not None
+-    assert manager.take_partial_tail_offloads() == {}
++    mamba_blocks = manager.coordinator.single_type_managers[1].req_to_blocks["0"]
++    ((group_id, block_id, boundary),) = drain_boundary_state_offloads(manager)["0"]
++    assert group_id == 1
++    assert boundary == block_size
++    assert block_id == mamba_blocks[0].block_id
+ 
+     req0.num_computed_tokens = 4
+     req0.append_output_token_ids([2])
+     assert manager.allocate_slots(req0, 1) is not None
+-    assert manager.take_partial_tail_offloads() == {}
++    # The boundary was already handed off; decoding emits nothing new.
++    assert manager.take_boundary_state_offloads() == {}
+ 
+ 
+ def test_truncate_computed_blocks_preserves_sparse_prefix_positions():
+@@ -1786,3 +1811,213 @@ def test_dcp_partial_hit_with_eagle_rewinds_one_hash_unit():
+     assert num_computed == 4
+     assert [len(group) for group in computed_blocks.blocks] == [1, 1]
+     assert manager.allocate_slots(req1, 4, num_computed, computed_blocks) is not None
++
++
++def _snapshot_offload_kv_cache_config(
++    hash_block_size: int, block_size: int, num_blocks: int = 24
++):
++    return KVCacheConfig(
++        num_blocks=num_blocks,
++        kv_cache_tensors=[],
++        kv_cache_groups=[
++            KVCacheGroupSpec(
++                ["full"],
++                FullAttentionSpec(
++                    block_size=hash_block_size,
++                    num_kv_heads=1,
++                    head_size=1,
++                    dtype=torch.float32,
++                ),
++            ),
++            KVCacheGroupSpec(
++                ["mamba"],
++                MambaSpec(
++                    block_size=block_size,
++                    shapes=(1, 1),
++                    dtypes=(torch.float32,),
++                    mamba_cache_mode="align",
++                ),
++            ),
++        ],
++    )
++
++
++def test_retention_snapshots_handed_off_with_exact_block_ids():
++    """Under sparse retention, each retained mamba boundary state block is
++    handed to the connector with its exact block id. Connectors must not resolve
++    align-mode state blocks positionally because the block table is not
++    append-only."""
++    hash_block_size = 2
++    block_size = 4
++    manager = make_kv_cache_manager(
++        kv_cache_config=_snapshot_offload_kv_cache_config(hash_block_size, block_size),
++        max_model_len=8192,
++        enable_caching=True,
++        hash_block_size=hash_block_size,
++    )
++    manager.coordinator.retention_interval = 2 * block_size
++
++    req0 = make_request("0", [0] * 16, hash_block_size, sha256)
++    computed_blocks, num_computed, _ = manager.get_computed_blocks(req0)
++    assert manager.allocate_slots(req0, 8, num_computed, computed_blocks) is not None
++
++    mamba_blocks = manager.coordinator.single_type_managers[1].req_to_blocks["0"]
++    offloads = drain_boundary_state_offloads(manager)
++    ((group_id, block_id, boundary),) = offloads["0"]
++    assert group_id == 1
++    assert boundary == 2 * block_size
++    assert block_id == mamba_blocks[1].block_id
++
++    req0.num_computed_tokens = 8
++    manager.new_step_starts()
++    assert manager.allocate_slots(req0, 8) is not None
++
++    offloads = drain_boundary_state_offloads(manager)
++    ((group_id, block_id2, boundary2),) = offloads["0"]
++    assert group_id == 1
++    assert boundary2 == 4 * block_size
++    assert block_id2 == mamba_blocks[3].block_id
++    # Interior align-mode positions stay null and are never handed off.
++    assert mamba_blocks[0].is_null and mamba_blocks[2].is_null
++
++    manager.free(req0)
++
++
++def test_snapshot_handoff_dense_default_retention():
++    """With dense (default) retention, every materialized mamba boundary
++    state block is handed off — regular mamba-align + prefix-match-unit
++    deployments get store-able boundary snapshots without setting
++    VLLM_PREFIX_CACHE_RETENTION_INTERVAL."""
++    hash_block_size = 2
++    block_size = 4
++    manager = make_kv_cache_manager(
++        kv_cache_config=_snapshot_offload_kv_cache_config(hash_block_size, block_size),
++        max_model_len=8192,
++        enable_caching=True,
++        hash_block_size=hash_block_size,
++    )
++    assert manager.coordinator.retention_interval is None
++
++    req0 = make_request("0", [0] * 16, hash_block_size, sha256)
++    computed_blocks, num_computed, _ = manager.get_computed_blocks(req0)
++    assert manager.allocate_slots(req0, 8, num_computed, computed_blocks) is not None
++
++    mamba_blocks = manager.coordinator.single_type_managers[1].req_to_blocks["0"]
++    ((group_id, block_id, boundary),) = drain_boundary_state_offloads(manager)["0"]
++    assert group_id == 1
++    assert boundary == 2 * block_size
++    assert block_id == mamba_blocks[1].block_id
++
++    req0.num_computed_tokens = 8
++    manager.new_step_starts()
++    assert manager.allocate_slots(req0, 8) is not None
++    ((group_id, block_id2, boundary2),) = drain_boundary_state_offloads(manager)["0"]
++    assert group_id == 1
++    assert boundary2 == 4 * block_size
++    assert block_id2 == mamba_blocks[3].block_id
++
++
++def _run_chunked_prefill(manager, req, chunk_size, num_chunks):
++    """Prefill ``req`` one ``chunk_size`` chunk per scheduler step, yielding the
++    boundary-state hand-offs offered (and claimed) at each step."""
++    computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
++    for step in range(num_chunks):
++        manager.new_step_starts()
++        req.num_computed_tokens = step * chunk_size
++        if step == 0:
++            allocated = manager.allocate_slots(
++                req, chunk_size, num_computed, computed_blocks
++            )
++        else:
++            allocated = manager.allocate_slots(req, chunk_size)
++        assert allocated is not None
++        yield drain_boundary_state_offloads(manager).get(req.request_id, [])
++
++
++def test_boundary_state_offer_includes_more_mamba_groups_than_two():
++    """One offer batch carries one exact block entry per mamba group."""
++    block_size = 8
++    num_mamba_groups = 3
++    manager = make_kv_cache_manager(
++        kv_cache_config=KVCacheConfig(
++            num_blocks=200,
++            kv_cache_tensors=[],
++            kv_cache_groups=[
++                KVCacheGroupSpec(
++                    ["full"],
++                    FullAttentionSpec(
++                        block_size=block_size,
++                        num_kv_heads=1,
++                        head_size=1,
++                        dtype=torch.float32,
++                    ),
++                ),
++                *(
++                    KVCacheGroupSpec(
++                        [f"mamba{i}"],
++                        MambaSpec(
++                            block_size=block_size,
++                            shapes=(1, 1),
++                            dtypes=(torch.float32,),
++                            mamba_cache_mode="align",
++                        ),
++                    )
++                    for i in range(num_mamba_groups)
++                ),
++            ],
++        ),
++        max_model_len=8192,
++        enable_caching=True,
++        hash_block_size=block_size,
++    )
++
++    req0 = make_request("0", [0] * (2 * block_size), block_size, sha256)
++    entries = next(_run_chunked_prefill(manager, req0, block_size, 1))
++
++    assert [group_id for group_id, _, _ in entries] == [1, 2, 3]
++    assert {boundary for _, _, boundary in entries} == {block_size}
++
++
++def test_boundary_states_offered_past_prompt_for_resumed_prefill():
++    """The core offers every committed boundary, including past
++    ``num_prompt_tokens``. A resumed request re-prefills its generated tokens
++    and every group re-saves them, so filtering on the original prompt length
++    would silently strip the mamba key for boundaries full attention still
++    stores; only the connector knows where its save window ends."""
++    block_size = 8
++    prompt_len = block_size
++    manager = make_kv_cache_manager(
++        kv_cache_config=_snapshot_offload_kv_cache_config(
++            hash_block_size=block_size, block_size=block_size, num_blocks=200
++        ),
++        max_model_len=8192,
++        enable_caching=True,
++        hash_block_size=block_size,
++    )
++
++    req0 = make_request("0", [0] * prompt_len, block_size, sha256)
++    assert [
++        boundary
++        for entries in _run_chunked_prefill(manager, req0, block_size, 1)
++        for _, _, boundary in entries
++    ] == [prompt_len]
++
++    # Generate past the next mamba boundary, then replay it as a resumed
++    # prefill: its committed boundary is offered even though it is past the
++    # prompt, matching what full attention saves for the same range.
++    for i in range(block_size):
++        manager.new_step_starts()
++        req0.num_computed_tokens = prompt_len + i
++        req0.append_output_token_ids([1])
++        assert manager.allocate_slots(req0, 1) is not None
++        drain_boundary_state_offloads(manager)
++    assert req0.num_tokens == 2 * block_size
++
++    manager.free(req0)
++    manager.new_step_starts()
++    req0.num_computed_tokens = 0
++    computed_blocks, num_computed, _ = manager.get_computed_blocks(req0)
++    assert manager.allocate_slots(req0, req0.num_tokens - num_computed, num_computed)
++    offered = [b for _, _, b in drain_boundary_state_offloads(manager).get("0", [])]
++    assert 2 * block_size in offered
++    assert req0.num_prompt_tokens < 2 * block_size
+diff --git a/tests/v1/core/test_single_type_kv_cache_manager.py b/tests/v1/core/test_single_type_kv_cache_manager.py
+index bf6a1cc23..074a3faf8 100644
+--- a/tests/v1/core/test_single_type_kv_cache_manager.py
++++ b/tests/v1/core/test_single_type_kv_cache_manager.py
+@@ -15,12 +15,14 @@ from vllm.v1.core.kv_cache_utils import (
+ from vllm.v1.core.single_type_kv_cache_manager import (
+     ChunkedLocalAttentionManager,
+     FullAttentionManager,
++    MambaManager,
+     RSWAManager,
+     SlidingWindowManager,
+ )
+ from vllm.v1.kv_cache_interface import (
+     ChunkedLocalAttentionSpec,
+     FullAttentionSpec,
++    MambaSpec,
+     RSWASpec,
+     SlidingWindowSpec,
+ )
+@@ -69,6 +71,36 @@ def test_external_computed_blocks_do_not_corrupt_free_pool():
+     assert len(manager.req_to_blocks[request_id]) == 3
+ 
+ 
++def test_mamba_speculative_block_relocation_requires_exclusive_ownership():
++    spec = MambaSpec(
++        block_size=4,
++        shapes=((1, 1),),
++        dtypes=(torch.float32,),
++        mamba_cache_mode="align",
++        num_speculative_blocks=1,
++    )
++    block_pool = BlockPool(num_gpu_blocks=4, enable_caching=True, hash_block_size=4)
++    manager = MambaManager(
++        spec,
++        block_pool=block_pool,
++        enable_caching=True,
++        kv_cache_group_id=0,
++        scheduler_block_size=4,
++    )
++    block = block_pool.get_new_blocks(1)[0]
++    blocks = [block]
++
++    manager._relocate_speculative_block(blocks, 0)
++
++    assert blocks == [block_pool.null_block, block]
++    assert block.ref_cnt == 1
++
++    pinned_block = block_pool.get_new_blocks(1)[0]
++    block_pool.touch((pinned_block,))
++    with pytest.raises(AssertionError, match="exclusively owned and unhashed"):
++        manager._relocate_speculative_block([pinned_block], 0)
++
++
+ def get_sliding_window_manager(
+     sliding_window_spec,
+     block_pool,
+diff --git a/tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py b/tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py
+index ca5dd2657..e69f71314 100644
+--- a/tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py
++++ b/tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py
+@@ -36,7 +36,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+     is_store_reachable_swa_chunk,
+ )
+ from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+-from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
++from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock, KVCacheBlockCopy
++from vllm.v1.core.sched.output import (
++    KVConnectorBlockState,
++    SchedulerOutput,
++)
+ from vllm.v1.kv_cache_interface import (
+     ChunkedLocalAttentionSpec,
+     FullAttentionSpec,
+@@ -107,11 +111,16 @@ def test_partial_tail_store_uses_attention_and_recurrent_cow_sources():
+     req_status = scheduler._req_status["req"]
+     req_status.group_states[0].block_ids[:] = [11, 12]
+     req_status.group_states[1].block_ids[:] = [0, 21]
+-    scheduler.manager.prepare_store.side_effect = (
+-        lambda keys, req_context: generate_store_output(keys)
++    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
++        generate_store_output(keys)
+     )
+ 
+-    output = SimpleNamespace(partial_tail_offloads={"req": [(1, 99, 28)]})
++    output = SimpleNamespace(
++        kv_connector_block_state=KVConnectorBlockState(
++            block_ids={},
++            boundary_state_offloads={"req": [(1, 99, 28)]},
++        )
++    )
+     jobs = scheduler._build_partial_tail_store_jobs(output)
+ 
+     assert len(jobs) == 1
+@@ -155,6 +164,83 @@ def test_partial_tail_store_uses_attention_and_recurrent_cow_sources():
+     assert recurrent_event.parent_block_hash is None
+ 
+ 
++def test_aligned_boundary_store_uses_exact_source_with_partial_tail():
++    scheduler = _make_partial_tail_scheduler()
++    _make_partial_tail_request(scheduler)
++    req_status = scheduler._req_status["req"]
++    req_status.group_states[0].block_ids[:] = [11, 12]
++    req_status.group_states[1].block_ids[:] = [0, 21]
++    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
++        generate_store_output(keys)
++    )
++
++    output = SimpleNamespace(
++        kv_connector_block_state=KVConnectorBlockState(
++            block_ids={},
++            boundary_state_offloads={"req": [(1, 98, 16), (1, 99, 28)]},
++        )
++    )
++    jobs = scheduler._build_partial_tail_store_jobs(output)
++
++    assert len(jobs) == 2
++    src_spec = next(
++        job.src_spec for job in jobs.values() if len(job.src_spec.block_ids) == 1
++    )
++    assert isinstance(src_spec, GPULoadStoreSpec)
++    assert src_spec.block_ids.tolist() == [98]
++    assert src_spec.group_sizes == [0, 1]
++    assert src_spec.block_indices == [0, 0]
++
++
++def test_aligned_boundary_store_flushes_before_cow_destination_reuse():
++    scheduler = _make_partial_tail_scheduler()
++    _make_partial_tail_request(scheduler)
++    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
++        generate_store_output(keys)
++    )
++
++    output = SchedulerOutput.make_empty()
++    output.kv_connector_block_state = KVConnectorBlockState(
++        block_ids={},
++        boundary_state_offloads={"req": [(1, 99, 16)]},
++    )
++    meta = scheduler.build_connector_meta(output)
++    [job_id] = meta.store_jobs
++
++    output = SchedulerOutput.make_empty()
++    output.kv_cache_block_copies = [KVCacheBlockCopy(98, 99)]
++    meta = scheduler.build_connector_meta(output)
++
++    assert meta.jobs_to_flush == {job_id}
++
++
++def test_normal_store_excludes_align_mode_mamba_sources():
++    scheduler = _make_partial_tail_scheduler()
++    request = _make_partial_tail_request(scheduler)
++    request.num_computed_tokens = 0
++    request.status = RequestStatus.RUNNING
++    req_status = scheduler._req_status["req"]
++    req_status.group_states[0].block_ids[:] = [11]
++    req_status.group_states[1].block_ids[:] = [99]
++    req_status.update_offload_keys()
++    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
++        generate_store_output(keys)
++    )
++
++    output = SimpleNamespace(
++        num_scheduled_tokens={"req": 16},
++        finished_req_ids=set(),
++    )
++    jobs = scheduler._build_store_jobs(output)
++
++    assert len(jobs) == 1
++    [job] = jobs.values()
++    src_spec = job.src_spec
++    assert isinstance(src_spec, GPULoadStoreSpec)
++    assert src_spec.block_ids.tolist() == [11]
++    assert src_spec.group_sizes == [1, 0]
++
++
+ def test_partial_lookup_returns_exact_boundary_and_group_load_keys():
+     scheduler = _make_partial_tail_scheduler()
+     request = _make_partial_tail_request(scheduler)
+diff --git a/tests/v1/kv_connector/unit/test_mooncake_store_connector.py b/tests/v1/kv_connector/unit/test_mooncake_store_connector.py
+index 7931a78d0..bc3432154 100644
+--- a/tests/v1/kv_connector/unit/test_mooncake_store_connector.py
++++ b/tests/v1/kv_connector/unit/test_mooncake_store_connector.py
+@@ -5,6 +5,9 @@ import threading
+ import time
+ from unittest.mock import MagicMock, patch
+ 
++import pytest
++import torch
++
+ from vllm.config import set_current_vllm_config
+ from vllm.distributed.kv_events import BlockStored
+ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+@@ -31,6 +34,7 @@ from vllm.v1.kv_cache_interface import (
+     KVCacheConfig,
+     KVCacheGroupSpec,
+     KVCacheTensor,
++    MambaSpec,
+ )
+ from vllm.v1.outputs import KVConnectorOutput
+ 
+@@ -62,6 +66,30 @@ def _make_kv_cache_config() -> KVCacheConfig:
+     )
+ 
+ 
++def test_scheduler_requires_align_mode_for_mamba():
++    vllm_config = _make_vllm_config()
++    mamba_spec = MambaSpec(
++        block_size=16,
++        shapes=((1, 1),),
++        dtypes=(torch.float32,),
++        mamba_cache_mode="none",
++    )
++    kv_cache_config = KVCacheConfig(
++        num_blocks=4,
++        kv_cache_tensors=[],
++        kv_cache_groups=[KVCacheGroupSpec(["mamba"], mamba_spec)],
++    )
++
++    with (
++        patch(
++            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
++            "scheduler.LookupKeyClient"
++        ),
++        pytest.raises(AssertionError, match="requires mamba_cache_mode='align'"),
++    ):
++        scheduler.MooncakeStoreScheduler(vllm_config, kv_cache_config)
++
++
+ def _make_block_stored() -> BlockStored:
+     return BlockStored(
+         block_hashes=[b"hash"],
+@@ -97,6 +125,10 @@ def test_scheduler_role_initializes_store_scheduler_only():
+     mock_worker.assert_not_called()
+     assert connector.connector_scheduler is mock_scheduler.return_value
+     assert connector.connector_worker is None
++    block_pool = MagicMock()
++
++    connector.bind_gpu_block_pool(block_pool)
++    mock_scheduler.return_value.bind_gpu_block_pool.assert_called_once_with(block_pool)
+ 
+ 
+ def test_worker_methods_delegate_to_store_worker():
+@@ -241,9 +273,13 @@ def test_update_connector_output_and_take_events():
+ 
+     kv_events = mooncake_store_connector.MooncakeStoreKVEvents(num_workers=1)
+     kv_events.add_events([event])
+-    connector.update_connector_output(KVConnectorOutput(kv_cache_events=kv_events))
++    output = KVConnectorOutput(kv_cache_events=kv_events)
++    connector.update_connector_output(output)
+ 
+     assert connector._kv_cache_events is kv_events
++    connector.connector_scheduler.update_connector_output.assert_called_once_with(
++        output
++    )
+     assert list(connector.take_events()) == [event]
+     assert connector._kv_cache_events is None
+ 
+diff --git a/tests/v1/kv_connector/unit/test_mooncake_store_coordinator.py b/tests/v1/kv_connector/unit/test_mooncake_store_coordinator.py
+index 7460e45d1..d2551281d 100644
+--- a/tests/v1/kv_connector/unit/test_mooncake_store_coordinator.py
++++ b/tests/v1/kv_connector/unit/test_mooncake_store_coordinator.py
+@@ -451,6 +451,27 @@ def test_store_mask_retention_prefix_stable_as_aligned_length_grows():
+     assert longer[: len(shorter)] == shorter
+ 
+ 
++def test_store_mask_excludes_mamba_groups_lookup_unaffected():
++    """Align-mode mamba block tables are not append-only (interior states are
++    nulled/freed; speculative blocks relocate), so the positional normal save
++    must never cover mamba chunks — regardless of retention. Lookups still
++    probe mamba boundaries: their keys come from the pinned snapshot/CoW
++    hand-off path instead."""
++    groups = [
++        KVCacheGroupSpec(["L0"], _full(16)),
++        KVCacheGroupSpec(["L1"], _mamba_align(16)),
++    ]
++    coord = _make_coord(groups, hash_block_size=16)
++    masks = coord.store_mask(64)
++    assert masks[0] is None  # full attn stays dense
++    assert masks[1] == [False] * 4
++
++    coord = _make_coord(groups, hash_block_size=16, retention_interval=32)
++    assert coord.store_mask(64)[1] == [False] * 4
++
++    assert coord.lookup_mask(64)[1] is None
++
++
+ # ----- Eagle / MTP interaction with load_mask -----
+ 
+ 
+diff --git a/tests/v1/kv_connector/unit/test_mooncake_store_hma_e2e.py b/tests/v1/kv_connector/unit/test_mooncake_store_hma_e2e.py
+index 9593ea0b8..184115e5d 100644
+--- a/tests/v1/kv_connector/unit/test_mooncake_store_hma_e2e.py
++++ b/tests/v1/kv_connector/unit/test_mooncake_store_hma_e2e.py
+@@ -236,6 +236,7 @@ def test_e2e_swa_plus_full_save_then_lookup_hits():
+     )
+ 
+     hs = [BlockHash(bytes([i + 1]) * 4) for i in range(4)]
++    # 1-based: block 0 is the reserved null block and the save skips it.
+     save_req = ReqMeta(
+         req_id="r0",
+         token_len_chunk=64,
+@@ -441,10 +442,10 @@ def test_sub_block_partial_tail_offload_reads_cow_block():
+         block_hashes=hs,
+         can_save=True,
+         num_prompt_tokens=20,
+-        partial_tail_offloads=[(1, mamba_cow_block, 12)],
++        boundary_state_offloads=[(1, mamba_cow_block, 12)],
+     )
+ 
+-    send._maybe_offload_partial_tail(req)
++    send._maybe_offload_boundary_states(req)
+ 
+     # boundary = 12 // 4 * 4 = 12 -> keyed by hs[12 // 4 - 1] = hs[2].
+     partial_hash = hs[2]
+@@ -512,8 +513,8 @@ def test_offload_syncs_event_before_put():
+         block_hashes=hs,
+         can_save=True,
+         num_prompt_tokens=12,
+-        partial_tail_offloads=[(1, 7, 12)],
+         store_job_id=1,
++        boundary_state_offloads=[(1, 7, 12)],
+     )
+     req.current_event = event
+ 
+@@ -589,10 +590,10 @@ def test_sub_block_partial_tail_offload_covers_smaller_group_blocks():
+         block_hashes=hs,
+         can_save=True,
+         num_prompt_tokens=12,
+-        partial_tail_offloads=[(1, mamba_cow_block, 12)],
++        boundary_state_offloads=[(1, mamba_cow_block, 12)],
+     )
+ 
+-    send._maybe_offload_partial_tail(req)
++    send._maybe_offload_boundary_states(req)
+ 
+     # FA (block 4): full blocks ending at 4, 8 and 12, keyed by their normal
+     # block-end hashes; mamba (block 16): the partial boundary block under
+diff --git a/tests/v1/kv_connector/unit/test_mooncake_store_scheduler.py b/tests/v1/kv_connector/unit/test_mooncake_store_scheduler.py
+index 0be676454..9cdaa9666 100644
+--- a/tests/v1/kv_connector/unit/test_mooncake_store_scheduler.py
++++ b/tests/v1/kv_connector/unit/test_mooncake_store_scheduler.py
+@@ -16,6 +16,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler impor
+     MooncakeStoreScheduler,
+ )
+ from vllm.v1.core.block_pool import BlockPool
++from vllm.v1.core.sched.output import KVConnectorBlockState
+ 
+ 
+ def _make_bare_scheduler(
+@@ -47,9 +48,20 @@ def _make_bare_scheduler(
+     scheduler._num_workers = 1
+     scheduler._next_store_job_id = 0
+     scheduler._pinned_saves = {}
++    scheduler._boundary_state_group_ids = frozenset({1})
+     return scheduler
+ 
+ 
++def _make_connector_block_state(
++    block_ids: tuple[list[int], ...] | None = None,
++    offloads: list[tuple[int, int, int]] | None = None,
++) -> KVConnectorBlockState:
++    return KVConnectorBlockState(
++        block_ids={} if block_ids is None else {"req-0": block_ids},
++        boundary_state_offloads=({} if offloads is None else {"req-0": offloads}),
++    )
++
++
+ def _make_scheduler_output(*, scheduled_spec_tokens: list[int] | None):
+     return SimpleNamespace(
+         finished_req_ids=set(),
+@@ -65,6 +77,7 @@ def _make_scheduler_output(*, scheduled_spec_tokens: list[int] | None):
+         scheduled_spec_decode_tokens=(
+             {"req-0": scheduled_spec_tokens} if scheduled_spec_tokens else {}
+         ),
++        kv_connector_block_state=_make_connector_block_state(block_ids=([0, 1, 2],)),
+     )
+ 
+ 
+@@ -84,6 +97,7 @@ def _make_decode_scheduler_output(
+         ),
+         num_scheduled_tokens={"req-0": num_scheduled_tokens},
+         scheduled_spec_decode_tokens={},
++        kv_connector_block_state=_make_connector_block_state(block_ids=([0, 1, 2],)),
+     )
+ 
+ 
+@@ -109,6 +123,7 @@ def _make_new_scheduler_output() -> SimpleNamespace:
+         ),
+         num_scheduled_tokens={"req-0": 32},
+         scheduled_spec_decode_tokens={},
++        kv_connector_block_state=_make_connector_block_state(block_ids=([0, 1],)),
+     )
+ 
+ 
+@@ -491,6 +506,7 @@ def _make_resumed_scheduler_output(*, num_scheduled_tokens: int) -> SimpleNamesp
+         ),
+         num_scheduled_tokens={"req-0": num_scheduled_tokens},
+         scheduled_spec_decode_tokens={},
++        kv_connector_block_state=_make_connector_block_state(block_ids=([0, 1, 2],)),
+     )
+ 
+ 
+@@ -915,7 +931,10 @@ def _add_pending_partial_tail_request(
+         ),
+         num_scheduled_tokens={},
+         scheduled_spec_decode_tokens={},
+-        partial_tail_offloads={"req-0": [(1, 7, 12)]},
++        kv_connector_block_state=_make_connector_block_state(
++            block_ids=block_ids,
++            offloads=[(1, 7, 12)],
++        ),
+     )
+ 
+ 
+@@ -940,15 +959,262 @@ def test_pending_partial_tail_emits_offload_only_reqmeta():
+     assert req_meta.req_id == "req-0"
+     assert req_meta.can_save is True
+     assert req_meta.token_len_chunk == 0
+-    assert req_meta.partial_tail_offloads == [(1, 7, 12)]
++    assert req_meta.boundary_state_offloads == [(1, 7, 12)]
+     assert req_meta.num_prompt_tokens == 12
+     assert req_meta.block_ids == ([0],)
++    store_job_id = req_meta.store_job_id
++    assert scheduler._pinned_saves[store_job_id][0] == [7]
++    assert scheduler._gpu_block_pool.blocks[0].ref_cnt == 0
++    assert scheduler._gpu_block_pool.blocks[7].ref_cnt == 1
+     tracker = scheduler._request_trackers["req-0"]
+     assert tracker.num_saved_tokens == 0
+     assert tracker.has_pending_offload is True
+ 
+ 
+-def test_resumed_partial_tail_uses_handoff_boundary():
++def test_decode_boundary_state_offload_dropped_unclaimed():
++    # A hand-off past the prefill end can never complete a joint hybrid hit
++    # (every other group stops saving there), so it is neither transferred nor
++    # claimed — leaving the core free to release the block immediately.
++    scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
++    request = SimpleNamespace(
++        all_token_ids=list(range(24)),
++        block_hashes=[b"h0", b"h1", b"h2", b"h3", b"h4", b"h5"],
++        num_output_placeholders=0,
++        num_prompt_tokens=12,
++    )
++    scheduler._unfinished_requests["req-0"] = (request, ([0],))
++    scheduler._request_trackers["req-0"] = RequestTracker(
++        req_id="req-0",
++        token_len=12,
++        allocated_block_ids=([0],),
++        num_saved_tokens=12,
++        token_ids=list(range(12)),
++        prefill_end_tokens=12,
++    )
++
++    out = SimpleNamespace(
++        finished_req_ids=set(),
++        preempted_req_ids=set(),
++        scheduled_new_reqs=[],
++        scheduled_cached_reqs=SimpleNamespace(
++            req_ids=[],
++            new_block_ids=[],
++            num_computed_tokens=[],
++            resumed_req_ids=set(),
++        ),
++        num_scheduled_tokens={},
++        scheduled_spec_decode_tokens={},
++        # Boundary 16 is a decode boundary for a 12-token prefill.
++        kv_connector_block_state=_make_connector_block_state(offloads=[(1, 7, 16)]),
++    )
++
++    meta = scheduler.build_connector_meta(out)
++
++    assert meta.requests == []
++    assert scheduler._pinned_saves == {}
++    assert scheduler._gpu_block_pool.blocks[7].ref_cnt == 0
++    assert scheduler._request_trackers["req-0"].has_pending_offload is False
++
++
++def _register_offload_request(scheduler, *, prefill_end_tokens, num_prompt_tokens):
++    request = SimpleNamespace(
++        all_token_ids=list(range(64)),
++        block_hashes=[bytes([i]) for i in range(16)],
++        num_output_placeholders=0,
++        num_prompt_tokens=num_prompt_tokens,
++    )
++    scheduler._unfinished_requests["req-0"] = (request, ([0],))
++    scheduler._request_trackers["req-0"] = RequestTracker(
++        req_id="req-0",
++        token_len=prefill_end_tokens,
++        allocated_block_ids=([0],),
++        num_saved_tokens=prefill_end_tokens,
++        token_ids=list(range(prefill_end_tokens)),
++        prefill_end_tokens=prefill_end_tokens,
++    )
++
++
++def _make_offload_only_output(entries, block_ids=([0],)):
++    return SimpleNamespace(
++        finished_req_ids=set(),
++        preempted_req_ids=set(),
++        scheduled_new_reqs=[],
++        scheduled_cached_reqs=SimpleNamespace(
++            req_ids=[],
++            new_block_ids=[],
++            num_computed_tokens=[],
++            resumed_req_ids=set(),
++        ),
++        num_scheduled_tokens={},
++        scheduled_spec_decode_tokens={},
++        kv_connector_block_state=_make_connector_block_state(
++            block_ids=block_ids,
++            offloads=entries,
++        ),
++    )
++
++
++def test_resumed_prefill_claims_boundaries_past_prompt_length():
++    # A resumed request re-prefills its previously generated tokens, so its
++    # save window (`prefill_end_tokens`) extends past `num_prompt_tokens`.
++    # Boundaries in that range must still be claimed, or the mamba key would be
++    # missing for boundaries full attention does store and no joint hit could
++    # complete there.
++    scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
++    _register_offload_request(scheduler, prefill_end_tokens=20, num_prompt_tokens=12)
++    out = _make_offload_only_output([(1, 7, 16), (1, 9, 20), (1, 11, 24)])
++
++    meta = scheduler.build_connector_meta(out)
++
++    # 16 and 20 are inside the resumed prefill; 24 is past it.
++    assert meta.requests[0].boundary_state_offloads == [(1, 7, 16), (1, 9, 20)]
++    store_job_id = meta.requests[0].store_job_id
++    assert scheduler._pinned_saves[store_job_id][0] == [7, 9]
++
++
++def test_boundary_state_job_pins_exact_blocks_once():
++    scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
++    _register_offload_request(scheduler, prefill_end_tokens=64, num_prompt_tokens=64)
++    scheduler._request_trackers["req-0"].allocated_block_ids = ([7],)
++    out = _make_offload_only_output(
++        [(1, 7, 16), (1, 8, 32), (1, 9, 48)], block_ids=([7],)
++    )
++
++    meta = scheduler.build_connector_meta(out)
++
++    req_meta = meta.requests[0]
++    assert req_meta.boundary_state_offloads == [
++        (1, 7, 16),
++        (1, 8, 32),
++        (1, 9, 48),
++    ]
++    store_job_id = req_meta.store_job_id
++    assert scheduler._pinned_saves[store_job_id][0] == [7, 8, 9]
++    assert [scheduler._gpu_block_pool.blocks[i].ref_cnt for i in (7, 8, 9)] == [
++        1,
++        1,
++        1,
++    ]
++
++    scheduler.update_connector_output(_make_worker_output({store_job_id: 1}))
++    assert [scheduler._gpu_block_pool.blocks[i].ref_cnt for i in (7, 8, 9)] == [
++        0,
++        0,
++        0,
++    ]
++
++
++def test_store_job_pins_current_non_null_non_mamba_blocks():
++    scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
++    request = SimpleNamespace(
++        all_token_ids=list(range(48)),
++        block_hashes=[bytes([i]) for i in range(12)],
++        num_output_placeholders=0,
++    )
++    scheduler._unfinished_requests["req-0"] = (request, ([7, 2, 0], [21, 0, 22]))
++    scheduler._request_trackers["req-0"] = RequestTracker(
++        req_id="req-0",
++        token_len=44,
++        allocated_block_ids=([7, 2, 0], [21, 0, 22]),
++        num_saved_tokens=32,
++        token_ids=list(range(44)),
++        prefill_end_tokens=48,
++    )
++    stale_block_ids = ([7, 2, 0, 5], [21, 0, 22, 23])
++    current_block_ids = ([7, 2, 0, 6], [24, 0, 25, 26])
++    out = SimpleNamespace(
++        finished_req_ids=set(),
++        preempted_req_ids=set(),
++        scheduled_new_reqs=[],
++        scheduled_cached_reqs=SimpleNamespace(
++            req_ids=["req-0"],
++            new_block_ids=[([5], [23])],
++            num_computed_tokens=[44],
++            resumed_req_ids=set(),
++        ),
++        num_scheduled_tokens={"req-0": 4},
++        scheduled_spec_decode_tokens={},
++        kv_connector_block_state=_make_connector_block_state(
++            block_ids=current_block_ids,
++            offloads=[(1, 8, 16)],
++        ),
++    )
++    pool = scheduler._gpu_block_pool
++
++    meta = scheduler.build_connector_meta(out)
++
++    assert scheduler._request_trackers["req-0"].allocated_block_ids == stale_block_ids
++    req_meta = meta.requests[0]
++    assert req_meta.block_ids == current_block_ids
++    store_job_id = req_meta.store_job_id
++    assert scheduler._pinned_saves[store_job_id][0] == [8, 7, 2, 6]
++    assert pool.blocks[0].ref_cnt == 0
++    assert pool.blocks[5].ref_cnt == 0
++    assert [pool.blocks[i].ref_cnt for i in (21, 22, 23, 24, 25, 26)] == [
++        0,
++        0,
++        0,
++        0,
++        0,
++        0,
++    ]
++    assert [pool.blocks[i].ref_cnt for i in (8, 7, 2, 6)] == [1, 1, 1, 1]
++
++    scheduler.update_connector_output(_make_worker_output({store_job_id: 1}))
++
++    assert [pool.blocks[i].ref_cnt for i in (8, 7, 2, 6)] == [0, 0, 0, 0]
++
++
++def test_boundary_state_release_is_per_store_job():
++    scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
++    _register_offload_request(scheduler, prefill_end_tokens=64, num_prompt_tokens=64)
++    first = scheduler.build_connector_meta(_make_offload_only_output([(1, 7, 16)]))
++    second = scheduler.build_connector_meta(_make_offload_only_output([(1, 8, 32)]))
++    first_job_id = first.requests[0].store_job_id
++    second_job_id = second.requests[0].store_job_id
++
++    scheduler.update_connector_output(_make_worker_output({first_job_id: 1}))
++
++    assert scheduler._gpu_block_pool.blocks[7].ref_cnt == 0
++    assert scheduler._gpu_block_pool.blocks[8].ref_cnt == 1
++    assert first_job_id not in scheduler._pinned_saves
++    assert second_job_id in scheduler._pinned_saves
++
++
++def test_preemption_and_request_id_reuse_do_not_release_inflight_job():
++    scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
++    _register_offload_request(scheduler, prefill_end_tokens=64, num_prompt_tokens=64)
++    first = scheduler.build_connector_meta(_make_offload_only_output([(1, 7, 16)]))
++    first_job_id = first.requests[0].store_job_id
++
++    scheduler.build_connector_meta(_make_preemption_scheduler_output())
++    assert scheduler._gpu_block_pool.blocks[7].ref_cnt == 1
++    assert first_job_id in scheduler._pinned_saves
++
++    _register_offload_request(scheduler, prefill_end_tokens=64, num_prompt_tokens=64)
++    second = scheduler.build_connector_meta(_make_offload_only_output([(1, 8, 32)]))
++    second_job_id = second.requests[0].store_job_id
++    assert second.requests[0].boundary_state_offloads == [(1, 8, 32)]
++
++    scheduler.update_connector_output(_make_worker_output({first_job_id: 1}))
++    assert scheduler._gpu_block_pool.blocks[7].ref_cnt == 0
++    assert scheduler._gpu_block_pool.blocks[8].ref_cnt == 1
++    assert second_job_id in scheduler._pinned_saves
++
++
++def test_boundary_state_never_claimed_without_a_send_thread():
++    # A kv_consumer has no store job that can acknowledge the block reference.
++    scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
++    scheduler.kv_role = "kv_consumer"
++    _register_offload_request(scheduler, prefill_end_tokens=64, num_prompt_tokens=64)
++    out = _make_offload_only_output([(1, 7, 16)])
++
++    assert scheduler.build_connector_meta(out).requests == []
++    assert scheduler._pinned_saves == {}
++    assert scheduler._gpu_block_pool.blocks[7].ref_cnt == 0
++
++
++def test_resumed_partial_tail_uses_exact_boundary():
+     scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
+     # Resumption replays prompt + previously generated tokens.
+     out = _add_pending_partial_tail_request(
+@@ -961,7 +1227,7 @@ def test_resumed_partial_tail_uses_handoff_boundary():
+     meta = scheduler.build_connector_meta(out)
+ 
+     assert len(meta.requests) == 1
+-    assert meta.requests[0].partial_tail_offloads == [(1, 7, 12)]
++    assert meta.requests[0].boundary_state_offloads == [(1, 7, 12)]
+     # Ordinary metadata retains the full resumed prefill range.
+     assert meta.requests[0].num_prompt_tokens == 20
+     tracker = scheduler._request_trackers["req-0"]
+@@ -969,8 +1235,9 @@ def test_resumed_partial_tail_uses_handoff_boundary():
+     assert tracker.has_pending_offload is True
+ 
+ 
+-def test_resumed_partial_tail_attached_to_save_keeps_handoff_boundary():
++def test_resumed_partial_tail_attached_to_save_keeps_exact_boundary():
+     scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
++    scheduler._boundary_state_group_ids = frozenset({0})
+     request = SimpleNamespace(
+         all_token_ids=list(range(48)),
+         block_hashes=[b"h0", b"h1", b"h2"],
+@@ -987,13 +1254,13 @@ def test_resumed_partial_tail_attached_to_save_keeps_handoff_boundary():
+         prefill_end_tokens=48,
+     )
+     out = _make_scheduler_output(scheduled_spec_tokens=None)
+-    out.partial_tail_offloads = {"req-0": [(0, 7, 36)]}
++    out.kv_connector_block_state.boundary_state_offloads = {"req-0": [(0, 7, 36)]}
+ 
+     meta = scheduler.build_connector_meta(out)
+ 
+     assert len(meta.requests) == 1
+     assert meta.requests[0].can_save is True
+-    assert meta.requests[0].partial_tail_offloads == [(0, 7, 36)]
++    assert meta.requests[0].boundary_state_offloads == [(0, 7, 36)]
+     assert meta.requests[0].num_prompt_tokens == 48
+     # Ordinary saving still covers the full resumed prefill range.
+     tracker = scheduler._request_trackers["req-0"]
+@@ -1019,7 +1286,8 @@ def test_partial_tail_cow_block_is_referenced_for_the_job():
+     store_job_id = meta.requests[0].store_job_id
+     # It leads the list, as in `pop_blocks_for_free`, so that the reversed free
+     # puts it last in eviction priority.
+-    assert scheduler._pinned_saves[store_job_id][0] == [7, 0]
++    assert scheduler._pinned_saves[store_job_id][0] == [7]
++    assert pool.blocks[0].ref_cnt == 0
+     assert pool.blocks[7].ref_cnt == 1
+ 
+     scheduler.update_connector_output(_make_worker_output({store_job_id: 1}))
+diff --git a/tests/v1/kv_connector/unit/test_mooncake_store_worker.py b/tests/v1/kv_connector/unit/test_mooncake_store_worker.py
+index 1bf1d82d9..7bfc66666 100644
+--- a/tests/v1/kv_connector/unit/test_mooncake_store_worker.py
++++ b/tests/v1/kv_connector/unit/test_mooncake_store_worker.py
+@@ -181,6 +181,7 @@ def _run_store_req(thread, req_meta: ReqMeta) -> None:
+ 
+ 
+ def _make_store_req(req_id: str, block_hashes: list[bytes]) -> ReqMeta:
++    # 1-based: block 0 is the reserved null block and the save skips it.
+     return ReqMeta(
+         req_id=req_id,
+         token_len_chunk=32,
+@@ -651,6 +652,7 @@ def _make_partial_tail_send_thread(
+         enable_partial_hash_hits=True,
+         hash_block_size=4,
+         lcm_block_size=16,
++        mamba_group_ids={1},
+     )
+     db = ChunkedTokenDatabase(
+         KeyMetadata("test-model", 0, 0, 0, 0),
+@@ -659,10 +661,18 @@ def _make_partial_tail_send_thread(
+     )
+     db.set_kv_caches_base_addr([0x1000])
+     db.set_block_len([256])
++    # Group 1 models the mamba "align" group the hand-offs reference.
++    db_mamba = ChunkedTokenDatabase(
++        KeyMetadata("test-model", 0, 0, 0, 0, group_id=1),
++        block_size=16,
++        hash_block_size=4,
++    )
++    db_mamba.set_kv_caches_base_addr([0x2000])
++    db_mamba.set_block_len([256])
+     return _make_store_sending_thread(
+         store,
+         coord=coord,
+-        token_databases=[db],
++        token_databases=[db, db_mamba],
+         replicate_config=replicate_config,
+         enable_group_semantics=enable_group_semantics,
+         supports_group_ids=supports_group_ids,
+@@ -673,20 +683,20 @@ def _make_partial_tail_req(block_ids: list[int]) -> ReqMeta:
+     return ReqMeta(
+         req_id="req-a",
+         token_len_chunk=0,
+-        block_ids=(block_ids,),
++        block_ids=(block_ids, [1]),
+         block_hashes=[b"a0", b"a1", b"a2"],
+         can_save=True,
+-        partial_tail_offloads=[(1, 7, 12)],
++        boundary_state_offloads=[(1, 7, 12)],
+     )
+ 
+ 
+ def test_partial_tail_offload_skips_null_source_blocks():
+     store = MagicMock()
+     store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+-    store.batch_put_from_multi_buffers.return_value = [256, 256]
++    store.batch_put_from_multi_buffers.side_effect = lambda keys, *a: [256] * len(keys)
+     thread = _make_partial_tail_send_thread(store)
+ 
+-    assert thread._maybe_offload_partial_tail(_make_partial_tail_req([0, 2, 3]))
++    assert thread._maybe_offload_boundary_states(_make_partial_tail_req([0, 2, 3]))
+ 
+     keys, addrs, _sizes, _replicate_config = (
+         store.batch_put_from_multi_buffers.call_args.args
+@@ -694,15 +704,21 @@ def test_partial_tail_offload_skips_null_source_blocks():
+     assert keys == [
+         "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6131",
+         "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6132",
++        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:1@6132",
++    ]
++    # FA reads blocks 2 and 3 (block 0 is null and skipped); the mamba
++    # boundary block reads the core-provided CoW block 7, not block_ids.
++    assert addrs == [
++        [0x1000 + 2 * 256],
++        [0x1000 + 3 * 256],
++        [0x2000 + 7 * 256],
+     ]
+-    assert addrs == [[0x1000 + 2 * 256], [0x1000 + 3 * 256]]
+ 
+ 
+ def test_store_sending_thread_skips_null_sparse_group_blocks():
+     from vllm.v1.kv_cache_interface import (
+         FullAttentionSpec,
+         KVCacheGroupSpec,
+-        MambaSpec,
+     )
+ 
+     store = MagicMock()
+@@ -711,16 +727,11 @@ def test_store_sending_thread_skips_null_sparse_group_blocks():
+         lambda keys, addrs, sizes, replicate_config: [256] * len(keys)
+     )
+     full = FullAttentionSpec(block_size=16, num_kv_heads=8, head_size=64, dtype=None)
+-    mamba = MambaSpec(
+-        block_size=16,
+-        shapes=((1, 1),),
+-        dtypes=(torch.float32,),
+-        mamba_cache_mode="align",
+-    )
++    sparse = FullAttentionSpec(block_size=16, num_kv_heads=8, head_size=64, dtype=None)
+     coord = mooncake_store_worker.MooncakeStoreCoordinator(
+         [
+             KVCacheGroupSpec(["full"], full),
+-            KVCacheGroupSpec(["mamba"], mamba),
++            KVCacheGroupSpec(["sparse"], sparse),
+         ],
+         scheduler_block_size=16,
+         hash_block_size=16,
+@@ -732,17 +743,17 @@ def test_store_sending_thread_skips_null_sparse_group_blocks():
+     )
+     db_full.set_kv_caches_base_addr([0x1000])
+     db_full.set_block_len([256])
+-    db_mamba = ChunkedTokenDatabase(
++    db_sparse = ChunkedTokenDatabase(
+         KeyMetadata("test-model", 0, 0, 0, 0, group_id=1),
+         block_size=16,
+     )
+-    db_mamba.set_kv_caches_base_addr([0x2000])
+-    db_mamba.set_block_len([512])
++    db_sparse.set_kv_caches_base_addr([0x2000])
++    db_sparse.set_block_len([512])
+ 
+     thread = _make_store_sending_thread(
+         store,
+         coord=coord,
+-        token_databases=[db_full, db_mamba],
++        token_databases=[db_full, db_sparse],
+     )
+     _run_store_req(
+         thread,
+@@ -756,15 +767,86 @@ def test_store_sending_thread_skips_null_sparse_group_blocks():
+     )
+ 
+     keys, addrs, _, _ = store.batch_put_from_multi_buffers.call_args.args
+-    mamba_keys = [key for key in keys if "@group:1" in key]
+-    assert [key.rsplit("@", 1)[-1] for key in mamba_keys] == [b"a1".hex()]
++    sparse_keys = [key for key in keys if "@group:1" in key]
++    assert [key.rsplit("@", 1)[-1] for key in sparse_keys] == [b"a1".hex()]
+     assert all(addr[0] >= 0x2000 for key, addr in zip(keys, addrs) if "@group:1" in key)
+ 
+ 
++def test_partial_tail_offload_skips_cap_omitted_mamba_group():
++    """A Mamba group omitted by the handoff cap must not fall back to the
++    connector's positional block table."""
++    from vllm.v1.kv_cache_interface import (
++        FullAttentionSpec,
++        KVCacheGroupSpec,
++        MambaSpec,
++    )
++
++    store = MagicMock()
++    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
++    store.batch_put_from_multi_buffers.side_effect = lambda keys, *a: [256] * len(keys)
++
++    full_spec = FullAttentionSpec(
++        block_size=4, num_kv_heads=8, head_size=64, dtype=torch.float32
++    )
++    mamba_spec = MambaSpec(
++        block_size=16,
++        shapes=((1, 1),),
++        dtypes=(torch.float32,),
++        mamba_cache_mode="align",
++    )
++    coord = mooncake_store_worker.MooncakeStoreCoordinator(
++        [
++            KVCacheGroupSpec(["full"], full_spec),
++            KVCacheGroupSpec(["mamba-1"], mamba_spec),
++            KVCacheGroupSpec(["mamba-2"], mamba_spec),
++        ],
++        scheduler_block_size=16,
++        hash_block_size=4,
++    )
++
++    def make_db(group_id: int, block_size: int, base_addr: int):
++        db = ChunkedTokenDatabase(
++            KeyMetadata("test-model", 0, 0, 0, 0, group_id=group_id),
++            block_size=block_size,
++            hash_block_size=4,
++        )
++        db.set_kv_caches_base_addr([base_addr])
++        db.set_block_len([256])
++        return db
++
++    db_full = make_db(0, 4, 0x1000)
++    db_mamba_1 = make_db(1, 16, 0x2000)
++    db_mamba_2 = make_db(2, 16, 0x3000)
++    thread = _make_store_sending_thread(
++        store,
++        coord=coord,
++        token_databases=[db_full, db_mamba_1, db_mamba_2],
++    )
++
++    req = ReqMeta(
++        req_id="req-a",
++        token_len_chunk=0,
++        block_ids=([1, 2, 3], [5], [9]),
++        block_hashes=[b"a0", b"a1", b"a2"],
++        can_save=True,
++        # The scheduler accepted group 1 and omitted group 2 at boundary 12.
++        boundary_state_offloads=[(1, 7, 12)],
++    )
++    assert thread._maybe_offload_boundary_states(req)
++
++    keys, addrs, _sizes, _replicate_config = (
++        store.batch_put_from_multi_buffers.call_args.args
++    )
++    puts = list(zip(keys, addrs, strict=True))
++    boundary_hash = BlockHash(b"a2")
++    assert (db_mamba_1.key_for(boundary_hash), [0x2000 + 7 * 256]) in puts
++    assert (db_mamba_2.key_for(boundary_hash), [0x3000 + 9 * 256]) not in puts
++
++
+ def test_partial_tail_offload_replaces_stale_group_ids_after_filtering():
+     store = MagicMock()
+-    store.batch_is_exist.return_value = [1, 0, 0]
+-    store.batch_put_from_multi_buffers.return_value = [256, 256]
++    store.batch_is_exist.return_value = [1, 0, 0, 0]
++    store.batch_put_from_multi_buffers.return_value = [256, 256, 256]
+     replicate_config = SimpleNamespace(group_ids=["stale"])
+     thread = _make_partial_tail_send_thread(
+         store,
+@@ -773,17 +855,19 @@ def test_partial_tail_offload_replaces_stale_group_ids_after_filtering():
+         supports_group_ids=True,
+     )
+ 
+-    assert thread._maybe_offload_partial_tail(_make_partial_tail_req([1, 2, 3]))
++    assert thread._maybe_offload_boundary_states(_make_partial_tail_req([1, 2, 3]))
+ 
+     keys, _addrs, _sizes, config = store.batch_put_from_multi_buffers.call_args.args
+     assert keys == [
+         "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6131",
+         "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6132",
++        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:1@6132",
+     ]
+     assert config is replicate_config
+     assert config.group_ids == [
+         "vllm-mooncake-store:test-model@6131",
+         "vllm-mooncake-store:test-model@6132",
++        "vllm-mooncake-store:test-model@6132",
+     ]
+ 
+ 
+@@ -815,6 +899,165 @@ def test_partial_tail_put_failure_activates_pressure_gate():
+     assert store.batch_put_from_multi_buffers.call_count == 1
+ 
+ 
++def test_normal_save_excludes_mamba_group_and_null_blocks():
++    """The positional normal save must never cover mamba chunks (align-mode
++    block tables are not append-only) and must skip chunks whose block is the
++    reserved null block, for any group."""
++    from vllm.v1.kv_cache_interface import (
++        FullAttentionSpec,
++        KVCacheGroupSpec,
++        MambaSpec,
++    )
++
++    store = MagicMock()
++    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
++    store.batch_put_from_multi_buffers.side_effect = lambda keys, *a: [256] * len(keys)
++
++    full_spec = FullAttentionSpec(
++        block_size=16, num_kv_heads=8, head_size=64, dtype=None
++    )
++    mamba_spec = MambaSpec(
++        block_size=16,
++        shapes=((1, 1),),
++        dtypes=(torch.float32,),
++        mamba_cache_mode="align",
++    )
++    coord = mooncake_store_worker.MooncakeStoreCoordinator(
++        [KVCacheGroupSpec(["L0"], full_spec), KVCacheGroupSpec(["L1"], mamba_spec)],
++        scheduler_block_size=16,
++        hash_block_size=16,
++    )
++    db_full = ChunkedTokenDatabase(
++        KeyMetadata("test-model", 0, 0, 0, 0, group_id=0), block_size=16
++    )
++    db_full.set_kv_caches_base_addr([0x1000])
++    db_full.set_block_len([256])
++    db_mamba = ChunkedTokenDatabase(
++        KeyMetadata("test-model", 0, 0, 0, 0, group_id=1), block_size=16
++    )
++    db_mamba.set_kv_caches_base_addr([0x2000])
++    db_mamba.set_block_len([256])
++    thread = _make_store_sending_thread(
++        store, coord=coord, token_databases=[db_full, db_mamba]
++    )
++
++    _run_store_req(
++        thread,
++        ReqMeta(
++            req_id="r0",
++            token_len_chunk=64,
++            # FA has a null at chunk 1; the mamba table is align-mode shaped
++            # (interior nulls + one state block) and must not be read at all.
++            block_ids=([1, 0, 3, 4], [0, 0, 0, 9]),
++            block_hashes=[b"a0", b"a1", b"a2", b"a3"],
++            can_save=True,
++        ),
++    )
++
++    keys, addrs, _sizes, _ = store.batch_put_from_multi_buffers.call_args.args
++    assert all("@group:0@" in k for k in keys)
++    assert [k.rsplit("@", 1)[-1] for k in keys] == ["6130", "6132", "6133"]
++    assert addrs == [[0x1000 + 256], [0x1000 + 3 * 256], [0x1000 + 4 * 256]]
++
++
++def test_block_aligned_snapshot_offload_uses_provided_block():
++    """A block-aligned hand-off (sparse-retention mamba checkpoint) uploads
++    exactly the core-pinned block under the boundary-end hash key; the
++    positional block table entry for that chunk must be ignored."""
++    store = MagicMock()
++    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
++    store.batch_put_from_multi_buffers.side_effect = lambda keys, *a: [256] * len(keys)
++    thread = _make_partial_tail_send_thread(store)
++
++    hs = [bytes([i + 1]) * 4 for i in range(8)]  # 8 hash units = 32 tokens
++    req = ReqMeta(
++        req_id="req-a",
++        token_len_chunk=0,
++        block_ids=([1, 2, 3], [5]),
++        block_hashes=hs,
++        can_save=True,
++        boundary_state_offloads=[(1, 7, 32)],
++    )
++    assert thread._maybe_offload_boundary_states(req)
++
++    keys, addrs, _sizes, _ = store.batch_put_from_multi_buffers.call_args.args
++    # boundary 32 is block-aligned for the mamba group (block 16): one key,
++    # keyed by hs[32 // 4 - 1], read from the handed-off block 7 — not from
++    # block_ids[1] and with no FA gap coverage.
++    assert keys == [thread.token_databases[1].key_for(BlockHash(hs[7]))]
++    assert addrs == [[0x2000 + 7 * 256]]
++
++
++def test_mixed_snapshot_and_sub_block_offloads():
++    """A retention snapshot and the prompt-end sub-block CoW tail can arrive
++    in one hand-off; the sub-block path covers FA gap blocks but reads the
++    mamba boundary only from the CoW block, never positionally."""
++    store = MagicMock()
++    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
++    store.batch_put_from_multi_buffers.side_effect = lambda keys, *a: [256] * len(keys)
++    thread = _make_partial_tail_send_thread(store)
++
++    hs = [bytes([i + 1]) * 4 for i in range(11)]  # 11 hash units = 44 tokens
++    req = ReqMeta(
++        req_id="req-a",
++        token_len_chunk=0,
++        block_ids=([1, 2, 3], [0, 0, 0]),
++        block_hashes=hs,
++        can_save=True,
++        boundary_state_offloads=[(1, 9, 32), (1, 7, 44)],
++    )
++    assert thread._maybe_offload_boundary_states(req)
++
++    keys, addrs, _sizes, _ = store.batch_put_from_multi_buffers.call_args.args
++    db_full, db_mamba = thread.token_databases
++    assert keys == [
++        # Aligned snapshot: boundary 32 from the handed-off block 9.
++        db_mamba.key_for(BlockHash(hs[7])),
++        # Sub-block boundary 44: FA gap blocks ending at 4, 8, 12.
++        db_full.key_for(BlockHash(hs[0])),
++        db_full.key_for(BlockHash(hs[1])),
++        db_full.key_for(BlockHash(hs[2])),
++        # Mamba boundary block from the CoW hand-off (block 7).
++        db_mamba.key_for(BlockHash(hs[10])),
++    ]
++    assert addrs == [
++        [0x2000 + 9 * 256],
++        [0x1000 + 1 * 256],
++        [0x1000 + 2 * 256],
++        [0x1000 + 3 * 256],
++        [0x2000 + 7 * 256],
++    ]
++
++
++def test_snapshot_offload_skips_null_handoff_block():
++    """A hand-off the core could not materialize (null block) carries no
++    committed state; persisting it would poison the boundary key."""
++    store = MagicMock()
++    thread = _make_partial_tail_send_thread(store)
++
++    hs = [bytes([i + 1]) * 4 for i in range(8)]
++    assert thread._maybe_offload_boundary_states(
++        ReqMeta(
++            req_id="req-a",
++            token_len_chunk=0,
++            block_ids=([1, 2, 3], [5]),
++            block_hashes=hs,
++            can_save=True,
++            boundary_state_offloads=[(1, NULL_BLOCK_ID, 32)],
++        )
++    )
++    store.batch_is_exist.assert_not_called()
++    store.batch_put_from_multi_buffers.assert_not_called()
++
++
++def test_worker_meta_is_absent_before_any_completed_job():
++    send_thread = _make_partial_tail_send_thread(MagicMock())
++    store_worker = object.__new__(mooncake_store_worker.MooncakeStoreWorker)
++    store_worker.kv_send_thread = send_thread
++
++    assert store_worker.build_connector_worker_meta() is None
++
++
+ def test_store_sending_thread_delta_start_rank_saves_second_local_chunk():
+     store = MagicMock()
+     store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+diff --git a/tests/v1/kv_connector/unit/test_offloading_connector.py b/tests/v1/kv_connector/unit/test_offloading_connector.py
+index 404478f78..08ef47699 100644
+--- a/tests/v1/kv_connector/unit/test_offloading_connector.py
++++ b/tests/v1/kv_connector/unit/test_offloading_connector.py
+@@ -212,12 +212,21 @@ def _accuracy_test(llm: LLM, subscriber: MockSubscriber | None):
+     if subscriber is not None:
+         subscriber.get_new_cpu_stored_events()
+ 
+-    # Pad prompt so its token count is a multiple of cpu_block_size.
+-    # Use the tokenizer directly to avoid expensive llm.generate() calls.
++    # Align the reusable prefix; the final token must be recomputed for logits.
+     tokenizer = llm.get_tokenizer()
+-    prompt = "Let's count to 10. One, two, three, four,"
+-    while len(tokenizer.encode(prompt)) % cpu_block_size != 0:
+-        prompt = ". " + prompt
++    prompt_token_ids = tokenizer.encode("Let's count to 10. One, two, three, four,")
++    reusable_prefix = prompt_token_ids[:-1]
++    final_token = prompt_token_ids[-1:]
++
++    [padding_token_id] = tokenizer.encode(".", add_special_tokens=False)
++    padding = [padding_token_id] * (-len(reusable_prefix) % cpu_block_size)
++    insert_at = int(reusable_prefix[0] == tokenizer.bos_token_id)
++    reusable_prefix[insert_at:insert_at] = padding
++    assert len(reusable_prefix) % cpu_block_size == 0
++
++    prompt = TokensPrompt(
++        prompt_token_ids=reusable_prefix + final_token,
++    )
+ 
+     # Seed the CPU cache with the prompt.
+     llm.generate(prompt, sampling_params, use_tqdm=False)
+diff --git a/tests/v1/kv_connector/unit/test_scheduler_kv_connector_override.py b/tests/v1/kv_connector/unit/test_scheduler_kv_connector_override.py
+index 164d9025d..6b4d2f894 100644
+--- a/tests/v1/kv_connector/unit/test_scheduler_kv_connector_override.py
++++ b/tests/v1/kv_connector/unit/test_scheduler_kv_connector_override.py
+@@ -22,8 +22,13 @@ from vllm.v1.request import Request
+ 
+ 
+ class DummyConnectorMetadata(KVConnectorMetadata):
+-    def __init__(self, block_hashes_by_req: dict[str, list[BlockHash]]):
++    def __init__(
++        self,
++        block_hashes_by_req: dict[str, list[BlockHash]],
++        block_ids_by_req: dict[str, tuple[list[int], ...]],
++    ):
+         self.block_hashes_by_req = block_hashes_by_req
++        self.block_ids_by_req = block_ids_by_req
+ 
+ 
+ class DummyKVConnector(KVConnectorBase_V1):
+@@ -47,8 +52,12 @@ class DummyKVConnector(KVConnectorBase_V1):
+         assert block_hashes_by_req is not None, (
+             "DummyKVConnector expected 'block_hashes_by_req' on scheduler_output"
+         )
++        block_state = scheduler_output.kv_connector_block_state
++        assert block_state is not None
++        block_ids_by_req = block_state.block_ids
+         return DummyConnectorMetadata(
+             block_hashes_by_req=block_hashes_by_req,
++            block_ids_by_req=block_ids_by_req,
+         )
+ 
+     def start_load_kv(self, kv_caches, finished_req_ids):
+@@ -129,3 +138,9 @@ def test_connector_receives_block_hashes(_load_plugin):
+             num_tokens // block_size
+         )
+         assert meta.block_hashes_by_req[req.request_id] == req.block_hashes
++
++    expected_block_ids = {
++        req.req_id: req.block_ids for req in output.scheduled_new_reqs
++    }
++    assert meta.block_ids_by_req == expected_block_ids
++    assert output.kv_connector_block_state is None
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+index 067d76b42..c2f0e6640 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+@@ -87,6 +87,11 @@ class MooncakeStoreCoordinator:
+             for g in kv_cache_groups
+         ), "scheduler_block_size must be a multiple of each group's block_size"
+         self.kv_cache_groups = kv_cache_groups
++        self.mamba_group_ids = {
++            group_id
++            for group_id, group in enumerate(kv_cache_groups)
++            if isinstance(_unwrap_spec(group.kv_cache_spec), MambaSpec)
++        }
+         self.hash_block_size = hash_block_size
+         self.lcm_block_size = scheduler_block_size
+         self.enable_partial_hash_hits = partial_hash_hits_enabled(
+@@ -205,12 +210,23 @@ class MooncakeStoreCoordinator:
+ 
+         Reuses the engine's ``SingleTypeKVCacheManager.reachable_block_mask``
+         so the store retains exactly the blocks the local prefix cache would.
++
++        Mamba groups are always all-False: the normal save resolves blocks
++        positionally from the connector's append-only block-ID snapshot, but
++        an align-mode mamba block table is not append-only (interior state
++        blocks are nulled/freed, and speculative decoding relocates the spec
++        blocks in place), so a positional read may hit a null, freed, or live
++        speculative-state block and persist wrong bytes under a valid prefix
++        hash. Mamba state is persisted only through the connector-pinned exact
++        block hand-off path
++        (``SchedulerOutput.kv_connector_block_state.boundary_state_offloads``).
+         """
+         return self._reachable_masks(
+             aligned_token_len,
+             start_token,
+             retention_interval=self.retention_interval,
+             num_prompt_tokens=num_prompt_tokens,
++            exclude_mamba=True,
+         )
+ 
+     def lookup_mask(
+@@ -237,6 +253,7 @@ class MooncakeStoreCoordinator:
+         *,
+         retention_interval: int | None,
+         num_prompt_tokens: int | None,
++        exclude_mamba: bool = False,
+     ) -> tuple[list[bool] | None, ...]:
+         mask_alignment = (
+             self.hash_block_size
+@@ -252,6 +269,9 @@ class MooncakeStoreCoordinator:
+             spec = _unwrap_spec(g.kv_cache_spec)
+             end_chunk = aligned_token_len // spec.block_size
+             start_chunk = min(end_chunk, max(0, cdiv(start_token, spec.block_size)))
++            if exclude_mamba and isinstance(spec, MambaSpec):
++                masks.append([False] * (end_chunk - start_chunk))
++                continue
+             manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
+             assert manager_cls is not None
+             use_eagle = g_idx in self.eagle_group_ids
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
+index d8ed4dee0..34b7ac565 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
+@@ -406,11 +406,11 @@ class ReqMeta:
+     # serve that purpose: it is reused once a preempted request resumes, so it
+     # would release the wrong job's blocks.
+     store_job_id: int | None = None
+-    # Core-provided per-mamba-group
+-    # (group_id, cow_block_id, boundary_tokens) for this request's partial tail.
+-    # Present only on the producer's CoW step; drives the connector's offload
+-    # (the FA group's block is derived from block_ids and boundary_tokens).
+-    partial_tail_offloads: list[tuple[int, int, int]] | None = None
++    # Core-provided (group_id, block_id, boundary_tokens) mamba "align"
++    # boundary states. A block-aligned entry is a committed boundary snapshot;
++    # a non-aligned entry is the sub-block CoW tail. The store-job reference
++    # keeps each exact block alive until every worker rank finishes the job.
++    boundary_state_offloads: list[tuple[int, int, int]] | None = None
+ 
+     @staticmethod
+     def from_request_tracker(
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
+index 566bcc14d..bc5fdcd5d 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
+@@ -23,11 +23,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (
+     LookupKeyClient,
+ )
+ from vllm.logger import init_logger
++from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+ from vllm.v1.core.block_pool import BlockPool
+ from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+ from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+ from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
+-from vllm.v1.kv_cache_interface import KVCacheConfig
++from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+ from vllm.v1.outputs import KVConnectorOutput
+ from vllm.v1.request import Request
+ 
+@@ -80,12 +81,15 @@ class MooncakeStoreScheduler:
+             self._hash_block_size,
+             vllm_config.parallel_config.decode_context_parallel_size,
+         )
+-
+-        # Per-request state
+-        self.load_specs: dict[str, LoadSpec] = {}  # to be loaded
+-        self._request_trackers: dict[str, RequestTracker] = {}  # scheduled new requests
+-        self._unfinished_requests: dict[str, tuple[Request, tuple[list[int], ...]]] = {}
+-        self._unfinished_request_ids: set[str] = set()
++        mamba_groups = {
++            group_id: group.kv_cache_spec
++            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
++            if isinstance(group.kv_cache_spec, MambaSpec)
++        }
++        assert all(
++            spec.mamba_cache_mode == "align" for spec in mamba_groups.values()
++        ), "MooncakeStoreScheduler requires mamba_cache_mode='align'"
++        self._boundary_state_group_ids = frozenset(mamba_groups)
+ 
+         self._gpu_block_pool: BlockPool | None = None
+         self._num_workers = vllm_config.parallel_config.world_size
+@@ -93,6 +97,12 @@ class MooncakeStoreScheduler:
+         # store_job_id -> (referenced block ids, ranks yet to report completion)
+         self._pinned_saves: dict[int, tuple[list[int], int]] = {}
+ 
++        # Per-request state
++        self.load_specs: dict[str, LoadSpec] = {}  # to be loaded
++        self._request_trackers: dict[str, RequestTracker] = {}  # scheduled new requests
++        self._unfinished_requests: dict[str, tuple[Request, tuple[list[int], ...]]] = {}
++        self._unfinished_request_ids: set[str] = set()
++
+     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
+         self._gpu_block_pool = gpu_block_pool
+ 
+@@ -381,47 +391,41 @@ class MooncakeStoreScheduler:
+                 if req_meta is not None:
+                     meta.add_request(req_meta)
+ 
+-        # Flush partial-tail offloads in the step they arrive: the CoW copy is
+-        # enqueued before the connector event records, so this step's event
+-        # fences the cow block. Ride the request's save meta when present, else
+-        # emit an offload-only ReqMeta (token_len_chunk=0 skips the normal
+-        # save; can_save=True takes the normal enqueue path).
+-        step_partial_tails = getattr(scheduler_output, "partial_tail_offloads", None)
+-        if step_partial_tails and not is_consumer:
+-            pending = dict(step_partial_tails)
+-            for req_meta in meta.requests:
+-                if req_meta.can_save:
+-                    groups = pending.pop(req_meta.req_id, None)
+-                    if groups:
+-                        req_meta.partial_tail_offloads = groups
+-                        tracker = self._request_trackers.get(req_meta.req_id)
+-                        if tracker is not None:
+-                            tracker.has_pending_offload = True
+-            for req_id, groups in pending.items():
+-                tracker = self._request_trackers.get(req_id)
+-                req_tuple = self._unfinished_requests.get(req_id)
+-                if tracker is None or req_tuple is None:
+-                    # Request finished/preempted within this step; its blocks
+-                    # are going away, so the offload is conservatively dropped.
+-                    logger.debug("Dropping partial-tail offload for request %s", req_id)
+-                    continue
+-                assert len({boundary for _, _, boundary in groups}) == 1
+-                tracker.has_pending_offload = True
+-                meta.add_request(
+-                    ReqMeta(
+-                        req_id=req_id,
+-                        token_len_chunk=0,
+-                        block_ids=tracker.allocated_block_ids,
+-                        block_hashes=req_tuple[0].block_hashes,
+-                        can_save=True,
+-                        num_prompt_tokens=tracker.prefill_end_tokens,
+-                        partial_tail_offloads=groups,
+-                    )
+-                )
++        block_state = getattr(scheduler_output, "kv_connector_block_state", None)
++        if (
++            block_state is not None
++            and block_state.boundary_state_offloads
++            and not is_consumer
++        ):
++            self._handle_boundary_state_offloads(
++                block_state.boundary_state_offloads, meta
++            )
+ 
++        self._apply_current_save_block_ids(meta, scheduler_output)
+         self._reference_save_blocks(meta)
+         return meta
+ 
++    def _apply_current_save_block_ids(
++        self,
++        meta: MooncakeStoreConnectorMetadata,
++        scheduler_output: SchedulerOutput,
++    ) -> None:
++        """Replace append-only mirrors with the core's current block tables."""
++        save_metas = [req_meta for req_meta in meta.requests if req_meta.can_save]
++        if not save_metas:
++            return
++
++        block_state = scheduler_output.kv_connector_block_state
++        assert block_state is not None, (
++            "Current block tables are required for Mooncake store jobs"
++        )
++        for req_meta in save_metas:
++            block_ids = block_state.block_ids.get(req_meta.req_id)
++            assert block_ids is not None, (
++                f"Missing current block table for store request {req_meta.req_id}"
++            )
++            req_meta.block_ids = block_ids
++
+     def _reference_save_blocks(self, meta: MooncakeStoreConnectorMetadata) -> None:
+         """Take a GPU block reference for every store job this step emits.
+ 
+@@ -439,21 +443,86 @@ class MooncakeStoreScheduler:
+             req_meta.store_job_id = store_job_id = self._next_store_job_id
+             self._next_store_job_id += 1
+             block_ids: list[int] = []
+-            if req_meta.partial_tail_offloads:
+-                # A partial-tail CoW block is deliberately kept out of the
+-                # request's block table, so it is absent from `block_ids` even
+-                # though the worker DMAs out of it just as asynchronously.
+-                # It leads the list, as in `pop_blocks_for_free`.
+-                block_ids += [bid for _, bid, _ in req_meta.partial_tail_offloads]
++            if req_meta.boundary_state_offloads:
++                block_ids.extend(
++                    block_id for _, block_id, _ in req_meta.boundary_state_offloads
++                )
++            assert NULL_BLOCK_ID not in block_ids, (
++                "A null block cannot back a boundary-state offload"
++            )
+             # Every allocated block is referenced, not just the ones covering
+             # this job's token range: a rank resumes from its own last
+             # successful offset, which lags the scheduler's whenever a save was
+             # skipped or failed, so it may read anywhere below the range.
+-            block_ids += [bid for group in req_meta.block_ids for bid in group]
++            block_ids.extend(
++                block_id
++                for group_id, group in enumerate(req_meta.block_ids)
++                if group_id not in self._boundary_state_group_ids
++                for block_id in group
++                if block_id != NULL_BLOCK_ID
++            )
++            # An aligned boundary block may also be present in the request's
++            # block table. Take and release exactly one reference per block.
++            block_ids = list(dict.fromkeys(block_ids))
++            assert NULL_BLOCK_ID not in block_ids
+             if not block_ids:
+                 continue
+             self._pinned_saves[store_job_id] = (block_ids, self._num_workers)
+-            pool.touch([pool.blocks[bid] for bid in block_ids])
++            pool.touch([pool.blocks[block_id] for block_id in block_ids])
++
++    def _handle_boundary_state_offloads(
++        self,
++        offloads: dict[str, list[tuple[int, int, int]]],
++        meta: MooncakeStoreConnectorMetadata,
++    ) -> None:
++        """Attach exact boundary-state blocks to store jobs for this step.
++
++        Flushed in the step they arrive: the CoW copy is enqueued before the
++        connector event records, so this step's event fences the exact block.
++        Entries ride the request's save meta when present, else an
++        offload-only ReqMeta (``token_len_chunk=0`` skips the normal save,
++        ``can_save=True`` takes the normal enqueue and store-job pinning path).
++        """
++        save_metas = {m.req_id: m for m in meta.requests if m.can_save}
++        for req_id, entries in offloads.items():
++            tracker = self._request_trackers.get(req_id)
++            req_tuple = self._unfinished_requests.get(req_id)
++            if tracker is None or req_tuple is None:
++                # Request finished/preempted within this step; its blocks are
++                # going away, so the offload is conservatively dropped.
++                logger.debug("Dropping boundary-state offload for request %s", req_id)
++                continue
++            accepted: list[tuple[int, int, int]] = []
++            for group_id, block_id, boundary_tokens in entries:
++                # Every other group stops saving at the end of this prefill, so
++                # a mamba-only key past it can never complete a joint hybrid
++                # hit. `prefill_end_tokens` — not the original prompt length —
++                # is the boundary: a resumed request re-prefills and re-saves
++                # its previously generated tokens for every group.
++                if boundary_tokens > tracker.prefill_end_tokens:
++                    continue
++                if block_id == NULL_BLOCK_ID:
++                    continue
++                if group_id not in self._boundary_state_group_ids:
++                    continue
++                accepted.append((group_id, block_id, boundary_tokens))
++            if not accepted:
++                continue
++            tracker.has_pending_offload = True
++            if (req_meta := save_metas.get(req_id)) is not None:
++                req_meta.boundary_state_offloads = accepted
++                continue
++            meta.add_request(
++                ReqMeta(
++                    req_id=req_id,
++                    token_len_chunk=0,
++                    block_ids=tracker.allocated_block_ids,
++                    block_hashes=req_tuple[0].block_hashes,
++                    can_save=True,
++                    num_prompt_tokens=tracker.prefill_end_tokens,
++                    boundary_state_offloads=accepted,
++                )
++            )
+ 
+     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
+         """Drop the block references of store jobs every rank has finished."""
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+index b1f1ac1d4..2331d4da6 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+@@ -648,48 +648,76 @@ class KVCacheStoreSendingThread(KVTransferThread):
+             self._skip_store_requests.clear()
+         return True
+ 
+-    def _maybe_offload_partial_tail(self, req_meta: ReqMeta) -> bool:
+-        """Offload the request's sub-block partial tail (its last prompt hash
+-        boundary) so a later request can hit the sub-block prefix.
+-
+-        Covers every block from the normal save's lcm floor to the boundary:
+-        the normal save floors to ``lcm_block_size``, so a smaller-block
+-        group's full blocks in that gap are never persisted elsewhere, and
+-        the consumer's lookup needs every group at every probed boundary.
+-        Full blocks are keyed by their block-end hash, the partial boundary
+-        block by the boundary sub-hash; the mamba "align" boundary block is
+-        the core-provided CoW block. All keys are deduped against the store.
+-
+-        Returns:
+-            True when no put is needed or every put succeeds, False otherwise.
++    def _boundary_snapshot_puts(
++        self, req_meta: ReqMeta, entries: list[tuple[int, int, int]]
++    ) -> list[tuple[str, list[int], list[int], KeyMetadata]]:
++        """Puts for committed mamba "align" boundary-state snapshots.
++
++        These are block-aligned boundaries, i.e. exactly what the normal save
++        would key — but ``store_mask`` masks mamba groups out of it entirely, so
++        this is their *only* writer. The exclusion is not an optimization: the
++        normal save resolves a chunk's address as
++        ``req_meta.block_ids[g][start // block_size]``, and ``block_ids`` is the
++        connector's append-only mirror of the core's per-group table. An
++        align-mode table is mutated in place (a superseded state block is freed
++        and nulled; speculative blocks relocate), and the connector is never
++        told, so a stale mirror entry is indistinguishable from a live one — a
++        retry of a failed or pressure-skipped chunk would read a block that now
++        belongs to another request.
++
++        Each entry's handed-off block *is* the boundary state and is pinned by
++        the core, so it is uploaded under its boundary-end hash key and never
++        resolved positionally.
+         """
+-        if not self.coord.enable_partial_hash_hits or not req_meta.block_hashes:
+-            return True
+-        partial_tail_offloads = req_meta.partial_tail_offloads
+-        if not partial_tail_offloads:
+-            return True
+         hash_block_size = self.coord.hash_block_size
+-        boundaries = {boundary for _, _, boundary in partial_tail_offloads}
++        puts: list[tuple[str, list[int], list[int], KeyMetadata]] = []
++        for group_id, block_id, boundary in entries:
++            if boundary == 0 or block_id == NULL_BLOCK_ID:
++                continue
++            hash_idx = boundary // hash_block_size - 1
++            if hash_idx >= len(req_meta.block_hashes):
++                continue
++            db = self.token_databases[group_id]
++            # Distribute across ranks by the same rule as normal chunks.
++            put_step = self.group_put_steps[group_id]
++            put_step_rank = (self.tp_rank + group_id) % put_step
++            if (boundary // db.block_size - 1) % put_step != put_step_rank:
++                continue
++            addr, size = db.prepare_value_for_block(block_id)
++            puts.append(
++                (db.key_for(req_meta.block_hashes[hash_idx]), addr, size, db.metadata)
++            )
++        return puts
++
++    def _sub_block_tail_puts(
++        self, req_meta: ReqMeta, entries: list[tuple[int, int, int]]
++    ) -> list[tuple[str, list[int], list[int], KeyMetadata]]:
++        """Puts for the request's sub-block partial tail (its last prompt hash
++        boundary), so a later request can hit the sub-block prefix.
++
++        Covers every group's blocks from the normal save's lcm floor to the
++        boundary: the normal save floors to ``lcm_block_size``, so a
++        smaller-block group's full blocks in that gap are never persisted
++        elsewhere, and the consumer's lookup needs every group at every probed
++        boundary. Full blocks are keyed by their block-end hash and the partial
++        boundary block by the boundary sub-hash; a mamba "align" group
++        contributes only its boundary block, from the core-provided CoW block.
++        """
++        boundaries = {boundary for _, _, boundary in entries}
+         if len(boundaries) != 1:
+             raise ValueError(
+-                "Partial-tail offloads for one request must share a boundary"
++                "Sub-block partial-tail offloads for one request must share a boundary"
+             )
+         boundary = boundaries.pop()
+-        if boundary == 0:
+-            return True
+-        if boundary // hash_block_size - 1 >= len(req_meta.block_hashes):
+-            return True
+-        mamba_offloads = {
+-            group_id: block_id for group_id, block_id, _ in partial_tail_offloads
+-        }
++        hash_block_size = self.coord.hash_block_size
++        if boundary == 0 or boundary // hash_block_size - 1 >= len(
++            req_meta.block_hashes
++        ):
++            return []
+ 
+-        keys: list[str] = []
+-        addrs: list[list[int]] = []
+-        sizes: list[list[int]] = []
+-        group_ids: list[str] | None = (
+-            [] if self.enable_group_semantics and self.supports_group_ids else None
+-        )
++        mamba_offloads = {group_id: block_id for group_id, block_id, _ in entries}
+         saved = self._saved_offset.get(req_meta.req_id, 0)
++        puts: list[tuple[str, list[int], list[int], KeyMetadata]] = []
+         for g_idx, db in enumerate(self.token_databases):
+             group_blocks = req_meta.block_ids[g_idx]
+             # Distribute across ranks by the same rule as normal chunks.
+@@ -705,16 +733,20 @@ class KVCacheStoreSendingThread(KVTransferThread):
+                     continue
+                 valid_end = min((block_idx + 1) * db.block_size, boundary)
+                 key_hash = req_meta.block_hashes[valid_end // hash_block_size - 1]
+-                if (
+-                    g_idx in mamba_offloads
+-                    and valid_end == boundary
+-                    and boundary % db.block_size != 0
+-                ):
+-                    block_id = mamba_offloads[g_idx]
+-                else:
+-                    if block_idx >= len(group_blocks):
++                if g_idx in mamba_offloads:
++                    if valid_end != boundary:
++                        # Interior align-mode state positions are null or
++                        # stale (the block table is not append-only) and never
++                        # valid gap content; only the boundary block is
++                        # persisted, from the core-provided hand-off.
+                         continue
++                    block_id = mamba_offloads[g_idx]
++                elif g_idx in self.coord.mamba_group_ids:
++                    continue
++                elif block_idx < len(group_blocks):
+                     block_id = group_blocks[block_idx]
++                else:
++                    continue
+                 if block_id == NULL_BLOCK_ID:
+                     logger.debug(
+                         "Skipping unavailable partial-tail source block "
+@@ -725,20 +757,58 @@ class KVCacheStoreSendingThread(KVTransferThread):
+                     )
+                     continue
+                 addr, size = db.prepare_value_for_block(block_id)
+-                key = db.key_for(key_hash)
+-                keys.append(key)
+-                addrs.append(addr)
+-                sizes.append(size)
+-                if group_ids is not None:
+-                    group_ids.append(
+-                        _make_mooncake_group_id(
+-                            db.metadata,
+-                            key.rsplit("@", 1)[-1],
+-                        )
+-                    )
++                puts.append((db.key_for(key_hash), addr, size, db.metadata))
++        return puts
++
++    def _maybe_offload_boundary_states(self, req_meta: ReqMeta) -> bool:
++        """Persist connector-pinned mamba "align" boundary states handed off
++        for this request, deduped against the store.
+ 
+-        if not keys:
++        This is every mamba key the connector writes — ``store_mask`` excludes
++        mamba groups from the positional normal save, aligned boundaries
++        included (see :meth:`_boundary_snapshot_puts`).
++
++        The two entry kinds are keyed and sourced differently, so they are
++        prepared separately and put in one batch:
++
++        - block-aligned for its group: a committed boundary-state snapshot,
++          the handed-off block itself;
++        - not block-aligned: the sub-block CoW partial tail, which also has to
++          cover the other groups' blocks in the normal save's lcm gap.
++
++        Returns:
++            True when no put is needed or every put succeeds, False otherwise.
++        """
++        offloads = req_meta.boundary_state_offloads
++        if not offloads or not req_meta.block_hashes:
++            return True
++
++        snapshots: list[tuple[int, int, int]] = []
++        sub_block: list[tuple[int, int, int]] = []
++        for group_id, block_id, boundary in offloads:
++            entry = (group_id, block_id, boundary)
++            if boundary % self.token_databases[group_id].block_size == 0:
++                snapshots.append(entry)
++            else:
++                sub_block.append(entry)
++
++        puts = self._boundary_snapshot_puts(req_meta, snapshots)
++        if sub_block and self.coord.enable_partial_hash_hits:
++            puts.extend(self._sub_block_tail_puts(req_meta, sub_block))
++
++        if not puts:
+             return True
++        keys = [key for key, _, _, _ in puts]
++        addrs = [addr for _, addr, _, _ in puts]
++        sizes = [size for _, _, size, _ in puts]
++        group_ids: list[str] | None = (
++            [
++                _make_mooncake_group_id(metadata, key.rsplit("@", 1)[-1])
++                for key, _, _, metadata in puts
++            ]
++            if self.enable_group_semantics and self.supports_group_ids
++            else None
++        )
+         exists_start = time.perf_counter()
+         try:
+             exists = self.store.batch_is_exist(keys)
+@@ -751,7 +821,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
+                 num_failed_keys=len(keys),
+             )
+             logger.error(
+-                "Failed to check partial-tail keys for request %s: %s",
++                "Failed to check boundary-state keys for request %s: %s",
+                 req_meta.req_id,
+                 e,
+             )
+@@ -787,7 +857,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
+                 num_failed_keys=len(keys),
+             )
+             logger.error(
+-                "Failed to put partial-tail keys for request %s: %s",
++                "Failed to put boundary-state keys for request %s: %s",
+                 req_meta.req_id,
+                 e,
+             )
+@@ -805,7 +875,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
+         if failed:
+             failed_codes = {res[i] for i in failed}
+             logger.warning(
+-                "Partial-tail put failed for request %s: %d/%d keys failed (codes=%s)",
++                "Boundary-state put failed for request %s: %d/%d keys failed "
++                "(codes=%s)",
+                 req_meta.req_id,
+                 len(failed),
+                 len(keys),
+@@ -818,7 +889,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
+         if self._clear_store_pressure():
+             logger.info(
+                 "Mooncake CPU/disk offloading pressure cleared after a "
+-                "successful partial-tail batch"
++                "successful boundary-state batch"
+             )
+         return True
+ 
+@@ -857,10 +928,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
+                 )
+                 return
+ 
+-            # Offload the sub-block partial tail (independent of the normal
+-            # block-aligned save, which may be skipped this step).
+-            if req_meta.partial_tail_offloads is not None and not (
+-                self._maybe_offload_partial_tail(req_meta)
++            # Offload the handed-off mamba boundary states (independent of the
++            # normal positional save, which may be skipped this step).
++            if req_meta.boundary_state_offloads is not None and not (
++                self._maybe_offload_boundary_states(req_meta)
+             ):
+                 return
+ 
+@@ -887,6 +958,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
+                 # Rotate the stride phase per group to balance load across ranks.
+                 put_step = self.group_put_steps[g_idx]
+                 put_step_rank = (self.tp_rank + g_idx) % put_step
++                group_blocks = block_ids_per_group[g_idx]
+                 for start, end, block_hash in db.process_tokens(
+                     token_len,
+                     req_meta.block_hashes,
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index ebc9b87e1..330f8270b 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -1130,6 +1130,9 @@ class OffloadingConnectorScheduler:
+                         if bid != 0:
+                             self._current_batch_allocated_block_ids.add(bid)
+ 
++        for copy in scheduler_output.kv_cache_block_copies or ():
++            self._current_batch_allocated_block_ids.add(copy.dst_block_id)
++
+         # Zero out stale block_ids in sliding window groups' pending-store
+         # positions. Only sliding window groups can have stale entries (blocks
+         # freed by remove_skipped_blocks then reallocated). Only positions in
+@@ -1151,18 +1154,89 @@ class OffloadingConnectorScheduler:
+                         ):
+                             group_state.block_ids[j] = 0
+ 
++    def _build_aligned_boundary_store_jobs(
++        self, handoffs: dict[str, list[tuple[int, int, int]]]
++    ) -> dict[int, TransferJob]:
++        store_jobs: dict[int, TransferJob] = {}
++        num_groups = len(self.config.kv_group_configs)
++        for req_id, entries in handoffs.items():
++            req_status = self._req_status.get(req_id)
++            if req_status is None:
++                continue
++            req = req_status.req
++            max_boundary = self._calc_num_offloadable_tokens(req_status, req.num_tokens)
++            for group_idx, block_id, boundary in entries:
++                group_config = self.config.kv_group_configs[group_idx]
++                if (
++                    block_id == 0
++                    or boundary > max_boundary
++                    or boundary % group_config.tokens_per_chunk != 0
++                ):
++                    continue
++
++                key = self._make_boundary_key(req, group_idx, boundary)
++                store_output = self.manager.prepare_store([key], req_status.req_context)
++                if store_output is None:
++                    self._connector_stats.increase_counter(
++                        _ConnectorMetricName.ALLOCATION_FAILURE
++                    )
++                    continue
++                if not store_output.keys_to_store:
++                    continue
++
++                job_id = self._generate_job_id()
++                req_status.transfer_jobs.add(job_id)
++                self._block_id_to_pending_jobs.setdefault(block_id, set()).add(job_id)
++                self._jobs[job_id] = TransferJobStatus(
++                    req_id=req_id,
++                    pending_count=self.config.num_workers,
++                    keys={key},
++                    is_store=True,
++                    fenced_block_ids=[block_id],
++                )
++                group_sizes = [0] * num_groups
++                group_sizes[group_idx] = 1
++                block_indices = [0] * num_groups
++                block_indices[group_idx] = boundary // group_config.tokens_per_block - 1
++                store_jobs[job_id] = TransferJob(
++                    req_id=req_id,
++                    src_spec=GPULoadStoreSpec(
++                        [block_id],
++                        group_sizes=group_sizes,
++                        block_indices=block_indices,
++                    ),
++                    dst_spec=store_output.store_spec,
++                )
++                self._events_tracker.record_store(
++                    req,
++                    group_config,
++                    boundary // group_config.tokens_per_chunk - 1,
++                    key,
++                )
++        return store_jobs
++
+     def _build_partial_tail_store_jobs(
+         self, scheduler_output: SchedulerOutput
+     ) -> dict[int, TransferJob]:
+-        handoffs = scheduler_output.partial_tail_offloads
+-        if not self.config.supports_partial_tail or not handoffs:
++        block_state = scheduler_output.kv_connector_block_state
++        handoffs = block_state.boundary_state_offloads if block_state else None
++        if not handoffs:
+             return {}
+ 
+-        store_jobs: dict[int, TransferJob] = {}
++        store_jobs = self._build_aligned_boundary_store_jobs(handoffs)
++        if not self.config.supports_partial_tail:
++            return store_jobs
++
+         for req_id, entries in handoffs.items():
++            entries = [
++                entry
++                for entry in entries
++                if entry[2] % self._partial_tail_block_size != 0
++            ]
++            if not entries:
++                continue
+             req_status = self._req_status.get(req_id)
+             assert req_status is not None
+-            assert entries
+             boundaries = {boundary for _, _, boundary in entries}
+             assert len(boundaries) == 1
+             boundary = boundaries.pop()
+@@ -1282,6 +1356,9 @@ class OffloadingConnectorScheduler:
+                     group_config, group_state, num_offloadable_tokens
+                 )
+ 
++                if group_config.requires_cow_source:
++                    continue
++
+                 start_chunk_idx = group_state.next_stored_chunk_idx
+                 if num_chunks <= start_chunk_idx:
+                     continue
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index a8a6c1ca9..1fbda7537 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -716,6 +716,10 @@ class BlockPool:
+             if self.metrics_collector:
+                 self.metrics_collector.on_block_accessed(block)
+ 
++    def is_block_writable(self, block: KVCacheBlock) -> bool:
++        """Return whether a block can be mutated by its sole owner."""
++        return not block.is_null and block.ref_cnt == 1 and block.block_hash is None
++
+     def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+         """Free a list of blocks. The blocks should be ordered by their
+         eviction priority, where the first block will be evicted first.
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index d1af91b65..613aab73c 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -189,10 +189,6 @@ class KVCacheManager:
+             tuple(() for _ in range(self.num_kv_cache_groups))
+         )
+ 
+-        # Off-table cow blocks handed to a KV connector for partial-tail
+-        # offload; pinned until the request's blocks are freed.
+-        self._partial_tail_pins: dict[str, list[KVCacheBlock]] = {}
+-
+     @property
+     def usage(self) -> float:
+         """Get the KV cache usage.
+@@ -575,9 +571,6 @@ class KVCacheManager:
+         Args:
+             request: The request to free the blocks.
+         """
+-        pins = self._partial_tail_pins.pop(request.request_id, None)
+-        if pins:
+-            self.block_pool.free_blocks(pins)
+         self.coordinator.free(request.request_id)
+ 
+     def remove_skipped_blocks(
+@@ -610,14 +603,7 @@ class KVCacheManager:
+         Returns:
+             The request's blocks in allocation order.
+         """
+-        blocks = self.coordinator.pop_blocks_for_free(request.request_id)
+-        # Pins ride the same (possibly deferred) free as the request blocks.
+-        # Preemption may release a pin under a still-queued offload — the same
+-        # exposure normal saves of table blocks already have.
+-        pins = self._partial_tail_pins.pop(request.request_id, None)
+-        if pins:
+-            blocks = pins + blocks
+-        return blocks
++        return self.coordinator.pop_blocks_for_free(request.request_id)
+ 
+     def evict_blocks(self, block_ids: set[int]) -> None:
+         """evict blocks from the prefix cache by their block IDs.
+@@ -854,18 +840,18 @@ class KVCacheManager:
+         retained_blocks = [block for pair in pending_copies for block in pair]
+         return copies, retained_blocks
+ 
+-    def take_partial_tail_offloads(self) -> dict[str, list[tuple[int, int, int]]]:
+-        """Drain producer partial-tail offload hand-offs per request.
++    def take_boundary_state_offloads(
++        self,
++    ) -> dict[str, list[tuple[int, int, int]]]:
++        """Drain this step's boundary-state hand-offs for a KV connector.
+ 
+         Returns ``{request_id: [(group_id, block_id, boundary_tokens), ...]}``
+-        for the durable boundary blocks of producers' last-prompt-boundary
+-        partial tails. Only mamba "align" groups contribute; empty otherwise.
+-        A KV connector reads the referenced blocks and offloads them so a later
+-        request can hit the sub-block prefix.
+-
+-        Each handed-off block lives off the request block table, so it is
+-        pinned here and unpinned when the request's blocks are freed — for a
+-        producer with saved tokens, after the connector reports sends done.
++        for mamba "align" boundary states: the
++        request's committed boundary-state snapshots and, on a sub-block partial
++        hit, the CoW copy of its last-prompt-boundary state. Only mamba "align"
++        groups contribute; empty otherwise. A connector reads the referenced
++        blocks — never resolving them positionally — and offloads them so a
++        later request can hit that prefix.
+         """
+         offloads: dict[str, list[tuple[int, int, int]]] = {}
+         for mgr in self.coordinator.single_type_managers:
+@@ -874,9 +860,7 @@ class KVCacheManager:
+                 group_id,
+                 block,
+                 boundary_tokens,
+-            ) in mgr.take_pending_partial_tail_offloads():
+-                self.block_pool.touch((block,))
+-                self._partial_tail_pins.setdefault(req_id, []).append(block)
++            ) in mgr.take_pending_boundary_state_offloads():
+                 offloads.setdefault(req_id, []).append(
+                     (group_id, block.block_id, boundary_tokens)
+                 )
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index c47a899c8..c9d969cd3 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -205,6 +205,16 @@ class ScheduledEncoderInputStats:
+     output_tokens: int = 0
+ 
+ 
++@dataclass
++class KVConnectorBlockState:
++    """Scheduler-local block state offered to a producer-side KV connector."""
++
++    # Authoritative current block-table snapshots.
++    block_ids: dict[str, tuple[list[int], ...]]
++    # Exact Mamba "align" boundary-state hand-offs.
++    boundary_state_offloads: dict[str, list[tuple[int, int, int]]]
++
++
+ @dataclass
+ class SchedulerOutput:
+     # list of the requests that are scheduled for the first time.
+@@ -278,11 +288,8 @@ class SchedulerOutput:
+     # CoW copies to apply after zeroing new blocks and before forward.
+     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
+ 
+-    # Producer partial-tail offload hand-off for external KV connectors:
+-    # {request_id: [(group_id, block_id, boundary_tokens), ...]} pointing at
+-    # the durable boundary block of a producer's last-prompt-boundary partial
+-    # tail (mamba "align" CoW target). None unless partial hash hits are active.
+-    partial_tail_offloads: dict[str, list[tuple[int, int, int]]] | None = None
++    # Scheduler-local; always None by the time this reaches a worker.
++    kv_connector_block_state: KVConnectorBlockState | None = None
+ 
+     # Dynamic speculative decoding: optimal K chosen by scheduler.
+     # Number of spec tokens to schedule for the next step.
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 55e8589a4..ecea90a25 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -42,6 +42,7 @@ from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+ from vllm.v1.core.sched.output import (
+     CachedRequestData,
+     GrammarOutput,
++    KVConnectorBlockState,
+     NewRequestData,
+     ScheduledEncoderInputStats,
+     SchedulerOutput,
+@@ -1263,20 +1264,32 @@ class Scheduler(SchedulerInterface):
+             self.prev_step_scheduled_req_ids.clear()
+             self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
+ 
+-        # Producer partial-tail hand-off for external KV connectors. Drained
+-        # before the CoW retentions are released below, so the pin lands while
+-        # the cow block still holds a retention ref. Without a producer-side
+-        # connector nothing consumes the hand-off, so skip the drain (and its
+-        # pin); the manager drops stale entries when the request's blocks are
+-        # popped for free.
+-        pending_partial_tail_offloads = None
+-        if (
+-            self.connector is not None
+-            and self.vllm_config.kv_transfer_config is not None
+-            and self.vllm_config.kv_transfer_config.is_kv_producer
+-        ):
+-            pending_partial_tail_offloads = (
+-                self.kv_cache_manager.take_partial_tail_offloads() or None
++        # Mamba "align" boundary states must be handed off with exact block ids;
++        # they cannot be reconstructed from a connector's append-only block
++        # table. Drained every step so stale offers cannot accumulate.
++        boundary_state_offloads = self.kv_cache_manager.take_boundary_state_offloads()
++
++        kv_connector_block_state = None
++        if self.connector is not None:
++            snapshot_req_ids = {req.req_id for req in new_reqs_data}
++            snapshot_req_ids.update(
++                req_id
++                for req_id, block_ids in zip(
++                    cached_reqs_data.req_ids,
++                    cached_reqs_data.new_block_ids,
++                    strict=True,
++                )
++                if block_ids
++            )
++            snapshot_req_ids.update(
++                req_id for req_id in boundary_state_offloads if req_id in self.requests
++            )
++            kv_connector_block_state = KVConnectorBlockState(
++                block_ids={
++                    req_id: self.kv_cache_manager.get_block_ids(req_id)
++                    for req_id in snapshot_req_ids
++                },
++                boundary_state_offloads=boundary_state_offloads,
+             )
+ 
+         kv_cache_block_copies, cow_retained_blocks = (
+@@ -1325,7 +1338,7 @@ class Scheduler(SchedulerInterface):
+             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
+             has_sync_kv_loads=has_sync_kv_loads,
+             kv_cache_block_copies=pending_kv_cache_block_copies,
+-            partial_tail_offloads=pending_partial_tail_offloads,
++            kv_connector_block_state=kv_connector_block_state,
+             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
+             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
+         )
+@@ -1345,6 +1358,9 @@ class Scheduler(SchedulerInterface):
+             )
+             scheduler_output.ec_connector_metadata = ec_meta
+ 
++        # Connector-only block state must not be dispatched to workers.
++        scheduler_output.kv_connector_block_state = None
++
+         # Advance the fence only for non-empty steps (those that actually
+         # write KV and have their output processed later in update_from_output).
+         if self.defer_block_free and total_num_scheduled_tokens > 0:
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 4d0957c64..b08f6f3c3 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -112,13 +112,14 @@ class SingleTypeKVCacheManager(ABC):
+         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
+         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
+         self._pending_cow_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
+-        # Partial-tail offload hand-off for external KV connectors: when a
+-        # producer registers its last-prompt-boundary partial tail and the
+-        # durable boundary block is not on the append-only request block table
+-        # (mamba "align" CoW target), record the request, group, block, and
+-        # exact token boundary so a connector can offload it under the right
+-        # hash. Populated only by mamba "align".
+-        self._pending_partial_tail_offloads: list[
++        # Boundary-state offload hand-off for external KV connectors. A mamba
++        # "align" block table is not append-only (interior states are
++        # nulled/freed and speculative blocks relocate in place), so a
++        # connector cannot resolve its state blocks positionally. Record
++        # (request, group, block, exact token boundary) for each committed
++        # boundary state so a connector can offload the right block under the
++        # right hash. Populated only by mamba "align".
++        self._pending_boundary_state_offloads: list[
+             tuple[str, int, KVCacheBlock, int]
+         ] = []
+ 
+@@ -385,19 +386,19 @@ class SingleTypeKVCacheManager(ABC):
+         self._pending_cow_copies = []
+         return pending_copies
+ 
+-    def take_pending_partial_tail_offloads(
++    def take_pending_boundary_state_offloads(
+         self,
+     ) -> list[tuple[str, int, KVCacheBlock, int]]:
+-        """Drain producer partial-tail hand-offs.
++        """Drain producer boundary-state hand-offs.
+ 
+         Entries are ``(req_id, group_id, block, boundary_tokens)``.
+ 
+-        Only mamba "align" populates this. The block lives off the request
+-        block table, so the caller must pin it until the connector has read
+-        it — nothing else keeps it alive once the CoW retention is released.
++        Only mamba "align" populates this. The blocks are not kept alive by
++        the request block table for the whole request, so a caller that reads
++        them asynchronously must pin them first.
+         """
+-        pending = self._pending_partial_tail_offloads
+-        self._pending_partial_tail_offloads = []
++        pending = self._pending_boundary_state_offloads
++        self._pending_boundary_state_offloads = []
+         return pending
+ 
+     def _apply_cow(
+@@ -1292,7 +1293,7 @@ class MambaManager(SingleTypeKVCacheManager):
+             # Requests that registered their own last-prompt-boundary partial
+             # tail (producers). On the next step's CoW the boundary state moves
+             # into a private cow_block; we record that block for connector
+-            # offload (see _pending_partial_tail_offloads).
++            # offload (see _pending_boundary_state_offloads).
+             self._producer_partial_tail_reqs: dict[str, int] = {}
+ 
+     @classmethod
+@@ -1625,13 +1626,12 @@ class MambaManager(SingleTypeKVCacheManager):
+                     )
+ 
+                 if blocks_allocated:
+-                    # reuse previous speculative blocks in this step
++                    # Relocate exclusively owned speculative scratch blocks.
+                     for block_idx in range(
+                         prev_block_len - self.num_speculative_blocks, prev_block_len
+                     ):
+                         if block_idx < num_skipped_blocks:
+-                            req_blocks.append(req_blocks[block_idx])
+-                            req_blocks[block_idx] = self._null_block
++                            self._relocate_speculative_block(req_blocks, block_idx)
+                         else:
+                             break
+                 num_new_blocks = num_required_blocks - len(req_blocks)
+@@ -1664,7 +1664,7 @@ class MambaManager(SingleTypeKVCacheManager):
+                             # This CoW preserved a producer's own boundary
+                             # state in cow_block; hand it to the connector for
+                             # partial-tail offload once the copy has run.
+-                            self._pending_partial_tail_offloads.append(
++                            self._pending_boundary_state_offloads.append(
+                                 (
+                                     request_id,
+                                     self.kv_cache_group_id,
+@@ -1685,17 +1685,31 @@ class MambaManager(SingleTypeKVCacheManager):
+                 returned_blocks.extend(new_blocks)
+                 return returned_blocks
+ 
++    def _relocate_speculative_block(
++        self, req_blocks: list[KVCacheBlock], block_idx: int
++    ) -> None:
++        block = req_blocks[block_idx]
++        assert self.block_pool.is_block_writable(block), (
++            "Speculative Mamba blocks must be exclusively owned and unhashed "
++            "before relocation"
++        )
++        req_blocks.append(block)
++        req_blocks[block_idx] = self._null_block
++
+     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
+         if self.mamba_cache_mode == "align":
+             self._allocated_block_reqs.discard(request_id)
+             self.last_state_block_idx.pop(request_id, None)
+             self._num_checkpoint_blocks.pop(request_id, None)
+             self._producer_partial_tail_reqs.pop(request_id, None)
+-            # A hand-off whose request died in this same scheduling pass must
+-            # not reach the connector: its unpin hook (free) has already run.
+-            self._pending_partial_tail_offloads = [
++            # An offer is only guaranteed to hold committed bytes until the end
++            # of the pass that made it. This request's blocks are going back to
++            # the pool now, so drop its not-yet-offered hand-offs rather than
++            # let a connector claim a block another request may already have
++            # been handed.
++            self._pending_boundary_state_offloads = [
+                 entry
+-                for entry in self._pending_partial_tail_offloads
++                for entry in self._pending_boundary_state_offloads
+                 if entry[0] != request_id
+             ]
+         return super().pop_blocks_for_free(request_id)
+@@ -1722,9 +1736,9 @@ class MambaManager(SingleTypeKVCacheManager):
+             if partial_hash is not None:
+                 self.cached_blocks_this_step.add(partial_hash)
+         if num_cached_blocks_after > num_cached_blocks_before:
+-            for block in self.req_to_blocks[request.request_id][
+-                num_cached_blocks_before:num_cached_blocks_after
+-            ]:
++            blocks = self.req_to_blocks[request.request_id]
++            for idx in range(num_cached_blocks_before, num_cached_blocks_after):
++                block = blocks[idx]
+                 # Skip null blocks (align-mode skipped states) and blocks that
+                 # were not cached this step — with sparse retention
+                 # (reachable_block_mask) the intermediate state snapshots carry
+@@ -1732,6 +1746,18 @@ class MambaManager(SingleTypeKVCacheManager):
+                 if block.is_null or block.block_hash is None:
+                     continue
+                 self.cached_blocks_this_step.add(block.block_hash)
++                if self.mamba_cache_mode == "align":
++                    # Offer every retained boundary with its exact block.
++                    # The connector filters against its save window, which may
++                    # extend past the original prompt during resumed prefill.
++                    self._pending_boundary_state_offloads.append(
++                        (
++                            request.request_id,
++                            self.kv_cache_group_id,
++                            block,
++                            (idx + 1) * self.block_size,
++                        )
++                    )
+ 
+     def new_step_starts(self) -> None:
+         self.cached_blocks_this_step.clear()
+-- 
+2.53.0
+

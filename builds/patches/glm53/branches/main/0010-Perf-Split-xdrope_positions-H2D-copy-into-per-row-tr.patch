@@ -1,0 +1,43 @@
+From 6f91e3d9537ea45128534ba9a234b81d6c843281 Mon Sep 17 00:00:00 2001
+From: Keyi Li <94494390+JasonKeyiL@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 10:28:43 -0700
+Subject: [PATCH 10/39] [Perf] Split xdrope_positions H2D copy into per-row
+ transfers (#53412)
+
+Signed-off-by: Keyi Li <likey6688@gmail.com>
+Co-authored-by: Keyi Li <likey6688@gmail.com>
+---
+ vllm/v1/worker/gpu_model_runner.py | 17 ++++++++++++-----
+ 1 file changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index a1cab24fb..19e2e514f 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -2227,11 +2227,18 @@ class GPUModelRunner(
+                     non_blocking=True,
+                 )
+         elif self.uses_xdrope_dim > 0:
+-            # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
+-            self.xdrope_positions.gpu[:, :total_num_scheduled_tokens].copy_(
+-                self.xdrope_positions.cpu[:, :total_num_scheduled_tokens],
+-                non_blocking=True,
+-            )
++            # Only relevant for models using XD-RoPE (e.g, HunYuan-VL).
++            # xdrope_positions is allocated as [uses_xdrope_dim, max_num_tokens
++            # + 1] with the same trailing-column trick as mrope_positions above,
++            # so cpu[:, :N] is a strided view of the pinned buffer and the
++            # single-slice copy_() runs into the same pageable-fallback silent
++            # sync described in PR #51841. Split into per-row copies for the
++            # same reason.
++            for row in range(self.xdrope_positions.gpu.shape[0]):
++                self.xdrope_positions.gpu[row, :total_num_scheduled_tokens].copy_(
++                    self.xdrope_positions.cpu[row, :total_num_scheduled_tokens],
++                    non_blocking=True,
++                )
+         if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
+             drift = self.num_computed_tokens[req_indices_gpu].to(
+                 torch.int64
+-- 
+2.53.0
+

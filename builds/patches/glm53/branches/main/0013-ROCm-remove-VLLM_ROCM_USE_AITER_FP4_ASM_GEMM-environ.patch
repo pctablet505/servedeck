@@ -1,0 +1,173 @@
+From 2f1cba799e02209e9782a747f7620e55d8251e67 Mon Sep 17 00:00:00 2001
+From: afriedri <afriedri@amd.com>
+Date: Fri, 28 Aug 2026 13:59:53 -0500
+Subject: [PATCH 13/39] [ROCm] remove VLLM_ROCM_USE_AITER_FP4_ASM_GEMM
+ environment variable; make w4a4 use the preshuffle triton+asm by default
+ (#53141)
+
+Signed-off-by: Andy Friedrich <afriedri@amd.com>
+Signed-off-by: afriedri <afriedri@amd.com>
+Co-authored-by: Andreas Karatzas <akaratza@amd.com>
+---
+ tests/kernels/quantization/test_rocm_mxfp4.py | 20 ++++++-------------
+ vllm/_aiter_ops.py                            |  6 +-----
+ vllm/envs.py                                  |  6 ------
+ .../kernels/linear/mxfp4/aiter.py             |  4 ++--
+ 4 files changed, 9 insertions(+), 27 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_rocm_mxfp4.py b/tests/kernels/quantization/test_rocm_mxfp4.py
+index db01213bf..2e497c8cd 100644
+--- a/tests/kernels/quantization/test_rocm_mxfp4.py
++++ b/tests/kernels/quantization/test_rocm_mxfp4.py
+@@ -147,26 +147,22 @@ def test_fp4_env_defaults():
+     """ROCm FP4 env defaults should stay stable for the AITER gates."""
+     import vllm.envs as envs
+ 
+-    assert envs.VLLM_ROCM_USE_AITER_FP4_ASM_GEMM is False
+     assert envs.VLLM_ROCM_USE_AITER_FP4BMM is True
+ 
+ 
+ @pytest.mark.parametrize(
+     (
+         "use_aiter",
+-        "use_fp4_asm_gemm",
+         "use_fp4bmm",
+     ),
+     [
+-        (True, True, True),
+-        (True, True, False),
+-        (True, False, True),
+-        (False, True, True),
++        (True, True),
++        (True, False),
++        (False, True),
+     ],
+ )
+ def test_rocm_aiter_fp4_enablement_follows_env_and_arch(
+     use_aiter,
+-    use_fp4_asm_gemm,
+     use_fp4bmm,
+     monkeypatch,
+ ):
+@@ -182,15 +178,11 @@ def test_rocm_aiter_fp4_enablement_follows_env_and_arch(
+     _assert_aiter_supported()
+ 
+     on_gfx950_value = on_gfx950()
+-    expected_asm_gemm = use_aiter and use_fp4_asm_gemm and on_gfx950_value
++    expected_asm_gemm = use_aiter and on_gfx950_value
+     expected_fp4bmm = use_aiter and use_fp4bmm and on_gfx950_value
+ 
+     with monkeypatch.context() as mp:
+         mp.setenv("VLLM_ROCM_USE_AITER", "1" if use_aiter else "0")
+-        mp.setenv(
+-            "VLLM_ROCM_USE_AITER_FP4_ASM_GEMM",
+-            "1" if use_fp4_asm_gemm else "0",
+-        )
+         mp.setenv("VLLM_ROCM_USE_AITER_FP4BMM", "1" if use_fp4bmm else "0")
+         _reload_envs()
+         rocm_aiter_ops.refresh_env_variables()
+@@ -410,7 +402,7 @@ def test_aiter_fp4_gemm_preshuffled_tuned_shapes(shape):
+     from aiter import per_1x32_f4_quant_hip
+     from aiter.ops.shuffle import shuffle_weight
+     from aiter.ops.triton.gemm_afp4wfp4 import (
+-        gemm_afp4wfp4_preshuffled_weight_scales,
++        gemm_afp4wfp4_preshuffle,
+     )
+     from aiter.ops.triton.quant import dynamic_mxfp4_quant
+ 
+@@ -446,7 +438,7 @@ def test_aiter_fp4_gemm_preshuffled_tuned_shapes(shape):
+ 
+     def run_preshuffled() -> torch.Tensor:
+         y = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
+-        return gemm_afp4wfp4_preshuffled_weight_scales(
++        return gemm_afp4wfp4_preshuffle(
+             A_q.contiguous().view(torch.uint8),
+             B_fp4.contiguous().view(torch.uint8).reshape(B_fp4.shape[0] // 16, -1),
+             A_s,
+diff --git a/vllm/_aiter_ops.py b/vllm/_aiter_ops.py
+index 4c215e4fe..9e1fb6fd8 100644
+--- a/vllm/_aiter_ops.py
++++ b/vllm/_aiter_ops.py
+@@ -1688,7 +1688,6 @@ class rocm_aiter_ops:
+         VLLM_ROCM_USE_AITER_MHA: Controls MHA ops including flash_attn_varlen.
+         VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: Controls Triton unified attention.
+         VLLM_ROCM_USE_AITER_FP8BMM: Controls FP8 batched matrix multiply.
+-        VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: Controls FP4 assembly GEMM.
+         VLLM_ROCM_USE_AITER_TRITON_ROPE: Controls Triton rotary embeddings.
+         VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: Controls shared expert fusion.
+         VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4: Controls a8w4 SiTU fused MoE variant.
+@@ -1755,8 +1754,6 @@ class rocm_aiter_ops:
+     _FP8BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP8BMM
+     _FP4BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP4BMM
+     _LINEAR_HIPBMM_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR_HIPBMM
+-    # TODO: Consolidate under _LINEAR_ENABLED
+-    _FP4_GEMM_DYNAMIC_QUANT_ASM = envs.VLLM_ROCM_USE_AITER_FP4_ASM_GEMM
+     # TODO: Consolidate under VLLM_ROCM_USE_AITER_ROPE
+     _TRITON_ROTARY_EMBED = envs.VLLM_ROCM_USE_AITER_TRITON_ROPE
+     _MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
+@@ -1787,7 +1784,6 @@ class rocm_aiter_ops:
+         cls._FP8BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP8BMM
+         cls._FP4BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP4BMM
+         cls._LINEAR_HIPBMM_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR_HIPBMM
+-        cls._FP4_GEMM_DYNAMIC_QUANT_ASM = envs.VLLM_ROCM_USE_AITER_FP4_ASM_GEMM
+         cls._TRITON_ROTARY_EMBED = envs.VLLM_ROCM_USE_AITER_TRITON_ROPE
+         cls._MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
+         cls._MOE_SITUV2_A8W4 = envs.VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4
+@@ -2008,7 +2004,7 @@ class rocm_aiter_ops:
+     def is_asm_fp4_gemm_dynamic_quant_enabled(cls) -> bool:
+         from vllm.platforms.rocm import on_gfx950
+ 
+-        return cls._AITER_ENABLED and cls._FP4_GEMM_DYNAMIC_QUANT_ASM and on_gfx950()
++        return cls._AITER_ENABLED and on_gfx950()
+ 
+     @classmethod
+     @if_aiter_supported
+diff --git a/vllm/envs.py b/vllm/envs.py
+index b574cf6aa..464d8d547 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -142,7 +142,6 @@ if TYPE_CHECKING:
+     VLLM_ROCM_USE_AITER_MLA: bool = True
+     VLLM_ROCM_AITER_MLA_ASM_PADDING: Literal["auto", "gluon", "asm"] = "auto"
+     VLLM_ROCM_USE_AITER_MHA: bool = True
+-    VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: bool = False
+     VLLM_ROCM_USE_AITER_TRITON_ROPE: bool = False
+     VLLM_ROCM_USE_AITER_FP8BMM: bool = True
+     VLLM_ROCM_USE_AITER_FP4BMM: bool = True
+@@ -1300,11 +1299,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_ROCM_USE_AITER_MHA": lambda: (
+         os.getenv("VLLM_ROCM_USE_AITER_MHA", "True").lower() in ("true", "1")
+     ),
+-    # Whether to use aiter fp4 gemm asm.
+-    # By default is disabled.
+-    "VLLM_ROCM_USE_AITER_FP4_ASM_GEMM": lambda: (
+-        os.getenv("VLLM_ROCM_USE_AITER_FP4_ASM_GEMM", "False").lower() in ("true", "1")
+-    ),
+     # Whether to use aiter rope.
+     # By default is disabled.
+     "VLLM_ROCM_USE_AITER_TRITON_ROPE": lambda: (
+diff --git a/vllm/model_executor/kernels/linear/mxfp4/aiter.py b/vllm/model_executor/kernels/linear/mxfp4/aiter.py
+index f1336dd00..d56c9b764 100644
+--- a/vllm/model_executor/kernels/linear/mxfp4/aiter.py
++++ b/vllm/model_executor/kernels/linear/mxfp4/aiter.py
+@@ -35,7 +35,7 @@ if is_aiter_found_and_supported():
+     ) -> torch.Tensor:
+         from aiter.ops.triton.gemm_afp4wfp4 import (
+             gemm_afp4wfp4,
+-            gemm_afp4wfp4_preshuffled_weight_scales,
++            gemm_afp4wfp4_preshuffle,
+         )
+         from aiter.ops.triton.quant import dynamic_mxfp4_quant
+ 
+@@ -63,7 +63,7 @@ if is_aiter_found_and_supported():
+                     x_s = x_s[:M, ...].view(torch.uint8)
+ 
+                 y = torch.empty(M, N, device=x_q.device, dtype=out_dtype)
+-                gemm_afp4wfp4_preshuffled_weight_scales(
++                gemm_afp4wfp4_preshuffle(
+                     x_q.view(torch.uint8),
+                     weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
+                     x_s,
+-- 
+2.53.0
+

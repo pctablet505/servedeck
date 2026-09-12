@@ -1,0 +1,88 @@
+From d1922cb5a718259976fcb9044c18c9711c9ca694 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Micha=C5=82=20Ganczarenko?= <michal.ganczarenko@intel.com>
+Date: Fri, 28 Aug 2026 12:28:25 +0200
+Subject: [PATCH 05/39] [Bugfix] Restore multimodal support on the plain "vllm"
+ throughput backend (#52168)
+
+Signed-off-by: Michal Ganczarenko <michal.ganczarenko@intel.com>
+---
+ tests/benchmarks/test_throughput_cli.py | 47 +++++++++++++++++++++++++
+ vllm/benchmarks/throughput.py           |  7 ++--
+ 2 files changed, 50 insertions(+), 4 deletions(-)
+
+diff --git a/tests/benchmarks/test_throughput_cli.py b/tests/benchmarks/test_throughput_cli.py
+index 8f6587224..6af4aad4d 100644
+--- a/tests/benchmarks/test_throughput_cli.py
++++ b/tests/benchmarks/test_throughput_cli.py
+@@ -230,3 +230,50 @@ def test_get_requests_resolves_mmvu(
+     requests = get_requests(args, hf_tokenizer)
+     assert len(requests) == 3
+     assert all(isinstance(r, SampleRequest) for r in requests)
++
++
++@pytest.mark.benchmark
++def test_get_requests_allows_multimodal_on_plain_vllm_backend(
++    monkeypatch: pytest.MonkeyPatch,
++    hf_tokenizer: PreTrainedTokenizerBase,
++) -> None:
++    """Regression: --backend vllm must accept multimodal datasets such as ASR.
++
++    _run_vllm_requests forwards multi_modal_data straight to LLM.generate, so
++    the vllm-chat-only gate in get_samples rejected a backend that always
++    worked.
++    """
++    import vllm.benchmarks.datasets.datasets as dsmod
++
++    class _StubASRDataset:
++        IS_MULTIMODAL = True
++        SUPPORTED_DATASET_PATHS = {"openslr/librispeech_asr"}
++
++        def __init__(self, **kwargs):
++            self.__dict__.update(kwargs)
++
++        def sample(self, *, num_requests, tokenizer, **kwargs):  # noqa: ARG002
++            return [
++                SampleRequest(prompt="q", prompt_len=1, expected_output_len=1)
++                for _ in range(num_requests)
++            ]
++
++    monkeypatch.setattr(dsmod, "ASRDataset", _StubASRDataset)
++
++    parser = FlexibleArgumentParser()
++    add_cli_args(parser)
++    args = parser.parse_args(
++        [
++            "--dataset-name",
++            "hf",
++            "--dataset-path",
++            "openslr/librispeech_asr",
++            "--backend",
++            "vllm",
++            "--num-prompts",
++            "3",
++        ]
++    )
++    requests = get_requests(args, hf_tokenizer)
++    assert len(requests) == 3
++    assert all(isinstance(r, SampleRequest) for r in requests)
+diff --git a/vllm/benchmarks/throughput.py b/vllm/benchmarks/throughput.py
+index 5b757d43d..17b2f2426 100644
+--- a/vllm/benchmarks/throughput.py
++++ b/vllm/benchmarks/throughput.py
+@@ -567,10 +567,9 @@ def _to_serve_args(args: argparse.Namespace) -> argparse.Namespace:
+ 
+ def get_requests(args, tokenizer):
+     serve_args = _to_serve_args(args)
+-    # Throughput reuses bench serve's dataset dispatch. vllm-chat is the only
+-    # multimodal-capable throughput backend, so it is the only one allowed past
+-    # the multimodal gates inside get_samples; other backends raise there.
+-    mm_backends = ("vllm-chat",) if args.backend == "vllm-chat" else ()
++    # Both offline vLLM backends forward multi_modal_data to the engine;
++    # "hf" and "mii" are text-only and get rejected inside get_samples.
++    mm_backends = ("vllm", "vllm-chat")
+     requests = get_samples(serve_args, tokenizer, multimodal_backends=mm_backends)
+     requests = assign_loras(requests, args)
+     requests = filter_requests_for_dp(requests, args.data_parallel_size)
+-- 
+2.53.0
+

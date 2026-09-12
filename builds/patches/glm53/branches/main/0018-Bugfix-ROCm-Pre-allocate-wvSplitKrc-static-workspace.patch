@@ -1,0 +1,88 @@
+From 70732942c6e0bcbe83a74cafc9214a0f49fd8929 Mon Sep 17 00:00:00 2001
+From: Nick Hill <nickhill123@gmail.com>
+Date: Fri, 28 Aug 2026 14:22:53 -0700
+Subject: [PATCH 18/39] [Bugfix][ROCm] Pre-allocate `wvSplitKrc` static
+ workspaces before KV init (#54247)
+
+Signed-off-by: Nick Hill <nickhill123@gmail.com>
+Co-authored-by: Kimi Code <noreply@moonshot.ai>
+---
+ vllm/model_executor/layers/utils.py | 21 +++++++++++++++++++++
+ vllm/v1/worker/utils.py             | 22 ++++++++++++++++------
+ 2 files changed, 37 insertions(+), 6 deletions(-)
+
+diff --git a/vllm/model_executor/layers/utils.py b/vllm/model_executor/layers/utils.py
+index dc6f6775f..08ce3b28d 100644
+--- a/vllm/model_executor/layers/utils.py
++++ b/vllm/model_executor/layers/utils.py
+@@ -368,6 +368,27 @@ direct_register_custom_op(
+ )
+ 
+ 
++@functools.cache
++def warmup_rocm_skinny_gemm_workspaces(device: torch.device) -> None:
++    """Eagerly allocate wvSplitKrc's process-lifetime static workspaces.
++
++    They are otherwise created lazily on the first qualifying GEMM
++    (csrc/rocm/skinny_gemms.cu), which can be the first real request — after
++    the KV cache backing buffer exists. If one landed in that segment's
++    rounding tail, it would pin the entire segment at engine shutdown.
++    """
++    from vllm.platforms.rocm import on_gfx950
++
++    if not on_gfx950():
++        return
++    try:
++        x = torch.zeros(16, 1024, dtype=torch.bfloat16, device=device)
++        weight = torch.zeros(32, 1024, dtype=torch.bfloat16, device=device)
++        ops.wvSplitKrc(x, weight, num_compute_units())
++    except Exception:
++        logger.debug("wvSplitKrc workspace warmup failed", exc_info=True)
++
++
+ # Above this weight size, oneDNN's onednn_mm consistently matches or beats
+ # the SGL AMX kernel once M grows past decode-sized batches, and is within
+ # noise of it at decode-sized M -- so larger weights default to oneDNN
+diff --git a/vllm/v1/worker/utils.py b/vllm/v1/worker/utils.py
+index 8ee389df3..4c407f410 100644
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -13,6 +13,7 @@ import torch
+ from vllm.config import CacheConfig, VllmConfig
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.attention import Attention
++from vllm.model_executor.layers.utils import warmup_rocm_skinny_gemm_workspaces
+ from vllm.model_executor.models.interfaces import MultiModalEmbeddings
+ from vllm.model_executor.models.utils import extract_layer_index
+ from vllm.platforms import current_platform
+@@ -393,12 +394,21 @@ def allocate_kv_cache(
+     sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
+     assert len(sizes) == 1, "KV cache tensors must share one backing allocation."
+     raw_size = sizes.pop()
+-    page_size = 4096
+-    buf = torch.zeros(
+-        ((raw_size + page_size - 1) // page_size) * page_size,
+-        dtype=torch.int8,
+-        device=device,
+-    )
++    # wvSplitKrc's process-lifetime static workspaces (csrc/rocm/skinny_gemms.cu)
++    # are created lazily on the first qualifying GEMM. Force that now, before
++    # the giant backing allocation below: if one landed in this segment's
++    # rounding tail it would pin the whole segment at engine shutdown.
++    if current_platform.is_rocm():
++        warmup_rocm_skinny_gemm_workspaces(device)
++        # Pad to the page granularity MoRIIO needs to register the shared
++        # backing as a single RDMA memory region. Other platforms keep the
++        # exact-size allocation: NIXL and SimpleCPUOffload rely on
++        # storage.nbytes() matching the logical KV size (see #53974).
++        page_size = 4096
++        buf_size = ((raw_size + page_size - 1) // page_size) * page_size
++    else:
++        buf_size = raw_size
++    buf = torch.zeros(buf_size, dtype=torch.int8, device=device)
+ 
+     kv_caches: dict[str, torch.Tensor] = {}
+     for tensor in kv_cache_config.kv_cache_tensors:
+-- 
+2.53.0
+

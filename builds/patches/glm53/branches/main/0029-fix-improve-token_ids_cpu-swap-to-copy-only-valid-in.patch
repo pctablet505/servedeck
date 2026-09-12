@@ -1,0 +1,33 @@
+From 68c52b5a937fe63c7a315739ad468f9d30fd483b Mon Sep 17 00:00:00 2001
+From: zzaebok <44357534+zzaebok@users.noreply.github.com>
+Date: Sat, 29 Aug 2026 08:22:39 +0800
+Subject: [PATCH 29/39] fix: improve token_ids_cpu swap to copy only valid
+ indices (#36255)
+
+Signed-off-by: Jaebok Lee <jaebok9541@naver.com>
+---
+ vllm/v1/worker/tpu_input_batch.py | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/v1/worker/tpu_input_batch.py b/vllm/v1/worker/tpu_input_batch.py
+index 245ac3c90..c16156a5e 100644
+--- a/vllm/v1/worker/tpu_input_batch.py
++++ b/vllm/v1/worker/tpu_input_batch.py
+@@ -377,10 +377,10 @@ class InputBatch:
+         # self.token_ids_cpu[i1, ...], self.token_ids_cpu[i2, ...], =\
+         #     self.token_ids_cpu[i2, ...], self.token_ids_cpu[i1, ...]
+         # instead, we need to temporarily copy the data for one of the indices
+-        # TODO(lucas): optimize this by only copying valid indices
+-        tmp = self.token_ids_cpu[i1, ...].copy()
+-        self.token_ids_cpu[i1, ...] = self.token_ids_cpu[i2, ...]
+-        self.token_ids_cpu[i2, ...] = tmp
++        n = max(self.num_tokens_no_spec[i1], self.num_tokens_no_spec[i2])
++        tmp = self.token_ids_cpu[i1, :n].copy()
++        self.token_ids_cpu[i1, :n] = self.token_ids_cpu[i2, :n]
++        self.token_ids_cpu[i2, :n] = tmp
+ 
+         swap_dict_values(self.generators, i1, i2)
+         swap_dict_values(self.min_tokens, i1, i2)
+-- 
+2.53.0
+

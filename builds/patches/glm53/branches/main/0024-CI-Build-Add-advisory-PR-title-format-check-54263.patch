@@ -1,0 +1,102 @@
+From b131311fb4ef7adc2752333ed7ae87182f5e2665 Mon Sep 17 00:00:00 2001
+From: Bugen Zhao <i@bugenzhao.com>
+Date: Sat, 29 Aug 2026 08:50:47 +1000
+Subject: [PATCH 24/39] [CI/Build] Add advisory PR title format check (#54263)
+
+---
+ .github/workflows/pr-title.yml | 24 +++++++++++++++++
+ docs/contributing/README.md    | 47 +++++++++++++++++++---------------
+ 2 files changed, 51 insertions(+), 20 deletions(-)
+ create mode 100644 .github/workflows/pr-title.yml
+
+diff --git a/.github/workflows/pr-title.yml b/.github/workflows/pr-title.yml
+new file mode 100644
+index 000000000..96cb26148
+--- /dev/null
++++ b/.github/workflows/pr-title.yml
+@@ -0,0 +1,24 @@
++name: PR title
++
++on:
++  pull_request:
++    types: [opened, edited, reopened, synchronize]
++
++permissions: {}
++
++jobs:
++  check-format:
++    name: Check format
++    runs-on: ubuntu-latest
++    steps:
++      - name: Validate title
++        env:
++          PR_TITLE: ${{ github.event.pull_request.title }}
++        run: |
++          pattern='^(\[[^][]+\])+ +[^[:space:]].*$'
++          if [[ "$PR_TITLE" =~ $pattern ]]; then
++            exit 0
++          fi
++
++          echo "::error::PR title must start with one or more [Tag] prefixes, followed by a space and a description."
++          exit 1
+diff --git a/docs/contributing/README.md b/docs/contributing/README.md
+index 3206094de..5622315b5 100644
+--- a/docs/contributing/README.md
++++ b/docs/contributing/README.md
+@@ -221,26 +221,33 @@ AI-assisted code must meet all quality standards: proper testing, documentation,
+ 
+ ### PR Title and Classification
+ 
+-Only specific types of PRs will be reviewed. The PR title is prefixed
+-appropriately to indicate the type of change. Please use one of the following:
+-
+-- `[Bugfix]` for bug fixes.
+-- `[CI/Build]` for build or continuous integration improvements.
+-- `[Doc]` for documentation fixes and improvements.
+-- `[Model]` for adding a new model or improving an existing model. Model name
+-  should appear in the title.
+-- `[Frontend]` For changes on the vLLM frontend (e.g., OpenAI API server,
+-  `LLM` class, etc.)
+-- `[Kernel]` for changes affecting CUDA kernels or other compute kernels.
+-- `[Core]` for changes in the core vLLM logic (e.g., `LLMEngine`,
+-  `AsyncLLMEngine`, `Scheduler`, etc.)
+-- `[Hardware][Vendor]` for hardware-specific changes. Vendor name should
+-  appear in the prefix (e.g., `[Hardware][AMD]`).
+-- `[Misc]` for PRs that do not fit the above categories. Please use this
+-  sparingly.
+-
+-!!! note
+-    If the PR spans more than one category, please include all relevant prefixes.
++PR titles must start with one or more bracketed tags, followed by a space and a
++concise description, for example, `[Bugfix][Scheduler] Fix priority handling`.
++Any descriptive tag is accepted. The following well-known tags improve
++consistency and discoverability; use one of them when it fits, or choose a more
++specific tag.
++
++**Type tags** describe the nature of the change:
++
++- `[Bugfix]`, `[Feature]`, `[Perf]`, and `[Refactor]` for code changes.
++- `[CI]` or `[CI/Build]`, `[Test]`, and `[Doc]` or `[Docs]` for project
++  infrastructure, tests, and documentation.
++- `[Misc]` when another type tag does not fit.
++
++**Scope tags** identify the affected area:
++
++- `[Model]`, `[Frontend]`, `[Rust Frontend]`, `[Core]`, and `[Kernel]` for major
++  areas of the codebase.
++- `[Model Runner V2]` or `[MRV2]`, `[Attention]`, `[Multimodal]`,
++  `[Quantization]`, `[MoE]`, `[Spec Decode]`, `[LoRA]`, `[KV Connector]`, and
++  `[KV Offload]` for frequently changed subsystems.
++- `[ROCm]`, `[XPU]`, `[CPU]`, or `[Hardware][Vendor]` for hardware-specific
++  changes. Replace `Vendor` with the vendor name, for example,
++  `[Hardware][AMD]`.
++
++Type and scope tags can be combined, and multiple tags from either category can
++be stacked without spaces. For example, `[Bugfix][KV Offload] Fix block
++accounting` or `[Perf][ROCm][Kernel] Optimize fused MoE`.
+ 
+ ### Code Quality
+ 
+-- 
+2.53.0
+

@@ -1,0 +1,743 @@
+From 2aac565cae880087d752e90f1a08dcd9b369f9a0 Mon Sep 17 00:00:00 2001
+From: Summer Yang <girasoleyang@gmail.com>
+Date: Fri, 28 Aug 2026 14:58:00 -0700
+Subject: [PATCH 20/39] [Core][KV Connector] Start async KV loads after the
+ forward launch when no sync loads are scheduled (#53333)
+
+Signed-off-by: Summer Yang <girasoleyang@gmail.com>
+Signed-off-by: Nick Hill <nickhill123@gmail.com>
+Co-authored-by: Nick Hill <nickhill123@gmail.com>
+---
+ tests/v1/core/test_scheduler.py               | 41 ++++++++++
+ .../unit/test_mooncake_store_worker.py        |  2 +-
+ .../kv_connector/unit/test_multi_connector.py | 24 +++---
+ .../unit/test_nixl_simple_cpu_offload.py      |  5 +-
+ tests/v1/simple_kv_offload/test_worker.py     |  7 +-
+ tests/v1/worker/test_gpu_kv_connector.py      | 79 ++++++++++++++++++
+ .../kv_transfer/kv_connector/v1/base.py       |  4 +-
+ .../kv_connector/v1/lmcache_connector.py      | 15 ++++
+ .../v1/lmcache_integration/vllm_v1_adapter.py | 15 +++-
+ .../v1/mooncake/store/connector.py            | 12 ++-
+ .../kv_connector/v1/mooncake/store/worker.py  | 80 +++++++++----------
+ .../v1/simple_cpu_offload_connector.py        | 10 ++-
+ vllm/v1/core/sched/output.py                  |  4 +
+ vllm/v1/core/sched/scheduler.py               |  6 ++
+ vllm/v1/simple_kv_offload/worker.py           | 79 +++++++++---------
+ vllm/v1/worker/gpu/kv_connector.py            | 14 ++++
+ .../worker/kv_connector_model_runner_mixin.py | 14 ++--
+ 17 files changed, 293 insertions(+), 118 deletions(-)
+ create mode 100644 tests/v1/worker/test_gpu_kv_connector.py
+
+diff --git a/tests/v1/core/test_scheduler.py b/tests/v1/core/test_scheduler.py
+index 920823bae..b9d709b8c 100644
+--- a/tests/v1/core/test_scheduler.py
++++ b/tests/v1/core/test_scheduler.py
+@@ -1975,6 +1975,47 @@ def _step_until_kv_transfer_finished(scheduler: Scheduler, req_ids: list[str]):
+     return initial_ecos
+ 
+ 
++@pytest.mark.parametrize(
++    ("load_modes", "expected_has_sync_loads"),
++    [
++        ((True,), False),
++        ((False,), True),
++        ((True, False), True),
++    ],
++)
++@pytest.mark.skip_global_cleanup
++def test_has_sync_kv_loads(
++    load_modes: tuple[bool, ...],
++    expected_has_sync_loads: bool,
++    tmp_path,
++):
++    (tmp_path / "config.json").write_text(
++        '{"architectures": ["OPTForCausalLM"], "model_type": "opt"}'
++    )
++    block_size = 16
++    scheduler = create_scheduler(
++        model=str(tmp_path),
++        skip_tokenizer_init=True,
++        use_kv_connector=mock_kv(matched_tokens=block_size, is_async=False),
++        block_size=block_size,
++    )
++    requests = create_requests(
++        num_requests=len(load_modes),
++        num_tokens=block_size * 2,
++        block_size=block_size,
++    )
++    for request in requests:
++        scheduler.add_request(request)
++
++    scheduler.connector.get_num_new_matched_tokens = Mock(
++        side_effect=[(block_size, is_async) for is_async in load_modes]
++    )
++
++    output = scheduler.schedule()
++
++    assert output.has_sync_kv_loads is expected_has_sync_loads
++
++
+ @pytest.mark.parametrize("is_async", [False, True])
+ def test_kv_connector_basic(is_async: bool):
+     """
+diff --git a/tests/v1/kv_connector/unit/test_mooncake_store_worker.py b/tests/v1/kv_connector/unit/test_mooncake_store_worker.py
+index 7db71c684..a3137d670 100644
+--- a/tests/v1/kv_connector/unit/test_mooncake_store_worker.py
++++ b/tests/v1/kv_connector/unit/test_mooncake_store_worker.py
+@@ -2960,7 +2960,7 @@ def test_putting_consumer_queues_decode_save():
+ 
+     with patch.object(torch.cuda, "Event") as event_cls:
+         event = event_cls.return_value
+-        w.get_finished(set(), meta)
++        w.wait_for_save(meta)
+ 
+     event.record.assert_called_once_with()
+     send_thread.add_request.assert_called_once_with(req)
+diff --git a/tests/v1/kv_connector/unit/test_multi_connector.py b/tests/v1/kv_connector/unit/test_multi_connector.py
+index 6dce07834..3f2d5da5b 100644
+--- a/tests/v1/kv_connector/unit/test_multi_connector.py
++++ b/tests/v1/kv_connector/unit/test_multi_connector.py
+@@ -294,18 +294,23 @@ def test_multi_example_connector_consistency():
+         "update_state_after_alloc num_blocks=[7] 0",
+         "build_connector_meta",
+     ]
+-    # First three events are from initialization (register_kv_caches,
+-    # set_host_xfer_buffer_ops, get_handshake_metadata), then generate() events.
+-    assert events["storage1-WORKER"][:8] == [
++    # First three events are from initialization. During generate(), layer hooks
++    # run before the deferred load is started after the forward pass.
++    expected_worker_prefix = [
+         "register_kv_caches",
+         "set_host_xfer_buffer_ops",
+         "get_handshake_metadata",
+         "handle_preemptions",
+         "bind_connector_metadata",
+-        "start_load_kv",
+         "wait_for_layer_load",
+         "save_kv_layer",
+     ]
++    for connector_name in ("storage1-WORKER", "storage2-WORKER"):
++        worker_events = events[connector_name]
++        assert worker_events[:7] == expected_worker_prefix
++        assert worker_events.index("start_load_kv") > worker_events.index(
++            "save_kv_layer"
++        )
+     assert storage2_scheduler_events[:7] == [
+         "bind_gpu_block_pool",
+         "get_finished_count",
+@@ -315,17 +320,6 @@ def test_multi_example_connector_consistency():
+         "update_state_after_alloc num_blocks=[7] 0",
+         "build_connector_meta",
+     ]
+-    assert events["storage2-WORKER"][:8] == [
+-        "register_kv_caches",
+-        "set_host_xfer_buffer_ops",
+-        "get_handshake_metadata",
+-        "handle_preemptions",
+-        "bind_connector_metadata",
+-        "start_load_kv",
+-        "wait_for_layer_load",
+-        "save_kv_layer",
+-    ]
+-
+     # Reset prefix cache or else we'll just get the tokens back from there.
+     llm.reset_prefix_cache()
+ 
+diff --git a/tests/v1/kv_connector/unit/test_nixl_simple_cpu_offload.py b/tests/v1/kv_connector/unit/test_nixl_simple_cpu_offload.py
+index 16d008767..bdab91a21 100644
+--- a/tests/v1/kv_connector/unit/test_nixl_simple_cpu_offload.py
++++ b/tests/v1/kv_connector/unit/test_nixl_simple_cpu_offload.py
+@@ -213,7 +213,7 @@ def _multi_connector_config(swa_enabled: bool = False):
+ def test_nixl_wins_load_over_cpu_offload():
+     """When NixlConnector (index 0) has matched tokens from a remote prefill, it should
+     win the load: Nixl metadata tracks the recv while CPU offload metadata has no load
+-     scheduled."""
++    scheduled."""
+     vllm_config, kv_cache_config = _multi_connector_config()
+     scheduler = create_scheduler(vllm_config, kv_cache_config=kv_cache_config)
+     mc = scheduler.connector
+@@ -227,6 +227,9 @@ def test_nixl_wins_load_over_cpu_offload():
+     )
+     scheduler.add_request(request)
+     sched_out = scheduler.schedule()
++    # The remote-prefill load is async, so the step has no sync KV loads
++    # and the worker will start the load after the forward.
++    assert not sched_out.has_sync_kv_loads
+ 
+     assert mc._requests_to_connector[request.request_id] == 0
+ 
+diff --git a/tests/v1/simple_kv_offload/test_worker.py b/tests/v1/simple_kv_offload/test_worker.py
+index ccc47dc38..473c3983a 100644
+--- a/tests/v1/simple_kv_offload/test_worker.py
++++ b/tests/v1/simple_kv_offload/test_worker.py
+@@ -152,8 +152,8 @@ class _RecordingBackend:
+         self.calls.append({"is_store": is_store, "wait_event": wait_event})
+ 
+ 
+-def test_get_finished_passes_wait_event_for_store_only():
+-    """get_finished gates stores on a compute-done event but not loads."""
++def test_transfer_hooks_pass_wait_event_for_store_only():
++    """wait_for_save gates stores on a compute-done event; start_load_kv does not."""
+     worker = SimpleCPUOffloadWorker(
+         vllm_config=None, kv_cache_config=None, cpu_capacity_bytes=0
+     )
+@@ -168,7 +168,8 @@ def test_get_finished_passes_wait_event_for_store_only():
+         store_cpu_blocks=[1],
+     )
+ 
+-    worker.get_finished(set())
++    worker.start_load_kv()
++    worker.wait_for_save()
+ 
+     store_calls = [c for c in recording.calls if c["is_store"]]
+     load_calls = [c for c in recording.calls if not c["is_store"]]
+diff --git a/tests/v1/worker/test_gpu_kv_connector.py b/tests/v1/worker/test_gpu_kv_connector.py
+new file mode 100644
+index 000000000..7fb40fff3
+--- /dev/null
++++ b/tests/v1/worker/test_gpu_kv_connector.py
+@@ -0,0 +1,79 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++import vllm.v1.worker.gpu.kv_connector as kv_connector_module
++from vllm.config import KVTransferConfig
++from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector
++
++
++def _make_connector(
++    monkeypatch: pytest.MonkeyPatch,
++    events: list[str],
++) -> ActiveKVConnector:
++    backend = Mock()
++    backend.handle_preemptions.side_effect = lambda _: events.append("handle")
++    backend.bind_connector_metadata.side_effect = lambda _: events.append("bind")
++    backend.start_load_kv.side_effect = lambda _: events.append("start")
++    backend.wait_for_save.side_effect = lambda: events.append("wait")
++    backend.get_finished.side_effect = lambda _: (set(), set())
++    backend.get_block_ids_with_load_errors.return_value = set()
++    backend.get_kv_connector_stats.return_value = None
++    backend.get_kv_connector_kv_cache_events.return_value = None
++    backend.build_connector_worker_meta.return_value = None
++    backend.clear_connector_metadata.side_effect = lambda: events.append("clear")
++    monkeypatch.setattr(kv_connector_module, "get_kv_transfer_group", lambda: backend)
++    monkeypatch.setattr(
++        kv_connector_module, "is_forward_context_available", lambda: True
++    )
++    monkeypatch.setattr(kv_connector_module, "get_forward_context", object)
++
++    kv_config = KVTransferConfig(
++        kv_connector="NixlConnector",
++        kv_role="kv_consumer",
++        kv_buffer_device="cpu",
++    )
++    connector = ActiveKVConnector(  # type: ignore[arg-type]
++        SimpleNamespace(kv_transfer_config=kv_config), {}
++    )
++    events.clear()
++    return connector
++
++
++def _scheduler_output(has_sync_kv_loads: bool) -> SimpleNamespace:
++    return SimpleNamespace(
++        kv_connector_metadata=object(),
++        finished_req_ids=set(),
++        has_sync_kv_loads=has_sync_kv_loads,
++    )
++
++
++@pytest.mark.parametrize("has_sync_kv_loads", [False, True])
++def test_load_start_phase(
++    monkeypatch: pytest.MonkeyPatch,
++    has_sync_kv_loads: bool,
++):
++    events: list[str] = []
++    connector = _make_connector(monkeypatch, events)
++    output = _scheduler_output(has_sync_kv_loads)
++
++    connector.pre_forward(output)  # type: ignore[arg-type]
++    assert events == (
++        ["handle", "bind", "start"] if has_sync_kv_loads else ["handle", "bind"]
++    )
++
++    connector.post_forward(set())
++    assert events == ["handle", "bind", "start", "wait", "clear"]
++
++
++def test_no_forward_starts_deferred_load_once(monkeypatch: pytest.MonkeyPatch):
++    events: list[str] = []
++    connector = _make_connector(monkeypatch, events)
++
++    connector.no_forward(_scheduler_output(False))  # type: ignore[arg-type]
++
++    assert events == ["handle", "bind", "start", "clear"]
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/base.py b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+index b0d7cf238..36e53828c 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/base.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+@@ -289,8 +289,8 @@ class KVConnectorBase_V1(ABC):
+     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
+         """
+         Start loading the KV cache from the connector to vLLM's paged
+-        KV buffer. This is called from the forward context before the
+-        forward pass to enable async loading during model execution.
++        KV buffer. Loads required by the current forward start before it;
++        independent asynchronous loads may start after it is submitted.
+ 
+         Args:
+             forward_context (ForwardContext): the forward context.
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_connector.py
+index 64aee2bd9..609d0480e 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_connector.py
+@@ -133,6 +133,21 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
+                 "please check and use the latest version"
+             )
+ 
++    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
++        super().bind_connector_metadata(connector_metadata)
++        engine = self._lmcache_engine
++        if hasattr(engine, "bind_connector_metadata"):
++            engine.bind_connector_metadata(connector_metadata)
++        else:
++            # Compat for engines predating the bind hook: start_load_kv may
++            # run after the forward (SchedulerOutput.has_sync_kv_loads), so
++            # the per-step layerwise state it used to reset must be reset
++            # here. Remove once LMCache ships bind_connector_metadata.
++            if hasattr(engine, "current_layer"):
++                engine.current_layer = 0
++            if hasattr(engine, "layerwise_retrievers"):
++                engine.layerwise_retrievers = []
++
+     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
+         """
+         Start loading the KV cache from the connector to vLLM's paged
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_integration/vllm_v1_adapter.py b/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_integration/vllm_v1_adapter.py
+index d72ebb5cd..6122a20f9 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_integration/vllm_v1_adapter.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_integration/vllm_v1_adapter.py
+@@ -783,6 +783,17 @@ class LMCacheConnectorV1Impl:
+     ####################
+     # Worker side APIs
+     ####################
++    def bind_connector_metadata(self, metadata: "KVConnectorMetadata") -> None:
++        """Per-step init, called when the runner binds this step's metadata.
++
++        The layerwise hooks fire during every forward once metadata is
++        bound, while start_load_kv may run after the forward launch on
++        steps without sync loads (SchedulerOutput.has_sync_kv_loads), so
++        the per-step state they consume must be reset here.
++        """
++        self.current_layer = 0
++        self.layerwise_retrievers = []
++
+     @_lmcache_nvtx_annotate
+     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+         logger.info("Registering KV caches")
+@@ -806,8 +817,6 @@ class LMCacheConnectorV1Impl:
+             The number of elements in kv_caches and layer_names should be
+             the same.
+         """
+-        self.current_layer = 0
+-
+         if len(self.kv_caches) == 0:
+             self._init_kv_caches_from_forward_context(forward_context)
+ 
+@@ -826,8 +835,6 @@ class LMCacheConnectorV1Impl:
+ 
+         self.lmcache_engine.post_init(kvcaches=kvcaches)
+ 
+-        self.layerwise_retrievers = []
+-
+         for idx, request in enumerate(metadata.requests):
+             if request.load_spec is None:
+                 continue
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
+index 955fddc71..7c7ece02b 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
+@@ -283,8 +283,10 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
+         self.connector_worker.register_kv_caches(kv_caches)
+ 
+     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
+-        # No-op: loads are issued in get_finished() for compute overlap.
+-        pass
++        assert self.connector_worker is not None
++        metadata = self._get_connector_metadata()
++        assert isinstance(metadata, MooncakeStoreConnectorMetadata)
++        self.connector_worker.start_load_kv(metadata)
+ 
+     def wait_for_layer_load(self, layer_name: str) -> None:
+         # No layerwise support - no-op
+@@ -301,8 +303,10 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
+         return
+ 
+     def wait_for_save(self):
+-        # No-op: stores are issued in get_finished() for compute overlap.
+-        pass
++        assert self.connector_worker is not None
++        metadata = self._get_connector_metadata()
++        assert isinstance(metadata, MooncakeStoreConnectorMetadata)
++        self.connector_worker.wait_for_save(metadata)
+ 
+     def get_finished(
+         self, finished_req_ids: set[str]
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+index b48e67683..fae793b89 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+@@ -1743,36 +1743,17 @@ class MooncakeStoreWorker:
+             "Started %d Mooncake KV-load receive thread(s)", self.num_recv_threads
+         )
+ 
+-    def start_load_kv(
+-        self,
+-        metadata: MooncakeStoreConnectorMetadata,
+-    ):
+-        """No-op: loads are issued in get_finished() for overlap."""
+-        pass
++    def start_load_kv(self, metadata: MooncakeStoreConnectorMetadata):
++        """Issue async loads.
+ 
+-    def wait_for_save(
+-        self,
+-        metadata: MooncakeStoreConnectorMetadata,
+-    ):
+-        """No-op: stores are issued in get_finished() for overlap."""
+-        pass
+-
+-    def get_finished(
+-        self,
+-        finished_req_ids: set[str],
+-        meta: MooncakeStoreConnectorMetadata,
+-    ) -> tuple[set[str], set[str]]:
+-        """Issue all I/O and get completed send/recv request IDs.
+-
+-        All load and store I/O requests are issued here (after model
+-        compute is launched on the compute stream) for better
+-        compute-I/O overlap.
++        Runs after the forward launch on steps without sync loads
++        (SchedulerOutput.has_sync_kv_loads), keeping load submission off
++        the critical path while preserving compute-I/O overlap.
+         """
+         if self._capacity_only:
+-            return set(), set()
++            return
+ 
+-        # Issue async loads
+-        for request in meta.requests:
++        for request in metadata.requests:
+             load_spec = request.load_spec
+             if load_spec is None or not load_spec.can_load:
+                 continue
+@@ -1781,21 +1762,40 @@ class MooncakeStoreWorker:
+             self.recv_request_queue.put(request)
+ 
+         assert self.load_async, "load_async must be True for better performance."
+-        # Issue stores with CUDA event synchronization.
+-        if self.can_put:
+-            current_event = None
+-            for request in meta.requests:
+-                if request.can_save:
+-                    current_event = torch.cuda.Event()
+-                    current_event.record()
+-                    break
+ 
+-            for request in meta.requests:
+-                if not request.can_save:
+-                    continue
+-                request.current_event = current_event
+-                assert self.kv_send_thread is not None
+-                self.kv_send_thread.add_request(request)
++    def wait_for_save(self, metadata: MooncakeStoreConnectorMetadata):
++        """Issue async stores with CUDA event synchronization.
++
++        Runs after the forward launch for compute-I/O overlap.
++        """
++        if self._capacity_only or not self.can_put:
++            return
++
++        current_event = None
++        for request in metadata.requests:
++            if request.can_save:
++                current_event = torch.cuda.Event()
++                current_event.record()
++                break
++
++        for request in metadata.requests:
++            if not request.can_save:
++                continue
++            request.current_event = current_event
++            assert self.kv_send_thread is not None
++            self.kv_send_thread.add_request(request)
++
++    def get_finished(
++        self, finished_req_ids: set[str], meta: MooncakeStoreConnectorMetadata
++    ) -> tuple[set[str], set[str]]:
++        """Get completed send/recv request IDs.
++
++        Loads are issued in start_load_kv() and stores in wait_for_save().
++        """
++        if self._capacity_only:
++            return set(), set()
++
++        if self.can_put:
+             self._close_ended_store_requests(finished_req_ids, meta)
+ 
+         # Blocks read by a store job are released by the scheduler when the job
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+index e19819221..90a421da0 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+@@ -196,10 +196,11 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
+             self.worker_handler.handle_preemptions(kv_connector_metadata)
+ 
+     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
+-        pass  # Launch loads ops in get_finished() after launching model execution
++        if self.worker_handler is not None:
++            self.worker_handler.start_load_kv()
+ 
+     def wait_for_layer_load(self, layer_name: str) -> None:
+-        pass  # Always load asynchronously and deferred to get_finished()
++        pass  # Always load asynchronously, issued in start_load_kv()
+ 
+     def save_kv_layer(
+         self,
+@@ -208,10 +209,11 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
+         attn_metadata: "AttentionMetadata",
+         **kwargs: Any,
+     ) -> None:
+-        pass  # Always save asynchronously and deferred to get_finished()
++        pass  # Always save asynchronously, issued in wait_for_save()
+ 
+     def wait_for_save(self) -> None:
+-        pass  # All stores are driven by get_finished() and no wait needed
++        if self.worker_handler is not None:
++            self.worker_handler.wait_for_save()
+ 
+     def get_finished(
+         self,
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index 977dd34e8..c47a899c8 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -262,6 +262,10 @@ class SchedulerOutput:
+     # KV Cache Connector metadata.
+     kv_connector_metadata: KVConnectorMetadata | None = None
+ 
++    # Whether any scheduled request consumes KV that the connector loads
++    # synchronously during this step (load_async=False).
++    has_sync_kv_loads: bool = False
++
+     # EC Cache Connector metadata
+     ec_connector_metadata: ECConnectorMetadata | None = None
+     # EC Cache Manager metadata
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 51f75a63d..55e8589a4 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -532,6 +532,8 @@ class Scheduler(SchedulerInterface):
+         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+         # Whether the running batch contains any prefill requests.
+         prefill_scheduled = False
++        # Whether any scheduled request has a synchronous connector KV load.
++        has_sync_kv_loads = False
+ 
+         # For logging.
+         scheduled_timestamp = time.monotonic()
+@@ -1142,6 +1144,9 @@ class Scheduler(SchedulerInterface):
+                     continue
+ 
+                 self.running.append(request)
++                if num_external_computed_tokens > 0:
++                    # load_kv_async is False here
++                    has_sync_kv_loads = True
+                 if self.log_stats:
+                     request.record_event(
+                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
+@@ -1318,6 +1323,7 @@ class Scheduler(SchedulerInterface):
+             finished_req_ids=self.finished_req_ids,
+             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
++            has_sync_kv_loads=has_sync_kv_loads,
+             kv_cache_block_copies=pending_kv_cache_block_copies,
+             partial_tail_offloads=pending_partial_tail_offloads,
+             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
+diff --git a/vllm/v1/simple_kv_offload/worker.py b/vllm/v1/simple_kv_offload/worker.py
+index dc95d4d3e..d49de261e 100644
+--- a/vllm/v1/simple_kv_offload/worker.py
++++ b/vllm/v1/simple_kv_offload/worker.py
+@@ -231,58 +231,59 @@ class SimpleCPUOffloadWorker:
+         self._connector_metadata = None
+ 
+     def start_load_kv(self) -> None:
+-        # NOTE: we defer launching both load and store to get_finished(),
+-        # which runs after model execution. This hides the CPU-side
+-        # block copy op overhead (~5ms) behind GPU compute.
+-        pass
++        # Invoked after the forward launch on steps without sync loads
++        # (SchedulerOutput.has_sync_kv_loads), so the CPU-side block copy
++        # op overhead (~5ms) stays hidden behind GPU compute. Stores are
++        # issued in wait_for_save().
++        metadata = self._connector_metadata
++        if metadata is not None and metadata.load_cpu_blocks:
++            backend = self._backend
++            assert backend is not None
++            backend.launch_copy(
++                metadata.load_cpu_blocks,
++                metadata.load_gpu_blocks,
++                is_store=False,
++                event_idx=metadata.load_event,
++                events_list=self._load_events,
++            )
+ 
+     def wait_for_save(self) -> None:
+-        pass
+-
+-    def get_finished(
+-        self,
+-        finished_req_ids: set[str],
+-    ) -> tuple[set[str] | None, set[str] | None]:
+-        """Submit transfers and report completed events to the scheduler.
++        """Submit async stores.
+ 
+         Stores (GPU->CPU) read the live KV cache, which the compute stream may
+         still be writing under v1 overlapped execution, so they are ordered
+-        after a compute-done event recorded on the current stream. Loads
+-        (CPU->GPU) read stable pinned host memory and launch immediately. See
++        after a compute-done event recorded on the current stream. See
+         #45704 for the bug and #39306 for the srcAccessOrder rationale.
++        """
++        metadata = self._connector_metadata
++        if metadata is not None and metadata.store_gpu_blocks:
++            backend = self._backend
++            assert backend is not None
++            if self._store_compute_done is None:
++                self._store_compute_done = torch.Event()
++            self._store_compute_done.record(torch.cuda.current_stream())
++            backend.launch_copy(
++                metadata.store_gpu_blocks,
++                metadata.store_cpu_blocks,
++                is_store=True,
++                event_idx=metadata.store_event,
++                events_list=self._store_events,
++                wait_event=self._store_compute_done,
++            )
++
++    def get_finished(
++        self, finished_req_ids: set[str]
++    ) -> tuple[set[str] | None, set[str] | None]:
++        """Report completed transfer events to the scheduler.
++
++        Loads are submitted in start_load_kv() and stores in wait_for_save().
+ 
+         Returns:
+             tuple of (finished_sending, finished_recving).
+             - finished_sending: always None (stores use worker metadata).
+             - finished_recving: req_ids whose loads have completed.
+         """
+-        # (1) Submit transfers
+         metadata = self._connector_metadata
+-        if metadata is not None:
+-            backend = self._backend
+-            assert backend is not None
+-            if metadata.load_cpu_blocks:
+-                backend.launch_copy(
+-                    metadata.load_cpu_blocks,
+-                    metadata.load_gpu_blocks,
+-                    is_store=False,
+-                    event_idx=metadata.load_event,
+-                    events_list=self._load_events,
+-                )
+-            if metadata.store_gpu_blocks:
+-                if self._store_compute_done is None:
+-                    self._store_compute_done = torch.Event()
+-                self._store_compute_done.record(torch.cuda.current_stream())
+-                backend.launch_copy(
+-                    metadata.store_gpu_blocks,
+-                    metadata.store_cpu_blocks,
+-                    is_store=True,
+-                    event_idx=metadata.store_event,
+-                    events_list=self._store_events,
+-                    wait_event=self._store_compute_done,
+-                )
+-
+-        # (2) Track completed transfer events
+         finished_recving: set[str] = set()
+ 
+         if self._pending_load_event_indices:
+diff --git a/vllm/v1/worker/gpu/kv_connector.py b/vllm/v1/worker/gpu/kv_connector.py
+index 317d9fb90..eaef0c291 100644
+--- a/vllm/v1/worker/gpu/kv_connector.py
++++ b/vllm/v1/worker/gpu/kv_connector.py
+@@ -54,6 +54,7 @@ class ActiveKVConnector(KVConnector):
+         self.kv_connector.register_kv_caches(kv_caches_dict)
+         self.kv_connector.set_host_xfer_buffer_ops(copy_kv_blocks)
+ 
++        self._pending_load_start = False
+         self._disabled = False
+ 
+     def pre_forward(self, scheduler_output: "SchedulerOutput") -> None:
+@@ -65,6 +66,16 @@ class ActiveKVConnector(KVConnector):
+         self.kv_connector.handle_preemptions(kv_connector_metadata)
+         self.kv_connector.bind_connector_metadata(kv_connector_metadata)
+ 
++        if scheduler_output.has_sync_kv_loads:
++            # Sync loads need to run before this step's forward.
++            self._start_load_kv()
++        else:
++            # Start any async loads in post-forward instead, keeping
++            # their host-side submission cost off the critical path.
++            self._pending_load_start = True
++
++    def _start_load_kv(self) -> None:
++        self._pending_load_start = False
+         # TODO: sort out KV Connectors' use of forward_context
+         if is_forward_context_available():
+             self.kv_connector.start_load_kv(get_forward_context())
+@@ -78,6 +89,9 @@ class ActiveKVConnector(KVConnector):
+         if self._disabled:
+             return None
+ 
++        if self._pending_load_start:
++            self._start_load_kv()
++
+         output = KVConnectorOutput()
+         if wait_for_save:
+             self.kv_connector.wait_for_save()
+diff --git a/vllm/v1/worker/kv_connector_model_runner_mixin.py b/vllm/v1/worker/kv_connector_model_runner_mixin.py
+index ceae77e2c..5d6235bf3 100644
+--- a/vllm/v1/worker/kv_connector_model_runner_mixin.py
++++ b/vllm/v1/worker/kv_connector_model_runner_mixin.py
+@@ -79,14 +79,18 @@ class KVConnectorModelRunnerMixin:
+         assert scheduler_output.kv_connector_metadata is not None
+         kv_connector.bind_connector_metadata(scheduler_output.kv_connector_metadata)
+ 
+-        # Background KV cache transfers happen here.
+-        # These transfers are designed to be async and the requests
+-        # involved may be disjoint from the running requests.
+-        # Do this here to save a collective_rpc.
+-        kv_connector.start_load_kv(get_forward_context())
++        # Start this step's KV loads, ordered after any in-flight KV block
++        # zeroing. Sync loads feed this step's forward so must precede it;
++        # otherwise start (async) loads after the forward launch, keeping
++        # their host-side submission cost off the critical path.
++        start_after_forward = not scheduler_output.has_sync_kv_loads
++        if not start_after_forward:
++            kv_connector.start_load_kv(get_forward_context())
+         try:
+             yield output
+         finally:
++            if start_after_forward:
++                kv_connector.start_load_kv(get_forward_context())
+             if wait_for_save and not defer_finalize:
+                 kv_connector.wait_for_save()
+ 
+-- 
+2.53.0
+

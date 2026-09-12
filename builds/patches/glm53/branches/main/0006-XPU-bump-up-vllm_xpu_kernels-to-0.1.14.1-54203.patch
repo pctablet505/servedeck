@@ -1,0 +1,25 @@
+From 94a54f581e1685a5706fe2809bd4ecb1a4c8e70b Mon Sep 17 00:00:00 2001
+From: Xinyu Chen <xinyu1.chen@intel.com>
+Date: Fri, 28 Aug 2026 22:12:17 +0800
+Subject: [PATCH 06/39] [XPU]bump up vllm_xpu_kernels to 0.1.14.1 (#54203)
+
+Signed-off-by: Xinyu Chen <xinyu1.chen@intel.com>
+---
+ requirements/xpu.txt | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/requirements/xpu.txt b/requirements/xpu.txt
+index 2997c9aba..13f3f5201 100644
+--- a/requirements/xpu.txt
++++ b/requirements/xpu.txt
+@@ -20,4 +20,4 @@ torchvision
+ torchcodec >= 0.14 # Required for the torchcodec video decoding backend
+ 
+ auto_round_lib==0.14.2
+-vllm_xpu_kernels==0.1.13.2
+\ No newline at end of file
++vllm_xpu_kernels==0.1.14.1
+\ No newline at end of file
+-- 
+2.53.0
+

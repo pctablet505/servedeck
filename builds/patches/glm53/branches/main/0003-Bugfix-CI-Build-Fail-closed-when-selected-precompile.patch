@@ -1,0 +1,84 @@
+From 3bb19cd8a32f9cd25f04883028ab3dc719f3edab Mon Sep 17 00:00:00 2001
+From: Jung Jiyu <142137932+jungjiyu@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 18:00:48 +0900
+Subject: [PATCH 03/39] [Bugfix][CI/Build] Fail closed when selected
+ precompiled CUDA variant is unavailable (#52545)
+
+Signed-off-by: Jung Jiyu <jiyu.jung@navercorp.com>
+---
+ docs/contributing/ci/nightly_builds.md |  4 ++--
+ setup.py                               | 30 ++++++++++----------------
+ 2 files changed, 13 insertions(+), 21 deletions(-)
+
+diff --git a/docs/contributing/ci/nightly_builds.md b/docs/contributing/ci/nightly_builds.md
+index c6d83fd9f..795255ec6 100644
+--- a/docs/contributing/ci/nightly_builds.md
++++ b/docs/contributing/ci/nightly_builds.md
+@@ -134,9 +134,9 @@ When installing vLLM with `VLLM_USE_PRECOMPILED=1`, the `setup.py` script:
+ 
+ 1. **Determines wheel location** via `precompiled_wheel_utils.determine_wheel_url()`:
+     - Env var `VLLM_PRECOMPILED_WHEEL_LOCATION` (user-specified URL/path) always takes precedence and skips all other steps.
+-    - Determines the variant from `VLLM_MAIN_CUDA_VERSION` (can be overridden with env var `VLLM_PRECOMPILED_WHEEL_VARIANT`); the default variant will also be tried as a fallback.
++    - For CUDA, uses `VLLM_PRECOMPILED_WHEEL_VARIANT` when specified. Otherwise, an explicitly set `VLLM_MAIN_CUDA_VERSION` selects the variant; if unset, the CUDA version is detected from PyTorch or nvidia-smi, with the default `VLLM_MAIN_CUDA_VERSION` used if detection fails.
+     - Determines the _base commit_ (explained later) of this branch (can be overridden with env var `VLLM_PRECOMPILED_WHEEL_COMMIT`).
+-2. **Fetches metadata** from `https://wheels.vllm.ai/{commit}/vllm/metadata.json` (for the default variant) or `https://wheels.vllm.ai/{commit}/{variant}/vllm/metadata.json` (for a specific variant).
++2. **For CUDA, fetches metadata** for the selected variant from `https://wheels.vllm.ai/{commit}/{variant}/vllm/metadata.json`.
+ 3. **Selects compatible wheel** based on:
+     - Package name (`vllm`)
+     - Platform tag (architecture match)
+diff --git a/setup.py b/setup.py
+index 5463dcfca..4b3488b5f 100644
+--- a/setup.py
++++ b/setup.py
+@@ -892,8 +892,7 @@ class precompiled_wheel_utils:
+         1. user-specified wheel location (can be either local or remote, via
+            VLLM_PRECOMPILED_WHEEL_LOCATION)
+         2. user-specified variant (VLLM_PRECOMPILED_WHEEL_VARIANT) from nightly repo
+-           or auto-detected CUDA variant based on system (torch, nvidia-smi)
+-        3. the default variant from nightly repo
++           or CUDA variant selected from VLLM_MAIN_CUDA_VERSION, torch, or nvidia-smi
+ 
+         If downloading from the nightly repo, the commit can be specified via
+         VLLM_PRECOMPILED_WHEEL_COMMIT; otherwise, the head commit in the main branch
+@@ -924,28 +923,21 @@ class precompiled_wheel_utils:
+                 )
+                 commit = precompiled_wheel_utils.get_base_commit_in_main_branch()
+             print(f"Using precompiled wheel commit {commit} with variant {variant}")
+-            try_default = False
+-            wheels, repo_url, download_filename = None, None, None
++            download_filename = None
+             try:
+                 wheels, repo_url = precompiled_wheel_utils.fetch_metadata_for_variant(
+                     commit, variant
+                 )
+             except Exception as e:
+-                logger.warning(
+-                    "Failed to fetch precompiled wheel metadata for variant %s: %s",
+-                    variant,
+-                    e,
+-                )
+-                try_default = True  # try outside handler to keep the stacktrace simple
+-            if try_default:
+-                print("Trying the default variant from remote")
+-                wheels, repo_url = precompiled_wheel_utils.fetch_metadata_for_variant(
+-                    commit, None
+-                )
+-                # if this also fails, then we have nothing more to try / cache
+-            assert wheels is not None and repo_url is not None, (
+-                "Failed to fetch precompiled wheel metadata"
+-            )
++                raise RuntimeError(
++                    "Failed to fetch precompiled wheel metadata for CUDA "
++                    f"variant {variant!r} at commit {commit}. The "
++                    "root/default variant is not used as a fallback because "
++                    "its CUDA compatibility with the selected variant cannot "
++                    "be verified. Provide a compatible wheel with "
++                    "VLLM_PRECOMPILED_WHEEL_LOCATION or disable "
++                    "VLLM_USE_PRECOMPILED to build from source."
++                ) from e
+             # The metadata.json has the following format:
+             # see .buildkite/scripts/generate-nightly-index.py for details
+             """[{
+-- 
+2.53.0
+

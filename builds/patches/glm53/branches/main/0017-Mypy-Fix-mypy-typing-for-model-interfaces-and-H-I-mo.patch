@@ -1,0 +1,1112 @@
+From 21fa2c5a2a471b9c978a5a3b7208a4c7fe88cefa Mon Sep 17 00:00:00 2001
+From: Taneem Ibrahim <taneem.ibrahim@gmail.com>
+Date: Fri, 28 Aug 2026 15:49:19 -0500
+Subject: [PATCH 17/39] [Mypy] Fix mypy typing for model interfaces and H/I
+ models (#54079)
+
+Signed-off-by: Taneem Ibrahim <taneem.ibrahim@gmail.com>
+Co-authored-by: Wentao Ye <44945378+yewentao256@users.noreply.github.com>
+---
+ tools/pre_commit/mypy.py                      |   2 -
+ vllm/model_executor/models/chatglm.py         |   2 +-
+ vllm/model_executor/models/commandr.py        |   2 +-
+ vllm/model_executor/models/gemma.py           |   2 +-
+ vllm/model_executor/models/gemma4_mm.py       |   2 +-
+ vllm/model_executor/models/granite.py         |   2 +-
+ .../model_executor/models/granitemoehybrid.py |   2 +-
+ vllm/model_executor/models/h2ovl.py           |   1 +
+ vllm/model_executor/models/hrm_text.py        |   4 +-
+ vllm/model_executor/models/hy_v3.py           |  23 ++--
+ vllm/model_executor/models/hy_v3_mtp.py       |  19 ++-
+ .../models/hyperclovax_vision_v2.py           |  15 ++-
+ vllm/model_executor/models/idefics3.py        |   3 +-
+ vllm/model_executor/models/interfaces.py      | 114 +++++++++++-------
+ vllm/model_executor/models/interfaces_base.py |  11 +-
+ vllm/model_executor/models/internlm2.py       |   2 +-
+ vllm/model_executor/models/interns1.py        |  50 +++++---
+ vllm/model_executor/models/interns1_pro.py    |  30 +++--
+ vllm/model_executor/models/interns2_mobius.py |   2 +-
+ vllm/model_executor/models/internvl.py        |  45 ++++---
+ .../model_executor/models/iquest_loopcoder.py |  16 ++-
+ vllm/model_executor/models/isaac.py           |   8 +-
+ vllm/model_executor/models/qwen3_vl.py        |   2 +-
+ 23 files changed, 222 insertions(+), 137 deletions(-)
+
+diff --git a/tools/pre_commit/mypy.py b/tools/pre_commit/mypy.py
+index 8a832746f..fcdf6d50c 100755
+--- a/tools/pre_commit/mypy.py
++++ b/tools/pre_commit/mypy.py
+@@ -112,8 +112,6 @@ SEPARATE_GROUPS = [
+ ]
+ 
+ EXCLUDE = [
+-    r"vllm/model_executor/models/[hH]",
+-    r"vllm/model_executor/models/[iI]",
+     r"vllm/model_executor/models/[jJ]",
+     r"vllm/model_executor/models/[kK]",
+     r"vllm/model_executor/models/[lL]",
+diff --git a/vllm/model_executor/models/chatglm.py b/vllm/model_executor/models/chatglm.py
+index 4363188ff..6e6b8ac8b 100644
+--- a/vllm/model_executor/models/chatglm.py
++++ b/vllm/model_executor/models/chatglm.py
+@@ -430,7 +430,7 @@ class ChatGLMBaseModel(nn.Module):
+ 
+ 
+ class ChatGLMForCausalLM(ChatGLMBaseModel, SupportsLoRA, SupportsPP, SupportsQuant):
+-    packed_modules_mapping = {
++    packed_modules_mapping: dict[str, list[str]] = {
+         "query_key_value": ["query_key_value"],
+         "dense_h_to_4h": ["dense_h_to_4h"],
+     }
+diff --git a/vllm/model_executor/models/commandr.py b/vllm/model_executor/models/commandr.py
+index 87b832f91..3fe78f081 100644
+--- a/vllm/model_executor/models/commandr.py
++++ b/vllm/model_executor/models/commandr.py
+@@ -417,7 +417,7 @@ class CohereForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsQuant):
+         orig_to_new_substr={"_quantizer.": None},
+         orig_to_new_prefix={"lm_head": None},
+     )
+-    packed_modules_mapping = {
++    packed_modules_mapping: dict[str, list[str]] = {
+         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+         "gate_up_proj": ["gate_proj", "up_proj"],
+     }
+diff --git a/vllm/model_executor/models/gemma.py b/vllm/model_executor/models/gemma.py
+index 983822c15..940ba0a72 100644
+--- a/vllm/model_executor/models/gemma.py
++++ b/vllm/model_executor/models/gemma.py
+@@ -339,7 +339,7 @@ class GemmaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsQuant):
+             ".up_proj": (".gate_up_proj", 1),
+         }
+     )
+-    packed_modules_mapping = {
++    packed_modules_mapping: dict[str, list[str]] = {
+         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+         "gate_up_proj": ["gate_proj", "up_proj"],
+     }
+diff --git a/vllm/model_executor/models/gemma4_mm.py b/vllm/model_executor/models/gemma4_mm.py
+index 428ab9ec1..2a15dacb6 100644
+--- a/vllm/model_executor/models/gemma4_mm.py
++++ b/vllm/model_executor/models/gemma4_mm.py
+@@ -1019,7 +1019,7 @@ class Gemma4ForConditionalGeneration(
+     mm_prefix_clamp_sliding_window: bool = True
+     supports_tower_connector_lora = True
+ 
+-    packed_modules_mapping = {
++    packed_modules_mapping: dict[str, list[str]] = {
+         "qkv_proj": [
+             "q_proj",
+             "k_proj",
+diff --git a/vllm/model_executor/models/granite.py b/vllm/model_executor/models/granite.py
+index 7b8f42fdd..55a90f5ff 100644
+--- a/vllm/model_executor/models/granite.py
++++ b/vllm/model_executor/models/granite.py
+@@ -395,7 +395,7 @@ class GraniteModel(nn.Module):
+ class GraniteForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsQuant):
+     hf_to_vllm_mapper = GraniteModel.hf_to_vllm_mapper
+     # LoRA specific attributes
+-    packed_modules_mapping = {
++    packed_modules_mapping: dict[str, list[str]] = {
+         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+         "gate_up_proj": ["gate_proj", "up_proj"],
+     }
+diff --git a/vllm/model_executor/models/granitemoehybrid.py b/vllm/model_executor/models/granitemoehybrid.py
+index 52b3a72a7..810770aab 100644
+--- a/vllm/model_executor/models/granitemoehybrid.py
++++ b/vllm/model_executor/models/granitemoehybrid.py
+@@ -587,7 +587,7 @@ class GraniteMoeHybridForCausalLM(
+     SupportsQuant,
+     SupportsMambaPrefixCaching,
+ ):
+-    packed_modules_mapping = {
++    packed_modules_mapping: dict[str, list[str]] = {
+         "qkv_proj": [
+             "q_proj",
+             "k_proj",
+diff --git a/vllm/model_executor/models/h2ovl.py b/vllm/model_executor/models/h2ovl.py
+index 02e31e719..5c4f984c1 100644
+--- a/vllm/model_executor/models/h2ovl.py
++++ b/vllm/model_executor/models/h2ovl.py
+@@ -114,6 +114,7 @@ class H2OVLMultiModalProcessor(BaseInternVLMultiModalProcessor[H2OVLProcessingIn
+             if isinstance(images, ImageEmbeddingItems):
+                 feature_size = images.get_feature_size(item_idx)
+             else:
++                assert isinstance(images, ImageProcessorItems)
+                 image_size = images.get_image_size(item_idx)
+                 feature_size = self.info.get_num_image_tokens(
+                     image_width=image_size.width,
+diff --git a/vllm/model_executor/models/hrm_text.py b/vllm/model_executor/models/hrm_text.py
+index 29825ece5..db8d9c20c 100644
+--- a/vllm/model_executor/models/hrm_text.py
++++ b/vllm/model_executor/models/hrm_text.py
+@@ -248,7 +248,7 @@ class HrmTextDecoderLayer(nn.Module):
+         self,
+         config: PretrainedConfig,
+         layer_idx_in_stack: int,
+-        stack_kind: str,
++        stack_kind: Literal["L", "H"],
+         cache_config: CacheConfig | None = None,
+         quant_config: QuantizationConfig | None = None,
+         prefix: str = "",
+@@ -312,7 +312,7 @@ class HrmTextStack(nn.Module):
+     def __init__(
+         self,
+         config: PretrainedConfig,
+-        stack_kind: str,
++        stack_kind: Literal["L", "H"],
+         cache_config: CacheConfig | None = None,
+         quant_config: QuantizationConfig | None = None,
+         prefix: str = "",
+diff --git a/vllm/model_executor/models/hy_v3.py b/vllm/model_executor/models/hy_v3.py
+index 43293e837..0b54c26f4 100644
+--- a/vllm/model_executor/models/hy_v3.py
++++ b/vllm/model_executor/models/hy_v3.py
+@@ -161,6 +161,7 @@ class HYV3MoEFused(nn.Module):
+             prefix=f"{prefix}.gate",
+         )
+ 
++        self.shared_mlp: HYV3FeedForward | None
+         if config.num_shared_experts > 0:
+             self.shared_mlp = HYV3FeedForward(
+                 hidden_size=config.hidden_size,
+@@ -467,28 +468,27 @@ class HYV3Model(nn.Module, MixtureOfExperts):
+         # Set MoE hyperparameters
+         self.num_expert_groups = 1
+         self.moe_layers = []
+-        example_layer = None
++        example_layer: HYV3MoEFused | None = None
+         for layer in self.layers:
+             if isinstance(layer, PPMissingLayer):
+                 continue
+ 
+             assert isinstance(layer, HYV3DecoderLayer)
+             if layer.block_type == "moe":
++                assert isinstance(layer.mlp, HYV3MoEFused)
+                 example_layer = layer.mlp
+-                self.moe_layers.append(layer.mlp.experts)
++                self.moe_layers.append(example_layer.experts)
+ 
+         if example_layer is None:
+             self.num_moe_layers = 0
+             raise RuntimeError("No MoE layer found in model.layers.")
+ 
+         self.num_moe_layers = len(self.moe_layers)
+-        self.num_logical_experts = getattr(example_layer, "n_logical_experts", None)
+-        self.num_physical_experts = getattr(example_layer, "n_physical_experts", None)
+-        self.num_local_physical_experts = getattr(
+-            example_layer, "n_local_physical_experts", None
+-        )
+-        self.num_routed_experts = getattr(example_layer, "n_routed_experts", None)
+-        self.num_redundant_experts = getattr(example_layer, "n_redundant_experts", None)
++        self.num_logical_experts = example_layer.n_logical_experts
++        self.num_physical_experts = example_layer.n_physical_experts
++        self.num_local_physical_experts = example_layer.n_local_physical_experts
++        self.num_routed_experts = example_layer.n_routed_experts
++        self.num_redundant_experts = example_layer.n_redundant_experts
+ 
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.embed_tokens(input_ids)
+@@ -572,9 +572,10 @@ class HYV3Model(nn.Module, MixtureOfExperts):
+                 continue
+             if "scale" in name:
+                 # Remapping the name of FP8 kv-scale.
+-                name = maybe_remap_kv_scale_name(name, params_dict)
+-                if name is None:
++                remapped_name = maybe_remap_kv_scale_name(name, params_dict)
++                if remapped_name is None:
+                     continue
++                name = remapped_name
+             is_found = False
+             for param_name, weight_name, shard_id in stacked_params_mapping:
+                 if weight_name not in name:
+diff --git a/vllm/model_executor/models/hy_v3_mtp.py b/vllm/model_executor/models/hy_v3_mtp.py
+index 193280d7c..aa9c2f35b 100644
+--- a/vllm/model_executor/models/hy_v3_mtp.py
++++ b/vllm/model_executor/models/hy_v3_mtp.py
+@@ -24,7 +24,7 @@
+ # limitations under the License.
+ """Inference-only HY V3 MTP model compatible with HuggingFace weights."""
+ 
+-from collections.abc import Iterable
++from collections.abc import Callable, Iterable
+ 
+ import regex as re
+ import torch
+@@ -288,7 +288,15 @@ class HYV3MTP(nn.Module):
+         num_kv_heads = getattr(
+             self.config, "num_key_value_heads", self.config.num_attention_heads
+         )
+-        split_params_mapping = [
++        split_params_mapping: list[
++            tuple[
++                str,
++                str,
++                int,
++                list[tuple[str | int, int]],
++                Callable[[torch.Tensor], torch.Tensor] | None,
++            ]
++        ] = [
+             (".gate_up_proj", ".gate_and_up_proj", 2, [(1, 1), (0, 1)], None),
+             (
+                 ".qkv_proj",
+@@ -308,7 +316,7 @@ class HYV3MTP(nn.Module):
+                 num_experts=self.config.num_experts,
+             )
+         else:
+-            expert_params_mapping = {}
++            expert_params_mapping = []
+ 
+         params_dict = dict(self.named_parameters())
+ 
+@@ -354,9 +362,10 @@ class HYV3MTP(nn.Module):
+             if name == "__skip__":
+                 continue
+             if "scale" in name:
+-                name = maybe_remap_kv_scale_name(name, params_dict)
+-                if name is None:
++                remapped_name = maybe_remap_kv_scale_name(name, params_dict)
++                if remapped_name is None:
+                     continue
++                name = remapped_name
+             is_found = False
+ 
+             for param_name, weight_name, shard_id in stacked_params_mapping:
+diff --git a/vllm/model_executor/models/hyperclovax_vision_v2.py b/vllm/model_executor/models/hyperclovax_vision_v2.py
+index b1d64db9d..96e718751 100644
+--- a/vllm/model_executor/models/hyperclovax_vision_v2.py
++++ b/vllm/model_executor/models/hyperclovax_vision_v2.py
+@@ -12,7 +12,7 @@ Supports:
+ 
+ from collections.abc import Iterable, Mapping, Sequence
+ from functools import partial
+-from typing import Annotated, Literal
++from typing import Annotated, Literal, TypedDict
+ 
+ import torch
+ import torch.nn as nn
+@@ -122,6 +122,11 @@ class HCXVisionV2VideoEmbeddingInputs(TensorSchema):
+ HCXVisionV2VideoInputs = HCXVisionV2VideoPixelInputs | HCXVisionV2VideoEmbeddingInputs
+ 
+ 
++class HCXVisionV2MultiModalInputs(TypedDict, total=False):
++    image: HCXVisionV2ImageInputs | None
++    video: HCXVisionV2VideoInputs | None
++
++
+ class HCXVisionV2ProcessingInfo(BaseProcessingInfo):
+     """Processing info for HyperCLOVAX V2 (32B Think model)."""
+ 
+@@ -329,6 +334,7 @@ class HCXVisionV2MultiModalProcessor(
+                 if grid_thw_elem is not None:
+                     # Access .data to get the actual tensor from MultiModalFieldElem
+                     grid_thw = grid_thw_elem.data
++                    assert isinstance(grid_thw, torch.Tensor)
+                     # Qwen2.5-VL style calculation
+                     h, w = grid_thw[1].item(), grid_thw[2].item()
+                     num_tokens = (h * w) // (merge_size**2)
+@@ -340,6 +346,7 @@ class HCXVisionV2MultiModalProcessor(
+                 if grid_thw_elem is not None:
+                     # Access .data to get the actual tensor from MultiModalFieldElem
+                     grid_thw = grid_thw_elem.data
++                    assert isinstance(grid_thw, torch.Tensor)
+                     t, h, w = grid_thw[0].item(), grid_thw[1].item(), grid_thw[2].item()
+                     num_tokens = (t * h * w) // (merge_size**2)
+                 else:
+@@ -606,8 +613,10 @@ class HCXVisionV2ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
+         sizes = (grid_thw.prod(-1) // merge_size // merge_size).tolist()
+         return video_embeds.split(sizes)
+ 
+-    def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict:
+-        modalities = {}
++    def _parse_and_validate_multimodal_inputs(
++        self, **kwargs: object
++    ) -> HCXVisionV2MultiModalInputs:
++        modalities: HCXVisionV2MultiModalInputs = {}
+ 
+         for input_key in kwargs:
+             if (
+diff --git a/vllm/model_executor/models/idefics3.py b/vllm/model_executor/models/idefics3.py
+index 9a55ac51d..80e223e4c 100644
+--- a/vllm/model_executor/models/idefics3.py
++++ b/vllm/model_executor/models/idefics3.py
+@@ -625,6 +625,7 @@ class Idefics3ForConditionalGeneration(
+         if image_input["type"] == "image_embeds":
+             return image_input["data"]
+ 
++        assert isinstance(image_input, Idefics3ImagePixelInputs)
+         image_features = self._process_image_pixels(image_input)
+         image_features = self.model.connector(image_features)
+ 
+@@ -788,7 +789,7 @@ class Idefics3ForConditionalGeneration(
+         path: str = "default",
+     ) -> torch.Tensor:
+         image_input = self._parse_and_validate_image_input(**mm_kwargs)
+-        assert image_input is not None and image_input["type"] == "pixel_values"
++        assert isinstance(image_input, Idefics3ImagePixelInputs)
+         image_features = self._process_image_pixels(image_input)
+         image_features = self.model.connector(image_features)
+         return image_features.flatten(0, 1)
+diff --git a/vllm/model_executor/models/interfaces.py b/vllm/model_executor/models/interfaces.py
+index b3102f567..fd81bb502 100644
+--- a/vllm/model_executor/models/interfaces.py
++++ b/vllm/model_executor/models/interfaces.py
+@@ -32,6 +32,7 @@ from typing_extensions import Self, TypeIs
+ 
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.quantization import QuantizationConfig
++from vllm.model_executor.models.interfaces_base import VllmModel
+ from vllm.utils.collection_utils import common_prefix
+ from vllm.utils.func_utils import supports_kw
+ 
+@@ -46,8 +47,9 @@ if TYPE_CHECKING:
+     from vllm.inputs import PromptType, TokensPrompt
+     from vllm.lora.model_manager import LoRAModelManager
+     from vllm.model_executor.layers.fused_moe import MoERunner
++    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+     from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFunc
+-    from vllm.model_executor.models.interfaces_base import VllmModel
++    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+     from vllm.model_executor.models.utils import WeightsMapper
+     from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItem
+     from vllm.multimodal.registry import _ProcessorFactories
+@@ -128,14 +130,24 @@ class SupportsMultiModalEmbeddings(Protocol):
+ 
+     supports_multimodal_embeddings: ClassVar[Literal[True]] = True
+ 
++    @overload
+     def embed_input_ids(
+         self,
+         input_ids: Tensor,
+-        multimodal_embeddings: MultiModalEmbeddings | None = None,
++        multimodal_embeddings: None = None,
+         *,
+         is_multimodal: Tensor | None = None,
+     ) -> Tensor: ...
+ 
++    @overload
++    def embed_input_ids(
++        self,
++        input_ids: Tensor,
++        multimodal_embeddings: MultiModalEmbeddings,
++        *,
++        is_multimodal: Tensor,
++    ) -> Tensor: ...
++
+ 
+ @runtime_checkable
+ class SupportsMultiModal(SupportsMultiModalEmbeddings, Protocol):
+@@ -243,26 +255,30 @@ class SupportsMultiModal(SupportsMultiModalEmbeddings, Protocol):
+             torch.nn.Module: The core language model component.
+         """
+         # Cached
+-        if self in _language_model_by_module:
+-            return _language_model_by_module[self]
++        assert isinstance(self, nn.Module)
++        self_module = self
++        if self_module in _language_model_by_module:
++            return _language_model_by_module[self_module]
+ 
+         if self._language_model_names:
+-            mod = self
++            mod = self_module
+             for attr in common_prefix(
+                 [name.split(".") for name in self._language_model_names]
+             ):
+                 if attr:
+                     mod = getattr(mod, attr)
+ 
+-            if mod is not self and hasattr(mod, "embed_input_ids"):
+-                _language_model_by_module[self] = mod
+-                return mod
++            candidate: object = mod
++            if candidate is not self_module and isinstance(candidate, VllmModel):
++                _language_model_by_module[self_module] = candidate
++                return candidate
+ 
+         # Fallback
+-        for mod in self.children():
+-            if hasattr(mod, "embed_input_ids"):
+-                _language_model_by_module[self] = mod
+-                return mod
++        for mod in self_module.children():
++            candidate = mod
++            if isinstance(candidate, VllmModel):
++                _language_model_by_module[self_module] = candidate
++                return candidate
+ 
+         raise NotImplementedError(
+             f"No language model found in {type(self).__name__}! "
+@@ -289,7 +305,7 @@ class SupportsMultiModal(SupportsMultiModalEmbeddings, Protocol):
+         """
+         from .utils import StageMissingLayer, collect_children, no_init_weights
+ 
+-        mm_config = vllm_config.model_config.multimodal_config
++        mm_config = vllm_config.model_config.get_multimodal_config()
+ 
+         with collect_children(self, targets=targets) as children_names:  # noqa: SIM117
+             with (
+@@ -339,7 +355,7 @@ class SupportsMultiModal(SupportsMultiModalEmbeddings, Protocol):
+         else:
+             stage_name = "_".join([*modalities, "tower"])
+ 
+-        mm_config = vllm_config.model_config.multimodal_config
++        mm_config = vllm_config.model_config.get_multimodal_config()
+ 
+         with collect_children(self, targets=targets) as children_names:  # noqa: SIM117
+             with (
+@@ -361,7 +377,8 @@ class SupportsMultiModal(SupportsMultiModalEmbeddings, Protocol):
+         offloader = get_offloader()
+         if offloader.supports_tower_offload:
+             for name in children_names:
+-                offloader.wrap_modules(iter([attrgetter(name)(self)]), prefix=name)
++                modules = (module for module in [attrgetter(name)(self)])
++                offloader.wrap_modules(modules, prefix=name)
+ 
+     @contextmanager
+     def _mark_composite_model(
+@@ -434,18 +451,6 @@ class SupportsMultiModal(SupportsMultiModalEmbeddings, Protocol):
+             num_connector_tokens if isinstance(num_connector_tokens, int) else None,
+         )
+ 
+-    @overload
+-    def embed_input_ids(self, input_ids: Tensor) -> Tensor: ...
+-
+-    @overload
+-    def embed_input_ids(
+-        self,
+-        input_ids: Tensor,
+-        multimodal_embeddings: MultiModalEmbeddings,
+-        *,
+-        is_multimodal: torch.Tensor,
+-    ) -> Tensor: ...
+-
+     def _embed_text_input_ids(
+         self,
+         input_ids: Tensor,
+@@ -465,6 +470,24 @@ class SupportsMultiModal(SupportsMultiModalEmbeddings, Protocol):
+ 
+         return embed_input_ids(input_ids)
+ 
++    @overload
++    def embed_input_ids(
++        self,
++        input_ids: Tensor,
++        multimodal_embeddings: None = None,
++        *,
++        is_multimodal: Tensor | None = None,
++    ) -> Tensor: ...
++
++    @overload
++    def embed_input_ids(
++        self,
++        input_ids: Tensor,
++        multimodal_embeddings: MultiModalEmbeddings,
++        *,
++        is_multimodal: Tensor,
++    ) -> Tensor: ...
++
+     def embed_input_ids(
+         self,
+         input_ids: Tensor,
+@@ -671,7 +694,7 @@ class SupportsLoRA(Protocol):
+     # The `embedding_module` and `embedding_padding_modules`
+     # are empty by default.
+     embedding_modules: ClassVar[dict[str, str]] = {}
+-    packed_modules_mapping: ClassVar[dict[str, list[str]]] = {}
++    packed_modules_mapping: dict[str, list[str]] = {}
+     # Module prefixes to skip during LoRA loading (e.g., ["mtp."] for MTP layers)
+     lora_skip_prefixes: ClassVar[list[str]] = []
+     lora_manager: "LoRAModelManager | None"
+@@ -864,11 +887,11 @@ class HasInnerState(Protocol):
+ 
+ 
+ @overload
+-def has_inner_state(model: object) -> TypeIs[HasInnerState]: ...
++def has_inner_state(model: type[object]) -> TypeIs[type[HasInnerState]]: ...
+ 
+ 
+ @overload
+-def has_inner_state(model: type[object]) -> TypeIs[type[HasInnerState]]: ...
++def has_inner_state(model: object) -> TypeIs[HasInnerState]: ...
+ 
+ 
+ def has_inner_state(
+@@ -891,11 +914,11 @@ class IsAttentionFree(Protocol):
+ 
+ 
+ @overload
+-def is_attention_free(model: object) -> TypeIs[IsAttentionFree]: ...
++def is_attention_free(model: type[object]) -> TypeIs[type[IsAttentionFree]]: ...
+ 
+ 
+ @overload
+-def is_attention_free(model: type[object]) -> TypeIs[type[IsAttentionFree]]: ...
++def is_attention_free(model: object) -> TypeIs[IsAttentionFree]: ...
+ 
+ 
+ def is_attention_free(
+@@ -946,11 +969,11 @@ class IsHybrid(Protocol):
+ 
+ 
+ @overload
+-def is_hybrid(model: object) -> TypeIs[IsHybrid]: ...
++def is_hybrid(model: type[object]) -> TypeIs[type[IsHybrid]]: ...
+ 
+ 
+ @overload
+-def is_hybrid(model: type[object]) -> TypeIs[type[IsHybrid]]: ...
++def is_hybrid(model: object) -> TypeIs[IsHybrid]: ...
+ 
+ 
+ def is_hybrid(
+@@ -1025,7 +1048,7 @@ class MixtureOfExperts(Protocol):
+         self.expert_weights = []
+         for layer_idx, layer in enumerate(self.moe_layers):
+             # Register the expert weights.
+-            self.expert_weights.append(layer.get_expert_weights())
++            self.expert_weights.append(list(layer.get_expert_weights()))
+             layer.set_eplb_state(
+                 moe_layer_idx=layer_idx,
+                 expert_load_view=expert_load_view,
+@@ -1083,11 +1106,11 @@ class HasNoOps(Protocol):
+ 
+ 
+ @overload
+-def has_noops(model: object) -> TypeIs[HasNoOps]: ...
++def has_noops(model: type[object]) -> TypeIs[type[HasNoOps]]: ...
+ 
+ 
+ @overload
+-def has_noops(model: type[object]) -> TypeIs[type[HasNoOps]]: ...
++def has_noops(model: object) -> TypeIs[HasNoOps]: ...
+ 
+ 
+ def has_noops(
+@@ -1108,14 +1131,14 @@ class SupportsMambaPrefixCaching(Protocol):
+ 
+ @overload
+ def supports_mamba_prefix_caching(
+-    model: object,
+-) -> TypeIs[SupportsMambaPrefixCaching]: ...
++    model: type[object],
++) -> TypeIs[type[SupportsMambaPrefixCaching]]: ...
+ 
+ 
+ @overload
+ def supports_mamba_prefix_caching(
+-    model: type[object],
+-) -> TypeIs[type[SupportsMambaPrefixCaching]]: ...
++    model: object,
++) -> TypeIs[SupportsMambaPrefixCaching]: ...
+ 
+ 
+ def supports_mamba_prefix_caching(
+@@ -1136,11 +1159,11 @@ class SupportsReplaySSM(Protocol):
+ 
+ 
+ @overload
+-def supports_replayssm(model: object) -> TypeIs[SupportsReplaySSM]: ...
++def supports_replayssm(model: type[object]) -> TypeIs[type[SupportsReplaySSM]]: ...
+ 
+ 
+ @overload
+-def supports_replayssm(model: type[object]) -> TypeIs[type[SupportsReplaySSM]]: ...
++def supports_replayssm(model: object) -> TypeIs[SupportsReplaySSM]: ...
+ 
+ 
+ def supports_replayssm(
+@@ -1172,7 +1195,7 @@ class SupportsQuant:
+     """The interface required for all models that support quantization."""
+ 
+     hf_to_vllm_mapper: "WeightsMapper | None" = None
+-    packed_modules_mapping: ClassVar[dict[str, list[str]]]
++    packed_modules_mapping: dict[str, list[str]]
+     quant_config: QuantizationConfig | None = None
+ 
+     def __new__(cls, *args, **kwargs) -> Self:
+@@ -1504,6 +1527,9 @@ class LocalArgmaxMixin:
+         ``self.draft_id_to_target_id`` (optional): nn.Parameter
+     """
+ 
++    logits_processor: "LogitsProcessor"
++    lm_head: "ParallelLMHead"
++
+     def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         """Vocab-parallel argmax with optional D2T remapping."""
+         top = self.logits_processor.get_top_tokens(
+diff --git a/vllm/model_executor/models/interfaces_base.py b/vllm/model_executor/models/interfaces_base.py
+index 0c182a891..e1a6b650c 100644
+--- a/vllm/model_executor/models/interfaces_base.py
++++ b/vllm/model_executor/models/interfaces_base.py
+@@ -57,7 +57,7 @@ class VllmModel(Protocol[T_co]):
+ 
+ 
+ def _check_vllm_model_init(model: type[object] | object) -> bool:
+-    model_init = model.__init__
++    model_init = getattr(model, "__init__")  # noqa: B009
+     return supports_kw(model_init, "vllm_config")
+ 
+ 
+@@ -274,10 +274,11 @@ def get_attn_type(model: type[object] | object) -> AttnTypeStr:
+ 
+ 
+ def get_score_type(model: type[object] | object) -> ScoreType:
+-    score_types = set()
+-    for m in model.__mro__:
+-        score_type = getattr(m, "score_type", "bi-encoder")
++    score_types: set[ScoreType] = set()
++    model_cls = model if isinstance(model, type) else type(model)
++    for m in model_cls.__mro__:
++        score_type: ScoreType = getattr(m, "score_type", "bi-encoder")
+         if score_type != "bi-encoder":
+             score_types.add(score_type)
+     assert len(score_types) < 2
+-    return "bi-encoder" if not score_types else list(score_types)[0]
++    return "bi-encoder" if not score_types else next(iter(score_types))
+diff --git a/vllm/model_executor/models/internlm2.py b/vllm/model_executor/models/internlm2.py
+index 4996723b3..29dd124b8 100644
+--- a/vllm/model_executor/models/internlm2.py
++++ b/vllm/model_executor/models/internlm2.py
+@@ -323,7 +323,7 @@ class InternLM2Model(nn.Module):
+ 
+ class InternLM2ForCausalLM(nn.Module, SupportsPP, SupportsLoRA, SupportsQuant):
+     hf_to_vllm_mapper = InternLM2Model.hf_to_vllm_mapper
+-    packed_modules_mapping = {
++    packed_modules_mapping: dict[str, list[str]] = {
+         "wqkv": ["wqkv"],
+         "gate_up_proj": ["w1", "w3"],
+     }
+diff --git a/vllm/model_executor/models/interns1.py b/vllm/model_executor/models/interns1.py
+index f8062cb75..0ed2723c3 100644
+--- a/vllm/model_executor/models/interns1.py
++++ b/vllm/model_executor/models/interns1.py
+@@ -7,7 +7,7 @@
+ # Licensed under The MIT License [see LICENSE for details]
+ # --------------------------------------------------------
+ from collections.abc import Iterable, Mapping, Sequence
+-from typing import Annotated, Literal, TypeAlias
++from typing import Annotated, Literal, TypeAlias, TypedDict
+ 
+ import regex as re
+ import torch
+@@ -22,7 +22,7 @@ from transformers.models.internvl.video_processing_internvl import (
+ )
+ 
+ from vllm.config import VllmConfig
+-from vllm.config.multimodal import BaseDummyOptions
++from vllm.config.multimodal import BaseDummyOptions, VideoDummyOptions
+ from vllm.inputs import MultiModalDataDict
+ from vllm.model_executor.layers.quantization import QuantizationConfig
+ from vllm.model_executor.models.interns1_vit import InternS1VisionModel
+@@ -148,6 +148,11 @@ class InternS1VideoEmbeddingInputs(TensorSchema):
+ InternS1VideoInputs: TypeAlias = InternS1VideoPixelInputs | InternS1VideoEmbeddingInputs
+ 
+ 
++class InternS1MultiModalInputs(TypedDict, total=False):
++    images: InternS1ImageInputs | None
++    videos: InternS1VideoInputs | None
++
++
+ def resolve_interns1_min_max_num(
+     min_dynamic_patch: int,
+     max_dynamic_patch: int,
+@@ -312,6 +317,7 @@ class InternS1DummyInputsBuilder(BaseDummyInputsBuilder[InternS1ProcessingInfo])
+ 
+         image_overrides = mm_options.get("image")
+         video_overrides = mm_options.get("video")
++        assert video_overrides is None or isinstance(video_overrides, VideoDummyOptions)
+ 
+         return {
+             "image": self._get_dummy_images(
+@@ -474,22 +480,24 @@ class InternS1MultiModalProcessor(BaseMultiModalProcessor[InternS1ProcessingInfo
+         video_token = hf_processor.video_token
+ 
+         tokenizer = self.info.get_tokenizer()
+-        video_token_id = cached_encode(tokenizer, video_token, add_special_tokens=False)
+-        assert len(video_token_id) == 1
+-        video_token_id = video_token_id[0]
++        video_token_ids = cached_encode(
++            tokenizer, video_token, add_special_tokens=False
++        )
++        assert len(video_token_ids) == 1
++        video_token_id = video_token_ids[0]
+ 
+         out_mm_data = out_mm_kwargs.get_data()
+         if "video_num_patches" in out_mm_data:
+-            video_num_patches = out_mm_data["video_num_patches"]
+-            assert isinstance(video_num_patches, torch.Tensor)
+-            video_num_patches = video_num_patches.tolist()
++            video_num_patches_tensor = out_mm_data["video_num_patches"]
++            assert isinstance(video_num_patches_tensor, torch.Tensor)
++            video_num_patches: list[int] = video_num_patches_tensor.tolist()
+         else:
+             video_num_patches = []
+ 
+         if "image_num_patches" in out_mm_data:
+-            image_num_patches = out_mm_data["image_num_patches"]
+-            assert isinstance(image_num_patches, torch.Tensor)
+-            image_num_patches = image_num_patches.tolist()
++            image_num_patches_tensor = out_mm_data["image_num_patches"]
++            assert isinstance(image_num_patches_tensor, torch.Tensor)
++            image_num_patches: list[int] = image_num_patches_tensor.tolist()
+         else:
+             image_num_patches = []
+ 
+@@ -602,8 +610,8 @@ class InternS1ForConditionalGeneration(
+                 prefix=maybe_prefix(prefix, "language_model"),
+             )
+ 
+-        self.img_context_token_id = None
+-        self.video_context_token_id = None
++        self.img_context_token_id: int | None = None
++        self.video_context_token_id: int | None = None
+ 
+         self.visual_token_mask = None
+         self.make_empty_intermediate_tensors = (
+@@ -756,8 +764,10 @@ class InternS1ForConditionalGeneration(
+         ]
+         return image_embeds.split(image_feature_sizes)
+ 
+-    def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict:
+-        modalities = {}
++    def _parse_and_validate_multimodal_inputs(
++        self, **kwargs: object
++    ) -> InternS1MultiModalInputs:
++        modalities: InternS1MultiModalInputs = {}
+ 
+         # Preserve the order of modalities if there are multiple of them
+         # from the order of kwargs.
+@@ -789,12 +799,14 @@ class InternS1ForConditionalGeneration(
+         for modality in modalities:
+             if modality == "images":
+                 image_input = modalities["images"]
+-                image_embeddings = self._process_vision_input(image_input)
+-                multimodal_embeddings += tuple(image_embeddings)
++                if image_input is not None:
++                    image_embeddings = self._process_vision_input(image_input)
++                    multimodal_embeddings += tuple(image_embeddings)
+             if modality == "videos":
+                 video_input = modalities["videos"]
+-                video_embeddings = self._process_vision_input(video_input)
+-                multimodal_embeddings += tuple(video_embeddings)
++                if video_input is not None:
++                    video_embeddings = self._process_vision_input(video_input)
++                    multimodal_embeddings += tuple(video_embeddings)
+ 
+         return multimodal_embeddings
+ 
+diff --git a/vllm/model_executor/models/interns1_pro.py b/vllm/model_executor/models/interns1_pro.py
+index ee52fbd03..40c5330ad 100644
+--- a/vllm/model_executor/models/interns1_pro.py
++++ b/vllm/model_executor/models/interns1_pro.py
+@@ -26,7 +26,7 @@
+ 
+ import functools
+ from collections.abc import Iterable
+-from typing import Any
++from typing import Any, ClassVar
+ 
+ import torch
+ from torch import nn
+@@ -321,6 +321,14 @@ class InternS1ProMoeAttention(nn.Module):
+             dual_chunk_attention_config=dual_chunk_attention_config,
+         )
+ 
++        attn_kwargs: dict[str, Any] = (
++            {
++                "layer_idx": extract_layer_index(prefix),
++                "dual_chunk_attention_config": dual_chunk_attention_config,
++            }
++            if dual_chunk_attention_config
++            else {}
++        )
+         self.attn = Attention(
+             self.num_heads,
+             self.head_dim,
+@@ -329,12 +337,7 @@ class InternS1ProMoeAttention(nn.Module):
+             cache_config=cache_config,
+             quant_config=quant_config,
+             prefix=f"{prefix}.attn",
+-            **{
+-                "layer_idx": extract_layer_index(prefix),
+-                "dual_chunk_attention_config": dual_chunk_attention_config,
+-            }
+-            if dual_chunk_attention_config
+-            else {},
++            **attn_kwargs,
+         )
+ 
+         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+@@ -489,6 +492,9 @@ class InternS1ProMoeLLMForCausalLM(Qwen3MoeForCausalLM):
+ 
+ 
+ class InternS1ProMoeMixtureOfExperts(MixtureOfExperts):
++    language_model: InternS1ProMoeLLMForCausalLM
++    num_local_physical_experts: int
++
+     def update_physical_experts_metadata(
+         self,
+         num_physical_experts: int,
+@@ -538,8 +544,8 @@ class InternS1ProMoeMixtureOfExperts(MixtureOfExperts):
+ class InternS1ProForConditionalGeneration(
+     Qwen3VLForConditionalGeneration, InternS1ProMoeMixtureOfExperts
+ ):
+-    is_3d_moe_weight: bool = True
+-    packed_modules_mapping = {
++    is_3d_moe_weight: ClassVar[bool] = True
++    packed_modules_mapping: dict[str, list[str]] = {
+         "qkv_proj": [
+             "q_proj",
+             "k_proj",
+@@ -559,7 +565,7 @@ class InternS1ProForConditionalGeneration(
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super(Qwen3VLForConditionalGeneration, self).__init__()
+         config: PretrainedConfig = vllm_config.model_config.hf_config
+-        multimodal_config = vllm_config.model_config.multimodal_config
++        multimodal_config = vllm_config.model_config.get_multimodal_config()
+ 
+         self.config = config
+         self.multimodal_config = multimodal_config
+@@ -601,8 +607,8 @@ class InternS1ProForConditionalGeneration(
+         # Set MoE hyperparameters
+         self.set_moe_parameters()
+ 
+-    def get_frope_params_map(self) -> str:
+-        mapper = {}
++    def get_frope_params_map(self) -> dict[str, str]:
++        mapper: dict[str, str] = {}
+         for name, params in self.language_model.model.named_parameters():
+             if "rotary_emb.sin_coef" in name:
+                 mapper["language_model.model.rotary_emb.sin_coef"] = (
+diff --git a/vllm/model_executor/models/interns2_mobius.py b/vllm/model_executor/models/interns2_mobius.py
+index b8111412f..4efaa5a08 100644
+--- a/vllm/model_executor/models/interns2_mobius.py
++++ b/vllm/model_executor/models/interns2_mobius.py
+@@ -476,7 +476,7 @@ class InternS2MobiusForConditionalGeneration(InternS2PreviewForConditionalGenera
+         if getattr(config, "image_token_index", None) is None:
+             config.image_token_index = config.image_token_id
+         quant_config = vllm_config.quant_config
+-        multimodal_config = vllm_config.model_config.multimodal_config
++        multimodal_config = vllm_config.model_config.get_multimodal_config()
+ 
+         self.config = config
+         self.model_config = vllm_config.model_config
+diff --git a/vllm/model_executor/models/internvl.py b/vllm/model_executor/models/internvl.py
+index 54fa28cf5..1170666be 100644
+--- a/vllm/model_executor/models/internvl.py
++++ b/vllm/model_executor/models/internvl.py
+@@ -10,14 +10,14 @@
+ from abc import abstractmethod
+ from collections.abc import Iterable, Mapping, Sequence
+ from functools import cached_property
+-from typing import Annotated, Any, Literal, TypeAlias, TypeVar
++from typing import Annotated, Any, Literal, TypeAlias, TypedDict, TypeVar
+ 
+ import torch
+ import torch.nn as nn
+ from transformers import BatchFeature, PretrainedConfig
+ 
+ from vllm.config import VllmConfig
+-from vllm.config.multimodal import BaseDummyOptions
++from vllm.config.multimodal import BaseDummyOptions, VideoDummyOptions
+ from vllm.inputs import MultiModalDataDict
+ from vllm.model_executor.layers.quantization import QuantizationConfig
+ from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
+@@ -128,6 +128,11 @@ class InternVLVideoEmbeddingInputs(TensorSchema):
+ InternVLVideoInputs: TypeAlias = InternVLVideoPixelInputs | InternVLVideoEmbeddingInputs
+ 
+ 
++class InternVLMultiModalInputs(TypedDict, total=False):
++    images: InternVLImageInputs | None
++    videos: InternVLVideoInputs | None
++
++
+ class BaseInternVLProcessingInfo(BaseProcessingInfo):
+     """Basic image-only ProcessingInfo for InternVL-style models."""
+ 
+@@ -286,6 +291,7 @@ class BaseInternVLMultiModalProcessor(BaseMultiModalProcessor[_I]):
+             if isinstance(images, ImageEmbeddingItems):
+                 feature_size = images.get_feature_size(item_idx)
+             else:
++                assert isinstance(images, ImageProcessorItems)
+                 image_size = images.get_image_size(item_idx)
+                 feature_size = self.info.get_num_image_tokens(
+                     image_width=image_size.width,
+@@ -433,6 +439,9 @@ class InternVLDummyInputsBuilder(
+             )
+             num_videos = mm_counts.get("video", 0)
+             video_overrides = mm_options.get("video")
++            assert video_overrides is None or isinstance(
++                video_overrides, VideoDummyOptions
++            )
+             dummy_video = {
+                 "video": self._get_dummy_videos(
+                     width=image_size,
+@@ -504,9 +513,9 @@ class InternVLMultiModalProcessor(
+         tokenizer = self.info.get_tokenizer()
+ 
+         if "video_num_patches" in out_mm_data:
+-            video_num_patches = out_mm_data["video_num_patches"]
+-            assert isinstance(video_num_patches, torch.Tensor)
+-            video_num_patches = video_num_patches.tolist()
++            video_num_patches_tensor = out_mm_data["video_num_patches"]
++            assert isinstance(video_num_patches_tensor, torch.Tensor)
++            video_num_patches: list[int] = video_num_patches_tensor.tolist()
+         else:
+             video_num_patches = []
+ 
+@@ -591,7 +600,7 @@ class InternVLChatModel(
+ 
+         config = vllm_config.model_config.hf_config
+         quant_config = vllm_config.quant_config
+-        multimodal_config = vllm_config.model_config.multimodal_config
++        multimodal_config = vllm_config.model_config.get_multimodal_config()
+ 
+         self.config = config
+         self.multimodal_config = multimodal_config
+@@ -621,15 +630,15 @@ class InternVLChatModel(
+                 prefix=maybe_prefix(prefix, "language_model"),
+             )
+ 
+-        self.img_context_token_id = None
+-        self.video_context_token_id = None
++        self.img_context_token_id: int | None = None
++        self.video_context_token_id: int | None = None
+ 
+         self.make_empty_intermediate_tensors = (
+             self.language_model.make_empty_intermediate_tensors
+         )
+ 
+     def _patch_quant_config(
+-        self, config: PretrainedConfig, quant_config: QuantizationConfig
++        self, config: PretrainedConfig, quant_config: QuantizationConfig | None
+     ):
+         # the awq models from OpenGVLab missing `modules_to_not_convert`
+         # patch the quant_config to add `modules_to_not_convert` back
+@@ -743,7 +752,7 @@ class InternVLChatModel(
+ 
+     def _parse_and_validate_video_input(
+         self, **kwargs: object
+-    ) -> InternVLVideoPixelInputs | None:
++    ) -> InternVLVideoInputs | None:
+         pixel_values_flat_video = kwargs.pop("pixel_values_flat_video", None)
+         video_num_patches = kwargs.pop("video_num_patches", None)
+         video_embeds = kwargs.pop("image_embeds", None)
+@@ -804,8 +813,10 @@ class InternVLChatModel(
+         ]
+         return image_embeds.split(image_feature_sizes)
+ 
+-    def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict:
+-        modalities = {}
++    def _parse_and_validate_multimodal_inputs(
++        self, **kwargs: object
++    ) -> InternVLMultiModalInputs:
++        modalities: InternVLMultiModalInputs = {}
+ 
+         # Preserve the order of modalities if there are multiple of them
+         # from the order of kwargs.
+@@ -834,12 +845,14 @@ class InternVLChatModel(
+         for modality in modalities:
+             if modality == "images":
+                 image_input = modalities["images"]
+-                image_embeddings = self._process_vision_input(image_input)
+-                multimodal_embeddings += tuple(image_embeddings)
++                if image_input is not None:
++                    image_embeddings = self._process_vision_input(image_input)
++                    multimodal_embeddings += tuple(image_embeddings)
+             if modality == "videos":
+                 video_input = modalities["videos"]
+-                video_embeddings = self._process_vision_input(video_input)
+-                multimodal_embeddings += tuple(video_embeddings)
++                if video_input is not None:
++                    video_embeddings = self._process_vision_input(video_input)
++                    multimodal_embeddings += tuple(video_embeddings)
+ 
+         return multimodal_embeddings
+ 
+diff --git a/vllm/model_executor/models/iquest_loopcoder.py b/vllm/model_executor/models/iquest_loopcoder.py
+index d3b670658..782bec0ed 100644
+--- a/vllm/model_executor/models/iquest_loopcoder.py
++++ b/vllm/model_executor/models/iquest_loopcoder.py
+@@ -16,7 +16,7 @@
+ 
+ from __future__ import annotations
+ 
+-from collections.abc import Iterable
++from collections.abc import Callable, Iterable
+ from dataclasses import replace
+ from typing import Any
+ 
+@@ -487,11 +487,14 @@ class IQuestLoopCoderModel(nn.Module):
+                     continue
+                 if name.endswith("scale"):
+                     # Remapping the name of FP8 kv-scale.
+-                    name = maybe_remap_kv_scale_name(name, params_dict)
+-                    if name is None:
++                    remapped_name = maybe_remap_kv_scale_name(name, params_dict)
++                    if remapped_name is None:
+                         continue
++                    name = remapped_name
+                 param = params_dict[name]
+-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
++                weight_loader: Callable[..., None] = getattr(
++                    param, "weight_loader", default_weight_loader
++                )
+                 if weight_loader == default_weight_loader:
+                     weight_loader(param, loaded_weight)
+                 else:
+@@ -518,9 +521,10 @@ class IQuestLoopCoderModel(nn.Module):
+                 if name.endswith(".bias") and name not in params_dict:
+                     continue
+                 # Remapping the name of FP8 kv-scale.
+-                name = maybe_remap_kv_scale_name(name, params_dict)
+-                if name is None:
++                remapped_name = maybe_remap_kv_scale_name(name, params_dict)
++                if remapped_name is None:
+                     continue
++                name = remapped_name
+                 param = params_dict[name]
+                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                 weight_loader(param, loaded_weight)
+diff --git a/vllm/model_executor/models/isaac.py b/vllm/model_executor/models/isaac.py
+index 024477e8e..1a97288d8 100644
+--- a/vllm/model_executor/models/isaac.py
++++ b/vllm/model_executor/models/isaac.py
+@@ -901,7 +901,11 @@ class IsaacForConditionalGeneration(
+         for mm_feature in sorted(mm_features, key=lambda f: f.mm_position.offset):
+             offset = mm_feature.mm_position.offset
+             if mm_feature.modality == "image":
+-                t, h, w = mm_feature.data["image_grid_thw"].data.tolist()
++                mm_data = mm_feature.data
++                assert mm_data is not None
++                grid_thw = mm_data["image_grid_thw"].data
++                assert isinstance(grid_thw, torch.Tensor)
++                t, h, w = grid_thw.tolist()
+                 assert t == 1, f"Image must have 1 frame, got {t}"
+                 yield offset, h // spatial_merge_size, w // spatial_merge_size
+             else:
+@@ -912,7 +916,7 @@ class IsaacForConditionalGeneration(
+         input_tokens: list[int],
+         mm_features: list[MultiModalFeatureSpec],
+     ) -> tuple[torch.Tensor, int]:
+-        llm_pos_ids_list = []
++        llm_pos_ids_list: list[np.ndarray] = []
+         st = 0
+         for offset, llm_grid_h, llm_grid_w in self.iter_mm_grid_hw(
+             input_tokens, mm_features
+diff --git a/vllm/model_executor/models/qwen3_vl.py b/vllm/model_executor/models/qwen3_vl.py
+index 5b45ce0c9..c36d78ce7 100644
+--- a/vllm/model_executor/models/qwen3_vl.py
++++ b/vllm/model_executor/models/qwen3_vl.py
+@@ -1753,7 +1753,7 @@ class Qwen3VLForConditionalGeneration(
+     SupportsEagle3,
+     SupportsMultiModalPruning,
+ ):
+-    packed_modules_mapping = {
++    packed_modules_mapping: dict[str, list[str]] = {
+         "qkv_proj": [
+             "q_proj",
+             "k_proj",
+-- 
+2.53.0
+

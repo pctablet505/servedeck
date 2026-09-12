@@ -1,0 +1,36 @@
+tree: /home/pctablet505/Projects/vllm-glm53/src
+captured: 2026-09-12 13:15:35 IST
+branch: glm53
+head: 878631b6079d2cf9fb80830ef9cb41b43aded098
+describe: v0.28.1rc0-56-g878631b60
+remotes:
+  fork	https://github.com/pctablet505/vllm.git (fetch)
+  fork	https://github.com/pctablet505/vllm.git (push)
+  origin	https://github.com/vllm-project/vllm.git (fetch) [blob:none]
+  origin	https://github.com/vllm-project/vllm.git (push)
+  zjy	https://github.com/ZJY0516/vllm.git (fetch)
+  zjy	https://github.com/ZJY0516/vllm.git (push)
+status:
+   M csrc/libtorch_stable/cache_kernels.cu
+   M vllm/model_executor/layers/attention/mla_attention.py
+   M vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+   M vllm/model_executor/layers/mhc.py
+   M vllm/model_executor/layers/sparse_attn_indexer_kpool.py
+   M vllm/model_executor/offloader/uva.py
+   M vllm/platforms/cuda.py
+   M vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
+   M vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py
+   M vllm/v1/attention/backends/mla/prefill/flash_attn.py
+  ?? vllm/model_executor/layers/fused_moe/experts/marlin_moe.py.bak
+  ?? vllm/model_executor/offloader/dma_stage.py
+  ?? vllm/model_executor/offloader/dma_stage.py.bak2
+  ?? vllm/model_executor/offloader/dma_stage.py.bak3
+  ?? vllm/model_executor/offloader/dma_stage.py.bak4
+  ?? vllm/model_executor/offloader/dma_stage.py.reviewed
+  ?? vllm/model_executor/offloader/uva.py.bak
+skip glm53-nope-mla-sm12x (258 commits, not a topic branch)
+branch main: 39 commit(s) over c01b50e390e6d3d0019aa53f41ff1198c8105e5a
+  36874 working-tree-tracked.patch
+  27195 working-tree-untracked.patch
+  64069 total
+  branch patch files: 39

@@ -1,0 +1,1184 @@
+From ae5b8e4a8d77a5de404a0cf9a91a56e8c7f2a94e Mon Sep 17 00:00:00 2001
+From: ukannika <uma.kannikanti@amd.com>
+Date: Fri, 28 Aug 2026 15:54:39 -0700
+Subject: [PATCH 25/39] [ROCm][PERF] Enable AITER PA gluon decode for
+ MiniMax-M3 MTP and dense layers (#52849)
+
+Signed-off-by: ukannika <uma.kannikanti@amd.com>
+Signed-off-by: ykamiset <yaminipreethi.kamisetty@amd.com>
+Co-authored-by: ykamiset <yaminipreethi.kamisetty@amd.com>
+Co-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>
+---
+ vllm/models/minimax_m3/amd/model.py           |  51 ++-
+ vllm/models/minimax_m3/amd/ops/sparse_pa.py   | 273 ++++++++------
+ .../minimax_m3/amd/sparse_attention_msa.py    |   5 +-
+ .../minimax_m3/common/sparse_attention.py     | 104 +++++-
+ vllm/v1/attention/backends/rocm_aiter_fa.py   | 342 ++++++++++++++----
+ 5 files changed, 574 insertions(+), 201 deletions(-)
+
+diff --git a/vllm/models/minimax_m3/amd/model.py b/vllm/models/minimax_m3/amd/model.py
+index 9f0e4bad5..235b76d74 100644
+--- a/vllm/models/minimax_m3/amd/model.py
++++ b/vllm/models/minimax_m3/amd/model.py
+@@ -101,6 +101,8 @@ from vllm.models.minimax_m3.common.mm_preprocess import (
+ from vllm.models.minimax_m3.common.sparse_attention import (
+     MiniMaxM3SparseBackend,
+     MiniMaxM3SparseImpl,
++    MiniMaxM3SparseMetadata,
++    minimax_m3_rebase_slots_to_page16,
+     minimax_m3_use_aiter_sparse_pa,
+     select_main_impl_cls,
+ )
+@@ -755,35 +757,45 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
+         if is_quantized_kv_cache(self.kv_cache_dtype):
+             kv_cache = kv_cache.view(self.impl.kv_cache_fp8_dtype)
+         key_cache, value_cache = kv_cache.unbind(1)
+-        if not key_cache.is_contiguous() or not value_cache.is_contiguous():
+-            raise RuntimeError(
+-                "MiniMax-M3 AITER sparse PA requires K/V-separated KV cache "
+-                "storage. Set VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=1 before "
+-                "initializing the engine."
+-            )
+ 
+-        x = 16 // key_cache.element_size()
++        x = 16 // kv_cache.element_size()
+         if self.head_dim % x != 0:
+             raise RuntimeError(
+                 "MiniMax-M3 AITER sparse PA requires head_dim divisible by "
+                 f"16 / dtype_size, got head_dim={self.head_dim}, x={x}"
+             )
+-        num_blocks = key_cache.shape[0]
+-        num_phys16 = num_blocks * 8
+-        self.kv_cache_k = key_cache.view(
++
++        num_blocks, _, block_size, _ = kv_cache.shape
++        pages_in_side = block_size // 16
++        if key_cache.is_contiguous() and value_cache.is_contiguous():
++            k_src, v_src = key_cache, value_cache
++            block_pages, v_page_offset = pages_in_side, 0
++        elif kv_cache.is_contiguous():
++            k_src = v_src = kv_cache
++            block_pages, v_page_offset = 2 * pages_in_side, pages_in_side
++        else:
++            raise RuntimeError(
++                "MiniMax-M3 AITER sparse PA needs each K/V head slot stored as "
++                "whole 16-token pages, but the resolved KV cache layout gives "
++                "neither dense planes nor block-contiguous pages."
++            )
++
++        num_phys16 = num_blocks * block_pages
++        self.kv_cache_k = k_src.view(
+             num_phys16,
+             self.num_kv_heads,
+             self.head_dim // x,
+             16,
+             x,
+         )
+-        self.kv_cache_v = value_cache.view(
++        # Offsetting V by half a block lets both sides share one page id.
++        self.kv_cache_v = v_src.view(
+             num_phys16,
+             self.num_kv_heads,
+             16 // x,
+             self.head_dim,
+             x,
+-        )
++        )[v_page_offset:]
+         self._aiter_sparse_pa_cache_data_ptr = self.kv_cache.data_ptr()
+ 
+     def get_aiter_sparse_pa_kv_cache(self) -> tuple[torch.Tensor, torch.Tensor]:
+@@ -807,6 +819,21 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
+         )
+ 
+         key_cache, value_cache = self.get_aiter_sparse_pa_kv_cache()
++        if value_cache.shape[0] != key_cache.shape[0]:
++            attn_metadata = get_forward_context().attn_metadata
++            page16_slot_mapping = None
++            if isinstance(attn_metadata, dict):
++                main_md = attn_metadata[self.layer_name]
++                assert isinstance(main_md, MiniMaxM3SparseMetadata)
++                page16_slot_mapping = main_md.page16_slot_mapping
++            if (
++                page16_slot_mapping is None
++                or page16_slot_mapping.shape != slot_mapping.shape
++            ):
++                page16_slot_mapping = minimax_m3_rebase_slots_to_page16(
++                    slot_mapping, self.kv_cache.shape[2]
++                )
++            slot_mapping = page16_slot_mapping
+         kv_cache_dtype = (
+             self.kv_cache_dtype
+             if is_quantized_kv_cache(self.kv_cache_dtype)
+diff --git a/vllm/models/minimax_m3/amd/ops/sparse_pa.py b/vllm/models/minimax_m3/amd/ops/sparse_pa.py
+index dbfde3cd8..f7010cac4 100644
+--- a/vllm/models/minimax_m3/amd/ops/sparse_pa.py
++++ b/vllm/models/minimax_m3/amd/ops/sparse_pa.py
+@@ -32,35 +32,34 @@ def _is_fp8_kv_cache_tensor(kv_cache: torch.Tensor) -> bool:
+ 
+ 
+ @triton.jit
+-def _build_sparse_block_table_kernel(
+-    topk_ptr,  # [1, batch, topk] int32, selected logical 128-block ids
+-    block_table_ptr,  # [batch, max_blocks] int32, logical 128-page table
+-    seq_lens_ptr,  # [batch] int32
+-    sparse_bt_ptr,  # [batch, topk * 8] int32, physical 16-page table
+-    sparse_ctx_ptr,  # [batch] int32
++def _write_sparse_block_table_row(
++    topk_row,  # [topk] int32, selected logical block ids for this query
++    bt_row,  # [max_blocks] int32, this request's logical page table
++    sbt_row,  # [topk * PAGES_PER_BLOCK] int32, physical 16-page table
++    ctx_ptr,  # int32, this query's attended context length
++    abs_pos,  # absolute position of this query token, may be negative
+     max_topk,
+-    stride_topk_n,
+     stride_topk_k,
+-    stride_bt_b,
+-    stride_sbt_b,
+     SPARSE_BLOCK_SIZE_C: tl.constexpr,
+     PAGES_PER_BLOCK: tl.constexpr,
++    BLOCK_PAGE_STRIDE: tl.constexpr,
+     BLOCK_SIZE_T: tl.constexpr,
+ ):
+-    pid_b = tl.program_id(0)
+-    seq_len = tl.load(seq_lens_ptr + pid_b)
+-    has_tokens = seq_len > 0
+-    last_blk = tl.maximum((seq_len - 1) // SPARSE_BLOCK_SIZE_C, 0)
++    """Compact one query's selected logical blocks into physical page-16 ids.
+ 
+-    topk_row = topk_ptr + pid_b * stride_topk_n
+-    bt_row = block_table_ptr + pid_b * stride_bt_b
+-    sbt_row = sparse_bt_ptr + pid_b * stride_sbt_b
++    ``BLOCK_PAGE_STRIDE`` is how many page ids a block spans, which is
++    ``PAGES_PER_BLOCK`` when each K/V side is its own dense plane and twice
++    that when both sides share a block. Padded rows carry a negative
++    ``abs_pos``, which clamps the causal range to empty.
++    """
++    causal_len = tl.maximum(abs_pos + 1, 0)
++    self_blk = abs_pos // SPARSE_BLOCK_SIZE_C
+ 
+     off_t = tl.arange(0, BLOCK_SIZE_T)
+     blk = tl.load(topk_row + off_t * stride_topk_k, mask=off_t < max_topk, other=-1)
+-    valid = has_tokens & (blk >= 0)
+-    is_tail = valid & (blk == last_blk)
+-    is_full = valid & (blk != last_blk)
++    valid = (causal_len > 0) & (blk >= 0) & (blk <= self_blk)
++    is_tail = valid & (blk == self_blk)
++    is_full = valid & (blk < self_blk)
+ 
+     n_full = tl.sum(is_full.to(tl.int32), axis=0)
+     n_valid = tl.sum(valid.to(tl.int32), axis=0)
+@@ -68,7 +67,7 @@ def _build_sparse_block_table_kernel(
+     slot = tl.where(is_full, earlier_full, n_full)
+ 
+     logical_page = tl.load(bt_row + blk, mask=valid, other=0).to(tl.int32)
+-    base_phys = logical_page * PAGES_PER_BLOCK
++    base_phys = logical_page * BLOCK_PAGE_STRIDE
+     dst_base = slot * PAGES_PER_BLOCK
+ 
+     for j in tl.static_range(PAGES_PER_BLOCK):
+@@ -83,42 +82,54 @@ def _build_sparse_block_table_kernel(
+         mask=(off_w >= n_used) & (off_w < row_width),
+     )
+ 
+-    tail_tokens = tl.where(has_tokens, seq_len - last_blk * SPARSE_BLOCK_SIZE_C, 0)
++    tail_tokens = causal_len - self_blk * SPARSE_BLOCK_SIZE_C
+     has_tail = tl.sum(is_tail.to(tl.int32), axis=0) > 0
+     ctx = n_full * SPARSE_BLOCK_SIZE_C + tl.where(has_tail, tail_tokens, 0)
+-    ctx = tl.where(has_tail, ctx, tl.minimum(n_valid * SPARSE_BLOCK_SIZE_C, seq_len))
+-    tl.store(sparse_ctx_ptr + pid_b, ctx)
++    ctx = tl.where(has_tail, ctx, tl.minimum(n_valid * SPARSE_BLOCK_SIZE_C, causal_len))
++    tl.store(ctx_ptr, ctx)
+ 
+ 
+-@torch.no_grad()
+-def minimax_m3_build_sparse_block_table(
+-    topk_idx: torch.Tensor,  # [1, batch, topk]
+-    block_table: torch.Tensor,  # [batch, max_blocks]
+-    seq_lens: torch.Tensor,  # [batch]
+-) -> tuple[torch.Tensor, torch.Tensor]:
+-    """Compact selected logical sparse blocks into physical page-16 tables."""
+-    assert topk_idx.shape[0] == 1, "AITER sparse PA requires num_kv_heads == 1"
+-    batch = topk_idx.shape[1]
+-    topk = topk_idx.shape[-1]
+-    width = topk * PAGES_PER_SPARSE_BLOCK
+-    sparse_bt = torch.empty((batch, width), dtype=torch.int32, device=topk_idx.device)
+-    sparse_ctx = torch.empty((batch,), dtype=torch.int32, device=topk_idx.device)
+-    _build_sparse_block_table_kernel[(batch,)](
+-        topk_idx,
+-        block_table,
+-        seq_lens,
+-        sparse_bt,
+-        sparse_ctx,
+-        topk,
+-        topk_idx.stride(1),
+-        topk_idx.stride(2),
+-        block_table.stride(0),
+-        sparse_bt.stride(0),
+-        SPARSE_BLOCK_SIZE_C=SPARSE_BLOCK_SIZE,
+-        PAGES_PER_BLOCK=PAGES_PER_SPARSE_BLOCK,
+-        BLOCK_SIZE_T=triton.next_power_of_2(topk),
++@triton.jit
++def _build_sparse_block_table_kernel(
++    topk_ptr,  # [1, batch * DECODE_QUERY_LEN, topk] int32, logical block ids
++    block_table_ptr,  # [batch, max_blocks] int32, logical 128-page table
++    seq_lens_ptr,  # [batch] int32
++    sparse_bt_ptr,  # [batch * DECODE_QUERY_LEN, topk * 8] int32
++    sparse_ctx_ptr,  # [batch * DECODE_QUERY_LEN] int32
++    max_topk,
++    stride_topk_n,
++    stride_topk_k,
++    stride_bt_b,
++    stride_sbt_b,
++    SPARSE_BLOCK_SIZE_C: tl.constexpr,
++    PAGES_PER_BLOCK: tl.constexpr,
++    BLOCK_PAGE_STRIDE: tl.constexpr,
++    BLOCK_SIZE_T: tl.constexpr,
++    DECODE_QUERY_LEN: tl.constexpr,
++):
++    # One program per query token. The decode indexer flattens speculative rows
++    # as ``req_id * DECODE_QUERY_LEN + local_q``, and a request's query tokens
++    # are the last DECODE_QUERY_LEN positions of its sequence, so both the
++    # request id and the absolute position follow from the program id.
++    pid_n = tl.program_id(0)
++    req_id = pid_n // DECODE_QUERY_LEN
++    local_q = pid_n % DECODE_QUERY_LEN
++    seq_len = tl.load(seq_lens_ptr + req_id)
++    abs_pos = seq_len - DECODE_QUERY_LEN + local_q
++
++    _write_sparse_block_table_row(
++        topk_ptr + pid_n * stride_topk_n,
++        block_table_ptr + req_id * stride_bt_b,
++        sparse_bt_ptr + pid_n * stride_sbt_b,
++        sparse_ctx_ptr + pid_n,
++        abs_pos,
++        max_topk,
++        stride_topk_k,
++        SPARSE_BLOCK_SIZE_C,
++        PAGES_PER_BLOCK,
++        BLOCK_PAGE_STRIDE,
++        BLOCK_SIZE_T,
+     )
+-    return sparse_bt, sparse_ctx
+ 
+ 
+ @triton.jit
+@@ -136,52 +147,39 @@ def _build_sparse_block_table_prefill_kernel(
+     stride_sbt_n,
+     SPARSE_BLOCK_SIZE_C: tl.constexpr,
+     PAGES_PER_BLOCK: tl.constexpr,
++    BLOCK_PAGE_STRIDE: tl.constexpr,
+     BLOCK_SIZE_T: tl.constexpr,
+ ):
+     pid_n = tl.program_id(0)
+     req_id = tl.load(req_id_ptr + pid_n)
+     abs_pos = tl.load(abs_pos_ptr + pid_n)
+-    # Padded speculative rows can have negative positions; clamp to empty range.
+-    causal_len = tl.maximum(abs_pos + 1, 0)
+-    self_blk = abs_pos // SPARSE_BLOCK_SIZE_C
+-
+-    topk_row = topk_ptr + pid_n * stride_topk_n
+-    bt_row = block_table_ptr + req_id * stride_bt_b
+-    sbt_row = sparse_bt_ptr + pid_n * stride_sbt_n
+-
+-    off_t = tl.arange(0, BLOCK_SIZE_T)
+-    blk = tl.load(topk_row + off_t * stride_topk_k, mask=off_t < max_topk, other=-1)
+-    valid = (causal_len > 0) & (blk >= 0) & (blk <= self_blk)
+-    is_tail = valid & (blk == self_blk)
+-    is_full = valid & (blk < self_blk)
+ 
+-    n_full = tl.sum(is_full.to(tl.int32), axis=0)
+-    n_valid = tl.sum(valid.to(tl.int32), axis=0)
+-    earlier_full = tl.cumsum(is_full.to(tl.int32), axis=0) - is_full.to(tl.int32)
+-    slot = tl.where(is_full, earlier_full, n_full)
+-
+-    logical_page = tl.load(bt_row + blk, mask=valid, other=0).to(tl.int32)
+-    base_phys = logical_page * PAGES_PER_BLOCK
+-    dst_base = slot * PAGES_PER_BLOCK
++    _write_sparse_block_table_row(
++        topk_ptr + pid_n * stride_topk_n,
++        block_table_ptr + req_id * stride_bt_b,
++        sparse_bt_ptr + pid_n * stride_sbt_n,
++        sparse_ctx_ptr + pid_n,
++        abs_pos,
++        max_topk,
++        stride_topk_k,
++        SPARSE_BLOCK_SIZE_C,
++        PAGES_PER_BLOCK,
++        BLOCK_PAGE_STRIDE,
++        BLOCK_SIZE_T,
++    )
+ 
+-    for j in tl.static_range(PAGES_PER_BLOCK):
+-        tl.store(sbt_row + dst_base + j, base_phys + j, mask=valid)
+ 
+-    n_used = n_valid * PAGES_PER_BLOCK
+-    off_w = tl.arange(0, BLOCK_SIZE_T * PAGES_PER_BLOCK)
+-    row_width = max_topk * PAGES_PER_BLOCK
+-    tl.store(
+-        sbt_row + off_w,
+-        tl.zeros_like(off_w),
+-        mask=(off_w >= n_used) & (off_w < row_width),
++def _alloc_sparse_block_table(
++    topk_idx: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    assert topk_idx.shape[0] == 1, "AITER sparse PA requires num_kv_heads == 1"
++    total_q = topk_idx.shape[1]
++    width = topk_idx.shape[-1] * PAGES_PER_SPARSE_BLOCK
++    return (
++        torch.empty((total_q, width), dtype=torch.int32, device=topk_idx.device),
++        torch.empty((total_q,), dtype=torch.int32, device=topk_idx.device),
+     )
+ 
+-    tail_tokens = causal_len - self_blk * SPARSE_BLOCK_SIZE_C
+-    has_tail = tl.sum(is_tail.to(tl.int32), axis=0) > 0
+-    ctx = n_full * SPARSE_BLOCK_SIZE_C + tl.where(has_tail, tail_tokens, 0)
+-    ctx = tl.where(has_tail, ctx, tl.minimum(n_valid * SPARSE_BLOCK_SIZE_C, causal_len))
+-    tl.store(sparse_ctx_ptr + pid_n, ctx)
+-
+ 
+ @torch.no_grad()
+ def minimax_m3_build_sparse_block_table_prefill(
+@@ -189,15 +187,12 @@ def minimax_m3_build_sparse_block_table_prefill(
+     block_table: torch.Tensor,  # [batch, max_blocks]
+     query_req_id: torch.Tensor,  # [total_q]
+     query_abs_pos: torch.Tensor,  # [total_q]
++    block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     """Build one page-16 sparse block table row per prefill query token."""
+-    assert topk_idx.shape[0] == 1, "AITER sparse PA requires num_kv_heads == 1"
+-    total_q = topk_idx.shape[1]
++    sparse_bt, sparse_ctx = _alloc_sparse_block_table(topk_idx)
+     topk = topk_idx.shape[-1]
+-    width = topk * PAGES_PER_SPARSE_BLOCK
+-    sparse_bt = torch.empty((total_q, width), dtype=torch.int32, device=topk_idx.device)
+-    sparse_ctx = torch.empty((total_q,), dtype=torch.int32, device=topk_idx.device)
+-    _build_sparse_block_table_prefill_kernel[(total_q,)](
++    _build_sparse_block_table_prefill_kernel[(topk_idx.shape[1],)](
+         topk_idx,
+         block_table,
+         query_req_id,
+@@ -211,6 +206,7 @@ def minimax_m3_build_sparse_block_table_prefill(
+         sparse_bt.stride(0),
+         SPARSE_BLOCK_SIZE_C=SPARSE_BLOCK_SIZE,
+         PAGES_PER_BLOCK=PAGES_PER_SPARSE_BLOCK,
++        BLOCK_PAGE_STRIDE=block_page_stride,
+         BLOCK_SIZE_T=triton.next_power_of_2(topk),
+     )
+     return sparse_bt, sparse_ctx
+@@ -221,27 +217,41 @@ def minimax_m3_build_sparse_block_table_decode(
+     topk_idx: torch.Tensor,  # [1, batch * decode_query_len, topk]
+     block_table: torch.Tensor,  # [batch, max_blocks]
+     seq_lens: torch.Tensor,  # [batch]
+-    decode_query_len: int,
++    decode_query_len: int = 1,
++    block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     """Build one page-16 sparse block table row per decode query token."""
+-    if decode_query_len == 1:
+-        return minimax_m3_build_sparse_block_table(topk_idx, block_table, seq_lens)
+-
+     total_q = topk_idx.shape[1]
+     expected_q = block_table.shape[0] * decode_query_len
+     assert total_q == expected_q, (
+         "MiniMax-M3 decode top-k rows must equal batch * decode_query_len: "
+         f"{total_q} != {expected_q}"
+     )
+-    pos = torch.arange(total_q, dtype=torch.int32, device=topk_idx.device)
+-    query_req_id = torch.div(pos, decode_query_len, rounding_mode="floor")
+-    q_offset = pos - query_req_id * decode_query_len
+-    query_abs_pos = (seq_lens[query_req_id] - decode_query_len + q_offset).to(
+-        torch.int32
+-    )
+-    return minimax_m3_build_sparse_block_table_prefill(
+-        topk_idx, block_table, query_req_id, query_abs_pos
++    sparse_bt, sparse_ctx = _alloc_sparse_block_table(topk_idx)
++    topk = topk_idx.shape[-1]
++    _build_sparse_block_table_kernel[(total_q,)](
++        topk_idx,
++        block_table,
++        seq_lens,
++        sparse_bt,
++        sparse_ctx,
++        topk,
++        topk_idx.stride(1),
++        topk_idx.stride(2),
++        block_table.stride(0),
++        sparse_bt.stride(0),
++        SPARSE_BLOCK_SIZE_C=SPARSE_BLOCK_SIZE,
++        PAGES_PER_BLOCK=PAGES_PER_SPARSE_BLOCK,
++        BLOCK_PAGE_STRIDE=block_page_stride,
++        BLOCK_SIZE_T=triton.next_power_of_2(topk),
++        DECODE_QUERY_LEN=decode_query_len,
+     )
++    return sparse_bt, sparse_ctx
++
++
++# Retained for the decode_query_len == 1 callers (and tests) that predate the
++# speculative-decode rows.
++minimax_m3_build_sparse_block_table = minimax_m3_build_sparse_block_table_decode
+ 
+ 
+ @triton.jit
+@@ -313,6 +323,21 @@ def minimax_m3_insert_index_cache(
+     )
+ 
+ 
++def _sides_are_packed(k_cache: torch.Tensor, v_cache: torch.Tensor) -> bool:
++    """Whether a block holds both its K and V pages instead of one side."""
++    return v_cache.shape[0] != k_cache.shape[0]
++
++
++def _block_page_stride(k_cache: torch.Tensor, v_cache: torch.Tensor) -> int:
++    """How many page ids one sparse block spans.
++
++    Each side owns ``PAGES_PER_SPARSE_BLOCK`` pages. When the sides are dense
++    planes a block is exactly that wide; when they interleave, a block covers
++    both sides' pages and V is reached from the same page id at a fixed offset.
++    """
++    return PAGES_PER_SPARSE_BLOCK * (2 if _sides_are_packed(k_cache, v_cache) else 1)
++
++
+ def _gluon_scale_arg(
+     scale: torch.Tensor | None,
+     *,
+@@ -361,7 +386,11 @@ def minimax_m3_sparse_attn_decode_aiter(
+     decode_query_len: int = 1,
+ ) -> None:
+     sparse_bt, sparse_ctx = minimax_m3_build_sparse_block_table_decode(
+-        topk_idx, block_table, seq_lens, decode_query_len
++        topk_idx,
++        block_table,
++        seq_lens,
++        decode_query_len,
++        _block_page_stride(k_cache, v_cache),
+     )
+     _run_gluon_decode(
+         q,
+@@ -384,23 +413,20 @@ def minimax_m3_sparse_attn_prefill_aiter(
+     v_cache: torch.Tensor,
+     topk_idx: torch.Tensor,  # [1, total_q, topk]
+     block_table: torch.Tensor,
+-    cu_seqlens_q: torch.Tensor,
+-    prefix_lens: torch.Tensor,
++    query_req_id: torch.Tensor,  # [total_q] int32, owning request per token
++    query_abs_pos: torch.Tensor,  # [total_q] int32, absolute position per token
+     num_kv_heads: int,
+     sm_scale: float,
+     output: torch.Tensor,
+     k_scale: torch.Tensor | None = None,
+     v_scale: torch.Tensor | None = None,
+ ) -> None:
+-    total_q = q.shape[0]
+-    pos = torch.arange(total_q, dtype=torch.int32, device=q.device)
+-    query_req_id = torch.searchsorted(cu_seqlens_q[1:].contiguous(), pos, right=True)
+-    query_req_id = query_req_id.to(torch.int32)
+-    query_abs_pos = (prefix_lens[query_req_id] + (pos - cu_seqlens_q[query_req_id])).to(
+-        torch.int32
+-    )
+     sparse_bt, sparse_ctx = minimax_m3_build_sparse_block_table_prefill(
+-        topk_idx, block_table, query_req_id, query_abs_pos
++        topk_idx,
++        block_table,
++        query_req_id,
++        query_abs_pos,
++        _block_page_stride(k_cache, v_cache),
+     )
+     _run_gluon_decode(
+         q,
+@@ -445,8 +471,11 @@ def _run_gluon_decode(
+     group_size = num_q_heads // num_kv_heads
+ 
+     nphys16, hkv = k_cache.shape[0], k_cache.shape[1]
++    # V is offset by half a block when the sides interleave, so it holds fewer
++    # pages than K even though both are addressed by the same page id.
++    v_nphys16 = v_cache.shape[0]
+     k_cache_view = k_cache.view(nphys16 * hkv, 1, *k_cache.shape[2:])
+-    v_cache_view = v_cache.view(nphys16 * hkv, 1, *v_cache.shape[2:])
++    v_cache_view = v_cache.view(v_nphys16 * hkv, 1, *v_cache.shape[2:])
+     q_view = q.view(total_q * num_kv_heads, group_size, head_size)
+     out_view = output.view(total_q * num_kv_heads, group_size, head_size)
+ 
+@@ -463,11 +492,19 @@ def _run_gluon_decode(
+     is_fp8 = _is_fp8_kv_cache_tensor(k_cache)
+     compute_type = aiter_dtypes.fp8 if is_fp8 else q.dtype
+     if is_fp8:
++        if _sides_are_packed(k_cache, v_cache) and not all(
++            scale is None or scale.numel() == 1 for scale in (k_scale, v_scale)
++        ):
++            raise NotImplementedError(
++                "MiniMax-M3 AITER sparse PA supports only scalar KV scales "
++                "when K and V pages share a block; per-token scales would "
++                "need the same page renumbering."
++            )
+         k_scale_arg = _gluon_scale_arg(
+             k_scale, num_phys_pages=nphys16, num_kv_heads=hkv
+         )
+         v_scale_arg = _gluon_scale_arg(
+-            v_scale, num_phys_pages=nphys16, num_kv_heads=hkv
++            v_scale, num_phys_pages=v_nphys16, num_kv_heads=hkv
+         )
+     else:
+         k_scale_arg = v_scale_arg = None
+diff --git a/vllm/models/minimax_m3/amd/sparse_attention_msa.py b/vllm/models/minimax_m3/amd/sparse_attention_msa.py
+index 5845d659b..272a075aa 100644
+--- a/vllm/models/minimax_m3/amd/sparse_attention_msa.py
++++ b/vllm/models/minimax_m3/amd/sparse_attention_msa.py
+@@ -75,14 +75,15 @@ class MiniMaxM3SparseAiterPAImpl(MiniMaxM3SparseImpl):
+         if main_md.num_prefills > 0:
+             p = main_md.prefill
+             assert p is not None
++            assert p.query_req_id is not None and p.query_abs_pos is not None
+             minimax_m3_sparse_attn_prefill_aiter(
+                 q[nd:],
+                 k_cache,
+                 v_cache,
+                 topk[:, nd:num_tokens, :],
+                 p.block_table,
+-                p.cu_seqlens_q,
+-                p.context_lens,
++                p.query_req_id,
++                p.query_abs_pos,
+                 self.num_kv_heads,
+                 self.scale,
+                 out[nd:],
+diff --git a/vllm/models/minimax_m3/common/sparse_attention.py b/vllm/models/minimax_m3/common/sparse_attention.py
+index 82256add4..148a20b9f 100644
+--- a/vllm/models/minimax_m3/common/sparse_attention.py
++++ b/vllm/models/minimax_m3/common/sparse_attention.py
+@@ -66,6 +66,49 @@ def _minimax_m3_aiter_sparse_pa_requested() -> bool:
+     return rocm_aiter_ops.is_enabled() and rocm_aiter_ops.is_shuffle_kv_cache_enabled()
+ 
+ 
++def minimax_m3_rebase_slots_to_page16(
++    slot_mapping: torch.Tensor,
++    block_size: int,
++    out: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Rebase a token slot mapping onto AITER's page-16 page numbering.
++
++    AITER's KV writer derives the destination page from ``slot // 16`` and
++    assumes pages are numbered consecutively. When the resolved layout stores
++    both K/V sides inside a block, a block spans twice as many pages, so only
++    the block component of the slot doubles -- the offset within the page must
++    not move. Clamping before the division leaves padding slots at their
++    negative sentinel, which is what tells the writer to skip them.
++    """
++    if out is None:
++        out = torch.empty_like(slot_mapping)
++    torch.clamp(slot_mapping, min=0, out=out)
++    return (
++        out.div_(block_size, rounding_mode="floor").mul_(block_size).add_(slot_mapping)
++    )
++
++
++def minimax_m3_query_token_positions(
++    cu_seqlens_q: torch.Tensor,
++    prefix_lens: torch.Tensor,
++    total_q: int,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Map each prefill query token to its request id and absolute KV position.
++
++    Both tensors are the same for every sparse layer in a step, so the AITER
++    sparse PA block-table builder reads them from the metadata instead of
++    rebuilding them once per layer.
++    """
++    pos = torch.arange(total_q, dtype=torch.int32, device=cu_seqlens_q.device)
++    query_req_id = torch.searchsorted(
++        cu_seqlens_q[1:].contiguous(), pos, right=True
++    ).to(torch.int32)
++    query_abs_pos = (prefix_lens[query_req_id] + (pos - cu_seqlens_q[query_req_id])).to(
++        torch.int32
++    )
++    return query_req_id, query_abs_pos
++
++
+ def minimax_m3_use_aiter_sparse_pa(num_kv_heads: int) -> bool:
+     """Whether to use the ROCm AITER page-16 sparse PA prototype."""
+     requested = _minimax_m3_aiter_sparse_pa_requested()
+@@ -117,10 +160,14 @@ class MiniMaxM3SparseBackend(AttentionBackend):
+ 
+     @classmethod
+     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...] | None:
+-        # AITER sparse PA unbinds K and V as separate contiguous regions, which
+-        # requires the head dimension to sit outside the block dimension.
++        # AITER sparse PA reads K and V as separate page-16 tensors. LHBNC
++        # gives each side a dense plane; LBHNC interleaves the sides inside a
++        # block, which the page-id rebasing in ops/sparse_pa.py absorbs. LBHNC
++        # is listed first because these layers publish two head slots while the
++        # indexer publishes one, and mixed HNC shapes need a block-compact
++        # layout to share the block-id pool.
+         if _minimax_m3_aiter_sparse_pa_requested():
+-            return (KVCacheLayout.LHBNC,)
++            return (KVCacheLayout.LBHNC, KVCacheLayout.LHBNC)
+         return super().supported_kv_cache_layouts()
+ 
+ 
+@@ -137,6 +184,12 @@ class MiniMaxM3SparsePrefillMetadata:
+     max_seq_len: int
+     total_kv_blocks: int
+ 
++    # Per-query-token request id and absolute KV position, built once per step
++    # for the AITER sparse PA block-table kernel. See
++    # ``minimax_m3_query_token_positions``.
++    query_req_id: torch.Tensor | None = None
++    query_abs_pos: torch.Tensor | None = None
++
+ 
+ @dataclass
+ class MiniMaxM3SparseDecodeMetadata:
+@@ -167,6 +220,11 @@ class MiniMaxM3SparseMetadata(AttentionMetadata):
+     prefill: MiniMaxM3SparsePrefillMetadata | None = None
+     decode: MiniMaxM3SparseDecodeMetadata | None = None
+ 
++    # ``slot_mapping`` rebased onto the page-16 numbering AITER's KV writer
++    # uses when both K/V sides share a block. Only set for the AITER sparse PA
++    # path; see ``MiniMaxM3SparseMetadataBuilder.build``.
++    page16_slot_mapping: torch.Tensor | None = None
++
+ 
+ class MiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[MiniMaxM3SparseMetadata]):
+     # Full cudagraphs for uniform decode batches, incl. spec-decode verify
+@@ -191,6 +249,19 @@ class MiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[MiniMaxM3SparseMet
+             dtype=torch.int32,
+             device=device,
+         )
++        # Every sparse layer shares one slot mapping, so the AITER page-16
++        # rebase is done here once per step instead of once per layer. Stable
++        # buffer for the same reason as the context lengths above.
++        self.use_aiter_sparse_pa = minimax_m3_use_aiter_sparse_pa(
++            kv_cache_spec.num_kv_heads
++        )
++        self.page16_slot_mapping_buffer: torch.Tensor | None = None
++        if self.use_aiter_sparse_pa:
++            self.page16_slot_mapping_buffer = torch.empty(
++                vllm_config.scheduler_config.max_num_batched_tokens,
++                dtype=torch.int64,
++                device=device,
++            )
+ 
+     def build(
+         self,
+@@ -236,17 +307,26 @@ class MiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[MiniMaxM3SparseMet
+             )
+             prefill_cu_seqlens_k[0] = 0
+             torch.cumsum(prefill_kv_lens, dim=0, out=prefill_cu_seqlens_k[1:])
++            prefill_cu_seqlens_q = (
++                query_start_loc[num_decodes:] - num_decode_tokens
++            ).to(torch.int32)
++            prefill_context_lens = context_lens[num_decodes:]
++            query_req_id = query_abs_pos = None
++            if self.use_aiter_sparse_pa:
++                query_req_id, query_abs_pos = minimax_m3_query_token_positions(
++                    prefill_cu_seqlens_q, prefill_context_lens, num_prefill_tokens
++                )
+             prefill_metadata = MiniMaxM3SparsePrefillMetadata(
+-                cu_seqlens_q=(query_start_loc[num_decodes:] - num_decode_tokens).to(
+-                    torch.int32
+-                ),
++                cu_seqlens_q=prefill_cu_seqlens_q,
+                 cu_seqlens_k=prefill_cu_seqlens_k,
+                 seq_lens=prefill_kv_lens,
+-                context_lens=context_lens[num_decodes:],
++                context_lens=prefill_context_lens,
+                 block_table=block_table[num_decodes:],
+                 max_query_len=common_attn_metadata.max_query_len,
+                 max_seq_len=common_attn_metadata.max_seq_len,
+                 total_kv_blocks=prefill_total_kv_blocks,
++                query_req_id=query_req_id,
++                query_abs_pos=query_abs_pos,
+             )
+ 
+         decode_metadata: MiniMaxM3SparseDecodeMetadata | None = None
+@@ -265,10 +345,20 @@ class MiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[MiniMaxM3SparseMet
+                 decode_query_len=decode_query_len,
+             )
+ 
++        page16_slot_mapping = None
++        if self.page16_slot_mapping_buffer is not None:
++            slot_mapping = common_attn_metadata.slot_mapping
++            page16_slot_mapping = minimax_m3_rebase_slots_to_page16(
++                slot_mapping,
++                self.kv_cache_spec.block_size,
++                out=self.page16_slot_mapping_buffer[: slot_mapping.shape[0]],
++            )
++
+         return MiniMaxM3SparseMetadata(
+             seq_lens=seq_lens,
+             max_seq_len=common_attn_metadata.max_seq_len,
+             slot_mapping=common_attn_metadata.slot_mapping,
++            page16_slot_mapping=page16_slot_mapping,
+             num_actual_tokens=num_tokens,
+             num_decodes=num_decodes,
+             num_decode_tokens=num_decode_tokens,
+diff --git a/vllm/v1/attention/backends/rocm_aiter_fa.py b/vllm/v1/attention/backends/rocm_aiter_fa.py
+index acd62f152..a73fb6c4b 100644
+--- a/vllm/v1/attention/backends/rocm_aiter_fa.py
++++ b/vllm/v1/attention/backends/rocm_aiter_fa.py
+@@ -2,13 +2,17 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Attention layer with AiterFlashAttention."""
+ 
+-from dataclasses import dataclass
++from dataclasses import dataclass, replace
+ from typing import ClassVar
+ 
+ import torch
+ 
+ from vllm._aiter_ops import rocm_aiter_ops
+-from vllm.config import VllmConfig, get_layers_from_vllm_config
++from vllm.config import (
++    VllmConfig,
++    get_current_vllm_config_or_none,
++    get_layers_from_vllm_config,
++)
+ from vllm.config.cache import CacheDType
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.attention import Attention
+@@ -17,7 +21,7 @@ from vllm.platforms.interface import DeviceCapability
+ from vllm.utils.gpu_sync_debug import gpu_sync_allowed
+ from vllm.utils.math_utils import cdiv
+ from vllm.utils.platform_utils import num_compute_units
+-from vllm.utils.torch_utils import is_quantized_kv_cache
++from vllm.utils.torch_utils import get_dtype_size, is_quantized_kv_cache
+ from vllm.v1.attention.backend import (
+     AttentionBackend,
+     AttentionCGSupport,
+@@ -34,9 +38,43 @@ from vllm.v1.attention.backends.utils import (
+ from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
+ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
+ 
++_PA_GLUON_MAX_QUERY_LEN = 4
++_PA_GLUON_MAX_QUERY_GROUP_SIZE = 64
++# Query group sizes the gluon paged-attention decode kernel is validated for: 8, 16
++_PA_GLUON_QUERY_GROUP_SIZES = (8, 16)
++
++# The kernel is only validated for this head size and kernel block size.
++_PA_GLUON_HEAD_SIZE = 128
++_PA_GLUON_BLOCK_SIZE = 128
++
++
++def _pa_gluon_supports(num_heads_q: int, num_heads_kv: int, head_size: int) -> bool:
++    """Whether the head config can use the PA decode gluon kernel.
++
++    Requires the shuffle KV cache layout (the kernel reads K/V in that layout)
++    plus a head config the kernel is validated for. Both the advertised kernel
++    block sizes and the decode dispatch go through this, so a config can never
++    be offered a 128-token page that gluon will then decline to serve.
++    """
++    return (
++        rocm_aiter_ops.is_shuffle_kv_cache_enabled()
++        and num_heads_kv > 0
++        and num_heads_q % num_heads_kv == 0
++        and num_heads_q // num_heads_kv in _PA_GLUON_QUERY_GROUP_SIZES
++        and head_size == _PA_GLUON_HEAD_SIZE
++    )
++
++
+ _PARTITION_SIZE_ROCM = 256
+ _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
+ if current_platform.is_rocm():
++    from aiter.ops.triton.gluon.pa_decode_gluon import (
++        get_recommended_splits,
++    )
++    from aiter.ops.triton.gluon.pa_decode_gluon import (
++        pa_decode_gluon as _pa_decode_gluon,
++    )
++
+     from vllm.triton_utils import tl, triton
+ 
+     def block_size(x, head_dim):
+@@ -126,15 +164,17 @@ if current_platform.is_rocm():
+             # for kv cache layout as
+             # K: [num_blocks, num_head, head_dim // x, page_size, x]
+             # V: [num_blocks, num_head, page_size // x, head_dim, x]
++            # The sides only sit a dense page apart when they are separate
++            # planes (H outermost), so take the block stride from the tensor.
+             key_cache_ptr_offset = (
+                 key_cache_ptr
+-                + block_id * num_heads * head_size * PAGE_SIZE
++                + block_id * k_cache_stride0
+                 + head_id * head_size * PAGE_SIZE
+                 + slot_id * x
+             )
+             value_cache_ptr_offset = (
+                 value_cache_ptr
+-                + block_id * num_heads * head_size * PAGE_SIZE
++                + block_id * v_cache_stride0
+                 + head_id * head_size * PAGE_SIZE
+                 + (slot_id // x) * head_size * x
+                 + slot_id % x
+@@ -319,6 +359,7 @@ logger = init_logger(__name__)
+ @dataclass
+ class AiterFlashAttentionDecodeMetadata:
+     max_query_len: int
++    uniform_query_len: int | None
+ 
+ 
+ @dataclass
+@@ -475,10 +516,11 @@ class AiterFlashAttentionMetadataBuilder(
+             and self.scale.numel() == 1
+             and is_quantized_kv_cache(self.vllm_config.cache_config.cache_dtype)
+         ):
+-            layers = get_layers_from_vllm_config(self.vllm_config, Attention)
+-            first_layer_name = [k for k in layers][0]
++            # Size the scales from a layer this builder owns. The draft model
++            # runs its own builder over its own KV cache, so the first layer of
++            # the whole config can carry an unrelated block count.
+             kv_cache_shape = self.vllm_config.compilation_config.static_forward_context[
+-                first_layer_name
++                self.layer_names[0]
+             ].kv_cache.shape
+             num_blocks = kv_cache_shape[0]
+             self.scale = torch.ones(
+@@ -510,8 +552,15 @@ class AiterFlashAttentionMetadataBuilder(
+ 
+         decode_metadata = None
+         if num_decodes > 0:
++            decode_max_query_len = query_lens_cpu[:num_decodes].max().item()
++            uniform_query_len = (
++                decode_max_query_len
++                if num_decode_tokens == num_decodes * decode_max_query_len
++                else None
++            )
+             decode_metadata = AiterFlashAttentionDecodeMetadata(
+-                max_query_len=query_lens_cpu[:num_decodes].max().item(),
++                max_query_len=decode_max_query_len,
++                uniform_query_len=uniform_query_len,
+             )
+ 
+         prefill_metadata = None
+@@ -682,9 +731,27 @@ class AiterFlashAttentionMetadataBuilder(
+         """
+         num_reqs = common_attn_metadata.num_reqs
+         num_tokens = common_attn_metadata.num_actual_tokens
++        max_query_len = common_attn_metadata.max_query_len
++
++        # Uniform-decode assumption does not hold for the
++        # drafter's first forward after a target step: it inherits the target's
++        # per-request query lengths, so rows can be longer than gluon's limit or
++        # ragged. Those batches need the real split, which costs a sync.
++        # _PA_GLUON_MAX_QUERY_LEN only binds when gluon is the decode consumer,
++        # so test that rather than the shuffle layout alone.
++        if _pa_gluon_supports(self.num_heads_q, self.num_heads_kv, self.headdim) and (
++            max_query_len > _PA_GLUON_MAX_QUERY_LEN
++            or num_tokens != num_reqs * max_query_len
++        ):
++            return self.build(
++                common_prefix_len=0, common_attn_metadata=common_attn_metadata
++            )
+ 
+         decode_metadata = AiterFlashAttentionDecodeMetadata(
+-            max_query_len=common_attn_metadata.max_query_len,
++            max_query_len=max_query_len,
++            uniform_query_len=(
++                max_query_len if num_tokens == num_reqs * max_query_len else None
++            ),
+         )
+ 
+         return AiterFlashAttentionMetadata(
+@@ -739,6 +806,21 @@ class AiterFlashAttentionBackend(AttentionBackend):
+ 
+     @staticmethod
+     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
++        if not rocm_aiter_ops.is_shuffle_kv_cache_enabled():
++            return [16, 32]
++        # Only gluon serves 128-token pages; the pa_fwd_asm/ll4mi decode
++        # fallback is limited to 16 and 32. Advertise 128 only when gluon can
++        # run so selection never picks a page we cannot serve.
++        vllm_config = get_current_vllm_config_or_none()
++        if vllm_config is not None and vllm_config.model_config is not None:
++            mc = vllm_config.model_config
++            pc = vllm_config.parallel_config
++            if _pa_gluon_supports(
++                mc.get_num_attention_heads(pc),
++                mc.get_num_kv_heads(pc),
++                mc.get_head_size(),
++            ):
++                return [16, 32, 128]
+         return [16, 32]
+ 
+     @classmethod
+@@ -765,13 +847,33 @@ class AiterFlashAttentionBackend(AttentionBackend):
+ 
+     @classmethod
+     def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
+-        """Validate the block size the ROCm gather kernels require."""
++        """Validate the block size the ROCm gather kernels require, and under
++        the shuffle layout publish K and V as two head slots.
++
++        The shuffle read/write kernels rearrange a whole ``head_size x
++        block_size`` tile per side, so each side needs its own contiguous run
++        in the page. Packed into the content dim they interleave per token
++        instead, which no layout can undo.
++        """
+         # block_size == 1 is the per-token page-size probe (see
+         # Platform.get_page_size_bytes); real blocks must be gatherable in
+         # 16-token units by the ROCm kernel.
+         if spec.block_size != 1 and spec.block_size % 16 != 0:
+             raise ValueError("Block size must be a multiple of 16.")
+-        return spec
++        if not rocm_aiter_ops.is_shuffle_kv_cache_enabled():
++            return spec
++        if spec.state_content_bytes is not None:
++            return spec
++        assert spec.head_size == spec.head_size_v, (
++            "Separate K/V head slots require symmetric K/V head sizes."
++        )
++        return replace(
++            spec,
++            num_head_slots=2,
++            state_content_bytes=spec.num_kv_heads
++            * spec.head_size
++            * get_dtype_size(spec.dtype),
++        )
+ 
+     @classmethod
+     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+@@ -1160,11 +1262,25 @@ class AiterFlashAttentionImpl(AttentionImpl):
+             if num_decodes > 0:
+                 assert attn_metadata.decode_metadata is not None
+                 decode_max_query_len = attn_metadata.decode_metadata.max_query_len
++                decode_query_len = attn_metadata.decode_metadata.uniform_query_len
+ 
+-                # Use unified_attention for speculative decoding (multi-token),
+-                # sliding window, or sinks
+-                # (pa_fwd_asm and paged_attention_v1 don't support sinks)
+-                if (
++                # check if we can use the gluon paged-attention decode kernel
++                use_gluon = (
++                    _pa_gluon_supports(
++                        self.num_heads, self.num_kv_heads, self.head_size
++                    )
++                    and key_cache.shape[1] == _PA_GLUON_BLOCK_SIZE
++                    and decode_query_len is not None
++                    and decode_query_len <= _PA_GLUON_MAX_QUERY_LEN
++                    and decode_query_len * (self.num_heads // self.num_kv_heads)
++                    <= _PA_GLUON_MAX_QUERY_GROUP_SIZE
++                    and (decode_query_len == 1 or attn_metadata.causal)
++                )
++                # Use unified_attention for the decodes the paged kernels can't
++                # take: sliding window, sinks, or a multi-token batch that gluon
++                # declined (pa_fwd_asm and paged_attention_v1 don't support
++                # sinks).
++                if not use_gluon and (
+                     self.sliding_window[0] != -1
+                     or decode_max_query_len > 1
+                     or self.sinks is not None
+@@ -1287,21 +1403,6 @@ class AiterFlashAttentionImpl(AttentionImpl):
+                     )
+                 elif rocm_aiter_ops.is_shuffle_kv_cache_enabled():
+                     _, num_heads, head_size = query.shape
+-                    num_seqs = attn_metadata.seq_lens.shape[0]
+-                    max_num_partitions = (
+-                        attn_metadata.max_seq_len + _PARTITION_SIZE_ROCM - 1
+-                    ) // _PARTITION_SIZE_ROCM
+-                    tmp_out = torch.empty(
+-                        (num_seqs, num_heads, max_num_partitions, head_size),
+-                        dtype=query.dtype,
+-                        device=query.device,
+-                    )
+-                    exp_sums = torch.empty(
+-                        (num_seqs, num_heads, max_num_partitions),
+-                        dtype=torch.float32,
+-                        device=query.device,
+-                    )
+-                    max_logits = torch.empty_like(exp_sums)
+                     num_blocks, block_size, num_kv_heads, _ = key_cache.shape
+                     x = 16 // key_cache.element_size()
+                     new_key_cache = key_cache.reshape(
+@@ -1310,37 +1411,146 @@ class AiterFlashAttentionImpl(AttentionImpl):
+                     new_value_cache = value_cache.reshape(
+                         num_blocks, num_kv_heads, block_size // x, head_size, x
+                     )
+-                    k_qscale = (
+-                        layer._k_scale
+-                        if attn_metadata.k_scale is None
+-                        else attn_metadata.k_scale
+-                    )
+-                    v_qscale = (
+-                        layer._v_scale
+-                        if attn_metadata.v_scale is None
+-                        else attn_metadata.v_scale
+-                    )
+-                    rocm_aiter_ops.paged_attention_common(
+-                        Q=query[:num_decode_tokens],
+-                        K=new_key_cache,
+-                        V=new_value_cache,
+-                        tmp_out=tmp_out,
+-                        max_logits=max_logits,
+-                        exp_sums=exp_sums,
+-                        max_seq_len=attn_metadata.max_seq_len,
+-                        block_tables=attn_metadata.block_table[:num_decodes],
+-                        context_lens=attn_metadata.seq_lens[:num_decodes],
+-                        block_tables_stride0=attn_metadata.block_table[
+-                            :num_decodes
+-                        ].stride(0),
+-                        scale=self.scale,
+-                        K_QScale_hip=k_qscale,
+-                        V_QScale_hip=v_qscale,
+-                        K_QScale_asm=k_qscale,
+-                        V_QScale_asm=v_qscale,
+-                        out_=output[:num_decode_tokens],
+-                        kv_cache_dtype=self.kv_cache_dtype,
+-                    )
++
++                    if use_gluon:
++                        is_fp8_kv = is_quantized_kv_cache(self.kv_cache_dtype)
++                        # Per-tensor descale, as a float32 [1] tensor.
++                        k_scale_gluon = (
++                            layer._k_scale.reshape(1).to(torch.float32)
++                            if is_fp8_kv
++                            else None
++                        )
++                        v_scale_gluon = (
++                            layer._v_scale.reshape(1).to(torch.float32)
++                            if is_fp8_kv
++                            else None
++                        )
++                        compute_type = (
++                            current_platform.fp8_dtype() if is_fp8_kv else query.dtype
++                        )
++                        # The kernel folds the query positions into the group
++                        # dim, so the intermediate buffers are sized by the
++                        # combined extent.
++                        query_group_size = decode_query_len * (
++                            num_heads // num_kv_heads
++                        )
++
++                        sliding_window_int = (
++                            self.sliding_window[0] + 1
++                            if self.sliding_window[0] > 0
++                            else 0
++                        )
++                        if sliding_window_int > 0:
++                            max_context_partition_num = 1
++                            context_partition_size = 128
++                        else:
++                            max_context_partition_num = get_recommended_splits(
++                                num_decodes, num_kv_heads
++                            )
++                            context_partition_size = _PARTITION_SIZE_ROCM
++
++                        intermediate_shape = (
++                            num_decodes,
++                            num_kv_heads,
++                            max_context_partition_num,
++                            query_group_size,
++                        )
++                        exp_sums = torch.empty(
++                            intermediate_shape,
++                            dtype=torch.float32,
++                            device=query.device,
++                        )
++                        max_logits = torch.empty_like(exp_sums)
++                        temporary_output = torch.empty(
++                            (*intermediate_shape, head_size),
++                            dtype=output.dtype,
++                            device=query.device,
++                        )
++
++                        _pa_decode_gluon(
++                            output=output[:num_decode_tokens],
++                            query=query[:num_decode_tokens],
++                            key_cache=new_key_cache,
++                            value_cache=new_value_cache,
++                            context_lengths=attn_metadata.seq_lens[:num_decodes].to(
++                                torch.int32
++                            ),
++                            block_tables=attn_metadata.block_table[:num_decodes].to(
++                                torch.int32
++                            ),
++                            softmax_scale=self.scale,
++                            query_length=decode_query_len,
++                            max_context_partition_num=max_context_partition_num,
++                            context_partition_size=context_partition_size,
++                            compute_type=compute_type,
++                            query_scale=None,
++                            key_scale=k_scale_gluon,
++                            value_scale=v_scale_gluon,
++                            exp_sums=exp_sums,
++                            max_logits=max_logits,
++                            temporary_output=temporary_output,
++                            alibi_slopes=self.alibi_slopes,
++                            sinks=self.sinks,
++                            sliding_window=sliding_window_int,
++                            ps=True,
++                        )
++                    else:
++                        # Unlike gluon, this kernel derives block addresses
++                        # arithmetically, so it only reads the right bytes when
++                        # each side is a dense plane of pages.
++                        assert new_key_cache.stride(0) == (
++                            num_kv_heads * head_size * block_size
++                        ), (
++                            "paged_attention_common needs the K/V sides as "
++                            "dense planes; the resolved KV cache layout "
++                            "interleaves them within a block."
++                        )
++                        num_seqs = attn_metadata.seq_lens.shape[0]
++                        max_num_partitions = (
++                            attn_metadata.max_seq_len + _PARTITION_SIZE_ROCM - 1
++                        ) // _PARTITION_SIZE_ROCM
++                        tmp_out = torch.empty(
++                            (num_seqs, num_heads, max_num_partitions, head_size),
++                            dtype=query.dtype,
++                            device=query.device,
++                        )
++                        exp_sums = torch.empty(
++                            (num_seqs, num_heads, max_num_partitions),
++                            dtype=torch.float32,
++                            device=query.device,
++                        )
++                        max_logits = torch.empty_like(exp_sums)
++                        k_qscale = (
++                            layer._k_scale
++                            if attn_metadata.k_scale is None
++                            else attn_metadata.k_scale
++                        )
++                        v_qscale = (
++                            layer._v_scale
++                            if attn_metadata.v_scale is None
++                            else attn_metadata.v_scale
++                        )
++                        rocm_aiter_ops.paged_attention_common(
++                            Q=query[:num_decode_tokens],
++                            K=new_key_cache,
++                            V=new_value_cache,
++                            tmp_out=tmp_out,
++                            max_logits=max_logits,
++                            exp_sums=exp_sums,
++                            max_seq_len=attn_metadata.max_seq_len,
++                            block_tables=attn_metadata.block_table[:num_decodes],
++                            context_lens=attn_metadata.seq_lens[:num_decodes],
++                            block_tables_stride0=attn_metadata.block_table[
++                                :num_decodes
++                            ].stride(0),
++                            scale=self.scale,
++                            K_QScale_hip=k_qscale,
++                            V_QScale_hip=v_qscale,
++                            K_QScale_asm=k_qscale,
++                            V_QScale_asm=v_qscale,
++                            out_=output[:num_decode_tokens],
++                            kv_cache_dtype=self.kv_cache_dtype,
++                        )
+                 else:
+                     _, num_heads, head_size = query.shape
+                     nbytes_per_qo_elem = torch.finfo(query.dtype).bits // 8
+@@ -1393,6 +1603,14 @@ class AiterFlashAttentionImpl(AttentionImpl):
+     def _split_kv_cache(
+         self, kv_cache: torch.Tensor
+     ) -> tuple[torch.Tensor, torch.Tensor]:
++        if rocm_aiter_ops.is_shuffle_kv_cache_enabled():
++            # (B, 2, N, H*hs) -> one (B, N, H, hs) per side, which is what the
++            # shuffle read/write kernels reinterpret in place. The heads are
++            # folded into the content dim by customize_spec.
++            key_cache, value_cache = kv_cache.unflatten(
++                -1, (self.num_kv_heads, self.head_size)
++            ).unbind(1)
++            return key_cache, value_cache
+         # (B, H, N, 2*hs) -> ((B, N, H, hs), (B, N, H, hs))
+         return kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+ 
+-- 
+2.53.0
+

@@ -1,0 +1,60 @@
+From 43196f2458bebb822cd825c0370b6f157b66f293 Mon Sep 17 00:00:00 2001
+From: Keyi Li <94494390+JasonKeyiL@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 19:00:46 -0700
+Subject: [PATCH 33/39] [Perf][MLA Sparse] Pin req_id_per_token before
+ non_blocking H2D on XPU and ROCm (#54295)
+
+Signed-off-by: Keyi Li <likey6688@gmail.com>
+Co-authored-by: Keyi Li <likey6688@gmail.com>
+Co-authored-by: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py | 3 ++-
+ vllm/v1/attention/backends/mla/xpu_mla_sparse.py        | 4 ++--
+ 2 files changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py b/vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py
+index 3736a38f5..54f716ea5 100644
+--- a/vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py
++++ b/vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py
+@@ -17,6 +17,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
+ )
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
++from vllm.utils.torch_utils import np_to_pinned_tensor
+ from vllm.v1.attention.backend import (
+     AttentionBackend,
+     AttentionCGSupport,
+@@ -515,7 +516,7 @@ class ROCMAiterMLASparseMetadataBuilder(
+         self._prev_req_extent = new_req_extent
+         self._prev_indices_extent = new_indices_extent
+         self.req_id_per_token_buffer[:new_req_extent].copy_(
+-            torch.from_numpy(req_id_per_token), non_blocking=True
++            np_to_pinned_tensor(req_id_per_token), non_blocking=True
+         )
+         query_lens = (
+             common_attn_metadata.query_start_loc[1:]
+diff --git a/vllm/v1/attention/backends/mla/xpu_mla_sparse.py b/vllm/v1/attention/backends/mla/xpu_mla_sparse.py
+index 817953446..8aaa4749d 100644
+--- a/vllm/v1/attention/backends/mla/xpu_mla_sparse.py
++++ b/vllm/v1/attention/backends/mla/xpu_mla_sparse.py
+@@ -13,7 +13,7 @@ from vllm.logger import init_logger
+ from vllm.model_executor.layers.attention.mla_attention import (
+     get_mla_dims,
+ )
+-from vllm.utils.torch_utils import is_quantized_kv_cache
++from vllm.utils.torch_utils import is_quantized_kv_cache, np_to_pinned_tensor
+ from vllm.v1.attention.backend import (
+     AttentionBackend,
+     AttentionCGSupport,
+@@ -158,7 +158,7 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
+         # Zero-fill for cudagraphs
+         self.req_id_per_token_buffer.fill_(0)
+         self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
+-            torch.from_numpy(req_id_per_token), non_blocking=True
++            np_to_pinned_tensor(req_id_per_token), non_blocking=True
+         )
+ 
+         req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
+-- 
+2.53.0
+

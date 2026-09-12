@@ -1,0 +1,57 @@
+From f956e1c343dc63720b50c01209bd5ada6d8589a2 Mon Sep 17 00:00:00 2001
+From: Thien Tran <gau.nernst@yahoo.com.sg>
+Date: Fri, 28 Aug 2026 16:32:20 +0800
+Subject: [PATCH 02/39] [Kimi-K3][Bugfix] Fix low-latency GEMM fallback
+ initialization (#54167)
+
+Signed-off-by: Thien Tran <gau.nernst@yahoo.com.sg>
+---
+ tests/kernels/test_bf16_skinny_gemm.py        | 19 ++++++-------------
+ .../models/kimi_k3/nvidia/low_latency_gemm.py |  1 +
+ 2 files changed, 7 insertions(+), 13 deletions(-)
+
+diff --git a/tests/kernels/test_bf16_skinny_gemm.py b/tests/kernels/test_bf16_skinny_gemm.py
+index 3fd03db49..c20823138 100644
+--- a/tests/kernels/test_bf16_skinny_gemm.py
++++ b/tests/kernels/test_bf16_skinny_gemm.py
+@@ -1031,19 +1031,12 @@ def test_residual_dispatch_falls_back_to_addmm(
+     assert output is fallback
+ 
+ 
+-def test_fallback_preserves_default_method(monkeypatch: pytest.MonkeyPatch) -> None:
+-    fallback = torch.empty(2, 8)
+-    monkeypatch.setattr(
+-        k3_gemm.UnquantizedLinearMethod,
+-        "apply",
+-        lambda *args: fallback,
+-    )
+-    # 1-D input fails the runtime check, forcing the base-method fallback.
++def test_fallback_preserves_default_method() -> None:
++    x = torch.randn(2, 4)
++    weight = torch.randn(3, 4)
++    # CPU tensors fail the runtime check, forcing the base-method fallback.
+     method = k3_gemm.KimiK3LowLatencyLinearMethod({}, {})
+ 
+-    output = method.apply(
+-        SimpleNamespace(weight=torch.empty(0)),
+-        torch.empty(0),
+-    )
++    output = method.apply(SimpleNamespace(weight=weight), x)
+ 
+-    assert output is fallback
++    torch.testing.assert_close(output, torch.nn.functional.linear(x, weight))
+diff --git a/vllm/models/kimi_k3/nvidia/low_latency_gemm.py b/vllm/models/kimi_k3/nvidia/low_latency_gemm.py
+index ecab56dbe..52e6aa047 100644
+--- a/vllm/models/kimi_k3/nvidia/low_latency_gemm.py
++++ b/vllm/models/kimi_k3/nvidia/low_latency_gemm.py
+@@ -725,6 +725,7 @@ class _KimiK3LowLatencyApply:
+     """Mixin: try the precomputed plan, else defer to the base method."""
+ 
+     def __init__(self, plan: dict[int, ResolvedCall]) -> None:
++        super().__init__()
+         self._plan = plan
+ 
+     def apply(
+-- 
+2.53.0
+

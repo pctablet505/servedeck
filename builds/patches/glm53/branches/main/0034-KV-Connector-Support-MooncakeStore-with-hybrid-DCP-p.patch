@@ -1,0 +1,1255 @@
+From 7fd9cc036e3c0cbf0dfa4d1a9bbd755ed4922031 Mon Sep 17 00:00:00 2001
+From: Wei Zhao <51183510+wzhao18@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 22:10:23 -0400
+Subject: [PATCH 34/39] [KV Connector] Support MooncakeStore with hybrid DCP
+ prefix caching (#53324)
+
+Signed-off-by: wzhao18 <wzhao18.sz@gmail.com>
+Signed-off-by: wzhao18 <weizha@nvidia.com>
+Signed-off-by: Yifan Qiao <yifanqiao@inferact.ai>
+Co-authored-by: Yifan Qiao <yifanqiao@inferact.ai>
+---
+ tests/v1/core/test_kv_cache_utils.py          |  35 +++
+ .../unit/test_mooncake_store_connector.py     |  30 +-
+ .../unit/test_mooncake_store_hma_e2e.py       |   8 +-
+ .../unit/test_mooncake_store_scheduler.py     |   5 +-
+ .../unit/test_mooncake_store_worker.py        | 262 +++++++++++++++++-
+ tests/v1/kv_connector/unit/utils.py           |   2 +
+ .../v1/mooncake/store/connector.py            |   7 +-
+ .../v1/mooncake/store/coordinator.py          |  32 ++-
+ .../kv_connector/v1/mooncake/store/data.py    |  34 +++
+ .../v1/mooncake/store/protocol.py             |  43 ++-
+ .../v1/mooncake/store/scheduler.py            |  10 +-
+ .../kv_connector/v1/mooncake/store/worker.py  | 130 ++++++---
+ vllm/v1/core/kv_cache_coordinator.py          |  14 +-
+ vllm/v1/core/kv_cache_utils.py                |  33 ++-
+ 14 files changed, 560 insertions(+), 85 deletions(-)
+
+diff --git a/tests/v1/core/test_kv_cache_utils.py b/tests/v1/core/test_kv_cache_utils.py
+index 824bab484..368133720 100644
+--- a/tests/v1/core/test_kv_cache_utils.py
++++ b/tests/v1/core/test_kv_cache_utils.py
+@@ -2334,6 +2334,41 @@ def test_hidden_state_group_preserves_hybrid_prefix_cache_granularity():
+     ) == (544, 136)
+ 
+ 
++def test_resolve_dcp_kv_block_size_unwraps_uniform_type_specs():
++    attention = FullAttentionSpec(
++        block_size=16,
++        num_kv_heads=1,
++        head_size=64,
++        dtype=torch.float16,
++    )
++    mamba = MambaSpec(
++        block_size=16,
++        shapes=((1, 1),),
++        dtypes=(torch.float16,),
++    )
++    wrapped_attention = UniformTypeKVCacheSpecs(
++        block_size=16,
++        kv_cache_specs={"attention.0": attention, "attention.1": attention},
++    )
++    wrapped_mamba = UniformTypeKVCacheSpecs(
++        block_size=16,
++        kv_cache_specs={"mamba.0": mamba, "mamba.1": mamba},
++    )
++
++    assert kv_cache_utils.resolve_dcp_kv_block_size(attention, 4) == 64
++    assert kv_cache_utils.resolve_dcp_kv_block_size(wrapped_attention, 4) == 64
++    assert kv_cache_utils.resolve_dcp_kv_block_size(mamba, 4) == 16
++    assert kv_cache_utils.resolve_dcp_kv_block_size(wrapped_mamba, 4) == 16
++
++    scaled_attention = kv_cache_utils.resolve_dcp_kv_cache_spec(wrapped_attention, 4)
++    assert scaled_attention.block_size == 64
++    assert isinstance(scaled_attention, UniformTypeKVCacheSpecs)
++    assert all(
++        spec.block_size == 64 for spec in scaled_attention.kv_cache_specs.values()
++    )
++    assert kv_cache_utils.resolve_dcp_kv_cache_spec(wrapped_mamba, 4) is wrapped_mamba
++
++
+ def test_multi_run_layer_compact_strides_place_hoisted_heads():
+     """A layer-compact run region is its own dense allocation: under LHBNC the head
+     groups sit between the layers and the blocks, so a run's block stride is one head
+diff --git a/tests/v1/kv_connector/unit/test_mooncake_store_connector.py b/tests/v1/kv_connector/unit/test_mooncake_store_connector.py
+index 729c75970..7931a78d0 100644
+--- a/tests/v1/kv_connector/unit/test_mooncake_store_connector.py
++++ b/tests/v1/kv_connector/unit/test_mooncake_store_connector.py
+@@ -19,7 +19,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
+     worker,
+ )
+ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
++    MooncakeLookupResult,
+     MooncakeStoreConnectorMetadata,
++    TailKeyBoundary,
+ )
+ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import (
+     MooncakeStoreConnectorStats,
+@@ -121,10 +123,14 @@ def test_worker_methods_delegate_to_store_worker():
+     connector.bind_connector_metadata(metadata)
+ 
+     connector.register_kv_caches(kv_caches)
++    connector.start_load_kv(MagicMock())
++    connector.wait_for_save()
+     result = connector.get_finished(finished_req_ids)
+     invalid_block_ids = connector.get_block_ids_with_load_errors()
+ 
+     worker.register_kv_caches.assert_called_once_with(kv_caches)
++    worker.start_load_kv.assert_called_once_with(metadata)
++    worker.wait_for_save.assert_called_once_with(metadata)
+     worker.get_finished.assert_called_once_with(finished_req_ids, metadata)
+     assert result == ({"req-1"}, {"req-2"})
+     worker.get_block_ids_with_load_errors.assert_called_once_with()
+@@ -359,7 +365,9 @@ def test_lookup_key_client_lookup_prepends_typed_tag():
+ 
+     # Blocking lookup (non_block defaults to False) runs on the executor and
+     # returns the resolved hit length.
+-    assert client.lookup("req0", num_tokens=128, block_hashes=[]) == 5
++    result = client.lookup("req0", num_tokens=128, block_hashes=[])
++    assert result is not None
++    assert result.hit_length == 5
+ 
+     sent_frames = fake_socket.send_multipart.call_args[0][0]
+     assert sent_frames[0] == protocol.LOOKUP_MSG
+@@ -394,7 +402,7 @@ def _poll_lookup(client, req_id, num_tokens=128, block_hashes=(), timeout=5.0):
+     while time.monotonic() < deadline:
+         result = client.lookup(req_id, num_tokens, list(block_hashes), non_block=True)
+         if result is not None:
+-            return result
++            return result.hit_length
+         time.sleep(0.005)
+     return None
+ 
+@@ -502,11 +510,13 @@ def test_get_num_new_matched_tokens_async_defers_then_reports():
+ 
+     # Lookup ready with a hit -> report need_to_allocate + async-load flag.
+     hit = 3 * block_size
+-    mock_client.lookup.return_value = hit
++    boundary = TailKeyBoundary(group_id=0, num_tokens=4 * block_size)
++    mock_client.lookup.return_value = MooncakeLookupResult(hit, (boundary,))
+     need, load_async = sched.get_num_new_matched_tokens(request, 0)
+     assert need == hit
+     assert load_async == sched.load_async
+     assert sched.load_specs["r1"].kvpool_cached_tokens == hit
++    assert sched.load_specs["r1"].tail_key_boundaries == (boundary,)
+ 
+ 
+ def test_protocol_tags_are_distinct_and_non_empty():
+@@ -519,6 +529,20 @@ def test_protocol_tags_are_distinct_and_non_empty():
+     assert protocol.RESP_OK != protocol.RESP_ERR
+ 
+ 
++def test_lookup_response_round_trip_preserves_tail_keys():
++    result = MooncakeLookupResult(
++        hit_length=20,
++        tail_key_boundaries=(
++            TailKeyBoundary(group_id=0, num_tokens=24),
++            TailKeyBoundary(group_id=1, num_tokens=20),
++        ),
++    )
++
++    assert protocol.decode_lookup_response(protocol.encode_lookup_response(result)) == (
++        result
++    )
++
++
+ def test_scheduler_reset_connector_cache_invokes_connector_reset():
+     """Cascade test: Scheduler.reset_prefix_cache(reset_connector=True)
+     cascades into MooncakeStoreConnector.reset_cache without dragging in
+diff --git a/tests/v1/kv_connector/unit/test_mooncake_store_hma_e2e.py b/tests/v1/kv_connector/unit/test_mooncake_store_hma_e2e.py
+index 43b123261..9593ea0b8 100644
+--- a/tests/v1/kv_connector/unit/test_mooncake_store_hma_e2e.py
++++ b/tests/v1/kv_connector/unit/test_mooncake_store_hma_e2e.py
+@@ -254,10 +254,10 @@ def test_e2e_swa_plus_full_save_then_lookup_hits():
+     worker.store = store
+ 
+     # Both groups stored all 4 blocks -> full hit.
+-    assert worker.lookup(num_tokens=65, block_hashes=hs) == 64
++    assert worker.lookup(num_tokens=65, block_hashes=hs).hit_length == 64
+     # Exact-multiple prompt: the full hit is re-derived one block lower,
+     # where both groups' stored blocks still cover the SWA window.
+-    assert worker.lookup(num_tokens=64, block_hashes=hs) == 48
++    assert worker.lookup(num_tokens=64, block_hashes=hs).hit_length == 48
+ 
+     # Evict SWA's first two blocks (outside its window of 32 tokens = 2 blocks).
+     swa_keys_outside_window = [
+@@ -270,12 +270,12 @@ def test_e2e_swa_plus_full_save_then_lookup_hits():
+ 
+     # SWA window=32 -> only last 2 blocks must be present in SWA group.
+     # Full has all 4. Coordinator should still return 64.
+-    assert worker.lookup(num_tokens=65, block_hashes=hs) == 64
++    assert worker.lookup(num_tokens=65, block_hashes=hs).hit_length == 64
+     # Exact-multiple prompt after eviction: the boundary one block lower
+     # needs SWA block 1, which is gone — no usable stored boundary remains
+     # (the pre-fix arithmetic clamp would have returned 48 and livelocked
+     # on load failure -> recompute -> same lookup).
+-    assert worker.lookup(num_tokens=64, block_hashes=hs) == 0
++    assert worker.lookup(num_tokens=64, block_hashes=hs).hit_length == 0
+ 
+ 
+ def test_recv_skips_swa_blocks_before_window():
+diff --git a/tests/v1/kv_connector/unit/test_mooncake_store_scheduler.py b/tests/v1/kv_connector/unit/test_mooncake_store_scheduler.py
+index b1ce5aeef..0be676454 100644
+--- a/tests/v1/kv_connector/unit/test_mooncake_store_scheduler.py
++++ b/tests/v1/kv_connector/unit/test_mooncake_store_scheduler.py
+@@ -7,6 +7,7 @@ import pytest
+ 
+ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+     LoadSpec,
++    MooncakeLookupResult,
+     MooncakeStoreWorkerMetadata,
+     ReqMeta,
+     RequestTracker,
+@@ -702,9 +703,9 @@ class _StubLookupClient:
+         num_tokens: int,
+         block_hashes: list[bytes],
+         non_block: bool = False,
+-    ) -> int:
++    ) -> MooncakeLookupResult:
+         self.num_tokens.append(num_tokens)
+-        return self._hit_tokens
++        return MooncakeLookupResult(self._hit_tokens)
+ 
+ 
+ def test_full_external_hit_keeps_kvpool_cached_tokens_block_aligned():
+diff --git a/tests/v1/kv_connector/unit/test_mooncake_store_worker.py b/tests/v1/kv_connector/unit/test_mooncake_store_worker.py
+index a3137d670..1bf1d82d9 100644
+--- a/tests/v1/kv_connector/unit/test_mooncake_store_worker.py
++++ b/tests/v1/kv_connector/unit/test_mooncake_store_worker.py
+@@ -31,8 +31,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+     ChunkedTokenDatabase,
+     KeyMetadata,
+     LoadSpec,
++    MooncakeLookupResult,
+     PoolKey,
+     ReqMeta,
++    TailKeyBoundary,
+ )
+ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import (
+     MooncakeStoreConnectorStats,
+@@ -150,6 +152,7 @@ def _make_load_req(
+     *,
+     token_len: int,
+     vllm_cached_tokens: int = 0,
++    tail_key_boundaries: tuple[TailKeyBoundary, ...] = (),
+ ) -> ReqMeta:
+     return ReqMeta(
+         req_id=req_id,
+@@ -161,6 +164,7 @@ def _make_load_req(
+             kvpool_cached_tokens=token_len,
+             can_load=True,
+             token_len=token_len,
++            tail_key_boundaries=tail_key_boundaries,
+         ),
+     )
+ 
+@@ -305,15 +309,16 @@ def _patch_worker_runtime(
+     local_ip: str = "10.0.0.7",
+     tp_rank: int = 0,
+     tp_size: int = 1,
++    pcp_size: int = 1,
+     dcp_size: int = 1,
+ ) -> None:
+-    single_rank_group = SimpleNamespace(world_size=1, rank_in_group=0)
++    pcp_group = SimpleNamespace(world_size=pcp_size, rank_in_group=0)
+     # DCP groups are contiguous splits of the TP group (see
+     # parallel_state.py), so dcp_rank == tp_rank % dcp_size.
+     dcp_group = SimpleNamespace(world_size=dcp_size, rank_in_group=tp_rank % dcp_size)
+     monkeypatch.setattr(worker, "get_tensor_model_parallel_rank", lambda: tp_rank)
+     monkeypatch.setattr(worker, "get_tensor_model_parallel_world_size", lambda: tp_size)
+-    monkeypatch.setattr(worker, "get_pcp_group", lambda: single_rank_group)
++    monkeypatch.setattr(worker, "get_pcp_group", lambda: pcp_group)
+     monkeypatch.setattr(worker, "get_dcp_group", lambda: dcp_group)
+     monkeypatch.setattr(worker, "get_ip", lambda: local_ip)
+     monkeypatch.setattr(worker, "LookupKeyServer", MagicMock())
+@@ -1433,6 +1438,29 @@ def test_recv_thread_uses_single_batch_when_no_disk_offload_budget(monkeypatch):
+     store.batch_get_replica_desc.assert_not_called()
+ 
+ 
++def test_recv_thread_keys_chunk_by_lookup_selected_boundary():
++    store = MagicMock()
++    store.batch_get_into_multi_buffers.return_value = [256, 256]
++    thread = _make_store_recving_thread(store)
++
++    # 32-token hit over 16-token chunks: chunk 1 would default to the hash at
++    # the 32-token boundary (a1); the lookup matched the 48-token one (a2).
++    req = _make_load_req(
++        "req-a",
++        [b"a0", b"a1", b"a2"],
++        token_len=32,
++        tail_key_boundaries=(TailKeyBoundary(group_id=0, num_tokens=48),),
++    )
++
++    thread._handle_request(req)
++
++    keys = store.batch_get_into_multi_buffers.call_args.args[0]
++    assert keys == [
++        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6130",
++        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6132",
++    ]
++
++
+ def test_recv_thread_logs_tier_summary_when_enabled(monkeypatch, caplog_vllm):
+     monkeypatch.setenv("VLLM_MOONCAKE_STORE_TIER_LOG", "1")
+     caplog_vllm.set_level(logging.INFO, logger=worker.logger.name)
+@@ -1799,6 +1827,59 @@ def test_requester_worker_init_builds_replicate_config_for_preferred_segment(
+     assert w.store_replicate_config.preferred_segment == "10.0.0.7:50053"
+ 
+ 
++def test_worker_scales_uniform_attention_group_under_dcp(tmp_path, monkeypatch):
++    from vllm.v1.kv_cache_interface import (
++        KVCacheConfig,
++        UniformTypeKVCacheSpecs,
++    )
++
++    store = MagicMock()
++    store.setup.return_value = 0
++    _install_fake_mooncake(monkeypatch, store)
++    _patch_worker_runtime(monkeypatch, tp_size=4, dcp_size=4)
++    monkeypatch.setenv(
++        "MOONCAKE_CONFIG_PATH",
++        _write_mooncake_config(
++            tmp_path,
++            {
++                "metadata_server": "http://metadata/endpoint",
++                "protocol": "tcp",
++                "device_name": "",
++                "master_server_address": "10.0.0.7:50051",
++            },
++        ),
++    )
++    inner_specs = {
++        "layer0": FullAttentionSpec(
++            block_size=16, num_kv_heads=8, head_size=64, dtype=None
++        ),
++        "layer1": FullAttentionSpec(
++            block_size=16, num_kv_heads=4, head_size=64, dtype=None
++        ),
++    }
++    uniform_spec = UniformTypeKVCacheSpecs(
++        block_size=16,
++        kv_cache_specs=inner_specs,
++    )
++    kv_cache_config = KVCacheConfig(
++        num_blocks=10,
++        kv_cache_tensors=[],
++        kv_cache_groups=[KVCacheGroupSpec(list(inner_specs), uniform_spec)],
++    )
++
++    w = worker.MooncakeStoreWorker(
++        _make_vllm_config(decode_context_parallel_size=4),
++        kv_cache_config,
++    )
++
++    scaled_spec = w._kv_cache_groups[0].kv_cache_spec
++    assert isinstance(scaled_spec, UniformTypeKVCacheSpecs)
++    assert scaled_spec.block_size == 64
++    assert all(spec.block_size == 64 for spec in scaled_spec.kv_cache_specs.values())
++    assert w.coord.attention_groups[0].spec.block_size == 64
++    assert w.token_dbs[0].block_size == 64
++
++
+ @pytest.mark.parametrize("dcp_size", [1, 4])
+ def test_worker_put_striding_covers_every_rank_get_namespace(
+     tmp_path, monkeypatch, dcp_size
+@@ -2668,12 +2749,12 @@ def test_lookup_rejects_boundary_missing_one_mamba_shard():
+     # 33 tokens for two 16-token blocks: the hit stops below the request end,
+     # so the full-hit re-derivation stays out of the shard accounting.
+     worker.store.batch_is_exist.side_effect = lambda keys: [1] * len(keys)
+-    assert worker.lookup(33, [b"h0", b"h1"]) == 32
++    assert worker.lookup(33, [b"h0", b"h1"]).hit_length == 32
+ 
+     worker.store.batch_is_exist.side_effect = lambda keys: [
+         0 if "tp_rank:1" in k and "group:1" in k else 1 for k in keys
+     ]
+-    assert worker.lookup(33, [b"h0", b"h1"]) == 0
++    assert worker.lookup(33, [b"h0", b"h1"]).hit_length == 0
+ 
+ 
+ def test_lookup_requires_all_dcp_rank_namespaces():
+@@ -2684,7 +2765,7 @@ def test_lookup_requires_all_dcp_rank_namespaces():
+     _refresh_group_tp_replication_factors(worker)
+     worker.store.batch_is_exist.return_value = [1, 1, 0, 1]
+ 
+-    assert worker.lookup(16, [b"a0"]) == 0
++    assert worker.lookup(16, [b"a0"]).hit_length == 0
+     assert worker.store.batch_is_exist.call_args.args[0] == [
+         "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6130",
+         "test-model@tp_rank:1@pcp0@dcp1@pp_rank:0@group:0@6130",
+@@ -2696,7 +2777,7 @@ def test_lookup_requires_all_dcp_rank_namespaces():
+ def test_lookup_partial_prefix_returns_first_hit_length():
+     worker = _make_bare_worker()
+     worker.store.batch_is_exist.return_value = [1, 1, 0]
+-    assert worker.lookup(48, [b"a0", b"a1", b"a2"]) == 32
++    assert worker.lookup(48, [b"a0", b"a1", b"a2"]).hit_length == 32
+ 
+ 
+ def test_lookup_partial_tail_uses_hash_alignment():
+@@ -2736,7 +2817,7 @@ def test_lookup_partial_tail_uses_hash_alignment():
+     _refresh_group_tp_replication_factors(worker)
+     worker.store.batch_is_exist.return_value = [0, 0, 1, 0, 0, 1]
+ 
+-    assert worker.lookup(13, [b"h0", b"h1", b"h2"]) == 12
++    assert worker.lookup(13, [b"h0", b"h1", b"h2"]).hit_length == 12
+ 
+ 
+ def test_lookup_full_hit_reuses_existing_boundary():
+@@ -2744,7 +2825,10 @@ def test_lookup_full_hit_reuses_existing_boundary():
+     worker = _make_bare_worker(block_size=16)
+     worker.store.batch_is_exist.return_value = [1, 1]
+ 
+-    assert worker.lookup(32, [b"h0", b"h1"]) == 16
++    assert worker.lookup(32, [b"h0", b"h1"]) == MooncakeLookupResult(
++        hit_length=16,
++        tail_key_boundaries=(TailKeyBoundary(group_id=0, num_tokens=16),),
++    )
+     assert worker.store.batch_is_exist.call_count == 1
+ 
+ 
+@@ -2765,10 +2849,144 @@ def test_lookup_full_hit_with_eagle_pops_once_not_twice():
+     # 64-token exact-multiple prompt, all 4 blocks stored: one eagle pop
+     # gives 48; a spurious re-derivation (anchored at 48) would pop again
+     # and return 32.
+-    assert worker.lookup(64, [b"h0", b"h1", b"h2", b"h3"]) == 48
++    assert worker.lookup(64, [b"h0", b"h1", b"h2", b"h3"]).hit_length == 48
+     assert worker.store.batch_is_exist.call_count == 1
+ 
+ 
++def test_lookup_plan_resolves_group_tail_keys_from_existing_hashes():
++    from vllm.v1.kv_cache_interface import (
++        FullAttentionSpec,
++        KVCacheGroupSpec,
++        MambaSpec,
++    )
++
++    worker = _make_bare_worker(block_size=16)
++    full = FullAttentionSpec(block_size=16, num_kv_heads=8, head_size=64, dtype=None)
++    mamba = MambaSpec(
++        block_size=16,
++        shapes=((1, 1),),
++        dtypes=(torch.float32,),
++        mamba_cache_mode="align",
++    )
++    worker._kv_cache_groups = [
++        KVCacheGroupSpec(["full"], full),
++        KVCacheGroupSpec(["mamba"], mamba),
++    ]
++    worker.hash_block_size = 4
++    worker.token_dbs = [
++        ChunkedTokenDatabase(
++            KeyMetadata("test-model", 0, 0, 0, 0, group_id=group_id),
++            block_size=16,
++            hash_block_size=4,
++        )
++        for group_id in range(2)
++    ]
++    worker.coord = mooncake_store_worker.MooncakeStoreCoordinator(
++        worker._kv_cache_groups,
++        scheduler_block_size=16,
++        hash_block_size=4,
++        use_eagle=True,
++    )
++    _refresh_group_tp_replication_factors(worker)
++    hashes = [BlockHash(f"h{i}".encode()) for i in range(6)]
++    present = {
++        (0, bytes(hashes[3])),
++        (0, bytes(hashes[5])),
++        (1, bytes(hashes[4])),
++        # A later Mamba state also exists, but its exact hit-boundary hash
++        # must win and therefore needs no override.
++        (1, bytes(hashes[5])),
++    }
++
++    def exists(keys):
++        return [
++            int(
++                any(
++                    f"@group:{group_id}@{block_hash.hex()}" in key
++                    for group_id, block_hash in present
++                )
++            )
++            for key in keys
++        ]
++
++    worker.store.batch_is_exist.side_effect = exists
++
++    result = worker.lookup(25, hashes)
++
++    # The eagle drop trims the hit to 20 tokens, but the block that survives
++    # truncation is the one keyed at the 24-token boundary (hashes[5]), which
++    # the load path cannot derive from hit_length.
++    assert result.hit_length == 20
++    assert result.tail_key_boundaries == (
++        TailKeyBoundary(group_id=0, num_tokens=24),
++        TailKeyBoundary(group_id=1, num_tokens=20),
++    )
++
++
++def test_lookup_plan_recovers_tail_key_after_multi_chunk_convergence():
++    from vllm.v1.kv_cache_interface import (
++        FullAttentionSpec,
++        KVCacheGroupSpec,
++        MambaSpec,
++    )
++
++    worker = _make_bare_worker(block_size=16)
++    full = FullAttentionSpec(block_size=16, num_kv_heads=8, head_size=64, dtype=None)
++    mamba = MambaSpec(
++        block_size=16,
++        shapes=((1, 1),),
++        dtypes=(torch.float32,),
++        mamba_cache_mode="align",
++    )
++    worker._kv_cache_groups = [
++        KVCacheGroupSpec(["full"], full),
++        KVCacheGroupSpec(["mamba"], mamba),
++    ]
++    worker.hash_block_size = 4
++    worker.token_dbs = [
++        ChunkedTokenDatabase(
++            KeyMetadata("test-model", 0, 0, 0, 0, group_id=group_id),
++            block_size=16,
++            hash_block_size=4,
++        )
++        for group_id in range(2)
++    ]
++    worker.coord = mooncake_store_worker.MooncakeStoreCoordinator(
++        worker._kv_cache_groups,
++        scheduler_block_size=16,
++        hash_block_size=4,
++    )
++    _refresh_group_tp_replication_factors(worker)
++    hashes = [BlockHash(f"h{i}".encode()) for i in range(12)]
++    present = {
++        (0, bytes(hashes[3])),
++        (0, bytes(hashes[7])),
++        (0, bytes(hashes[11])),
++        (1, bytes(hashes[4])),
++    }
++
++    def exists(keys):
++        return [
++            int(
++                any(
++                    f"@group:{group_id}@{block_hash.hex()}" in key
++                    for group_id, block_hash in present
++                )
++            )
++            for key in keys
++        ]
++
++    worker.store.batch_is_exist.side_effect = exists
++
++    result = worker.lookup(49, hashes)
++
++    assert result.hit_length == 20
++    assert result.tail_key_boundaries == (
++        TailKeyBoundary(group_id=0, num_tokens=32),
++        TailKeyBoundary(group_id=1, num_tokens=20),
++    )
++
++
+ def test_lookup_full_hit_swa_degrades_when_no_stored_boundary_is_usable():
+     """The motivating livelock: the producer of a 64-token prompt stored
+     only its SWA tail window (blocks 2-3). The old arithmetic clamp turned
+@@ -2790,7 +3008,7 @@ def test_lookup_full_hit_swa_degrades_when_no_stored_boundary_is_usable():
+     )
+     worker.store.batch_is_exist.return_value = [0, 0, 1, 1]
+ 
+-    assert worker.lookup(64, [b"h0", b"h1", b"h2", b"h3"]) == 0
++    assert worker.lookup(64, [b"h0", b"h1", b"h2", b"h3"]).hit_length == 0
+     assert worker.store.batch_is_exist.call_count == 1
+ 
+ 
+@@ -2811,7 +3029,7 @@ def test_lookup_swa_single_group_returns_full_when_tail_window_present():
+         hash_block_size=worker.hash_block_size,
+     )
+     worker.store.batch_is_exist.return_value = [0, 0, 1, 1]
+-    assert worker.lookup(65, [b"h0", b"h1", b"h2", b"h3"]) == 64
++    assert worker.lookup(65, [b"h0", b"h1", b"h2", b"h3"]).hit_length == 64
+ 
+ 
+ def test_lookup_checks_all_potential_swa_hit_boundaries():
+@@ -2865,7 +3083,7 @@ def test_lookup_checks_all_potential_swa_hit_boundaries():
+         [f"h{i}".encode() for i in range(12)],
+     )
+ 
+-    assert result == 32
++    assert result.hit_length == 32
+     keys = worker.store.batch_is_exist.call_args.args[0]
+     assert len(keys) == 6
+     swa_keys = [key for key in keys if "@group:1@" in key]
+@@ -2949,6 +3167,24 @@ def test_consumer_starts_send_thread_only_when_put_is_enabled(save_decode_cache)
+     assert (worker.kv_send_thread is not None) == save_decode_cache
+ 
+ 
++def test_start_load_kv_queues_async_load():
++    w = _make_bare_worker()
++    req = _make_load_req(
++        "load-req",
++        [b"h0", b"h1"],
++        token_len=32,
++    )
++    assert req.load_spec is not None
++    req.load_spec.token_len = 0
++    meta = mooncake_store_worker.MooncakeStoreConnectorMetadata(set(), set())
++    meta.add_request(req)
++
++    w.start_load_kv(meta)
++
++    assert req.load_spec.token_len == 32
++    assert w.recv_request_queue.get_nowait() is req
++
++
+ def test_putting_consumer_queues_decode_save():
+     w = _make_bare_worker(kv_role="kv_consumer", save_decode_cache=True)
+     send_thread = MagicMock()
+@@ -3385,7 +3621,7 @@ def test_lookup_records_mooncake_metrics():
+     result = worker.lookup(33, [b"a0", b"a1"])
+     stats = worker.get_kv_connector_stats()
+ 
+-    assert result == 32
++    assert result.hit_length == 32
+     assert isinstance(stats, MooncakeStoreConnectorStats)
+     assert len(stats.data["lookup_exists"]) == 1
+     assert stats.data["lookup_exists"][0]["num_keys"] == 2
+diff --git a/tests/v1/kv_connector/unit/utils.py b/tests/v1/kv_connector/unit/utils.py
+index b815fbec9..80cab94b3 100644
+--- a/tests/v1/kv_connector/unit/utils.py
++++ b/tests/v1/kv_connector/unit/utils.py
+@@ -465,6 +465,7 @@ def make_kv_cache_config(
+     mamba_enabled: bool = False,
+     sw_size: int = 128,
+     num_blocks: int = 100,
++    mamba_cache_mode: Literal["all", "align", "none"] = "none",
+ ) -> KVCacheConfig:
+     kv_cache_groups = [
+         KVCacheGroupSpec(
+@@ -498,6 +499,7 @@ def make_kv_cache_config(
+                     block_size=block_size,
+                     shapes=((16,), (16,)),
+                     dtypes=(torch.float16,),
++                    mamba_cache_mode=mamba_cache_mode,
+                 ),
+             )
+         )
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
+index 7c7ece02b..b6128b28d 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
+@@ -109,11 +109,8 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
+                     f"{cache_block_size} (mamba_cache_mode != 'align')"
+                 )
+         pcp = vllm_config.parallel_config.prefill_context_parallel_size
+-        dcp = vllm_config.parallel_config.decode_context_parallel_size
+-        if len(kv_cache_config.transfer_groups) > 1 and pcp * dcp > 1:
+-            unsupported.append(
+-                f"PCP/DCP > 1 (pcp={pcp}, dcp={dcp}) with hybrid attention"
+-            )
++        if len(kv_cache_config.transfer_groups) > 1 and pcp > 1:
++            unsupported.append(f"PCP > 1 (pcp={pcp}) with hybrid attention")
+         if unsupported:
+             raise ValueError(
+                 "MooncakeStoreConnector does not support: " + "; ".join(unsupported)
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+index de5c84635..067d76b42 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+@@ -55,6 +55,12 @@ class ExternalCachedBlockPool:
+             return [self._present_block] * len(group_ids)
+         return None
+ 
++    def contains(self, group_id: int, block_hash: BlockHash) -> bool:
++        """Return whether a group has a loadable key for this hash."""
++        return (
++            self._exists is not None and (group_id, bytes(block_hash)) in self._exists
++        )
++
+ 
+ class MooncakeStoreCoordinator:
+     """Mirror of ``HybridKVCacheCoordinator.find_longest_cache_hit`` over an
+@@ -67,6 +73,7 @@ class MooncakeStoreCoordinator:
+         hash_block_size: int,
+         use_eagle: bool = False,
+         retention_interval: int | None = None,
++        dcp_world_size: int = 1,
+     ) -> None:
+         assert all(
+             g.kv_cache_spec.block_size % hash_block_size == 0 for g in kv_cache_groups
+@@ -83,7 +90,7 @@ class MooncakeStoreCoordinator:
+         self.hash_block_size = hash_block_size
+         self.lcm_block_size = scheduler_block_size
+         self.enable_partial_hash_hits = partial_hash_hits_enabled(
+-            kv_cache_groups, hash_block_size
++            kv_cache_groups, hash_block_size, dcp_world_size
+         )
+         self.use_eagle = use_eagle
+         # Mirror vLLM core's KVCacheCoordinator.retention_interval.
+@@ -376,10 +383,11 @@ class MooncakeStoreCoordinator:
+         # Truncate full-attention hit_blocks to final converged length;
+         # other specs already trim themselves inside their hit logic. cdiv keeps
+         # the partial tail block when hit_length is not block-aligned.
+-        first_group = self.attention_groups[0]
+-        if isinstance(first_group.spec, FullAttentionSpec):
+-            num_blocks = cdiv(hit_length, first_group.spec.block_size)
+-            for group_id in first_group.group_ids:
++        for group in self.attention_groups:
++            if not isinstance(group.spec, FullAttentionSpec):
++                continue
++            num_blocks = cdiv(hit_length, group.spec.block_size)
++            for group_id in group.group_ids:
+                 full_blks = hit_blocks_by_group[group_id]
+                 assert full_blks is not None
+                 del full_blks[num_blocks:]
+@@ -398,15 +406,17 @@ def _unwrap_spec(spec: KVCacheSpec) -> KVCacheSpec:
+ 
+ 
+ def partial_hash_hits_enabled(
+-    kv_cache_groups: list[KVCacheGroupSpec], hash_block_size: int
++    kv_cache_groups: list[KVCacheGroupSpec],
++    hash_block_size: int,
++    dcp_world_size: int = 1,
+ ) -> bool:
+-    """Mirror of core's ``HybridKVCacheCoordinator.enable_partial_hash_hits``
+-    (its dcp == 1 clause holds: the connector rejects hybrid + DCP/PCP > 1).
+-    Single copy on purpose — scheduler and coordinator must not disagree.
+-    """
++    """Match core's DCP-aware Mamba partial-hit condition."""
+     return any(
+         isinstance(spec := _unwrap_spec(g.kv_cache_spec), MambaSpec)
+         and spec.mamba_cache_mode == "align"
+-        and spec.block_size > hash_block_size
++        and (
++            (dcp_world_size == 1 and spec.block_size > hash_block_size)
++            or (dcp_world_size > 1 and spec.block_size >= hash_block_size)
++        )
+         for g in kv_cache_groups
+     )
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
+index 725da61e7..d8ed4dee0 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
+@@ -300,6 +300,39 @@ class ChunkedTokenDatabase:
+             yield start_idx, end_idx, h
+ 
+ 
++@dataclass(frozen=True)
++class TailKeyBoundary:
++    """Hash boundary used to key a group's tail block in the store.
++
++    Attributes:
++        group_id: KV-cache group containing the tail block.
++        num_tokens: Token boundary whose prefix hash identifies the matched
++            stored block. The loader uses
++            ``block_hashes[num_tokens // hash_block_size - 1]`` instead of the
++            hash implied by ``MooncakeLookupResult.hit_length``. This changes
++            only the load key, not the reusable prefix.
++    """
++
++    group_id: int
++    num_tokens: int
++
++
++@dataclass
++class MooncakeLookupResult:
++    """Lookup result used to build the subsequent load request.
++
++    Attributes:
++        hit_length: Longest prefix that every KV-cache group can reuse after
++            their individual cache hits converge.
++        tail_key_boundaries: Hash boundary used to store each cache group's
++            tail block when ``hit_length`` does not identify its store key.
++            There is one entry per group for every nonzero hit.
++    """
++
++    hit_length: int
++    tail_key_boundaries: tuple[TailKeyBoundary, ...] = ()
++
++
+ @dataclass
+ class LoadSpec:
+     """Specification for loading KV cache from external store."""
+@@ -308,6 +341,7 @@ class LoadSpec:
+     kvpool_cached_tokens: int
+     can_load: bool
+     token_len: int = 0
++    tail_key_boundaries: tuple[TailKeyBoundary, ...] = ()
+ 
+ 
+ @dataclass
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/protocol.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/protocol.py
+index eb6c65afa..1e71ed0b6 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/protocol.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/protocol.py
+@@ -16,7 +16,9 @@ Wire format (REQ/REP over IPC):
+                    fixed-size block hash (0 when there are no hashes)
+           frame 3: raw block hashes concatenated back-to-back (each hash_len
+                    bytes); the server splits on hash_len
+-        Response: [hit_count: u32 big-endian, 4 bytes]
++        Response: hit_length (u32 big-endian, first 4 bytes), followed by zero
++                  or more 8-byte tail-key boundaries. Each entry is group_id
++                  (u32), then boundary_tokens (u32).
+ 
+       msg_type == RESET_MSG:
+           (no payload frames)
+@@ -31,6 +33,11 @@ Mirrors the named-tag convention used by the NIXL connector (see
+ ``vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py``).
+ """
+ 
++from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
++    MooncakeLookupResult,
++    TailKeyBoundary,
++)
++
+ # Request message-type tags. Frame 0 of every request.
+ LOOKUP_MSG: bytes = b"lookup"
+ RESET_MSG: bytes = b"reset"
+@@ -38,3 +45,37 @@ RESET_MSG: bytes = b"reset"
+ # Single-byte response status codes for admin commands.
+ RESP_OK: bytes = b"\x01"
+ RESP_ERR: bytes = b"\x00"
++
++# group_id (u32), boundary_tokens (u32).
++TAIL_KEY_BOUNDARY_ENTRY_SIZE: int = 8
++
++
++def encode_lookup_response(result: MooncakeLookupResult) -> bytes:
++    hit_length = result.hit_length.to_bytes(4, "big")
++    if not result.tail_key_boundaries:
++        return hit_length
++
++    payload = bytearray(hit_length)
++    for boundary in result.tail_key_boundaries:
++        payload.extend(boundary.group_id.to_bytes(4, "big"))
++        payload.extend(boundary.num_tokens.to_bytes(4, "big"))
++    return bytes(payload)
++
++
++def decode_lookup_response(payload: bytes) -> MooncakeLookupResult:
++    if len(payload) < 4 or (len(payload) - 4) % TAIL_KEY_BOUNDARY_ENTRY_SIZE:
++        raise ValueError("Invalid Mooncake lookup response")
++
++    hit_length = int.from_bytes(payload[:4], "big")
++    if len(payload) == 4:
++        return MooncakeLookupResult(hit_length)
++
++    boundaries = []
++    for offset in range(4, len(payload), TAIL_KEY_BOUNDARY_ENTRY_SIZE):
++        boundaries.append(
++            TailKeyBoundary(
++                group_id=int.from_bytes(payload[offset : offset + 4], "big"),
++                num_tokens=int.from_bytes(payload[offset + 4 : offset + 8], "big"),
++            )
++        )
++    return MooncakeLookupResult(hit_length, tuple(boundaries))
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
+index 3abf7da4f..566bcc14d 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
+@@ -76,7 +76,9 @@ class MooncakeStoreScheduler:
+             kv_cache_config, vllm_config
+         )
+         self.enable_partial_hash_hits = partial_hash_hits_enabled(
+-            kv_cache_config.kv_cache_groups, self._hash_block_size
++            kv_cache_config.kv_cache_groups,
++            self._hash_block_size,
++            vllm_config.parallel_config.decode_context_parallel_size,
+         )
+ 
+         # Per-request state
+@@ -115,15 +117,16 @@ class MooncakeStoreScheduler:
+         if request.num_tokens < align:
+             return 0, False
+ 
+-        num_external_hit_tokens = self.client.lookup(
++        lookup_result = self.client.lookup(
+             request.request_id,
+             request.num_tokens,
+             request.block_hashes,
+             non_block=self.lookup_async,
+         )
+-        if num_external_hit_tokens is None:
++        if lookup_result is None:
+             # Lookup not ready yet; scheduler will retry on a later step.
+             return None, False
++        num_external_hit_tokens = lookup_result.hit_length
+ 
+         if num_external_hit_tokens < num_computed_tokens:
+             need_to_allocate = 0
+@@ -145,6 +148,7 @@ class MooncakeStoreScheduler:
+             vllm_cached_tokens=num_computed_tokens,
+             kvpool_cached_tokens=num_external_hit_tokens,
+             can_load=False,
++            tail_key_boundaries=lookup_result.tail_key_boundaries,
+         )
+ 
+         return need_to_allocate, self.load_async
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+index fae793b89..b1f1ac1d4 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+@@ -44,16 +44,20 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+     BlobBlockHashes,
+     ChunkedTokenDatabase,
+     KeyMetadata,
++    MooncakeLookupResult,
+     MooncakeStoreConnectorMetadata,
+     MooncakeStoreWorkerMetadata,
+     PoolKey,
+     ReqMeta,
++    TailKeyBoundary,
+ )
+ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.protocol import (  # noqa: E501
+     LOOKUP_MSG,
+     RESET_MSG,
+     RESP_ERR,
+     RESP_OK,
++    decode_lookup_response,
++    encode_lookup_response,
+ )
+ from vllm.logger import init_logger
+ from vllm.utils.math_utils import cdiv
+@@ -63,11 +67,11 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+ from vllm.v1.core.kv_cache_utils import (
+     BlockHash,
+     maybe_convert_block_hash,
++    resolve_dcp_kv_cache_spec,
+     resolve_kv_cache_block_sizes,
+ )
+ from vllm.v1.kv_cache_interface import (
+     KVCacheConfig,
+-    KVCacheGroupSpec,
+     KVCacheSpec,
+     MambaSpec,
+     MLAAttentionSpec,
+@@ -1179,6 +1183,12 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+         # Skip chunks the consumer's per-group spec wouldn't populate
+         # locally (e.g. SWA pre-window) even if the producer stored them.
+         load_mask_per_group = self.coord.load_mask(req_meta.block_hashes, token_len)
++        tail_key_boundaries = {
++            boundary.group_id: boundary.num_tokens
++            for boundary in (
++                req_meta.load_spec.tail_key_boundaries  # type: ignore[union-attr]
++            )
++        }
+ 
+         addr_list: list[list[int]] = []
+         size_list: list[list[int]] = []
+@@ -1193,6 +1203,13 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+                 chunk_idx = start // db.block_size
+                 if chunk_idx >= len(mask) or not mask[chunk_idx]:
+                     continue
++                boundary_tokens = (
++                    tail_key_boundaries.get(g_idx) if end == token_len else None
++                )
++                if boundary_tokens is not None:
++                    block_hash = req_meta.block_hashes[
++                        boundary_tokens // db.hash_block_size - 1
++                    ]
+                 key_list.append(db.key_for(block_hash))
+                 chunks.append((start, end))
+             g_addrs, g_sizes, g_block_ids = db.prepare_values(
+@@ -1494,21 +1511,15 @@ class MooncakeStoreWorker:
+             )
+             return
+ 
+-        # Single-group + PCP/DCP > 1: scale the lone group's spec.block_size to
+-        # self.block_size (= scheduler_block_size) so the coordinator's
+-        # ``block_size % hash_block_size == 0`` invariant holds.
+-        groups = list(kv_cache_config.transfer_groups)
+-        if len(groups) == 1 and groups[0].kv_cache_spec.block_size != self.block_size:
+-            g = groups[0]
+-            groups = [
+-                dataclasses.replace(
+-                    g,
+-                    kv_cache_spec=dataclasses.replace(
+-                        g.kv_cache_spec, block_size=self.block_size
+-                    ),
+-                )
+-            ]
+-        self._kv_cache_groups: list[KVCacheGroupSpec] = groups
++        self._kv_cache_groups = [
++            dataclasses.replace(
++                group,
++                kv_cache_spec=resolve_dcp_kv_cache_spec(
++                    group.kv_cache_spec, self.dcp_size
++                ),
++            )
++            for group in kv_cache_config.transfer_groups
++        ]
+         spec_cfg = getattr(vllm_config, "speculative_config", None)
+         use_eagle = bool(
+             spec_cfg.use_eagle()
+@@ -1521,6 +1532,7 @@ class MooncakeStoreWorker:
+             hash_block_size=self.hash_block_size,
+             use_eagle=use_eagle,
+             retention_interval=kv_cache_config.prefix_cache_retention_interval,
++            dcp_world_size=self.dcp_size,
+         )
+         # One ChunkedTokenDatabase per group; addresses populated in
+         # register_kv_caches once the kv-cache layout is known. Each group's
+@@ -1881,7 +1893,9 @@ class MooncakeStoreWorker:
+             return None
+         return MooncakeStoreWorkerMetadata(completed_saves=completed_saves)
+ 
+-    def lookup(self, num_tokens: int, block_hashes: Sequence[BlockHash]) -> int:
++    def lookup(
++        self, num_tokens: int, block_hashes: Sequence[BlockHash]
++    ) -> MooncakeLookupResult:
+         """Check how many prefix tokens exist in the store.
+ 
+         Checks across all rank-specific key namespaces that may be loaded. A
+@@ -1889,11 +1903,11 @@ class MooncakeStoreWorker:
+         the last token is recomputed for sampling.
+         """
+         if self._capacity_only:
+-            return 0
++            return MooncakeLookupResult(0)
+ 
+         token_len = self.coord.align_lookup_length(num_tokens)
+         if not block_hashes or token_len <= 0:
+-            return 0
++            return MooncakeLookupResult(0)
+ 
+         # Build per-(group, hash) candidate keys expanded across rank namespaces.
+         # candidate_meta stores the (group, hash_bytes) for key slice.
+@@ -1934,7 +1948,7 @@ class MooncakeStoreWorker:
+                 candidate_meta.append((g_idx, bytes(h)))
+ 
+         if not candidate_keys:
+-            return 0
++            return MooncakeLookupResult(0)
+ 
+         lookup_start = time.perf_counter()
+         try:
+@@ -1953,7 +1967,7 @@ class MooncakeStoreWorker:
+                 num_failed_keys=len(candidate_keys),
+             )
+             logger.error("Remote connection failed in lookup: %s", e)
+-            return 0
++            return MooncakeLookupResult(0)
+ 
+         # A (group, hash) is "present" only when every namespace that will be
+         # loaded has it (per-group count: sharded groups need every rank's
+@@ -1970,7 +1984,7 @@ class MooncakeStoreWorker:
+             self.hash_block_size,
+             exists_set,
+         )
+-        _masks, hit_length = self.coord.find_longest_cache_hit(
++        _, hit_length = self.coord.find_longest_cache_hit(
+             block_hashes,
+             token_len,
+             cached_block_pool,
+@@ -1978,13 +1992,63 @@ class MooncakeStoreWorker:
+         if hit_length >= num_tokens:
+             usable_length = self.coord.align_lookup_length(num_tokens - 1)
+             if usable_length <= 0:
+-                return 0
+-            _masks, hit_length = self.coord.find_longest_cache_hit(
++                return MooncakeLookupResult(0)
++            _, hit_length = self.coord.find_longest_cache_hit(
+                 block_hashes,
+                 usable_length,
+                 cached_block_pool,
+             )
+-        return hit_length
++        return MooncakeLookupResult(
++            hit_length,
++            self._tail_key_boundaries(
++                block_hashes,
++                hit_length,
++                cached_block_pool,
++            ),
++        )
++
++    def _tail_key_boundaries(
++        self,
++        block_hashes: Sequence[BlockHash],
++        hit_length: int,
++        cached_block_pool: ExternalCachedBlockPool,
++    ) -> tuple[TailKeyBoundary, ...]:
++        """Return the hash boundary used to store each group's tail block.
++
++        With fine-grained prefix matching, ``hit_length`` may fall within a
++        physical cache block and may not align with the hash boundary used to
++        store that block. For each KV-cache group, return the token boundary
++        whose hash was used as the store key.
++        """
++        if hit_length <= 0:
++            return ()
++
++        boundaries = []
++        hit_boundary_hash_idx = hit_length // self.hash_block_size - 1
++        for group_id, db in enumerate(self.token_dbs):
++            chunk_id = cdiv(hit_length, db.block_size) - 1
++            boundary_tokens = hit_length
++            contains_hit_boundary = cached_block_pool.contains(
++                group_id, block_hashes[hit_boundary_hash_idx]
++            )
++            if not self.coord.enable_partial_hash_hits:
++                assert contains_hit_boundary
++            if not contains_hit_boundary:
++                next_chunk_hash_idx = min(
++                    (chunk_id + 1) * db.block_size // self.hash_block_size,
++                    len(block_hashes),
++                )
++                for hash_idx in range(hit_boundary_hash_idx + 1, next_chunk_hash_idx):
++                    if cached_block_pool.contains(group_id, block_hashes[hash_idx]):
++                        boundary_tokens = (hash_idx + 1) * self.hash_block_size
++                        break
++                else:
++                    raise AssertionError(
++                        f"No tail key found for cache group {group_id} at "
++                        f"hit length {hit_length}"
++                    )
++            boundaries.append(TailKeyBoundary(group_id, boundary_tokens))
++        return tuple(boundaries)
+ 
+     def get_kv_events(self) -> list[BlockStored]:
+         if self.enable_kv_events and self.kv_send_thread is not None:
+@@ -2017,7 +2081,7 @@ class LookupKeyServer:
+     """ZMQ server on worker rank 0 for the LookupKey admin channel.
+ 
+     Handles two request types, tagged at frame 0:
+-    - ``LOOKUP_MSG``: prefix-cache hit query, returns hit count.
++    - ``LOOKUP_MSG``: prefix-cache hit query, returns its load plan.
+     - ``RESET_MSG``: drains the send thread queue, then runs
+       ``store.remove_all(force=True)``. Caller must have paused the
+       scheduler first.
+@@ -2054,7 +2118,7 @@ class LookupKeyServer:
+                     blob = all_frames[3].buffer
+                     block_hashes = BlobBlockHashes(blob, hash_len)
+                     result = self.store_worker.lookup(num_tokens, block_hashes)
+-                    self.socket.send(result.to_bytes(4, "big"))
++                    self.socket.send(encode_lookup_response(result))
+ 
+                 elif msg_type == RESET_MSG:
+                     try:
+@@ -2114,9 +2178,11 @@ class LookupKeyClient:
+         self.executor = ThreadPoolExecutor(
+             max_workers=1, thread_name_prefix="MooncakeLookupClient"
+         )
+-        self.futures: dict[str, Future[int]] = {}
++        self.futures: dict[str, Future[MooncakeLookupResult]] = {}
+ 
+-    def _lookup(self, num_tokens: int, block_hashes: list[BlockHash]) -> int:
++    def _lookup(
++        self, num_tokens: int, block_hashes: list[BlockHash]
++    ) -> MooncakeLookupResult:
+         hash_len = len(block_hashes[0]) if block_hashes else 0
+         all_frames = (
+             LOOKUP_MSG,
+@@ -2126,7 +2192,7 @@ class LookupKeyClient:
+         )
+         self.socket.send_multipart(all_frames, copy=False)
+         resp = self.socket.recv()
+-        return int.from_bytes(resp, "big")
++        return decode_lookup_response(resp)
+ 
+     def lookup(
+         self,
+@@ -2134,7 +2200,7 @@ class LookupKeyClient:
+         num_tokens: int,
+         block_hashes: list[BlockHash],
+         non_block: bool = False,
+-    ) -> int | None:
++    ) -> MooncakeLookupResult | None:
+         """If non_block is True, will return None until the result is ready,
+         so the caller retries on a later step."""
+         future = self.futures.get(req_id)
+@@ -2147,7 +2213,7 @@ class LookupKeyClient:
+             return future.result()
+         except Exception as e:
+             logger.error("Async Mooncake lookup failed for %s: %s", req_id, e)
+-            return 0
++            return MooncakeLookupResult(0)
+         finally:
+             del self.futures[req_id]
+ 
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index 767ea0033..c097542f8 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -867,14 +867,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+             if is_simple_hybrid:
+                 break
+ 
+-        # Truncate full attention blocks to final hit_length (if present)
+-        first_group = self.attention_groups[0]
+-        if isinstance(first_group.spec, FullAttentionSpec):
+-            group_block_size = self.single_type_managers[
+-                first_group.group_ids[0]
+-            ].block_size
++        # Truncate every full-attention group (target and draft) blocks
++        # to final hit_length.
++        for group in self.attention_groups:
++            if not isinstance(group.spec, FullAttentionSpec):
++                continue
++            group_block_size = self.single_type_managers[group.group_ids[0]].block_size
+             num_blocks = cdiv(hit_length, group_block_size)
+-            for group_id in first_group.group_ids:
++            for group_id in group.group_ids:
+                 if (blks := hit_blocks_by_group[group_id]) is not None:
+                     del blks[num_blocks:]
+                     hit_length_by_group[group_id] = hit_length
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 337a55aa6..9b77fbd20 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -35,6 +35,7 @@ from vllm.v1.kv_cache_interface import (
+     SlidingWindowSpec,
+     UniformTypeKVCacheSpecs,
+     compute_layout_strides,
++    iter_layer_specs,
+     replace_as,
+ )
+ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+@@ -647,6 +648,33 @@ def hash_block_tokens(
+     )
+ 
+ 
++def resolve_dcp_kv_block_size(spec: KVCacheSpec, dcp_world_size: int) -> int:
++    """Return the token span of a cache block under DCP."""
++    layer_specs = iter_layer_specs(spec)
++    if len(layer_specs) > 0 and all(
++        isinstance(layer_spec, AttentionSpec) for layer_spec in layer_specs
++    ):
++        return spec.block_size * dcp_world_size
++    return spec.block_size
++
++
++def resolve_dcp_kv_cache_spec(spec: KVCacheSpec, dcp_world_size: int) -> KVCacheSpec:
++    """Return a KV cache spec with block sizes adjusted for DCP."""
++    block_size = resolve_dcp_kv_block_size(spec, dcp_world_size)
++    if block_size == spec.block_size:
++        return spec
++    if isinstance(spec, UniformTypeKVCacheSpecs):
++        return replace(
++            spec,
++            block_size=block_size,
++            kv_cache_specs={
++                name: resolve_dcp_kv_cache_spec(layer_spec, dcp_world_size)
++                for name, layer_spec in spec.kv_cache_specs.items()
++            },
++        )
++    return replace(spec, block_size=block_size)
++
++
+ def resolve_kv_cache_block_sizes(
+     kv_cache_config: KVCacheConfig,
+     vllm_config: VllmConfig,
+@@ -674,10 +702,7 @@ def resolve_kv_cache_block_sizes(
+         return bs, bs
+ 
+     group_block_sizes = [
+-        g.kv_cache_spec.block_size * dcp
+-        if isinstance(g.kv_cache_spec, AttentionSpec)
+-        else g.kv_cache_spec.block_size
+-        for g in groups
++        resolve_dcp_kv_block_size(g.kv_cache_spec, dcp) for g in groups
+     ]
+     scheduler_block_size = math.lcm(*group_block_sizes)
+ 
+-- 
+2.53.0
+

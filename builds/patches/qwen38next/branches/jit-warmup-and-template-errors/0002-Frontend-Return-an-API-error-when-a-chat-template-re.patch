@@ -1,0 +1,319 @@
+From c31d091239193c4d54bfa5a29cedb22bedbf9f3e Mon Sep 17 00:00:00 2001
+From: pctablet505 <pctablet505@gmail.com>
+Date: Wed, 9 Sep 2026 23:59:56 +0530
+Subject: [PATCH 2/2] [Frontend] Return an API error when a chat template
+ rejects the request
+
+`chat_template_kwargs={"reasoning_effort": "ultra"}` reached the client as the
+model template's own prose with `param: null`, and dumped a full traceback into
+the server log, because `safe_apply_chat_template` wraps every failure --
+including the template's deliberate `raise_exception` -- in a bare
+`ValueError(str(exc))` and logs it with `logger.exception`.
+
+Detect the exact `jinja2.exceptions.TemplateError` that `raise_exception`
+raises (subclasses such as `TemplateSyntaxError` and `UndefinedError` mean the
+template itself is broken, so they keep their existing handling), and raise a
+`ChatTemplateApplicationError` instead: a `VLLMValidationError` so the response
+carries `param="chat_template_kwargs"` and names the offending keys, and still
+a `ValueError` so existing handlers are unaffected. The status code stays 400.
+
+The template's message already names the values that model accepts, so it is
+forwarded verbatim rather than restated against a list that would drift.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../renderers/test_chat_template_rejection.py | 169 ++++++++++++++++++
+ vllm/entrypoints/chat_utils.py                |  18 ++
+ vllm/renderers/hf.py                          |  57 ++++++
+ 3 files changed, 244 insertions(+)
+ create mode 100644 tests/renderers/test_chat_template_rejection.py
+
+diff --git a/tests/renderers/test_chat_template_rejection.py b/tests/renderers/test_chat_template_rejection.py
+new file mode 100644
+index 000000000..2fb08f185
+--- /dev/null
++++ b/tests/renderers/test_chat_template_rejection.py
+@@ -0,0 +1,169 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""A chat template that rejects the request must produce an API error, not a stack.
++
++`{{ raise_exception(...) }}` is how a model's chat template validates its own
++inputs -- e.g. Qwen4Exp rejecting `chat_template_kwargs={"reasoning_effort":
++"ultra"}`.  Today the renderer wraps every failure, including that one, into a
++bare `ValueError(str(exc))` and logs a full traceback, so the client gets the
++template's prose with no indication of which request field was at fault.
++"""
++
++import jinja2
++import jinja2.sandbox
++import pytest
++
++from vllm.entrypoints.chat_utils import ChatTemplateApplicationError
++from vllm.entrypoints.serve.exception_handling.error_response import (
++    create_error_response,
++)
++from vllm.exceptions import VLLMValidationError
++from vllm.renderers.hf import safe_apply_chat_template
++
++# A miniature stand-in for the model's own chat template: the set of accepted
++# values lives in the template, exactly as it does in the served model, so no
++# test (and no fix) may hardcode it.
++REASONING_EFFORT_TEMPLATE = """
++{%- set effort = reasoning_effort | default('xhigh') -%}
++{%- if effort not in ['xhigh', 'medium', 'low'] -%}
++{{- raise_exception('Unexpected reasoning effort ' ~ effort ~
++   '. Supported types are xhigh (default), medium, and low.') -}}
++{%- endif -%}
++{%- for message in messages -%}{{ message['content'] }}{%- endfor -%}
++"""
++
++# Parses, then fails at render time with `jinja2.exceptions.UndefinedError` --
++# a TemplateError *subclass*, and a bug in the template rather than in the
++# request.
++BROKEN_TEMPLATE = (
++    "{% for message in messages %}"
++    "{{ message['content'] }}{{ missing_thing.attribute }}"
++    "{% endfor %}"
++)
++
++SUPPORTED_VALUES_TEXT = "Supported types are xhigh (default), medium, and low."
++
++
++class _TemplateTokenizer:
++    """Renders a Jinja chat template the way `transformers` does."""
++
++    def __init__(self, template: str) -> None:
++        self._template = template
++
++    def get_chat_template(self, chat_template=None, tools=None) -> str:
++        return self._template
++
++    def apply_chat_template(
++        self,
++        conversation,
++        *,
++        tools=None,
++        chat_template=None,
++        tokenize=False,
++        **kwargs,
++    ):
++        env = jinja2.sandbox.ImmutableSandboxedEnvironment(
++            trim_blocks=True, lstrip_blocks=True
++        )
++
++        def raise_exception(message):
++            raise jinja2.exceptions.TemplateError(message)
++
++        env.globals["raise_exception"] = raise_exception
++        kwargs.pop("return_dict", None)
++        return env.from_string(chat_template).render(
++            messages=list(conversation), **kwargs
++        )
++
++
++CONVERSATION = [{"role": "user", "content": "hi"}]
++
++
++def _apply(template: str, **chat_template_kwargs):
++    return safe_apply_chat_template(
++        None,
++        _TemplateTokenizer(template),
++        CONVERSATION,
++        chat_template=template,
++        tokenize=False,
++        **chat_template_kwargs,
++    )
++
++
++def test_supported_reasoning_effort_still_renders():
++    """Over-correction guard: the fix must not reject values the template accepts."""
++    assert _apply(REASONING_EFFORT_TEMPLATE, reasoning_effort="low") == "hi"
++    assert _apply(REASONING_EFFORT_TEMPLATE) == "hi"
++
++
++def test_rejected_reasoning_effort_raises_a_validation_error():
++    with pytest.raises(ChatTemplateApplicationError) as excinfo:
++        _apply(REASONING_EFFORT_TEMPLATE, reasoning_effort="ultra")
++
++    exc = excinfo.value
++    # Still a ValueError so existing `except ValueError` handlers keep working,
++    # and a VLLMValidationError so the error response carries `param`.
++    assert isinstance(exc, ValueError)
++    assert isinstance(exc, VLLMValidationError)
++    assert exc.parameter == "chat_template_kwargs"
++    message = str(exc)
++    # The accepted values come from the template, not from a hardcoded list.
++    assert SUPPORTED_VALUES_TEXT in message
++    assert "reasoning_effort" in message
++    # `parameter=`/`value=` belong in the error object's fields, not the prose.
++    assert "parameter=" not in message
++
++
++def test_error_response_is_a_well_formed_openai_error():
++    with pytest.raises(ChatTemplateApplicationError) as excinfo:
++        _apply(REASONING_EFFORT_TEMPLATE, reasoning_effort="ultra")
++
++    response = create_error_response(excinfo.value)
++    assert response.error.code == 400
++    assert response.error.type == "BadRequestError"
++    assert response.error.param == "chat_template_kwargs"
++    assert SUPPORTED_VALUES_TEXT in response.error.message
++    # No template internals: no traceback frames, no filesystem paths.
++    assert "Traceback" not in response.error.message
++    assert "jinja2" not in response.error.message
++    assert "site-packages" not in response.error.message
++
++
++def test_template_rejection_is_not_logged_as_a_server_fault(caplog):
++    """A client-caused 400 must not dump a traceback into the server log."""
++    with caplog.at_level("WARNING"):
++        with pytest.raises(ChatTemplateApplicationError):
++            _apply(REASONING_EFFORT_TEMPLATE, reasoning_effort="ultra")
++
++    assert caplog.records, "the rejection should still be logged once"
++    assert all(record.exc_info is None for record in caplog.records)
++    assert all(record.levelname != "ERROR" for record in caplog.records)
++
++
++def test_a_broken_template_is_not_reported_as_a_request_error():
++    """Only `raise_exception` is the caller's fault.
++
++    An `UndefinedError` means the model ships a broken template. It is a
++    `TemplateError` subclass, so a `isinstance` check would swallow it and
++    blame the client; it must keep its existing handling instead.
++    """
++    with pytest.raises(ValueError) as excinfo:
++        _apply(BROKEN_TEMPLATE)
++    assert not isinstance(excinfo.value, ChatTemplateApplicationError)
++
++
++def test_a_non_template_failure_is_not_reported_as_a_request_error():
++    class _ExplodingTokenizer(_TemplateTokenizer):
++        def apply_chat_template(self, conversation, **kwargs):
++            raise RuntimeError("cache is on fire")
++
++    with pytest.raises(ValueError) as excinfo:
++        safe_apply_chat_template(
++            None,
++            _ExplodingTokenizer(REASONING_EFFORT_TEMPLATE),
++            CONVERSATION,
++            chat_template=REASONING_EFFORT_TEMPLATE,
++            tokenize=False,
++        )
++    assert not isinstance(excinfo.value, ChatTemplateApplicationError)
++    assert "cache is on fire" in str(excinfo.value)
+diff --git a/vllm/entrypoints/chat_utils.py b/vllm/entrypoints/chat_utils.py
+index 30b6ecc76..c86d66d58 100644
+--- a/vllm/entrypoints/chat_utils.py
++++ b/vllm/entrypoints/chat_utils.py
+@@ -94,6 +94,24 @@ class ChatTemplateResolutionError(ValueError):
+     """
+ 
+ 
++class ChatTemplateApplicationError(VLLMValidationError, ValueError):
++    """Raised when the model's own chat template rejects the request.
++
++    A chat template validates its inputs by calling Jinja's `raise_exception`,
++    so the message is authored by the model and already names the values that
++    template accepts. Forward it rather than restating a list here, which would
++    drift the moment the model ships a new template.
++
++    `VLLMValidationError` makes the entrypoints emit a 400 carrying `param`;
++    `ValueError` keeps the pre-existing `except ValueError` handlers working.
++    """
++
++    def __str__(self) -> str:
++        # `parameter` is reported in the error object's own field, so keep it
++        # out of the message the client reads.
++        return Exception.__str__(self)
++
++
+ MODALITY_PLACEHOLDERS_MAP = {
+     "image": "<##IMAGE##>",
+     "audio": "<##AUDIO##>",
+diff --git a/vllm/renderers/hf.py b/vllm/renderers/hf.py
+index 6afd245cc..32a08fcd8 100644
+--- a/vllm/renderers/hf.py
++++ b/vllm/renderers/hf.py
+@@ -22,6 +22,7 @@ from typing_extensions import override
+ 
+ from vllm.entrypoints.chat_utils import (
+     PROMPT_EMBEDS_PLACEHOLDER_TOKEN,
++    ChatTemplateApplicationError,
+     ChatTemplateResolutionError,
+     load_chat_template,
+     parse_chat_messages,
+@@ -672,6 +673,60 @@ def resolve_chat_template_kwargs(
+     return {k: v for k, v in chat_template_kwargs.items() if k in accept_vars}
+ 
+ 
++# Chat-template kwargs vLLM itself sets on the caller's behalf. Anything else
++# reaching `safe_apply_chat_template` came from the request's
++# `chat_template_kwargs`.
++_VLLM_MANAGED_TEMPLATE_KWARGS = frozenset(
++    {
++        "add_generation_prompt",
++        "continue_final_message",
++        "documents",
++        "return_assistant_tokens_mask",
++        "return_dict",
++        "tokenize",
++    }
++)
++
++
++def _is_template_raised_error(exc: BaseException) -> bool:
++    """Whether a chat template rejected its inputs via `raise_exception`.
++
++    `transformers` exposes `raise_exception` to chat templates and it raises
++    `jinja2.exceptions.TemplateError` itself, never a subclass. Subclasses
++    (`TemplateSyntaxError`, `UndefinedError`, ...) mean the template is broken,
++    which is a server fault, so this matches the exact class rather than using
++    `isinstance`. The class is matched by name to avoid importing jinja2 here,
++    as `create_error_response` already does.
++    """
++    cls = type(exc)
++    return cls.__name__ == "TemplateError" and cls.__module__.startswith("jinja2")
++
++
++def _chat_template_rejection(
++    exc: BaseException, chat_template_kwargs: Mapping[str, Any]
++) -> ChatTemplateApplicationError:
++    """Turn a template's own rejection into an API validation error.
++
++    The template's message already names the values that template accepts, so
++    it is forwarded verbatim; restating the set here would drift as soon as the
++    model ships a new template.
++    """
++    request_kwargs = sorted(set(chat_template_kwargs) - _VLLM_MANAGED_TEMPLATE_KWARGS)
++    if request_kwargs:
++        message = (
++            f"The model's chat template rejected chat_template_kwargs "
++            f"{request_kwargs}: {exc}"
++        )
++        parameter = "chat_template_kwargs"
++    else:
++        message = f"The model's chat template rejected this request: {exc}"
++        parameter = None
++    # A rejected request is a 400, not a server fault: log it once without a
++    # traceback rather than through `logger.exception`.
++    logger.warning("%s", message)
++    return ChatTemplateApplicationError(message, parameter=parameter)
++
++
+ @overload
+ def safe_apply_chat_template(
+     model_config: ModelConfig,
+@@ -794,6 +849,8 @@ def safe_apply_chat_template(
+             **resolved_kwargs,
+         )
+     except Exception as e:
++        if _is_template_raised_error(e):
++            raise _chat_template_rejection(e, kwargs) from e
+         logger.exception(
+             "An error occurred in `transformers` while applying chat template"
+         )
+-- 
+2.53.0
+

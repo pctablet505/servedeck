@@ -1,0 +1,391 @@
+From d25b5d5a5e18cbf2d76ace82b80089b571c32838 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 9 Sep 2026 23:46:43 +0530
+Subject: [PATCH] [Test] PLE BF16->FP8 conversion: quantiser and
+ loader-contract tests
+
+Covers the converter that turns the Flash-Next BF16 PLE n-gram table
+(ple-bf16-*.safetensors) into the FP8 E4M3 form ple_layer.py's FP8 path
+expects.
+
+Contract assertions are taken from the real code, not restated:
+Qwen4ExpPLEFp8EmbeddingMethod.create_weights supplies the required
+parameter names/dtypes/shapes, Qwen4ExpNGramEmbedding.load_weights
+supplies the "ngram_embedding.shard_" and "ngram_embedding.weight_scale"
+literals, Qwen4ExpPLELayer._dequantize_embeddings pins the scale as
+multiplicative, and serve.sh supplies the detection glob the output
+filenames must satisfy.
+
+TP rank/size are stubbed rather than initialising NCCL so the tests run
+on CPU without touching a GPU.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../qwen4_exp/test_ple_fp8_conversion.py      | 355 ++++++++++++++++++
+ 1 file changed, 355 insertions(+)
+ create mode 100644 tests/models/qwen4_exp/test_ple_fp8_conversion.py
+
+diff --git a/tests/models/qwen4_exp/test_ple_fp8_conversion.py b/tests/models/qwen4_exp/test_ple_fp8_conversion.py
+new file mode 100644
+index 000000000..65c29d31e
+--- /dev/null
++++ b/tests/models/qwen4_exp/test_ple_fp8_conversion.py
+@@ -0,0 +1,355 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Tests for the BF16 -> FP8 PLE n-gram table converter.
++
++Two groups:
++
++* quantiser semantics -- round-trip of a known tensor, E4M3 saturation,
++  which direction the scale is applied, and the scale's dtype;
++* loader contract -- the produced safetensors file carries exactly the
++  tensor names and dtypes that ``ple_layer.py``'s FP8 path looks up.  The
++  expectations are taken from the real classes
++  (``Qwen4ExpPLEFp8EmbeddingMethod.create_weights``,
++  ``Qwen4ExpNGramEmbedding.load_weights``,
++  ``Qwen4ExpPLELayer._dequantize_embeddings``), never restated from memory.
++
++The converter under test is selected by ``$PLE_FP8_CONVERTER`` so a mutated
++copy can be pointed at these tests to prove they fail before the fix.
++"""
++
++from __future__ import annotations
++
++import importlib.util
++import inspect
++import json
++import os
++import re
++
++import pytest
++import torch
++from safetensors import safe_open
++from safetensors.torch import save_file
++from torch import nn
++
++from vllm.models.qwen4_exp.nvidia.ple_layer import (
++    Qwen4ExpNGramEmbedding,
++    Qwen4ExpPLEFp8EmbeddingMethod,
++    Qwen4ExpPLELayer,
++)
++
++DEFAULT_CONVERTER = os.path.expanduser(
++    "~/Projects/vllm-qwen38next/ple_fp8/convert_ple_bf16_to_fp8.py"
++)
++SERVE_SH = os.path.expanduser("~/Projects/vllm-qwen38next/serve.sh")
++
++EMBED_DIM = 8
++ROWS = 32
++
++
++def _load_converter():
++    path = os.environ.get("PLE_FP8_CONVERTER", DEFAULT_CONVERTER)
++    if not os.path.isfile(path):
++        pytest.skip(f"converter not found at {path}")
++    spec = importlib.util.spec_from_file_location("ple_fp8_convert", path)
++    module = importlib.util.module_from_spec(spec)
++    assert spec.loader is not None
++    spec.loader.exec_module(module)
++    return module
++
++
++@pytest.fixture(scope="module")
++def conv():
++    return _load_converter()
++
++
++# ---------------------------------------------------------------------------
++# what the real loader requires
++# ---------------------------------------------------------------------------
++@pytest.fixture(autouse=True)
++def _single_rank(monkeypatch):
++    """vLLM parameters read the TP rank/size at construction.  The served
++    config is TP=1; stub the two getters rather than initialising NCCL,
++    which would require a GPU (and this test must not touch one)."""
++    import vllm.model_executor.parameter as parameter_mod
++
++    monkeypatch.setattr(parameter_mod, "get_tensor_model_parallel_rank", lambda: 0)
++    monkeypatch.setattr(
++        parameter_mod, "get_tensor_model_parallel_world_size", lambda: 1
++    )
++
++
++def _runtime_fp8_parameters() -> dict[str, torch.Tensor]:
++    """Run the real FP8 quant method's create_weights and report the
++    parameters it registers -- names, dtypes and shapes."""
++    module = nn.Module()
++    Qwen4ExpPLEFp8EmbeddingMethod().create_weights(
++        module,
++        EMBED_DIM,            # input_size_per_partition (embedding_dim)
++        [ROWS],               # output_partition_sizes
++        EMBED_DIM,            # input_size
++        ROWS,                 # output_size
++        params_dtype=torch.bfloat16,
++        weight_loader=None,
++    )
++    return dict(module.named_parameters())
++
++
++def _loader_literals() -> tuple[str, str]:
++    """The shard prefix and the offload scale name, read out of the real
++    ``Qwen4ExpNGramEmbedding.load_weights`` source rather than retyped."""
++    src = inspect.getsource(Qwen4ExpNGramEmbedding.load_weights)
++    prefix = re.search(r'shard_prefix\s*=\s*"([^"]+)"', src)
++    scale = re.search(r'name\s*!=\s*"([^"]+weight_scale)"', src)
++    assert prefix is not None, "could not find shard_prefix in load_weights"
++    assert scale is not None, "could not find the offload weight_scale name"
++    return prefix.group(1), scale.group(1)
++
++
++def test_runtime_expects_fp8_weight_and_bf16_per_tensor_scale():
++    params = _runtime_fp8_parameters()
++    assert set(params) == {"weight", "weight_scale"}
++    assert params["weight"].dtype == torch.float8_e4m3fn
++    assert tuple(params["weight"].shape) == (ROWS, EMBED_DIM)
++    # per-tensor, one entry per output partition -- not per shard, not per row
++    assert params["weight_scale"].dtype == torch.bfloat16
++    assert tuple(params["weight_scale"].shape) == (1,)
++
++
++# ---------------------------------------------------------------------------
++# quantiser semantics
++# ---------------------------------------------------------------------------
++def test_round_trip_of_a_known_e4m3_grid_tensor_is_bit_exact(conv):
++    scale = 0.00019931793212890625  # exactly representable in bf16
++    codes = torch.tensor(
++        [0.0, 1.0, -1.0, 2.0, 3.5, -7.0, 256.0, -448.0, 0.001953125],
++        dtype=torch.float32,
++    )
++    x = (codes * scale).to(torch.bfloat16).to(torch.float32)
++    q = conv.quantize(x, scale)
++    assert q.dtype == torch.float8_e4m3fn
++    back = conv.dequantize(q, scale).to(torch.bfloat16).to(torch.float32)
++    assert torch.equal(back, x), f"{back} != {x}"
++
++
++def test_e4m3_max_constant_matches_the_dtype(conv):
++    """The scale is derived from the FP8 range, so the range must be the
++    dtype's, not a hand-typed number for some other FP8 flavour."""
++    assert conv.FP8_E4M3_MAX == torch.finfo(torch.float8_e4m3fn).max == 448.0
++    assert conv.E4M3_MIN_DENORMAL == torch.finfo(torch.float8_e4m3fn).tiny / 2**3
++
++
++def test_saturates_at_the_finite_e4m3_max_instead_of_overflowing(conv):
++    scale = 1.0
++    x = torch.tensor([448.0, 449.0, 1e6, -1e6, float("inf")], dtype=torch.float32)
++    q = conv.quantize(x, scale)
++    back = conv.dequantize(q, scale)
++    assert torch.isfinite(back).all(), back
++    assert back.tolist() == [448.0, 448.0, 448.0, -448.0, 448.0]
++
++
++def test_nan_does_not_poison_the_row(conv):
++    q = conv.quantize(torch.tensor([float("nan"), 1.0]), 1.0)
++    back = conv.dequantize(q, 1.0)
++    assert torch.isfinite(back).all()
++    assert back[0].item() == 0.0
++
++
++def test_scale_is_multiplicative_using_the_real_dequantiser(conv):
++    """ple_layer's own _dequantize_embeddings must reconstruct the input.
++
++    This pins the direction of the scale: the checkpoint stores the
++    multiplicative scale, so the converter must DIVIDE by it.  A converter
++    that stores or applies the reciprocal fails here.
++    """
++    scale = 0.00019931793212890625
++    # every entry is an exact E4M3 code (17 and 33 are NOT representable)
++    codes = torch.tensor([1.0, 2.0, 16.0, 240.0, -32.0], dtype=torch.float32)
++    x = (codes * scale).to(torch.bfloat16)
++    q = conv.quantize(x, scale)
++
++    class _Stub:
++        def _get_embedding_weight_scale(self):
++            return torch.tensor([scale], dtype=torch.bfloat16)
++
++    got = Qwen4ExpPLELayer._dequantize_embeddings(_Stub(), q, torch.bfloat16)
++    assert torch.equal(got, x), f"{got} != {x}"
++
++
++def test_scale_selection_recovers_the_original_fp8_grid(conv, tmp_path):
++    scale = 0.00019931793212890625
++    torch.manual_seed(0)
++    # Build the fixture the way the real checkpoint was built: FP8 codes
++    # dequantised to BF16.  Round-tripping a table of arbitrary integers
++    # would test a grid that E4M3 cannot represent (17 and 33 are not codes).
++    codes = (torch.randn(ROWS, EMBED_DIM) * 40).to(torch.float8_e4m3fn).to(
++        torch.float32
++    )
++    codes[0, 0] = 2.0**-9    # smallest denormal present -> grid detectable
++    codes[0, 1] = 256.0      # amax
++    x = (codes * scale).to(torch.bfloat16)
++    name = "model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight"
++    save_file({name: x}, str(tmp_path / "ple-bf16-00.safetensors"))
++
++    out = tmp_path / "out"
++    report = conv.convert(str(tmp_path), str(out))
++    layer = next(iter(report["layers"].values()))
++    assert layer["scale"] == pytest.approx(scale, rel=0, abs=0)
++    assert layer["quality"]["bit_exact_fraction"] == 1.0
++    assert layer["quality"]["max_abs_error"] == 0.0
++
++
++def test_top_code_bf16_rounding_does_not_reject_the_correct_scale(conv, tmp_path):
++    """Regression: dequantising FP8 to BF16 rounds bf16(448 * scale) UP, so
++    amax / scale comes out at 448.31, not 448.  A converter that rejects any
++    candidate scale with amax/scale > 448 throws away the exactly-correct
++    grid scale and silently falls back to a lossy one.  Saturating that single
++    value back to code 448 is lossless, because it dequantises to the same
++    bf16 number it came from.
++    """
++    scale = 0.00019931793212890625
++    assert float(torch.tensor(448.0 * scale, dtype=torch.bfloat16)) > 448.0 * scale
++    torch.manual_seed(3)
++    codes = (torch.randn(ROWS, EMBED_DIM) * 40).to(torch.float8_e4m3fn).to(
++        torch.float32
++    )
++    codes[0, 0] = 2.0**-9
++    codes[0, 1] = 448.0     # the top code -> amax rounds above 448 * scale
++    x = (codes * scale).to(torch.bfloat16)
++    save_file(
++        {"model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight": x},
++        str(tmp_path / "ple-bf16-00.safetensors"),
++    )
++    report = conv.convert(str(tmp_path), str(tmp_path / "out"))
++    layer = next(iter(report["layers"].values()))
++    assert layer["scale"] == scale, layer["scale_source"]
++    assert layer["quality"]["bit_exact_fraction"] == 1.0
++    assert layer["quality"]["max_abs_error"] == 0.0
++    # the saturation really did happen -- this is not a vacuous pass
++    assert layer["quality"]["clamped_elements"] >= 1
++
++
++# ---------------------------------------------------------------------------
++# loader contract on a real produced file
++# ---------------------------------------------------------------------------
++@pytest.fixture
++def converted(conv, tmp_path):
++    prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
++    torch.manual_seed(1)
++    tensors_a = {
++        f"{prefix}.shard_0.weight": (torch.randn(ROWS, EMBED_DIM) * 0.01).to(
++            torch.bfloat16
++        ),
++        f"{prefix}.shard_1.weight": (torch.randn(ROWS, EMBED_DIM) * 0.01).to(
++            torch.bfloat16
++        ),
++    }
++    tensors_b = {
++        f"{prefix}.shard_2.weight": (torch.randn(ROWS, EMBED_DIM) * 0.01).to(
++            torch.bfloat16
++        ),
++        "model.language_model.layers.1.ple.ple_embedding.layer_multipliers": (
++            torch.tensor([3, 5, 7], dtype=torch.long)
++        ),
++    }
++    save_file(tensors_a, str(tmp_path / "ple-bf16-00.safetensors"))
++    save_file(tensors_b, str(tmp_path / "ple-bf16-01.safetensors"))
++    index = {
++        "metadata": {"total_size": 1234},
++        "weight_map": {
++            **{k: "ple-bf16-00.safetensors" for k in tensors_a},
++            **{k: "ple-bf16-01.safetensors" for k in tensors_b},
++            "model.language_model.embed_tokens.weight": "model-bf16-00001.safetensors",
++        },
++    }
++    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
++    out = tmp_path / "out"
++    report = conv.convert(str(tmp_path), str(out))
++    return prefix, tmp_path, out, report
++
++
++def test_produced_tensors_match_the_loader_contract(converted):
++    prefix, src, out, _report = converted
++    required = _runtime_fp8_parameters()
++    shard_prefix, offload_scale_name = _loader_literals()
++
++    found: dict[str, torch.dtype] = {}
++    for path in sorted(out.glob("*.safetensors")):
++        with safe_open(str(path), framework="pt") as f:
++            for name in f.keys():
++                found[name] = f.get_tensor(name).dtype
++
++    shard_names = [n for n in found if n.startswith(f"{prefix}.shard_")]
++    assert len(shard_names) == 3
++    for name in shard_names:
++        # exactly the "<prefix>.shard_<N>.weight" spelling load_weights parses
++        assert name.startswith(f"{prefix.rsplit('.', 1)[0]}.{shard_prefix}") or name.startswith(
++            f"{prefix}.shard_"
++        )
++        assert name.endswith(".weight")
++        assert name[len(f"{prefix}.shard_") : -len(".weight")].isdigit()
++        assert found[name] == required["weight"].dtype
++
++    scale_name = f"{prefix}.weight_scale"
++    assert scale_name in found, sorted(found)
++    assert scale_name.endswith(offload_scale_name)
++    assert found[scale_name] == required["weight_scale"].dtype
++    # exactly one global scale for the whole PLE layer
++    assert sum(1 for n in found if n.endswith(".weight_scale")) == 1
++
++
++def test_scale_shape_is_loadable_by_vocab_parallel_embedding(converted):
++    prefix, _src, out, _report = converted
++    required = _runtime_fp8_parameters()
++    for path in sorted(out.glob("*.safetensors")):
++        with safe_open(str(path), framework="pt") as f:
++            if f"{prefix}.weight_scale" in f.keys():
++                t = f.get_tensor(f"{prefix}.weight_scale")
++                break
++    else:
++        pytest.fail("no weight_scale written")
++    # VocabParallelEmbedding.weight_loader: 0-d is reshaped to (1,), then
++    # `assert param.data.shape == loaded_weight.shape`.
++    loaded = t.reshape(1) if t.ndim == 0 else t
++    assert loaded.shape == required["weight_scale"].shape
++
++
++def test_output_filenames_match_serve_sh_detection_glob(converted):
++    _prefix, _src, out, report = converted
++    if not os.path.isfile(SERVE_SH):
++        pytest.skip("serve.sh not present")
++    text = open(SERVE_SH).read()
++    m = re.search(r'ls "\$_PLE_SNAP"/\*/([A-Za-z0-9_.*-]+\.safetensors)', text)
++    assert m is not None, "could not find the PLE FP8 detection glob in serve.sh"
++    pattern = m.group(1)
++    import fnmatch
++
++    names = [p.name for p in out.glob("*.safetensors")]
++    assert names, "converter wrote no safetensors"
++    assert all(fnmatch.fnmatch(n, pattern) for n in names), (names, pattern)
++
++
++def test_index_is_rewritten_so_the_loader_actually_reads_the_fp8_files(converted):
++    prefix, _src, out, _report = converted
++    index = json.loads((out / "model.safetensors.index.json").read_text())
++    wm = index["weight_map"]
++    for name, file in wm.items():
++        if ".ngram_embedding.shard_" in name:
++            assert file.startswith("model-plefp8-"), (name, file)
++    assert wm[f"{prefix}.weight_scale"].startswith("model-plefp8-")
++    # untouched entries survive
++    assert wm["model.language_model.embed_tokens.weight"] == "model-bf16-00001.safetensors"
++
++
++def test_non_ple_tensors_are_copied_through_bit_identically(converted):
++    _prefix, src, out, _report = converted
++    name = "model.language_model.layers.1.ple.ple_embedding.layer_multipliers"
++    with safe_open(str(src / "ple-bf16-01.safetensors"), framework="pt") as f:
++        before = f.get_tensor(name)
++    after = None
++    for path in sorted(out.glob("*.safetensors")):
++        with safe_open(str(path), framework="pt") as f:
++            if name in f.keys():
++                after = f.get_tensor(name)
++    assert after is not None, "pass-through tensor was dropped"
++    assert after.dtype == before.dtype
++    assert torch.equal(after, before)
+-- 
+2.53.0
+

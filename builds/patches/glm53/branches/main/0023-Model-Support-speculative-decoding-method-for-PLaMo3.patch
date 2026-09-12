@@ -1,0 +1,208 @@
+From df14152ac6b09f76345dae05b99541c3e87f8d35 Mon Sep 17 00:00:00 2001
+From: Shinichi Hemmi <50256998+Alnusjaponica@users.noreply.github.com>
+Date: Sat, 29 Aug 2026 07:31:07 +0900
+Subject: [PATCH 23/39] [Model] Support speculative decoding method for PLaMo3
+ (#54239)
+
+Signed-off-by: Shinichi Hemmi <shemmi@preferred.jp>
+---
+ tests/model_executor/test_plamo3.py  | 72 ++++++++++++++++++++++++++++
+ vllm/model_executor/models/plamo3.py | 39 +++++++++++----
+ 2 files changed, 101 insertions(+), 10 deletions(-)
+ create mode 100644 tests/model_executor/test_plamo3.py
+
+diff --git a/tests/model_executor/test_plamo3.py b/tests/model_executor/test_plamo3.py
+new file mode 100644
+index 000000000..5618f8eee
+--- /dev/null
++++ b/tests/model_executor/test_plamo3.py
+@@ -0,0 +1,72 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++from torch import nn
++
++from vllm.model_executor.models import plamo3 as plamo3_mod
++from vllm.model_executor.models.interfaces import supports_eagle3
++from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
++    set_eagle3_aux_hidden_state_layers,
++)
++
++
++class DummyDecoderLayer(nn.Module):
++    def forward(self, positions, hidden_states, residual):
++        del positions
++        return hidden_states + 1, hidden_states + 2
++
++
++class DummyNorm(nn.Module):
++    def forward(self, hidden_states, residual):
++        return hidden_states + residual, None
++
++
++@pytest.mark.cpu_test
++def test_plamo3_returns_dflash_selected_auxiliary_hidden_states(monkeypatch):
++    decoder = plamo3_mod.Plamo3Decoder.__new__(plamo3_mod.Plamo3Decoder)
++    nn.Module.__init__(decoder)
++    decoder.start_layer = 0
++    decoder.end_layer = 2
++    decoder.layers = nn.ModuleList([DummyDecoderLayer() for _ in range(8)])
++
++    model = plamo3_mod.Plamo3Model.__new__(plamo3_mod.Plamo3Model)
++    nn.Module.__init__(model)
++    model.layers = decoder
++    model.norm = DummyNorm()
++    model.do_not_compile = True
++
++    target = plamo3_mod.Plamo3ForCausalLM.__new__(plamo3_mod.Plamo3ForCausalLM)
++    nn.Module.__init__(target)
++    target.model = model
++
++    monkeypatch.setattr(
++        plamo3_mod,
++        "get_pp_group",
++        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
++    )
++
++    assert supports_eagle3(target)
++    assert target.get_eagle3_default_aux_hidden_state_layers() == (2, 4, 5)
++
++    spec_config = SimpleNamespace(
++        draft_model_config=SimpleNamespace(
++            hf_config=SimpleNamespace(dflash_config={"target_layer_ids": [0, 1]})
++        )
++    )
++    set_eagle3_aux_hidden_state_layers(target, spec_config)
++    assert decoder.aux_hidden_state_layers == (1, 2)
++
++    output, aux_hidden_states = target(
++        input_ids=None,
++        positions=torch.tensor([0]),
++        inputs_embeds=torch.tensor([[1.0, 2.0]]),
++    )
++
++    torch.testing.assert_close(output, torch.tensor([[7.0, 9.0]]))
++    assert len(aux_hidden_states) == 2
++    torch.testing.assert_close(aux_hidden_states[0], torch.tensor([[5.0, 7.0]]))
++    torch.testing.assert_close(aux_hidden_states[1], torch.tensor([[7.0, 9.0]]))
+diff --git a/vllm/model_executor/models/plamo3.py b/vllm/model_executor/models/plamo3.py
+index 3f9553f64..ad38bf48d 100644
+--- a/vllm/model_executor/models/plamo3.py
++++ b/vllm/model_executor/models/plamo3.py
+@@ -35,7 +35,12 @@ from vllm.model_executor.model_loader.weight_utils import (
+     composed_weight_loader,
+     default_weight_loader,
+ )
+-from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
++from vllm.model_executor.models.interfaces import (
++    EagleModelMixin,
++    SupportsEagle3,
++    SupportsLoRA,
++    SupportsPP,
++)
+ from vllm.model_executor.models.utils import (
+     AutoWeightsLoader,
+     extract_layer_index,
+@@ -285,7 +290,7 @@ class Plamo3DecoderLayer(nn.Module):
+         return hidden_states, residual
+ 
+ 
+-class Plamo3Decoder(torch.nn.Module):
++class Plamo3Decoder(torch.nn.Module, EagleModelMixin):
+     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
+         super().__init__()
+         num_hidden_layers = vllm_config.model_config.hf_config.num_hidden_layers
+@@ -296,23 +301,32 @@ class Plamo3Decoder(torch.nn.Module):
+             prefix=f"{prefix}.layers",
+         )
+ 
++    def __len__(self) -> int:
++        return len(self.layers)
++
+     def forward(
+         self,
+         positions: torch.Tensor,
+         hidden_states: torch.Tensor,
+         residual: torch.Tensor | None,
+-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+-        for layer in islice(self.layers, self.start_layer, self.end_layer):
++    ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor]]:
++        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
++        for idx, layer in enumerate(
++            islice(self.layers, self.start_layer, self.end_layer)
++        ):
+             hidden_states, residual = layer(
+                 positions=positions,
+                 hidden_states=hidden_states,
+                 residual=residual,
+             )
+-        return hidden_states, residual
++            self._maybe_add_hidden_state(
++                aux_hidden_states, idx + 1, hidden_states, residual
++            )
++        return hidden_states, residual, aux_hidden_states
+ 
+ 
+ @support_torch_compile
+-class Plamo3Model(nn.Module):
++class Plamo3Model(nn.Module, EagleModelMixin):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+         config = vllm_config.model_config.hf_config
+@@ -340,13 +354,16 @@ class Plamo3Model(nn.Module):
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.embed_tokens(input_ids)
+ 
++    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
++        self.layers._set_aux_hidden_state_layers(layers)
++
+     def forward(
+         self,
+         input_ids: torch.Tensor | None,
+         positions: torch.Tensor,
+         intermediate_tensors: IntermediateTensors | None = None,
+         inputs_embeds: torch.Tensor | None = None,
+-    ) -> torch.Tensor:
++    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+         if get_pp_group().is_first_rank:
+             if inputs_embeds is not None:
+                 hidden_states = inputs_embeds
+@@ -358,7 +375,7 @@ class Plamo3Model(nn.Module):
+             hidden_states = intermediate_tensors["hidden_states"]
+             residual = intermediate_tensors["residual"]
+ 
+-        hidden_states, residual = self.layers(
++        hidden_states, residual, aux_hidden_states = self.layers(
+             positions=positions, hidden_states=hidden_states, residual=residual
+         )
+         if not get_pp_group().is_last_rank:
+@@ -366,10 +383,12 @@ class Plamo3Model(nn.Module):
+                 {"hidden_states": hidden_states, "residual": residual}
+             )
+         hidden_states, _ = self.norm(hidden_states, residual)
++        if len(aux_hidden_states) > 0:
++            return hidden_states, aux_hidden_states
+         return hidden_states
+ 
+ 
+-class Plamo3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
++class Plamo3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
+     packed_modules_mapping = {
+         "qkv_proj": ["qkv_proj"],
+         "gate_up_proj": ["gate_up_proj"],
+@@ -416,7 +435,7 @@ class Plamo3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
+         positions: torch.Tensor,
+         intermediate_tensors: IntermediateTensors | None = None,
+         inputs_embeds: torch.Tensor | None = None,
+-    ) -> torch.Tensor:
++    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+         hidden_states = self.model(
+             input_ids, positions, intermediate_tensors, inputs_embeds
+         )
+-- 
+2.53.0
+

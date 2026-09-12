@@ -1,0 +1,517 @@
+diff --git a/tests/entrypoints/unit_tests/test_reasoning_field_chat_template_roundtrip.py b/tests/entrypoints/unit_tests/test_reasoning_field_chat_template_roundtrip.py
+new file mode 100644
+index 000000000..9cfeb71ea
+--- /dev/null
++++ b/tests/entrypoints/unit_tests/test_reasoning_field_chat_template_roundtrip.py
+@@ -0,0 +1,104 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""T1 (2026-09-09 investigation): does the chat template still see
++reasoning on re-sent assistant turns?
++
++``ChatCompletionRequest`` normalizes an incoming ``reasoning_content`` key
++to ``reasoning`` (protocol.py's ``_normalize_messages_before``), so
++downstream serving code only has to check one field. Qwen3.8-Flash-Next's
++own ``chat_template.jinja`` (mazinb/Qwen3.8-Flash-Next-Uncensored-NVFP4
++snapshot) was written against the legacy variable name and reads
++``message.reasoning_content is string`` when deciding whether to render a
++``<think>...</think>`` block for a prior assistant turn. If nothing
++restored ``reasoning_content`` after the rename, every re-sent assistant
++turn would render an empty think block -- the same erasure class that
++caused GLM's multi-turn amnesia (see the ``glm53-erased-reasoning-is-the-
++root-cause`` memory note).
++
++``_parse_chat_message_content`` (vllm/entrypoints/chat_utils.py) is where
++that restoration happens: it reads ``message.get("reasoning")`` and, if
++present, sets BOTH ``reasoning`` and ``reasoning_content`` on the
++``ConversationMessage`` dict handed to the Jinja renderer. This test locks
++that in -- it was previously unverified by any test in this tree.
++"""
++
++from unittest.mock import MagicMock
++
++from vllm.entrypoints.chat_utils import _parse_chat_message_content
++
++
++def _mock_tracker() -> MagicMock:
++    """A multimodal item tracker stand-in for a plain-text-only message.
++
++    ``_parse_chat_message_content_parts`` only touches
++    ``mm_parser.model_config.enable_prompt_embeds`` (must be falsy for a
++    plain string part) and ``mm_parser.mm_placeholder_storage()`` (must be
++    falsy so the plain "\n".join(texts) path is taken instead of the
++    multimodal-placeholder path) for text-only content.
++    """
++    tracker = MagicMock()
++    parser = tracker.create_parser.return_value
++    parser.model_config.enable_prompt_embeds = False
++    parser.mm_placeholder_storage.return_value = {}
++    return tracker
++
++
++def test_reasoning_field_restored_as_reasoning_content_for_template():
++    message = {
++        "role": "assistant",
++        "content": "4",
++        # As left by ChatCompletionRequest._normalize_messages_before:
++        # reasoning_content has already been renamed to reasoning by the
++        # time a message dict reaches this function.
++        "reasoning": "2+2 equals 4",
++    }
++
++    result = _parse_chat_message_content(
++        message,
++        _mock_tracker(),
++        content_format="string",
++        interleave_strings=False,
++    )
++
++    assert len(result) == 1
++    conv_msg = result[0]
++    assert conv_msg.get("reasoning") == "2+2 equals 4"
++    assert conv_msg.get("reasoning_content") == "2+2 equals 4", (
++        "chat_template.jinja reads message.reasoning_content; if this is "
++        "missing, reasoning is silently dropped from re-sent assistant "
++        "turns for any template (e.g. Qwen3.8-Flash-Next's) written "
++        "against the legacy field name."
++    )
++
++
++def test_no_reasoning_field_leaves_reasoning_content_absent():
++    message = {"role": "assistant", "content": "Hi"}
++
++    result = _parse_chat_message_content(
++        message,
++        _mock_tracker(),
++        content_format="string",
++        interleave_strings=False,
++    )
++
++    conv_msg = result[0]
++    assert "reasoning" not in conv_msg
++    assert "reasoning_content" not in conv_msg
++
++
++def test_non_assistant_role_does_not_get_reasoning_content():
++    """Only assistant turns get the reasoning_content restoration --
++    matches chat_template.jinja, which only reads it for message.role ==
++    "assistant"."""
++    message = {"role": "user", "content": "Hi", "reasoning": "should be ignored"}
++
++    result = _parse_chat_message_content(
++        message,
++        _mock_tracker(),
++        content_format="string",
++        interleave_strings=False,
++    )
++
++    conv_msg = result[0]
++    assert "reasoning" not in conv_msg
++    assert "reasoning_content" not in conv_msg
+diff --git a/tests/models/qwen4_exp/test_qsa_update_draft_decode_metadata.py b/tests/models/qwen4_exp/test_qsa_update_draft_decode_metadata.py
+new file mode 100644
+index 000000000..7817d10dc
+--- /dev/null
++++ b/tests/models/qwen4_exp/test_qsa_update_draft_decode_metadata.py
+@@ -0,0 +1,401 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""T3 (2026-09-09 investigation): fused multi-step draft decode for QSA.
++
++``QSAMetadataBuilder`` previously had no ``update_draft_decode_metadata()``
++override (base class default: ``supports_draft_decode_metadata_update =
++False``, method raises ``NotImplementedError``), so the speculator's fused
++multi-step draft decode fast path always fell back to rebuilding attention
++metadata between every draft step -- the exact log line this investigation
++started from: "Fused multi-step draft decode is not supported by attention
++backend(s) QWEN4_EXP_EXP_QSA_STATE; falling back to rebuilding attention
++metadata between draft steps."
++
++These tests lock in that the new implementation produces metadata
++bit-identical to a from-scratch rebuild for one more decode step, for both
++QSA cache shapes served by ``QSAMetadataBuilder``:
++  * the raw-key ring (``CircularBufferSpec``, one physical block per
++    request, positions wrap via ``circular_qsa_slot_mapping``)
++  * the compressed-key cache (``MLAAttentionSpec`` with
++    ``compress_ratio > 1``, boundary-only slots via
++    ``compressed_qsa_slot_mapping`` plus the per-request ``k_work_metadata``
++    work-item list)
++
++CPU-only: ``build_qsa_metadata`` resolves to
++``build_qsa_metadata_triton`` whenever Triton is *importable*
++(``HAS_TRITON``), regardless of whether a GPU is present to actually launch
++the kernel -- true in this venv, so ``build()`` itself cannot run
++unmodified on CPU. Every test here monkeypatches the module-level
++``build_qsa_metadata`` binding to the pure-torch
++``_build_qsa_metadata_torch`` fallback (the same function real CPU-only
++dev boxes without Triton installed take) so ``build()`` (used both for the
++initial state and as the from-scratch-rebuild oracle) runs on plain CPU
++tensors. ``update_draft_decode_metadata`` itself needed no such patch: it
++is pure torch already (``_logical_positions``, ``circular_qsa_slot_mapping``,
++``compressed_qsa_slot_mapping`` have no Triton dependency).
++
++GPU-gated / NOT verified here: CUDA graph capture-and-replay semantics
++(the base class docstring warns implementations must keep replayed state in
++persistent storage) and whether the real speculator loop truly advances
++``seq_lens``/``block_table`` in place before calling this method (traced
++from source -- v1/worker/gpu/spec_decode/autoregressive/speculator.py's
++Triton kernels increment ``input_buffers.seq_lens`` in place -- but not
++executed on hardware).
++"""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++import vllm.models.qwen4_exp.common.qsa_cache as qsa_cache_module
++from vllm.models.qwen4_exp.common.qsa_cache import QSAMetadataBuilder
++from vllm.v1.attention.backend import CommonAttentionMetadata
++from vllm.v1.kv_cache_interface import CircularBufferSpec, MLAAttentionSpec
++
++
++@pytest.fixture(autouse=True)
++def _force_torch_qsa_metadata_path(monkeypatch: pytest.MonkeyPatch) -> None:
++    """build() picks build_qsa_metadata_triton whenever Triton is
++    importable, regardless of whether a GPU can actually launch it -- true
++    in this venv. Force the pure-torch fallback so build() runs on CPU
++    tensors; this is the same function real Triton-less CPU boxes use."""
++    monkeypatch.setattr(
++        qsa_cache_module,
++        "build_qsa_metadata",
++        qsa_cache_module._build_qsa_metadata_torch,
++    )
++
++
++def _vllm_config(max_num_batched_tokens: int = 16, max_num_seqs: int = 8):
++    return SimpleNamespace(
++        scheduler_config=SimpleNamespace(
++            max_num_batched_tokens=max_num_batched_tokens,
++            max_num_seqs=max_num_seqs,
++        )
++    )
++
++
++def _decode_common_metadata(
++    *,
++    seq_lens: list[int],
++    block_table: torch.Tensor,
++    slot_mapping: torch.Tensor | None = None,
++) -> CommonAttentionMetadata:
++    """One query token per request (pure decode -- what a draft step is)."""
++    num_reqs = len(seq_lens)
++    query_start_loc = torch.arange(num_reqs + 1, dtype=torch.int32)
++    if slot_mapping is None:
++        slot_mapping = torch.zeros(num_reqs, dtype=torch.int64)
++    return CommonAttentionMetadata(
++        query_start_loc=query_start_loc,
++        query_start_loc_cpu=query_start_loc,
++        seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
++        num_reqs=num_reqs,
++        num_actual_tokens=num_reqs,
++        max_query_len=1,
++        max_seq_len=max(seq_lens),
++        block_table_tensor=block_table,
++        slot_mapping=slot_mapping,
++    )
++
++
++def _padded_decode_common_metadata(
++    *,
++    seq_lens_real: list[int],
++    num_rows_padded: int,
++    block_table: torch.Tensor,
++) -> CommonAttentionMetadata:
++    """CUDA-graph-padded decode batch: ``len(seq_lens_real)`` real one-token
++    decode requests followed by ``num_rows_padded - len(seq_lens_real)``
++    zero-query-length padding rows, matching what
++    ``_build_draft_attn_metadata`` hands the speculator (num_actual_tokens ==
++    num_tokens_padded) and what ``token_to_req_indices`` does with the tail
++    (query length 0 -> drops out of the repeat -> token_to_req 0).
++
++    Real rows get a valid (>= 0) raw slot_mapping entry; padded rows get -1,
++    mirroring production (a CircularBufferSpec group's raw slot_mapping is
++    disabled/always -1 -- see model_runner.py -- while an MLAAttentionSpec
++    group's raw slot_mapping is the real per-token main-KV-cache slot, valid
++    for real rows and -1 for padding).
++    """
++    n = len(seq_lens_real)
++    assert num_rows_padded >= n
++    query_start_loc = torch.clamp(
++        torch.arange(num_rows_padded + 1, dtype=torch.int32), max=n
++    )
++    seq_lens = torch.zeros(num_rows_padded, dtype=torch.int32)
++    seq_lens[:n] = torch.tensor(seq_lens_real, dtype=torch.int32)
++    slot_mapping = torch.full((num_rows_padded,), -1, dtype=torch.int64)
++    slot_mapping[:n] = 0
++    return CommonAttentionMetadata(
++        query_start_loc=query_start_loc,
++        query_start_loc_cpu=query_start_loc,
++        seq_lens=seq_lens,
++        num_reqs=num_rows_padded,
++        num_actual_tokens=num_rows_padded,
++        max_query_len=1,
++        max_seq_len=int(seq_lens.max()),
++        block_table_tensor=block_table,
++        slot_mapping=slot_mapping,
++    )
++
++
++def _assert_padded_update_matches_oracle(
++    builder_factory,
++    *,
++    block_table: torch.Tensor,
++    seq_lens_real: list[int],
++    num_rows_padded: int,
++    num_draft_steps: int = 2,
++) -> None:
++    """Drive ``num_draft_steps`` fused draft-decode updates on a
++    CUDA-graph-padded batch (``len(seq_lens_real)`` real rows padded out to
++    ``num_rows_padded`` total rows) and, after every step, assert the result
++    is bit-identical to an independent from-scratch ``build()`` at the same
++    advanced ``seq_lens`` with the same padding -- and that every padded
++    row's slot and logical position stay -1.
++    """
++    n = len(seq_lens_real)
++    builder = builder_factory()
++    step0 = _padded_decode_common_metadata(
++        seq_lens_real=seq_lens_real,
++        num_rows_padded=num_rows_padded,
++        block_table=block_table,
++    )
++    metadata = builder.build(common_prefix_len=0, common_attn_metadata=step0)
++    slot_mapping_ptr = metadata.slot_mapping.data_ptr()
++    logical_positions_ptr = metadata.logical_positions.data_ptr()
++    k_work_ptr = (
++        metadata.k_work_metadata.data_ptr()
++        if metadata.k_work_metadata.numel() > 0
++        else None
++    )
++
++    cur_seq_lens = list(seq_lens_real)
++    for step in range(1, num_draft_steps + 1):
++        metadata.seq_lens[:n] += 1
++        cur_seq_lens = [s + 1 for s in cur_seq_lens]
++        builder.update_draft_decode_metadata(metadata)
++
++        # Buffers must never be reallocated -- CUDA graph replay re-runs only
++        # the captured kernels, not this Python method.
++        assert metadata.slot_mapping.data_ptr() == slot_mapping_ptr, step
++        assert metadata.logical_positions.data_ptr() == logical_positions_ptr, step
++        if k_work_ptr is not None:
++            assert metadata.k_work_metadata.data_ptr() == k_work_ptr, step
++
++        oracle_builder = builder_factory()
++        oracle_step = _padded_decode_common_metadata(
++            seq_lens_real=cur_seq_lens,
++            num_rows_padded=num_rows_padded,
++            block_table=block_table,
++        )
++        oracle = oracle_builder.build(
++            common_prefix_len=0, common_attn_metadata=oracle_step
++        )
++
++        assert torch.equal(metadata.slot_mapping, oracle.slot_mapping), step
++        assert torch.equal(
++            metadata.logical_positions, oracle.logical_positions
++        ), step
++        assert torch.equal(metadata.k_work_metadata, oracle.k_work_metadata), step
++
++        if n < num_rows_padded:
++            assert torch.all(metadata.slot_mapping[n:] == -1), step
++            assert torch.all(metadata.logical_positions[n:] == -1), step
++
++
++class TestCircularBufferRing:
++    """QSA raw-key ring: one physical block per request, ring capacity =
++    ``block_size`` (8 here, matching the shipped span=compress_ratio(4) +
++    num_speculative_tokens(3) -> capacity 8 at spec=3)."""
++
++    def _spec(self) -> CircularBufferSpec:
++        return CircularBufferSpec(
++            block_size=8, num_kv_heads=1, head_size=16, dtype=torch.bfloat16
++        )
++
++    def _builder(self) -> QSAMetadataBuilder:
++        return QSAMetadataBuilder(
++            self._spec(), ["layer.0"], _vllm_config(), torch.device("cpu")
++        )
++
++    def test_supports_fused_decode(self):
++        assert self._builder().supports_draft_decode_metadata_update is True
++
++    def test_update_matches_from_scratch_rebuild(self):
++        builder = self._builder()
++        block_table = torch.tensor([[5], [9]], dtype=torch.int32)  # 2 requests
++
++        step1 = _decode_common_metadata(seq_lens=[20, 35], block_table=block_table)
++        metadata = builder.build(common_prefix_len=0, common_attn_metadata=step1)
++        step1_slot_mapping = metadata.slot_mapping.clone()
++        step1_logical_positions = metadata.logical_positions.clone()
++
++        # Simulate the speculator's persistent-buffer advance: seq_lens is
++        # the same tensor object build() aliased from common_attn_metadata,
++        # mutated in place -- as the real draft loop's Triton kernel does
++        # (speculator.py, "Increment position and seq_lens").
++        metadata.seq_lens += 1
++        builder.update_draft_decode_metadata(metadata)
++
++        # Oracle: an independent builder, rebuilt from scratch for the
++        # already-advanced (step 2) state.
++        oracle_builder = self._builder()
++        step2 = _decode_common_metadata(seq_lens=[21, 36], block_table=block_table)
++        oracle = oracle_builder.build(common_prefix_len=0, common_attn_metadata=step2)
++
++        assert torch.equal(metadata.slot_mapping, oracle.slot_mapping)
++        assert torch.equal(metadata.logical_positions, oracle.logical_positions)
++        # And it actually advanced -- guards against a silent no-op.
++        assert not torch.equal(metadata.slot_mapping, step1_slot_mapping)
++        assert not torch.equal(metadata.logical_positions, step1_logical_positions)
++
++    def test_update_is_in_place_not_a_new_tensor(self):
++        """CUDA graph replay does not re-run this Python method, so the
++        writes it records during capture must land in the same buffers
++        build() allocated -- a reassignment would silently stop updating
++        once replayed."""
++        builder = self._builder()
++        block_table = torch.tensor([[5], [9]], dtype=torch.int32)
++        step1 = _decode_common_metadata(seq_lens=[20, 35], block_table=block_table)
++        metadata = builder.build(common_prefix_len=0, common_attn_metadata=step1)
++        slot_mapping_storage = metadata.slot_mapping.data_ptr()
++        logical_positions_storage = metadata.logical_positions.data_ptr()
++
++        metadata.seq_lens += 1
++        builder.update_draft_decode_metadata(metadata)
++
++        assert metadata.slot_mapping.data_ptr() == slot_mapping_storage
++        assert metadata.logical_positions.data_ptr() == logical_positions_storage
++
++    def test_update_matches_oracle_2_real_padded_to_8(self):
++        """CUDA-graph batch padding: 2 real requests, batch padded to 8 rows
++        (this is the reviewer's repro shape: ring blocks 5 and 9,
++        block_size 8). Without the fix, padded rows alias onto request 0's
++        raw-key ring instead of staying at PAD_SLOT_ID."""
++        _assert_padded_update_matches_oracle(
++            self._builder,
++            block_table=torch.tensor([[5], [9]], dtype=torch.int32),
++            seq_lens_real=[20, 35],
++            num_rows_padded=8,
++        )
++
++    def test_update_matches_oracle_3_real_padded_to_4(self):
++        """A second padding ratio/request-count combination (3 real rows,
++        1 padding row) so the fix is not just verified at the 2-of-8 shape."""
++        _assert_padded_update_matches_oracle(
++            self._builder,
++            block_table=torch.tensor([[2], [5], [9]], dtype=torch.int32),
++            seq_lens_real=[12, 20, 35],
++            num_rows_padded=4,
++        )
++
++
++class TestCompressedKeyCache:
++    """QSA compressed-key cache: boundary-only slots (one write per
++    ``compress_ratio`` committed tokens) plus the ``k_work_metadata`` work
++    list the compression kernel consumes."""
++
++    def _spec(self) -> MLAAttentionSpec:
++        return MLAAttentionSpec(
++            block_size=32,
++            num_kv_heads=1,
++            head_size=64,
++            dtype=torch.bfloat16,
++            compress_ratio=4,
++        )
++
++    def _builder(self) -> QSAMetadataBuilder:
++        return QSAMetadataBuilder(
++            self._spec(), ["layer.0"], _vllm_config(), torch.device("cpu")
++        )
++
++    def test_supports_fused_decode(self):
++        assert self._builder().supports_draft_decode_metadata_update is True
++
++    def test_update_matches_from_scratch_rebuild_across_group_boundary(self):
++        """compress_ratio=4: a slot is only written when logical_position
++        lands on a group boundary ((position + 1) % 4 == 0). Chosen so req0
++        is ON a boundary at step 1 and OFF at step 2, and req1 is the
++        reverse -- exercising both the valid-slot and the -1 (no write this
++        step) cases across the transition.
++        """
++        builder = self._builder()
++        block_table = torch.tensor([[3, 4], [7, 8]], dtype=torch.int32)
++
++        # positions: req0 19 -> 20 (boundary -> not); req1 22 -> 23 (not -> boundary)
++        step1 = _decode_common_metadata(seq_lens=[20, 23], block_table=block_table)
++        metadata = builder.build(common_prefix_len=0, common_attn_metadata=step1)
++        assert metadata.slot_mapping[0].item() != -1  # req0 hits a boundary
++        assert metadata.slot_mapping[1].item() == -1  # req1 does not
++
++        metadata.seq_lens += 1
++        builder.update_draft_decode_metadata(metadata)
++
++        oracle_builder = self._builder()
++        step2 = _decode_common_metadata(seq_lens=[21, 24], block_table=block_table)
++        oracle = oracle_builder.build(common_prefix_len=0, common_attn_metadata=step2)
++
++        assert torch.equal(metadata.slot_mapping, oracle.slot_mapping)
++        assert torch.equal(metadata.logical_positions, oracle.logical_positions)
++        assert torch.equal(metadata.k_work_metadata, oracle.k_work_metadata)
++        assert metadata.slot_mapping[0].item() == -1  # req0 no longer at boundary
++        assert metadata.slot_mapping[1].item() != -1  # req1 now is
++
++    def test_token_valid_mask_survives_the_update(self):
++        """token_valid is captured once at build() time from the scheduler's
++        raw slot_mapping and is NOT recomputed by update_draft_decode_metadata
++        (batch composition -- which rows are real vs. padding -- cannot
++        change mid-draft-loop). A row the scheduler marked invalid at build
++        time must stay masked to -1 even once it reaches a compression
++        boundary on a later draft step."""
++        builder = self._builder()
++        block_table = torch.tensor([[3, 4]], dtype=torch.int32)  # 1 request
++        # Raw scheduler slot_mapping < 0 marks this token invalid (e.g. a
++        # padding row in a CUDA-graph-padded batch).
++        raw_slot_mapping = torch.tensor([-1], dtype=torch.int64)
++
++        step1 = _decode_common_metadata(
++            seq_lens=[19], block_table=block_table, slot_mapping=raw_slot_mapping
++        )
++        metadata = builder.build(common_prefix_len=0, common_attn_metadata=step1)
++        assert metadata.token_valid[0].item() is False
++
++        # Advance straight onto a compression boundary (position 19 -> 22,
++        # (22 + 1) % 4 == 0): the compressed_qsa_slot_mapping math alone
++        # would produce a real slot here.
++        metadata.seq_lens += 3
++        builder.update_draft_decode_metadata(metadata)
++
++        assert metadata.slot_mapping[0].item() == -1, (
++            "a row invalid at build() time must stay masked after "
++            "update_draft_decode_metadata, even at a compression boundary"
++        )
++
++    def test_update_matches_oracle_2_real_padded_to_8(self):
++        """CUDA-graph batch padding on the compressed-key cache: 2 real
++        requests, batch padded to 8 rows. Without the fix, padded rows'
++        logical_positions alias onto request 0's positions and, whenever
++        that aliased position lands on a compression-group boundary,
++        ``compressed_qsa_slot_mapping`` would write a live slot for a
++        padding row instead of leaving it at PAD_SLOT_ID."""
++        _assert_padded_update_matches_oracle(
++            self._builder,
++            block_table=torch.tensor([[3, 4], [7, 8]], dtype=torch.int32),
++            seq_lens_real=[20, 23],
++            num_rows_padded=8,
++        )
++
++    def test_update_matches_oracle_3_real_padded_to_4(self):
++        """A second padding ratio/request-count combination (3 real rows,
++        1 padding row) so the fix is not just verified at the 2-of-8 shape."""
++        _assert_padded_update_matches_oracle(
++            self._builder,
++            block_table=torch.tensor(
++                [[3, 4], [7, 8], [11, 12]], dtype=torch.int32
++            ),
++            seq_lens_real=[20, 23, 17],
++            num_rows_padded=4,
++        )

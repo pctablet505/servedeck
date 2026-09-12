@@ -1,0 +1,245 @@
+diff --git a/tests/entrypoints/openai/chat_completion/test_serving_chat.py b/tests/entrypoints/openai/chat_completion/test_serving_chat.py
+index debf54759..ae227098b 100644
+--- a/tests/entrypoints/openai/chat_completion/test_serving_chat.py
++++ b/tests/entrypoints/openai/chat_completion/test_serving_chat.py
+@@ -841,6 +841,79 @@ async def test_streaming_reasoning_usage_counts_across_deltas():
+     }
+ 
+ 
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    "include_reasoning", [True, False], ids=["with_reasoning", "no_reasoning"]
++)
++async def test_non_streaming_reasoning_field_and_usage_counts(include_reasoning):
++    """T1 (2026-09-09 investigation): does the non-streaming response
++    actually drop reasoning content, or is it a client field-name
++    mismatch?
++
++    Exercises the real ``chat_completion_full_generator()`` path
++    (serving.py ``chat_completion_full_generator``, the
++    ``parser.parse()`` / ``include_reasoning`` / ``count_reasoning_tokens``
++    block): ``reasoning`` comes from ``parser.parse()`` and is nulled out
++    ONLY when ``request.include_reasoning`` is ``False``, while
++    ``parser.count_reasoning_tokens()`` is always added to usage
++    regardless of that flag. This reproduces the exact reported symptom
++    -- a ``None`` message field alongside a nonzero
++    ``usage.completion_tokens_details.reasoning_tokens`` -- and shows it
++    is gated by ``include_reasoning`` (default ``True``), not an
++    unconditional drop. It also locks in that the field to read is
++    ``message.reasoning``, not ``message.reasoning_content``: this
++    build's ``ChatMessage`` has no ``reasoning_content`` field at all
++    (renamed upstream -- see ``chat_completion/protocol.py``'s
++    ``_normalize_messages_before`` docstring, and
++    ``vllm-project/vllm@main`` which matches this file byte-for-byte).
++    """
++    serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
++    serving._include_reasoning_tokens_details = True
++    serving.model_config = None
++
++    parser = MagicMock()
++    parser.parse.return_value = ("careful reasoning", "42", None)
++    parser.count_reasoning_tokens.return_value = 5
++
++    output = _make_metrics_request_output(metrics=None, token_ids=(10, 11, 12))
++    output.outputs[0].text = "<think>careful reasoning</think>42"
++
++    request = ChatCompletionRequest(
++        model="test-model",
++        messages=[{"role": "user", "content": "Test prompt"}],
++        max_tokens=10,
++        include_reasoning=include_reasoning,
++    )
++
++    response = await serving.chat_completion_full_generator(
++        request,
++        _single_request_output(output),
++        "chatcmpl-test-id",
++        "test-model",
++        conversation=[{"role": "user", "content": "Test"}],
++        tokenizer=MagicMock(),
++        request_metadata=RequestResponseMetadata(request_id="chatcmpl-test-id"),
++        parser=parser,
++    )
++
++    assert isinstance(response, ChatCompletionResponse)
++    message = response.choices[0].message
++    dumped = message.model_dump()
++    assert "reasoning_content" not in dumped, (
++        "ChatMessage has no reasoning_content field in this vLLM version; "
++        "clients must read `reasoning`."
++    )
++
++    # usage.reasoning_tokens is unconditional: parser.count_reasoning_tokens()
++    # is called regardless of include_reasoning (serving.py).
++    assert response.usage.completion_tokens_details.reasoning_tokens == 5
++
++    if include_reasoning:
++        assert message.reasoning == "careful reasoning"
++    else:
++        assert message.reasoning is None
++
++
+ @dataclass
+ class MockEngine:
+     model_config: MockModelConfig = field(default_factory=MockModelConfig)
+diff --git a/tests/v1/core/test_kv_cache_utils.py b/tests/v1/core/test_kv_cache_utils.py
+index 9b2afeb00..66b15df93 100644
+--- a/tests/v1/core/test_kv_cache_utils.py
++++ b/tests/v1/core/test_kv_cache_utils.py
+@@ -44,6 +44,7 @@ from vllm.v1.core.kv_cache_utils import (
+ )
+ from vllm.v1.kv_cache_interface import (
+     ChunkedLocalAttentionSpec,
++    CircularBufferSpec,
+     FullAttentionSpec,
+     HiddenStateCacheSpec,
+     KVCacheConfig,
+@@ -2256,6 +2257,99 @@ def test_hidden_state_group_preserves_hybrid_prefix_cache_granularity():
+     ) == (544, 136)
+ 
+ 
++def test_prefix_match_unit_qwen4exp_qsa_shipped_config():
++    """T2 (2026-09-09 investigation): legal ``--prefix-match-unit`` values
++    for the shipped Qwen3.8-Flash-Next config (MTP spec 3,
++    ``--mamba-ssm-cache-dtype bfloat16``), and confirmation that today's
++    no-override behavior already collapses to the full attention block.
++
++    The shipped config drives the attention block size to 832 tokens (boot
++    log: platforms/interface.py's "Setting attention block size to N
++    tokens..." logs 1600 without ``--mamba-ssm-cache-dtype bfloat16``; 832
++    is the previously-measured bf16 value -- see the
++    ``qwen-flashnext-perf-ceiling`` memory note). QSA's raw-key ring
++    (``CircularBufferSpec``, ring capacity 8 at spec=3,
++    indexer_compress_ratio=4) is NOT prefix-cacheable
++    (``CircularBufferSpec.prefix_cacheable`` is ``False`` -- it holds only
++    the still-uncommitted rows of one in-flight compression group), so it
++    is excluded from ``hashing_sizes``. Only the QSA compressed-key group
++    (``MLAAttentionSpec``) and the mamba/GDN state group (``MambaSpec``,
++    ``mamba_cache_mode="align"``) are prefix-cacheable, and both already
++    sit at ``block_size=832`` -- their GCD is trivially 832, which is
++    exactly why prefix caching today matches only at full-832-token
++    granularity (an agent turn landing mid-block re-prefills up to 831
++    tokens).
++    """
++    block_size = 832
++    compressed_key_spec = MLAAttentionSpec(
++        block_size=block_size,
++        num_kv_heads=1,
++        head_size=576,
++        dtype=torch.bfloat16,
++    )
++    mamba_spec = MambaSpec(
++        block_size=block_size,
++        shapes=((16384,),),
++        dtypes=(torch.bfloat16,),
++        mamba_cache_mode="align",
++    )
++    raw_key_ring_spec = CircularBufferSpec(
++        block_size=8,
++        num_kv_heads=1,
++        head_size=128,
++        dtype=torch.bfloat16,
++    )
++    assert compressed_key_spec.prefix_cacheable is True
++    assert mamba_spec.prefix_cacheable is True
++    assert raw_key_ring_spec.prefix_cacheable is False
++
++    groups = [
++        KVCacheGroupSpec(["model.layers.0.qsa_compressed"], compressed_key_spec),
++        KVCacheGroupSpec(["model.layers.0.mamba"], mamba_spec),
++        KVCacheGroupSpec(["model.layers.0.qsa_ring"], raw_key_ring_spec),
++    ]
++    kv_cache_config = KVCacheConfig(num_blocks=1, kv_cache_tensors=[], kv_cache_groups=groups)
++
++    def _vllm_config(prefix_match_unit):
++        return SimpleNamespace(
++            cache_config=SimpleNamespace(
++                block_size=block_size,
++                enable_prefix_caching=True,
++                prefix_match_unit=prefix_match_unit,
++            ),
++            parallel_config=SimpleNamespace(decode_context_parallel_size=1),
++            kv_transfer_config=None,
++        )
++
++    # Today's behavior (no override): hash_block_size collapses to the
++    # full attention block -- this is the reported defect.
++    assert kv_cache_utils.resolve_kv_cache_block_sizes(
++        kv_cache_config, _vllm_config(None)
++    ) == (832, 832)
++
++    # Legal override: divides 832 (= 2**6 * 13) and is a multiple of
++    # indexer_compress_ratio=4 (checked separately by the CSA+linear
++    # group-building path, kv_cache_utils.py ~line 1839). Every divisor of
++    # 832 that is also a multiple of 4: 4, 8, 16, 32, 52, 64, 104, 208, 416.
++    for legal in (4, 8, 16, 32, 52, 64, 104, 208, 416):
++        assert kv_cache_utils.resolve_kv_cache_block_sizes(
++            kv_cache_config, _vllm_config(legal)
++        ) == (832, legal)
++
++    # Illegal: does not divide 832 at all.
++    with pytest.raises(ValueError, match="prefix_match_unit"):
++        kv_cache_utils.resolve_kv_cache_block_sizes(kv_cache_config, _vllm_config(100))
++
++    # Illegal in practice: divides 832 but is not a multiple of
++    # indexer_compress_ratio=4 (26 * 32 == 832). resolve_kv_cache_block_sizes
++    # itself does not know about the compression ratio -- only the
++    # CSA+linear group-building path enforces that constraint -- so this
++    # passes here but would be rejected at model-load time.
++    assert kv_cache_utils.resolve_kv_cache_block_sizes(
++        kv_cache_config, _vllm_config(26)
++    ) == (832, 26)
++
++
+ def test_mla_draft_prefers_standard_layout_when_pages_can_be_unified():
+     specs = {
+         "target.0.attn": new_mla_spec(),
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 6ee337f14..711c7ef5f 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -291,6 +291,7 @@ if TYPE_CHECKING:
+     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
+     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
+     VLLM_PLE_CPU_OFFLOAD: bool = False
++    VLLM_PLE_FP8_CHECKPOINT: bool = False
+     VLLM_PLE_OFFLOAD_READY_TIMEOUT: float = 600.0
+     VLLM_LOG_MODEL_INSPECTION: bool = False
+     VLLM_DEBUG_MFU_METRICS: bool = False
+@@ -2036,6 +2037,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_PLE_CPU_OFFLOAD": lambda: (
+         os.getenv("VLLM_PLE_CPU_OFFLOAD", "False").lower() in ("true", "1")
+     ),
++    # Force the FP8 PLE embedding path even when the checkpoint's top-level
++    # quant_config is not Fp8Config. Needed for NVFP4 checkpoints whose PLE
++    # n-gram table is still FP8 with one global weight_scale (e.g.
++    # RadixArk/Qwen3.8-Flash-Next-NVFP4): the default gate below only fires
++    # for Fp8Config, so the weight_scale parameter is never created and
++    # loading dies with "no module or parameter named
++    # 'ngram_embedding.weight_scale'".
++    "VLLM_PLE_FP8_CHECKPOINT": lambda: (
++        os.getenv("VLLM_PLE_FP8_CHECKPOINT", "False").lower() in ("true", "1")
++    ),
+     # Timeout for PLE weight loading and TP worker registration.
+     "VLLM_PLE_OFFLOAD_READY_TIMEOUT": lambda: float(
+         os.getenv("VLLM_PLE_OFFLOAD_READY_TIMEOUT", "600")
+diff --git a/vllm/models/qwen4_exp/nvidia/ple_layer.py b/vllm/models/qwen4_exp/nvidia/ple_layer.py
+index 5f9c6f28b..aea0636ff 100644
+--- a/vllm/models/qwen4_exp/nvidia/ple_layer.py
++++ b/vllm/models/qwen4_exp/nvidia/ple_layer.py
+@@ -190,6 +190,15 @@ def _get_ple_embedding_quant_method(
+ ) -> QuantizeMethodBase | None:
+     """Select global-scale FP8 only for quantized PLE checkpoint shards."""
+ 
++    # An NVFP4/ModelOpt checkpoint can still carry an FP8 PLE table with one
++    # global weight_scale (RadixArk/Qwen3.8-Flash-Next-NVFP4 does). The checks
++    # below only recognise a top-level Fp8Config, so for those checkpoints the
++    # weight_scale parameter is never created and weight loading fails with
++    # "no module or parameter named 'ngram_embedding.weight_scale'".
++    # VLLM_PLE_FP8_CHECKPOINT forces the FP8 PLE path for exactly that case.
++    if envs.VLLM_PLE_FP8_CHECKPOINT:
++        return Qwen4ExpPLEFp8EmbeddingMethod()
++
+     if not isinstance(quant_config, Fp8Config):
+         return None
+     if not quant_config.is_checkpoint_fp8_serialized:

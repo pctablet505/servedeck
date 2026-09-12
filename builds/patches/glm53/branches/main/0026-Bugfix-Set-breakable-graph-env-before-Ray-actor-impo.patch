@@ -1,0 +1,137 @@
+From 9662ab0835e9eac28ac7d95d4b25ecb7140b7bf3 Mon Sep 17 00:00:00 2001
+From: Ace Eldeib <aeldeib@coreweave.com>
+Date: Fri, 28 Aug 2026 19:11:50 -0400
+Subject: [PATCH 26/39] [Bugfix] Set breakable graph env before Ray actor
+ import (#53293)
+
+Signed-off-by: Ace Eldeib <aeldeib@coreweave.com>
+Co-authored-by: Codex <codex@openai.com>
+---
+ tests/test_ray_env_utils.py         | 28 +++++++++++++++++++++++++++-
+ vllm/v1/executor/ray_env_utils.py   | 15 +++++++++++++++
+ vllm/v1/executor/ray_executor.py    |  4 ++++
+ vllm/v1/executor/ray_executor_v2.py |  6 +++++-
+ 4 files changed, 51 insertions(+), 2 deletions(-)
+
+diff --git a/tests/test_ray_env_utils.py b/tests/test_ray_env_utils.py
+index d311de41b..8e066bc6d 100644
+--- a/tests/test_ray_env_utils.py
++++ b/tests/test_ray_env_utils.py
+@@ -5,7 +5,10 @@
+ import os
+ from unittest.mock import patch
+ 
+-from vllm.v1.executor.ray_env_utils import get_driver_env_vars
++from vllm.v1.executor.ray_env_utils import (
++    get_driver_env_vars,
++    update_runtime_env_for_worker_import,
++)
+ 
+ WORKER_VARS: set[str] = {
+     "CUDA_VISIBLE_DEVICES",
+@@ -49,3 +52,26 @@ class TestExclusion:
+     )
+     def test_non_carry_over_blacklist(self):
+         assert "LMCACHE_LOCAL_CPU" not in get_driver_env_vars(WORKER_VARS)
++
++
++class TestImportTimePropagation:
++    @patch.dict(os.environ, {"VLLM_USE_BREAKABLE_CUDAGRAPH": "1"}, clear=False)
++    def test_breakable_cudagraph_is_available_during_actor_import(self):
++        runtime_env = {"env_vars": {"EXISTING": "value"}}
++
++        result = update_runtime_env_for_worker_import(runtime_env)
++
++        assert result is runtime_env
++        assert result["env_vars"] == {
++            "EXISTING": "value",
++            "VLLM_USE_BREAKABLE_CUDAGRAPH": "1",
++        }
++
++    @patch.dict(os.environ, {"OTHER_ENV_VAR": "value"}, clear=True)
++    def test_other_env_vars_are_unchanged(self):
++        runtime_env = {"env_vars": {"EXISTING": "value"}}
++
++        result = update_runtime_env_for_worker_import(runtime_env)
++
++        assert result is runtime_env
++        assert result["env_vars"] == {"EXISTING": "value"}
+diff --git a/vllm/v1/executor/ray_env_utils.py b/vllm/v1/executor/ray_env_utils.py
+index 6ce12b8ca..799cc4b84 100644
+--- a/vllm/v1/executor/ray_env_utils.py
++++ b/vllm/v1/executor/ray_env_utils.py
+@@ -4,6 +4,8 @@ import os
+ 
+ from vllm.ray.ray_env import RAY_NON_CARRY_OVER_ENV_VARS
+ 
++_RAY_WORKER_PRE_IMPORT_ENV_VARS = frozenset({"VLLM_USE_BREAKABLE_CUDAGRAPH"})
++
+ 
+ def get_driver_env_vars(
+     worker_specific_vars: set[str],
+@@ -16,3 +18,16 @@ def get_driver_env_vars(
+     exclude_vars = worker_specific_vars | RAY_NON_CARRY_OVER_ENV_VARS
+ 
+     return {key: value for key, value in os.environ.items() if key not in exclude_vars}
++
++
++def update_runtime_env_for_worker_import(runtime_env: dict) -> dict:
++    """Expose driver environment variables needed before Ray actor import.
++
++    VllmConfig can auto-enable breakable CUDA graphs after Ray starts, while
++    eager_break_during_capture resolves the setting during model import.
++    """
++    for env_var in _RAY_WORKER_PRE_IMPORT_ENV_VARS:
++        if env_var in os.environ:
++            env_vars = runtime_env.setdefault("env_vars", {})
++            env_vars[env_var] = os.environ[env_var]
++    return runtime_env
+diff --git a/vllm/v1/executor/ray_executor.py b/vllm/v1/executor/ray_executor.py
+index 986e4d9bb..b2c385a86 100644
+--- a/vllm/v1/executor/ray_executor.py
++++ b/vllm/v1/executor/ray_executor.py
+@@ -22,6 +22,9 @@ from vllm.utils.network_utils import (
+ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+ from vllm.v1.engine import ReconfigureDistributedRequest, ReconfigureRankType
+ from vllm.v1.executor.abstract import Executor
++from vllm.v1.executor.ray_env_utils import (
++    update_runtime_env_for_worker_import,
++)
+ from vllm.v1.executor.ray_utils import (
+     WORKER_SPECIFIC_ENV_VARS,
+     FutureWrapper,
+@@ -147,6 +150,7 @@ class RayDistributedExecutor(Executor):
+         env_vars.update(
+             {env_var: "1" for env_var in current_platform.ray_noset_device_env_vars}
+         )
++        update_runtime_env_for_worker_import(runtime_env)
+         return ray_remote_kwargs
+ 
+     # child class could overwrite this to return actual env vars.
+diff --git a/vllm/v1/executor/ray_executor_v2.py b/vllm/v1/executor/ray_executor_v2.py
+index e8e5f5107..8f4b84ed0 100644
+--- a/vllm/v1/executor/ray_executor_v2.py
++++ b/vllm/v1/executor/ray_executor_v2.py
+@@ -26,7 +26,10 @@ from vllm.v1.executor.multiproc_executor import (
+     MultiprocExecutor,
+     WorkerProc,
+ )
+-from vllm.v1.executor.ray_env_utils import get_driver_env_vars
++from vllm.v1.executor.ray_env_utils import (
++    get_driver_env_vars,
++    update_runtime_env_for_worker_import,
++)
+ from vllm.v1.executor.ray_utils import (
+     WORKER_SPECIFIC_ENV_VARS,
+     build_actor_name,
+@@ -258,6 +261,7 @@ class RayExecutorV2(MultiprocExecutor):
+ 
+         env_vars = runtime_env.setdefault("env_vars", {})
+         env_vars.update({v: "1" for v in current_platform.ray_noset_device_env_vars})
++        update_runtime_env_for_worker_import(runtime_env)
+         if self.parallel_config.ray_workers_use_nsight:
+             runtime_env["nsight"] = {
+                 "t": "cuda,cudnn,cublas",
+-- 
+2.53.0
+

@@ -1,0 +1,1458 @@
+From d8fd6246b4e3615d4dee33165636dd6902dbea96 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 9 Sep 2026 23:33:20 +0530
+Subject: [PATCH] [Qwen4Exp] on-demand host-RAM offload for the vision encoder
+
+Serving Qwen3.8-Flash-Next on one 96 GiB card sizes the KV cache from
+whatever VRAM the weights leave behind, so a vision tower that is idle for
+essentially every forward pass is still charged for 100% of the time. The
+escape hatch we had been using, --language-model-only, buys that VRAM back
+by deleting multimodal support outright.
+
+This keeps the tower's weights in pinned host RAM and pays PCIe only while
+an image is actually being encoded.
+
+  --mm-encoder-offload onload   (default "none": nothing changes)
+
+"onload" installs a forward pre-hook/hook pair on each selected submodule:
+the pre-hook copies that submodule's parameters to the device just before it
+runs, the hook drops them again. Device residency is one submodule at a time
+(40.5 MiB peak for this checkpoint), not the whole tower. "uva" is offered
+for a compiled or CUDA-graph-captured encoder, where the pointer swapping
+that "onload" does would be baked into the graph; resolve_mm_encoder_offload_mode
+raises rather than let that combination produce wrong pixels.
+
+Selection is deliberately narrow: only modules that own parameters directly
+(so containers are never double-counted), only above 1 MiB (norms stay put),
+and only under an explicit prefix allowlist. patch_embed and pos_embed are
+excluded on purpose -- pos_embed.weight is handed straight to a Triton kernel
+and patch_embed backs the tower's .dtype/.device properties, so neither
+reaches its parameters through nn.Module.__call__. For
+mazinb/Qwen3.8-Flash-Next-Uncensored-NVFP4 that offloads 888,759,008 of the
+tower's 897,862,112 bytes and leaves 8.68 MiB resident.
+
+The hook runs from the model-level process_weights_after_loading, not from
+load_weights: every layer's quant_method.process_weights_after_loading runs
+after load_weights and may repack or replace a parameter, and
+device_loading_context would drag a host-resident parameter back onto the
+device and hand it back as a fresh unpinned CPU tensor.
+
+Tests are CPU-only: module selection against a meta-device replica of the
+real tower (names, shapes and dtype exact), the onload/free lifecycle with a
+stand-in device copy, and a config-resolution test that runs serve.sh under
+DRY_RUN=1 and checks the argv it builds actually parses to the documented
+EngineArgs -- serve.sh hardcodes --limit-mm-per-prompt {"image":0,"video":0}
+and word-splits EXTRA_ARGS after it, so both "later occurrence wins" and
+"the JSON survives unquoted expansion" are load-bearing.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ tests/config/test_mm_encoder_offload_args.py  | 246 +++++++++++
+ .../offloader/test_mm_encoder_offload.py      | 404 ++++++++++++++++++
+ .../test_mm_encoder_offload_wiring.py         | 171 ++++++++
+ vllm/config/offload.py                        |  18 +
+ vllm/engine/arg_utils.py                      |   5 +
+ vllm/model_executor/offloader/__init__.py     |  12 +
+ vllm/model_executor/offloader/mm_encoder.py   | 274 ++++++++++++
+ vllm/models/qwen4_exp/amd/model.py            |  61 +++
+ vllm/models/qwen4_exp/nvidia/model.py         |  61 +++
+ 9 files changed, 1252 insertions(+)
+ create mode 100644 tests/config/test_mm_encoder_offload_args.py
+ create mode 100644 tests/model_executor/offloader/test_mm_encoder_offload.py
+ create mode 100644 tests/models/qwen4_exp/test_mm_encoder_offload_wiring.py
+ create mode 100644 vllm/model_executor/offloader/mm_encoder.py
+
+diff --git a/tests/config/test_mm_encoder_offload_args.py b/tests/config/test_mm_encoder_offload_args.py
+new file mode 100644
+index 000000000..b32025099
+--- /dev/null
++++ b/tests/config/test_mm_encoder_offload_args.py
+@@ -0,0 +1,246 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The launcher's serve line must resolve to the config we documented.
++
++Two layers are pinned here:
++
++1. the argv itself, taken from `serve.sh` under `DRY_RUN=1` with the
++   documented `EXTRA_ARGS` -- because `serve.sh` hardcodes
++   `--limit-mm-per-prompt '{"image":0,"video":0}'` and `EXTRA_ARGS` is
++   word-split *after* it, so whether images are on at all depends on argparse
++   letting the later occurrence win, and on the JSON surviving an unquoted
++   `${EXTRA_ARGS}` expansion;
++2. the `EngineArgs` those arguments resolve to -- the values that decide how
++   much VRAM the multimodal path costs.
++
++A future edit to either the launcher or the arg wiring that quietly re-enables
++a resident vision tower fails here instead of at 3 a.m. on the box.
++"""
++
++import os
++import re
++import shutil
++import subprocess
++
++import pytest
++
++from vllm.config.offload import OffloadConfig
++from vllm.engine.arg_utils import EngineArgs
++from vllm.utils.argparse_utils import FlexibleArgumentParser
++
++#: The one string the owner pastes into `local_llm/.config`. Single source of
++#: truth for this file: everything below is derived from it.
++#:
++#: The JSON values carry no quotes and no spaces on purpose. `serve.sh`
++#: expands `${EXTRA_ARGS:-}` unquoted, so word splitting is the only thing that
++#: happens to this string -- quote removal is not, and `'{"image":2}'` would
++#: reach vLLM with its apostrophes attached.
++DOCUMENTED_EXTRA_ARGS = (
++    "--mamba-ssm-cache-dtype bfloat16 "
++    "--prefix-match-unit 208 "
++    "--mm-encoder-offload onload "
++    "--limit-mm-per-prompt.image 2 "
++    "--limit-mm-per-prompt.video 0 "
++    "--mm-processor-kwargs.max_pixels 2097152 "
++    "--mm-processor-cache-gb 0.5"
++)
++
++#: `local_llm/llm` reads `.config` with this bash regex and *silently skips*
++#: any line it does not match. The value class is `[^"]*`, so a double quote
++#: anywhere in EXTRA_ARGS drops the whole line -- and with it
++#: --mamba-ssm-cache-dtype and --prefix-match-unit, not just the new flags.
++#: That is why the multimodal settings are spelled as dotted sub-arguments
++#: instead of the JSON forms `--limit-mm-per-prompt {"image":2,"video":0}` and
++#: `--mm-processor-kwargs {"max_pixels":2097152}`.
++LLM_CONFIG_LINE_RE = re.compile(r'^[ \t]*([A-Z_]+)="([^"]*)"[ \t]*$')
++
++LAUNCHER = "/home/pctablet505/Projects/vllm-qwen38next/serve.sh"
++
++# The launcher-independent tail, for the parse-level assertions. Mirrors what
++# `serve.sh` builds; `test_launcher_argv_matches_the_documented_args` is what
++# proves the mirror is honest.
++DOCUMENTED_MM_ARGS = [
++    "--max-model-len",
++    "262144",
++    "--gpu-memory-utilization",
++    "0.95",
++    "--max-num-seqs",
++    "16",
++    "--max-num-batched-tokens",
++    "8192",
++    "--limit-mm-per-prompt",
++    '{"image":0,"video":0}',  # serve.sh's hardcoded text-only default ...
++    *DOCUMENTED_EXTRA_ARGS.split(),  # ... which EXTRA_ARGS must override
++]
++
++#: serve.sh passes these to the API server; EngineArgs does not own them.
++NOT_ENGINE_ARGS = {
++    "--host": 1,
++    "--port": 1,
++    "--enable-auto-tool-choice": 0,
++    "--tool-call-parser": 1,
++}
++
++
++def _parse(argv: list[str]) -> EngineArgs:
++    parser = FlexibleArgumentParser()
++    parser = EngineArgs.add_cli_args(parser)
++    return EngineArgs.from_cli_args(parser.parse_args(argv))
++
++
++@pytest.fixture(scope="module")
++def documented_args() -> EngineArgs:
++    return _parse(DOCUMENTED_MM_ARGS)
++
++
++def test_language_model_only_is_off(documented_args: EngineArgs):
++    """The whole point of the change: images are enabled again."""
++    assert documented_args.language_model_only is False
++
++
++def test_encoder_offload_mode_is_onload(documented_args: EngineArgs):
++    assert documented_args.mm_encoder_offload == "onload"
++
++
++def test_encoder_offload_defaults_to_off():
++    """Omitting the flag must not change any other deployment's behaviour."""
++    assert _parse([]).mm_encoder_offload == "none"
++    assert OffloadConfig().mm_encoder_offload == "none"
++
++
++def test_encoder_offload_rejects_an_unknown_mode():
++    with pytest.raises(SystemExit):
++        _parse(["--mm-encoder-offload", "swap"])
++
++
++def test_extra_args_override_the_launchers_hardcoded_text_only_limits(
++    documented_args: EngineArgs,
++):
++    """serve.sh hardcodes image=0,video=0 and appends EXTRA_ARGS after it.
++    FlexibleArgumentParser collects `--limit-mm-per-prompt.image 2` into a dict
++    and re-appends it as JSON at the end of argv, so the dotted form wins. If
++    that ever stopped being true the server would boot silently text-only and
++    this feature would be dead on arrival."""
++    limits = documented_args.limit_mm_per_prompt
++    assert limits["image"] == 2
++    assert limits["video"] == 0
++
++
++def test_max_pixels_is_capped(documented_args: EngineArgs):
++    """max_pixels bounds tokens-per-image, which bounds the profiled encoder
++    batch. Uncapped, this checkpoint's preprocessor allows 16.7 Mpx =
++    16,384 tokens per image; 2 Mpx caps it at 2,048."""
++    assert documented_args.mm_processor_kwargs["max_pixels"] == 2_097_152
++
++
++def test_processor_cache_is_small(documented_args: EngineArgs):
++    """Host RAM, not VRAM - but this box already holds a 95 GiB PLE table."""
++    assert documented_args.mm_processor_cache_gb == 0.5
++
++
++def test_offload_config_carries_the_mode_through():
++    """EngineArgs -> OffloadConfig is the hop the worker actually reads."""
++    config = OffloadConfig(mm_encoder_offload="onload")
++    assert config.mm_encoder_offload == "onload"
++    assert config.compute_hash() != OffloadConfig().compute_hash()
++
++
++# --------------------------------------------------------------------------
++# the launcher itself
++# --------------------------------------------------------------------------
++
++
++def _launcher_argv() -> list[str]:
++    """`serve.sh`'s argv for the documented config, via its DRY_RUN hook."""
++    env = {
++        **os.environ,
++        "DRY_RUN": "1",
++        "DRY_RUN_FORMAT": "nul",
++        "PORT": "8001",
++        "MAX_LEN": "262144",
++        "MAX_SEQS": "16",
++        "GPU_UTIL": "0.95",
++        "SERVED_NAME": "qwen38-flash-next",
++        "EXTRA_ARGS": DOCUMENTED_EXTRA_ARGS,
++    }
++    out = subprocess.run(
++        [shutil.which("bash") or "bash", LAUNCHER],
++        env=env,
++        capture_output=True,
++        text=True,
++        timeout=120,
++        check=True,
++    ).stdout
++    return [arg for arg in out.split("\0") if arg]
++
++
++@pytest.mark.skipif(
++    not os.path.exists(LAUNCHER), reason="box-local launcher not present"
++)
++def test_launcher_argv_matches_the_documented_args():
++    """The JSON must arrive as one word with no stray quotes, and the
++    overriding --limit-mm-per-prompt must come after the hardcoded one."""
++    argv = _launcher_argv()
++
++    assert argv[argv.index("--limit-mm-per-prompt") + 1] == '{"image":0,"video":0}'
++    assert argv[argv.index("--limit-mm-per-prompt.image") + 1] == "2"
++    assert argv[argv.index("--limit-mm-per-prompt.video") + 1] == "0"
++    assert argv[argv.index("--mm-encoder-offload") + 1] == "onload"
++    assert argv[argv.index("--mm-processor-kwargs.max_pixels") + 1] == "2097152"
++    assert argv[argv.index("--mm-processor-cache-gb") + 1] == "0.5"
++    assert "--language-model-only" not in argv
++    assert argv.index("--limit-mm-per-prompt") < argv.index(
++        "--limit-mm-per-prompt.image"
++    ), "EXTRA_ARGS must land after the launcher's hardcoded limits"
++
++
++@pytest.mark.skipif(
++    not os.path.exists(LAUNCHER), reason="box-local launcher not present"
++)
++def test_launcher_argv_resolves_to_the_documented_engine_args():
++    """End to end: what the launcher runs is what we said it costs."""
++    argv = _launcher_argv()
++    # Drop "<venv>/bin/vllm serve <model>", and let the API-server-only flags
++    # (--host, --tool-call-parser, ...) fall through: EngineArgs does not own
++    # them and they have nothing to do with what this feature costs.
++    # Drop "<venv>/bin/vllm serve <model>" and the API-server-only flags, then
++    # use parse_args, not parse_known_args: the dotted-subargument handling
++    # that makes --limit-mm-per-prompt.image work lives in
++    # FlexibleArgumentParser.parse_args and parse_known_args goes around it.
++    engine_argv: list[str] = []
++    i = 3
++    while i < len(argv):
++        if argv[i] in NOT_ENGINE_ARGS:
++            i += 1 + NOT_ENGINE_ARGS[argv[i]]
++            continue
++        engine_argv.append(argv[i])
++        i += 1
++    args = _parse(engine_argv)
++
++    assert args.language_model_only is False
++    assert args.mm_encoder_offload == "onload"
++    assert args.limit_mm_per_prompt == {"image": 2, "video": 0}
++    assert args.mm_processor_kwargs["max_pixels"] == 2_097_152
++    assert args.mm_processor_cache_gb == 0.5
++    assert args.gpu_memory_utilization == 0.95
++    assert args.max_num_seqs == 16
++
++
++def test_the_config_line_survives_the_llm_readers_regex():
++    """`llm` skips a `.config` line it cannot match, without a word of warning.
++    A JSON spelling of these flags contains double quotes, which that regex
++    forbids -- the line would vanish and take --mamba-ssm-cache-dtype and
++    --prefix-match-unit down with it."""
++    line = f'EXTRA_ARGS="{DOCUMENTED_EXTRA_ARGS}"'
++    match = LLM_CONFIG_LINE_RE.match(line)
++    assert match is not None, line
++    assert match.group(1) == "EXTRA_ARGS"
++    assert match.group(2) == DOCUMENTED_EXTRA_ARGS
++    assert match.group(2).split() == DOCUMENTED_EXTRA_ARGS.split()
++
++
++def test_the_config_line_has_nothing_the_shell_would_reinterpret():
++    """serve.sh expands ${EXTRA_ARGS:-} unquoted, so word splitting is the only
++    thing that may happen to it: no quotes to leave attached, no glob character
++    to expand against the cwd, no $ to substitute."""
++    assert not set(DOCUMENTED_EXTRA_ARGS) & set("\"'$`*?[]\\")
+diff --git a/tests/model_executor/offloader/test_mm_encoder_offload.py b/tests/model_executor/offloader/test_mm_encoder_offload.py
+new file mode 100644
+index 000000000..47fa43c42
+--- /dev/null
++++ b/tests/model_executor/offloader/test_mm_encoder_offload.py
+@@ -0,0 +1,404 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CPU tests for on-demand host-RAM offloading of the multimodal encoder.
++
++These run entirely on CPU: the "device" the offloader onloads to is meta or CPU
++and the modules are tiny stand-ins shaped like a ViT block, so the
++module-selection rules and the onload/free lifecycle are exercised without a
++GPU.
++"""
++
++import pytest
++import torch
++import torch.nn as nn
++
++from vllm.model_executor.offloader.mm_encoder import (
++    VISION_TOWER_PROJECTION_PREFIXES,
++    MMEncoderOffloader,
++    module_param_bytes,
++    resolve_mm_encoder_offload_mode,
++    select_offload_modules,
++)
++
++
++class _Block(nn.Module):
++    """A ViT block in miniature: big projections, tiny norms."""
++
++    def __init__(self, dim: int, big: int) -> None:
++        super().__init__()
++        self.norm1 = nn.LayerNorm(dim)
++        self.qkv = nn.Linear(dim, big, bias=True)
++        self.proj = nn.Linear(big, dim, bias=True)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return self.proj(self.qkv(self.norm1(x)))
++
++
++class _Tower(nn.Module):
++    def __init__(self, dim: int = 64, big: int = 4096, depth: int = 2) -> None:
++        super().__init__()
++        # Stands in for patch_embed/pos_embed: parameters that some kernel
++        # reads directly, so they must never be selected.
++        self.pos_embed = nn.Embedding(4096, dim)
++        self.blocks = nn.ModuleList(_Block(dim, big) for _ in range(depth))
++        self.merger = nn.Linear(dim, big, bias=False)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        for block in self.blocks:
++            x = block(x)
++        return self.merger(x)
++
++
++TOWER_PREFIXES = ("blocks.", "merger.")
++
++
++class _FakeDeviceOffloader(MMEncoderOffloader):
++    """Stands in for an accelerator on a CPU-only test runner.
++
++    A real H2D copy lands in a different storage; ``Tensor.to("cpu")`` from CPU
++    returns the very same tensor, so without this the residency assertions
++    below would pass no matter what the hooks did.
++    """
++
++    def _to_device(self, tensor: torch.Tensor) -> torch.Tensor:
++        return tensor.clone()
++
++
++def _is_resident(module: nn.Module, host_ptrs: set[int]) -> bool:
++    """True when this module's parameters are the device copies, not the
++    host originals."""
++    return any(
++        param.data_ptr() not in host_ptrs
++        for _, param in module.named_parameters(recurse=False)
++    )
++
++
++def _host_ptrs(offloader: MMEncoderOffloader) -> set[int]:
++    return {
++        tensor.data_ptr()
++        for params in offloader._host_params.values()
++        for tensor in params.values()
++    }
++
++
++def _names(selected):
++    return [name for name, _ in selected]
++
++
++# --------------------------------------------------------------------------
++# module selection
++# --------------------------------------------------------------------------
++
++
++def test_selects_only_big_leaf_modules_under_the_allowlist():
++    tower = _Tower()
++    selected = select_offload_modules(
++        tower, include_prefixes=TOWER_PREFIXES, min_bytes=1 << 16
++    )
++
++    assert _names(selected) == [
++        "blocks.0.qkv",
++        "blocks.0.proj",
++        "blocks.1.qkv",
++        "blocks.1.proj",
++        "merger",
++    ]
++
++
++def test_excluded_prefixes_are_never_selected():
++    """pos_embed's weight is passed to a kernel directly, so it must stay put."""
++    tower = _Tower()
++    selected = select_offload_modules(tower, min_bytes=1 << 16)
++    assert "pos_embed" in _names(selected), "guard: pos_embed is big enough to qualify"
++
++    selected = select_offload_modules(
++        tower, exclude_prefixes=("pos_embed",), min_bytes=1 << 16
++    )
++    assert "pos_embed" not in _names(selected)
++
++
++def test_containers_are_never_selected():
++    """A container's bytes belong to its children; selecting it double-counts
++    them and would fire the hooks twice per forward."""
++    tower = _Tower()
++    selected = select_offload_modules(
++        tower, include_prefixes=TOWER_PREFIXES, min_bytes=1 << 16
++    )
++    names = _names(selected)
++    assert "blocks" not in names
++    assert "blocks.0" not in names
++    for _, module in selected:
++        assert module_param_bytes(module) > 0
++
++
++def test_min_bytes_keeps_tiny_modules_resident():
++    tower = _Tower()
++    selected = select_offload_modules(
++        tower, include_prefixes=TOWER_PREFIXES, min_bytes=1 << 16
++    )
++    assert not any(name.endswith("norm1") for name in _names(selected))
++
++    # With no threshold the norms qualify too - proof the exclusion above is
++    # the threshold's doing and not an accident of the allowlist.
++    selected = select_offload_modules(
++        tower, include_prefixes=TOWER_PREFIXES, min_bytes=0
++    )
++    assert "blocks.0.norm1" in _names(selected)
++
++
++# --------------------------------------------------------------------------
++# onload / free lifecycle
++# --------------------------------------------------------------------------
++
++
++def test_offload_moves_weights_off_the_device_and_reports_the_bytes():
++    tower = _Tower()
++    expected = sum(
++        module_param_bytes(m)
++        for _, m in select_offload_modules(
++            tower, include_prefixes=TOWER_PREFIXES, min_bytes=1 << 16
++        )
++    )
++
++    offloader = MMEncoderOffloader("onload", "cpu", min_bytes=1 << 16,
++                                   pin_memory=False)
++    moved = offloader.offload(tower, include_prefixes=TOWER_PREFIXES)
++
++    assert moved == expected
++    assert offloader.offloaded_bytes == expected
++    assert len(offloader.offloaded_modules) == 5
++
++
++def test_weights_are_onloaded_for_the_forward_and_freed_after():
++    """The whole point: device residency is confined to the forward pass."""
++    tower = _Tower()
++    offloader = _FakeDeviceOffloader("onload", "cpu", min_bytes=1 << 16,
++                                     pin_memory=False)
++    offloader.offload(tower, include_prefixes=TOWER_PREFIXES)
++    host_ptrs = _host_ptrs(offloader)
++
++    seen: list[bool] = []
++    tower.blocks[0].qkv.register_forward_pre_hook(
++        lambda module, args: seen.append(_is_resident(module, host_ptrs))
++    )
++
++    assert not _is_resident(tower.blocks[0].qkv, host_ptrs)
++    tower(torch.zeros(2, 64))
++
++    # The recording hook runs after the onload hook registered before it.
++    assert seen == [True]
++    # ... and every offloaded module is back on the host afterwards.
++    for name in offloader.offloaded_modules:
++        assert not _is_resident(tower.get_submodule(name), host_ptrs), name
++
++    assert offloader.onload_calls == 5
++    assert offloader.free_calls == 5
++
++
++def test_only_the_running_module_is_resident():
++    """Peak device residency is one module, not the whole tower - this is what
++    makes the design fit a server with no spare VRAM."""
++    tower = _Tower()
++    offloader = _FakeDeviceOffloader("onload", "cpu", min_bytes=1 << 16,
++                                     pin_memory=False)
++    offloader.offload(tower, include_prefixes=TOWER_PREFIXES)
++    host_ptrs = _host_ptrs(offloader)
++
++    peak = 0
++
++    def _measure(module, args):
++        nonlocal peak
++        resident = sum(
++            module_param_bytes(tower.get_submodule(n))
++            for n in offloader.offloaded_modules
++            if _is_resident(tower.get_submodule(n), host_ptrs)
++        )
++        peak = max(peak, resident)
++
++    for name in offloader.offloaded_modules:
++        tower.get_submodule(name).register_forward_pre_hook(_measure)
++
++    tower(torch.zeros(2, 64))
++
++    largest = max(
++        module_param_bytes(tower.get_submodule(n)) for n in offloader.offloaded_modules
++    )
++    assert peak == largest
++    assert peak < offloader.offloaded_bytes
++
++
++def test_forward_result_is_unchanged_by_offloading():
++    torch.manual_seed(0)
++    tower = _Tower(dim=16, big=256, depth=2)
++    x = torch.randn(3, 16)
++    with torch.no_grad():
++        expected = tower(x)
++
++    offloader = _FakeDeviceOffloader("onload", "cpu", min_bytes=0,
++                                     pin_memory=False)
++    offloader.offload(tower, include_prefixes=TOWER_PREFIXES)
++    assert offloader.offloaded_modules, "guard: nothing was offloaded"
++    with torch.no_grad():
++        got = tower(x)
++
++    torch.testing.assert_close(got, expected)
++
++
++def test_close_removes_the_hooks():
++    tower = _Tower()
++    offloader = MMEncoderOffloader("onload", "cpu", pin_memory=False)
++    offloader.offload(tower, include_prefixes=TOWER_PREFIXES)
++    offloader.close()
++
++    tower(torch.zeros(2, 64))
++    assert offloader.onload_calls == 0
++
++
++def test_mode_none_is_a_no_op():
++    tower = _Tower()
++    offloader = MMEncoderOffloader("none", "cpu", pin_memory=False)
++    assert offloader.offload(tower, include_prefixes=TOWER_PREFIXES) == 0
++    assert tower.blocks[0].qkv.weight.device.type == "cpu"
++    assert offloader.offloaded_modules == []
++
++
++def test_unknown_mode_is_rejected():
++    with pytest.raises(ValueError, match="Unknown mm encoder offload mode"):
++        MMEncoderOffloader("swap", "cpu")
++
++
++# --------------------------------------------------------------------------
++# config resolution
++# --------------------------------------------------------------------------
++
++
++class _FakeCompilationConfig:
++    def __init__(self, compile_mm_encoder=False, cudagraph_mm_encoder=False):
++        self.compile_mm_encoder = compile_mm_encoder
++        self.cudagraph_mm_encoder = cudagraph_mm_encoder
++
++
++class _FakeOffloadConfig:
++    def __init__(self, mm_encoder_offload):
++        self.mm_encoder_offload = mm_encoder_offload
++
++
++class _FakeVllmConfig:
++    def __init__(self, mode, **compile_kwargs):
++        self.offload_config = _FakeOffloadConfig(mode)
++        self.compilation_config = _FakeCompilationConfig(**compile_kwargs)
++
++
++@pytest.mark.parametrize("mode", ["none", "onload", "uva"])
++def test_resolve_passes_the_configured_mode_through(mode):
++    assert resolve_mm_encoder_offload_mode(_FakeVllmConfig(mode)) == mode
++
++
++@pytest.mark.parametrize(
++    "flag", ["compile_mm_encoder", "cudagraph_mm_encoder"]
++)
++def test_onload_is_rejected_when_the_encoder_graph_is_captured(flag):
++    """A captured graph bakes in weight pointers that onload invalidates."""
++    config = _FakeVllmConfig("onload", **{flag: True})
++    with pytest.raises(ValueError, match="uva"):
++        resolve_mm_encoder_offload_mode(config)
++
++
++@pytest.mark.parametrize(
++    "flag", ["compile_mm_encoder", "cudagraph_mm_encoder"]
++)
++def test_uva_is_allowed_when_the_encoder_graph_is_captured(flag):
++    config = _FakeVllmConfig("uva", **{flag: True})
++    assert resolve_mm_encoder_offload_mode(config) == "uva"
++
++
++# --------------------------------------------------------------------------
++# the selection the Qwen4Exp model actually asks for
++# --------------------------------------------------------------------------
++
++# Qwen3.8-Flash-Next vision_config: depth 27, hidden 1152, intermediate 4304,
++# out_hidden_size 2560, spatial_merge_size 2, all weights bfloat16.
++QWEN_TOWER_INCLUDE_PREFIXES = VISION_TOWER_PROJECTION_PREFIXES
++# Sum of the selected tensors in model-bf16-00001.safetensors of
++# mazinb/Qwen3.8-Flash-Next-Uncensored-NVFP4, i.e. every visual.* tensor except
++# patch_embed, pos_embed and the LayerNorms.
++QWEN_OFFLOADABLE_BYTES = 888_759_008
++QWEN_LARGEST_MODULE_BYTES = 42_476_544  # merger.linear_fc1
++
++
++def _meta_linear(in_f: int, out_f: int, bias: bool = True) -> nn.Linear:
++    return nn.Linear(in_f, out_f, bias=bias, device="meta", dtype=torch.bfloat16)
++
++
++def _qwen_vision_tower_replica() -> nn.Module:
++    """Module tree with the real tower's names, shapes and dtype.
++
++    Built on the meta device, so it costs no memory: only names and parameter
++    sizes matter to `select_offload_modules`, and both are exact here.
++    """
++    hidden, depth, intermediate, out_hidden, merge = 1152, 27, 4304, 2560, 2
++    merged = hidden * merge**2
++
++    def _norm(dim: int) -> nn.Module:
++        return nn.LayerNorm(dim, device="meta", dtype=torch.bfloat16)
++
++    tower = nn.Module()
++    tower.patch_embed = nn.Module()
++    tower.patch_embed.proj = nn.Conv3d(
++        3, hidden, (2, 16, 16), stride=(2, 16, 16),
++        device="meta", dtype=torch.bfloat16,
++    )
++    tower.pos_embed = nn.Embedding(2304, hidden, device="meta", dtype=torch.bfloat16)
++
++    blocks = nn.ModuleList()
++    for _ in range(depth):
++        block = nn.Module()
++        block.norm1 = _norm(hidden)
++        block.norm2 = _norm(hidden)
++        block.attn = nn.Module()
++        block.attn.qkv = _meta_linear(hidden, 3 * hidden)
++        block.attn.proj = _meta_linear(hidden, hidden)
++        block.mlp = nn.Module()
++        block.mlp.linear_fc1 = _meta_linear(hidden, intermediate)
++        block.mlp.linear_fc2 = _meta_linear(intermediate, hidden)
++        blocks.append(block)
++    tower.blocks = blocks
++
++    tower.merger = nn.Module()
++    tower.merger.norm = _norm(hidden)
++    tower.merger.linear_fc1 = _meta_linear(merged, merged)
++    tower.merger.linear_fc2 = _meta_linear(merged, out_hidden)
++    return tower
++
++
++def test_qwen_tower_selection_is_exactly_the_projections():
++    """The prefixes the model passes must pick every projection and nothing
++    whose weight a kernel reads outside `nn.Module.__call__`."""
++    tower = _qwen_vision_tower_replica()
++    selected = select_offload_modules(
++        tower, include_prefixes=QWEN_TOWER_INCLUDE_PREFIXES
++    )
++    names = _names(selected)
++
++    assert len(names) == 110  # 27 blocks x 4 projections + 2 merger projections
++    assert set(names) == {
++        f"blocks.{i}.{leaf}"
++        for i in range(27)
++        for leaf in ("attn.qkv", "attn.proj", "mlp.linear_fc1", "mlp.linear_fc2")
++    } | {"merger.linear_fc1", "merger.linear_fc2"}
++
++    # pos_embed.weight goes straight to a Triton kernel and patch_embed backs
++    # the tower's .dtype/.device properties: both must stay resident.
++    assert "pos_embed" not in names
++    assert "patch_embed.proj" not in names
++    assert not any(".norm" in name for name in names)
++
++
++def test_qwen_tower_offloadable_bytes_match_the_checkpoint():
++    tower = _qwen_vision_tower_replica()
++    selected = select_offload_modules(
++        tower, include_prefixes=QWEN_TOWER_INCLUDE_PREFIXES
++    )
++    total = sum(module_param_bytes(m) for _, m in selected)
++    assert total == QWEN_OFFLOADABLE_BYTES
++    assert max(module_param_bytes(m) for _, m in selected) == QWEN_LARGEST_MODULE_BYTES
+diff --git a/tests/models/qwen4_exp/test_mm_encoder_offload_wiring.py b/tests/models/qwen4_exp/test_mm_encoder_offload_wiring.py
+new file mode 100644
+index 000000000..79adc301c
+--- /dev/null
++++ b/tests/models/qwen4_exp/test_mm_encoder_offload_wiring.py
+@@ -0,0 +1,171 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Qwen4Exp's own use of the multimodal encoder offloader.
++
++The offloader itself is covered by
++tests/model_executor/offloader/test_mm_encoder_offload.py. What is tested here
++is the model's wiring: that `load_weights` hands the vision tower over, with
++the prefixes that leave `patch_embed`/`pos_embed` alone, and that a plain
++text-only deployment is untouched.
++"""
++
++import pytest
++import torch
++import torch.nn as nn
++
++from vllm.models.qwen4_exp.nvidia.model import Qwen4ExpForConditionalGeneration
++
++_offload = Qwen4ExpForConditionalGeneration._maybe_offload_mm_encoder
++
++HIDDEN, INTERMEDIATE, OUT_HIDDEN, MERGE = 1152, 4304, 2560, 2
++
++
++@pytest.fixture(autouse=True)
++def _no_pinned_memory(monkeypatch: pytest.MonkeyPatch):
++    """On the box the host copies are pinned; a CPU-only runner has no CUDA
++    allocator to pin with, and pinning is not what these tests are about."""
++    monkeypatch.setattr(
++        "vllm.model_executor.offloader.mm_encoder.should_pin_memory", lambda: False
++    )
++
++
++def _tiny_tower(depth: int = 1) -> nn.Module:
++    """One real-width block plus a merger: big enough to clear the offloader's
++    1 MiB floor, small enough to build in a CPU test."""
++    merged = HIDDEN * MERGE**2
++    tower = nn.Module()
++    tower.patch_embed = nn.Module()
++    tower.patch_embed.proj = nn.Conv3d(3, HIDDEN, (2, 16, 16), stride=(2, 16, 16))
++    tower.pos_embed = nn.Embedding(2304, HIDDEN)
++
++    blocks = nn.ModuleList()
++    for _ in range(depth):
++        block = nn.Module()
++        block.norm1 = nn.LayerNorm(HIDDEN)
++        block.norm2 = nn.LayerNorm(HIDDEN)
++        block.attn = nn.Module()
++        block.attn.qkv = nn.Linear(HIDDEN, 3 * HIDDEN)
++        block.attn.proj = nn.Linear(HIDDEN, HIDDEN)
++        block.mlp = nn.Module()
++        block.mlp.linear_fc1 = nn.Linear(HIDDEN, INTERMEDIATE)
++        block.mlp.linear_fc2 = nn.Linear(INTERMEDIATE, HIDDEN)
++        blocks.append(block)
++    tower.blocks = blocks
++
++    tower.merger = nn.Module()
++    tower.merger.norm = nn.LayerNorm(HIDDEN)
++    tower.merger.linear_fc1 = nn.Linear(merged, merged)
++    tower.merger.linear_fc2 = nn.Linear(merged, OUT_HIDDEN)
++    return tower
++
++
++class _Stub:
++    """The two attributes `__init__` sets, plus the real methods.
++
++    Borrowing the unbound methods rather than instantiating the model keeps
++    this a CPU test: constructing Qwen4ExpForConditionalGeneration would build
++    a 48-layer MoE decoder.
++    """
++
++    process_weights_after_loading = (
++        Qwen4ExpForConditionalGeneration.process_weights_after_loading
++    )
++    _maybe_offload_mm_encoder = _offload
++
++    def __init__(self, mode: str, tower: nn.Module) -> None:
++        self.visual = tower
++        self.mm_encoder_offload_mode = mode
++        self.mm_encoder_offloader = None
++
++
++def _stub(mode: str, tower: nn.Module) -> _Stub:
++    return _Stub(mode, tower)
++
++
++def test_offloads_the_projections_and_leaves_the_kernel_fed_weights_alone():
++    tower = _tiny_tower()
++    model = _stub("onload", tower)
++
++    _offload(model)
++
++    offloader = model.mm_encoder_offloader
++    assert set(offloader.offloaded_modules) == {
++        "blocks.0.attn.qkv",
++        "blocks.0.attn.proj",
++        "blocks.0.mlp.linear_fc1",
++        "blocks.0.mlp.linear_fc2",
++        "merger.linear_fc1",
++        "merger.linear_fc2",
++    }
++    # pos_embed.weight is read by a Triton kernel outside any module call, and
++    # patch_embed backs the tower's .dtype/.device properties.
++    assert "pos_embed" not in offloader.offloaded_modules
++    assert "patch_embed.proj" not in offloader.offloaded_modules
++
++
++def test_offloading_preserves_the_tower_dtype_and_device_properties():
++    """`_process_image_input` casts pixels with `self.visual.dtype`, which
++    reads patch_embed's weight - so patch_embed must survive on the device."""
++    tower = _tiny_tower()
++    before = (tower.patch_embed.proj.weight.dtype, tower.patch_embed.proj.weight.device)
++
++    _offload(_stub("onload", tower))
++
++    assert (
++        tower.patch_embed.proj.weight.dtype,
++        tower.patch_embed.proj.weight.device,
++    ) == before
++
++
++def test_mode_none_leaves_the_model_untouched():
++    tower = _tiny_tower()
++    model = _stub("none", tower)
++
++    _offload(model)
++
++    assert model.mm_encoder_offloader is None
++    assert tower.blocks[0].attn.qkv.weight.device == torch.device("cpu")
++
++
++def test_a_tower_with_no_parameters_is_skipped():
++    """`--limit-mm-per-prompt '{"image":0,"video":0}'` replaces the tower with a
++    StageMissingLayer even when --language-model-only is absent, so the offload
++    path can be reached with nothing to offload. It must not abort the load."""
++    from vllm.model_executor.models.utils import StageMissingLayer
++
++    model = _stub("onload", StageMissingLayer("vision_tower"))
++
++    _offload(model)
++
++    assert model.mm_encoder_offloader is None
++
++
++def test_the_post_load_hook_is_what_triggers_the_offload():
++    """`load_weights` is too early: every layer's
++    `quant_method.process_weights_after_loading` runs after it, and
++    `device_loading_context` would pull a host-resident parameter back onto the
++    device and hand it back as a fresh, unpinned CPU tensor. The model-level
++    post-load hook is the last pass over the weights, so that is where the
++    offload has to happen."""
++    tower = _tiny_tower()
++    model = _stub("onload", tower)
++
++    model.process_weights_after_loading()
++
++    assert model.mm_encoder_offloader is not None
++    assert model.mm_encoder_offloader.offloaded_bytes > 0
++
++
++def test_offloading_twice_does_not_pin_a_second_copy():
++    """A sleep/wake_up reload runs the post-load hooks again."""
++    tower = _tiny_tower()
++    model = _stub("onload", tower)
++
++    _offload(model)
++    first = model.mm_encoder_offloader
++    _offload(model)
++
++    assert model.mm_encoder_offloader is first
++    assert first.onload_calls == 0
++    # Two stacked hook pairs would fire twice for one forward.
++    assert len(first._handles) == 2 * len(first.offloaded_modules)
+diff --git a/vllm/config/offload.py b/vllm/config/offload.py
+index ad65e8acf..5dd65ba85 100644
+--- a/vllm/config/offload.py
++++ b/vllm/config/offload.py
+@@ -10,6 +10,7 @@ from pydantic import Field, model_validator
+ from vllm.config.utils import config
+ 
+ OffloadBackend = Literal["auto", "uva", "prefetch"]
++MMEncoderOffload = Literal["none", "onload", "uva"]
+ 
+ 
+ @config
+@@ -94,6 +95,23 @@ class OffloadConfig:
+     prefetch: PrefetchOffloadConfig = Field(default_factory=PrefetchOffloadConfig)
+     """Parameters for prefetch offloading backend."""
+ 
++    mm_encoder_offload: MMEncoderOffload = "none"
++    """Keep the multimodal (vision) encoder's weights in host RAM instead of
++    VRAM, so a mostly-text deployment does not pay for a tower it rarely uses.
++    Independent of `offload_backend`, which targets the decoder layers.
++    Options:
++    - "none": the encoder stays resident in VRAM (default).
++    - "onload": weights live in pinned host RAM; each encoder submodule is
++      copied to the device just before it runs and dropped right after, so the
++      device holds at most one submodule's weights at a time. Requires the
++      encoder to run eagerly (not compiled, not CUDA-graph captured).
++    - "uva": weights live in pinned host RAM behind a zero-copy device view.
++      Device pointers are stable, so this is the option for a compiled or
++      CUDA-graph-captured encoder, but the weights are read over PCIe from
++      inside each GEMM rather than as one bulk transfer.
++    Only models that opt in honour this; today that is Qwen4Exp
++    (Qwen3.8-Flash-Next)."""
++
+     @model_validator(mode="after")
+     def validate_offload_config(self) -> "OffloadConfig":
+         """Validate offload configuration constraints."""
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index 44ee837c6..897ed8d52 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -525,6 +525,7 @@ class EngineArgs:
+     disable_sliding_window: bool = ModelConfig.disable_sliding_window
+     disable_cascade_attn: bool = ModelConfig.disable_cascade_attn
+     offload_backend: str = OffloadConfig.offload_backend
++    mm_encoder_offload: str = OffloadConfig.mm_encoder_offload
+     cpu_offload_gb: float = UVAOffloadConfig.cpu_offload_gb
+     cpu_offload_params: set[str] = get_field(UVAOffloadConfig, "cpu_offload_params")
+     offload_group_size: int = PrefetchOffloadConfig.offload_group_size
+@@ -1286,6 +1287,9 @@ class EngineArgs:
+         offload_group.add_argument(
+             "--offload-params", **prefetch_kwargs["offload_params"]
+         )
++        offload_group.add_argument(
++            "--mm-encoder-offload", **offload_kwargs["mm_encoder_offload"]
++        )
+ 
+         # Multimodal related configs
+         multimodal_kwargs = get_kwargs(MultiModalConfig)
+@@ -2491,6 +2495,7 @@ class EngineArgs:
+                 offload_prefetch_step=self.offload_prefetch_step,
+                 offload_params=self.offload_params,
+             ),
++            mm_encoder_offload=self.mm_encoder_offload,
+         )
+ 
+         if self.gdn_prefill_backend is not None:
+diff --git a/vllm/model_executor/offloader/__init__.py b/vllm/model_executor/offloader/__init__.py
+index f1b49c69e..f1d1e3f38 100644
+--- a/vllm/model_executor/offloader/__init__.py
++++ b/vllm/model_executor/offloader/__init__.py
+@@ -10,16 +10,28 @@ from vllm.model_executor.offloader.base import (
+     set_offloader,
+     should_pin_memory,
+ )
++from vllm.model_executor.offloader.mm_encoder import (
++    VISION_TOWER_PROJECTION_PREFIXES,
++    MMEncoderOffloader,
++    MMEncoderOffloadMode,
++    resolve_mm_encoder_offload_mode,
++    select_offload_modules,
++)
+ from vllm.model_executor.offloader.prefetch import PrefetchOffloader
+ from vllm.model_executor.offloader.uva import UVAOffloader
+ 
+ __all__ = [
+     "BaseOffloader",
++    "MMEncoderOffloadMode",
++    "MMEncoderOffloader",
+     "NoopOffloader",
+     "UVAOffloader",
++    "VISION_TOWER_PROJECTION_PREFIXES",
+     "PrefetchOffloader",
+     "create_offloader",
+     "get_offloader",
++    "resolve_mm_encoder_offload_mode",
++    "select_offload_modules",
+     "set_offloader",
+     "should_pin_memory",
+ ]
+diff --git a/vllm/model_executor/offloader/mm_encoder.py b/vllm/model_executor/offloader/mm_encoder.py
+new file mode 100644
+index 000000000..f0b78ea01
+--- /dev/null
++++ b/vllm/model_executor/offloader/mm_encoder.py
+@@ -0,0 +1,274 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""On-demand host-RAM offloading for the multimodal (vision) encoder.
++
++Motivation
++----------
++On a single-GPU deployment the KV cache is sized to consume whatever VRAM is
++left after the weights, so every byte the vision tower holds is a byte the KV
++cache does not get.  For a text-heavy workload with occasional images that is a
++bad trade: the tower is idle for ~100% of the forward passes yet is charged for
++100% of the time.  The usual escape hatch (``--language-model-only``) buys the
++VRAM back by removing multimodal support entirely.
++
++This module keeps the tower's weights in *host* RAM and pays PCIe only while an
++image is actually being encoded.
++
++Modes
++-----
++``onload``
++    Weights live in pinned host memory.  A forward pre-hook copies one
++    submodule's parameters to the device just before that submodule runs and a
++    forward hook drops them again, so the device holds at most one submodule's
++    weights at a time (tens of MiB, not the whole tower).  This is the default
++    because a single-GPU server at ``--gpu-memory-utilization 0.95`` has no
++    headroom to materialise the whole tower on demand.
++
++``uva``
++    Weights live in pinned host memory with a device-accessible view (zero
++    copy).  Device pointers never change, which is what CUDA-graph capture and
++    ``torch.compile`` of the encoder require, at the cost of reading the
++    weights over PCIe from inside the GEMM instead of as one bulk transfer.
++
++Both modes leave ~0 bytes of steady-state VRAM behind.
++
++Scope
++-----
++``select_offload_modules`` deliberately only picks modules that *own*
++parameters and that own enough of them to be worth a PCIe round trip.  A
++``LayerNorm``'s 2 KiB is not; a 10 MiB projection is.  Callers pass an explicit
++prefix allowlist because a module is only safe to offload if every use of its
++parameters goes through ``nn.Module.__call__`` -- a parameter that some kernel
++reads directly (e.g. ``pos_embed.weight`` handed to a Triton kernel) would
++still be on the host when the kernel runs.
++"""
++
++from collections.abc import Iterable, Sequence
++from typing import TYPE_CHECKING, Literal
++
++import torch
++import torch.nn as nn
++
++from vllm.logger import init_logger
++from vllm.model_executor.offloader.base import should_pin_memory
++from vllm.utils.mem_utils import format_gib
++from vllm.utils.platform_utils import is_uva_available
++from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
++
++if TYPE_CHECKING:
++    from vllm.config import VllmConfig
++
++logger = init_logger(__name__)
++
++MMEncoderOffloadMode = Literal["none", "onload", "uva"]
++
++#: Modules whose own parameters total less than this are left on the device.
++#: 1 MiB is well above every norm/bias in a ViT block and well below every
++#: projection matrix, so the split is unambiguous rather than tuned.
++DEFAULT_MIN_OFFLOAD_BYTES = 1 << 20
++
++#: Offloadable subtrees of a Qwen3-VL-style vision tower. Everything under
++#: these prefixes reaches its parameters through ``nn.Module.__call__``, which
++#: is what lets a forward hook move them. Deliberately absent: ``patch_embed``
++#: (backs the tower's ``.dtype``/``.device`` properties) and ``pos_embed``
++#: (its weight is handed straight to a Triton kernel) - 8.4 MiB of a 856 MiB
++#: tower.
++VISION_TOWER_PROJECTION_PREFIXES = ("blocks.", "merger.", "deepstack_merger_list.")
++
++
++def module_param_bytes(module: nn.Module) -> int:
++    """Bytes of the parameters this module owns directly (no recursion)."""
++    return sum(
++        p.numel() * p.element_size() for _, p in module.named_parameters(recurse=False)
++    )
++
++
++def select_offload_modules(
++    root: nn.Module,
++    *,
++    include_prefixes: Sequence[str] | None = None,
++    exclude_prefixes: Sequence[str] = (),
++    min_bytes: int = DEFAULT_MIN_OFFLOAD_BYTES,
++) -> list[tuple[str, nn.Module]]:
++    """Pick the submodules of ``root`` whose weights are worth offloading.
++
++    A module qualifies when all of the following hold:
++
++    * it owns parameters directly -- containers are never selected, so a
++      module's bytes are counted once and hooks fire exactly once per module;
++    * those parameters total at least ``min_bytes``;
++    * its dotted name starts with one of ``include_prefixes`` (when given);
++    * its dotted name starts with none of ``exclude_prefixes``.
++
++    Returns ``(name, module)`` pairs in ``named_modules`` order.
++    """
++
++    def _matches(name: str, prefixes: Iterable[str]) -> bool:
++        return any(name == p.rstrip(".") or name.startswith(p) for p in prefixes)
++
++    selected: list[tuple[str, nn.Module]] = []
++    for name, module in root.named_modules():
++        if not name:
++            continue
++        if include_prefixes is not None and not _matches(name, include_prefixes):
++            continue
++        if exclude_prefixes and _matches(name, exclude_prefixes):
++            continue
++        if module_param_bytes(module) < min_bytes:
++            continue
++        selected.append((name, module))
++    return selected
++
++
++class MMEncoderOffloader:
++    """Moves selected encoder submodules to host RAM and back on demand.
++
++    The offloader owns the pinned host copies, so it must outlive the model.
++    ``onload_calls``/``free_calls`` are exposed for tests and for a one-line
++    sanity check in the logs.
++    """
++
++    def __init__(
++        self,
++        mode: MMEncoderOffloadMode,
++        device: torch.device | str,
++        *,
++        min_bytes: int = DEFAULT_MIN_OFFLOAD_BYTES,
++        pin_memory: bool | None = None,
++    ) -> None:
++        if mode not in ("none", "onload", "uva"):
++            raise ValueError(f"Unknown mm encoder offload mode: {mode!r}")
++        self.mode: MMEncoderOffloadMode = mode
++        self.device = torch.device(device)
++        self.min_bytes = min_bytes
++        self.pin_memory = should_pin_memory() if pin_memory is None else pin_memory
++
++        self.offloaded_bytes = 0
++        self.offloaded_modules: list[str] = []
++        self.onload_calls = 0
++        self.free_calls = 0
++        # name -> {param name: pinned host tensor}
++        self._host_params: dict[str, dict[str, torch.Tensor]] = {}
++        self._handles: list[torch.utils.hooks.RemovableHandle] = []
++
++    def offload(
++        self,
++        root: nn.Module,
++        *,
++        include_prefixes: Sequence[str] | None = None,
++        exclude_prefixes: Sequence[str] = (),
++    ) -> int:
++        """Offload the qualifying submodules of ``root``. Returns bytes moved."""
++        if self.mode == "none":
++            return 0
++
++        if self.mode == "uva" and not is_uva_available():
++            raise RuntimeError(
++                "mm_encoder_offload='uva' requires unified virtual addressing, "
++                "which this platform does not provide. Use 'onload' instead."
++            )
++
++        selected = select_offload_modules(
++            root,
++            include_prefixes=include_prefixes,
++            exclude_prefixes=exclude_prefixes,
++            min_bytes=self.min_bytes,
++        )
++        for name, module in selected:
++            self._offload_module(name, module)
++
++        logger.info(
++            "Multimodal encoder offload (%s): %d modules, %s moved to host RAM",
++            self.mode,
++            len(self.offloaded_modules),
++            format_gib(self.offloaded_bytes),
++        )
++        return self.offloaded_bytes
++
++    def _offload_module(self, name: str, module: nn.Module) -> None:
++        host: dict[str, torch.Tensor] = {}
++        for pname, p in module.named_parameters(recurse=False):
++            cpu_data = p.data.to(device="cpu")
++            if self.pin_memory and not cpu_data.is_pinned():
++                cpu_data = cpu_data.pin_memory()
++            host[pname] = cpu_data
++            self.offloaded_bytes += cpu_data.numel() * cpu_data.element_size()
++            if self.mode == "uva":
++                p.data = get_accelerator_view_from_cpu_tensor(cpu_data)
++                p._vllm_is_uva_offloaded = True
++            else:
++                p.data = cpu_data
++
++        if not host:
++            return
++
++        self._host_params[name] = host
++        self.offloaded_modules.append(name)
++
++        if self.mode == "onload":
++            self._handles.append(
++                module.register_forward_pre_hook(self._make_onload_hook(name))
++            )
++            self._handles.append(
++                module.register_forward_hook(self._make_free_hook(name))
++            )
++
++    def _to_device(self, tensor: torch.Tensor) -> torch.Tensor:
++        """The host-to-device transfer. Overridden in tests, which have no
++        accelerator to move to and need the copy to be observable."""
++        return tensor.to(self.device, non_blocking=self.pin_memory)
++
++    def _make_onload_hook(self, name: str):
++        def _onload(module: nn.Module, args):  # noqa: ANN001
++            self.onload_calls += 1
++            host = self._host_params[name]
++            for pname, p in module.named_parameters(recurse=False):
++                p.data = self._to_device(host[pname])
++            return None
++
++        return _onload
++
++    def _make_free_hook(self, name: str):
++        def _free(module: nn.Module, args, output):  # noqa: ANN001
++            self.free_calls += 1
++            host = self._host_params[name]
++            for pname, p in module.named_parameters(recurse=False):
++                p.data = host[pname]
++            return None
++
++        return _free
++
++    def close(self) -> None:
++        """Remove the hooks. The host copies stay valid until dropped."""
++        for handle in self._handles:
++            handle.remove()
++        self._handles.clear()
++
++
++def resolve_mm_encoder_offload_mode(
++    vllm_config: "VllmConfig",
++) -> MMEncoderOffloadMode:
++    """Read the requested mode off the config and reject unsafe combinations.
++
++    ``onload`` swaps device pointers between forward passes, which a captured
++    CUDA graph or a compiled encoder graph would have baked in. ``uva`` keeps
++    pointers stable and is the answer for those setups, so we say so rather
++    than silently producing wrong pixels.
++    """
++    mode: MMEncoderOffloadMode = vllm_config.offload_config.mm_encoder_offload
++    if mode == "none":
++        return mode
++
++    compilation_config = vllm_config.compilation_config
++    if mode == "onload" and (
++        getattr(compilation_config, "compile_mm_encoder", False)
++        or getattr(compilation_config, "cudagraph_mm_encoder", False)
++    ):
++        raise ValueError(
++            "mm_encoder_offload='onload' is incompatible with "
++            "compile_mm_encoder/cudagraph_mm_encoder: both capture the "
++            "encoder's weight pointers, which onload changes on every "
++            "forward. Use mm_encoder_offload='uva' (stable pointers) or "
++            "disable encoder compilation/CUDA graphs."
++        )
++    return mode
+diff --git a/vllm/models/qwen4_exp/amd/model.py b/vllm/models/qwen4_exp/amd/model.py
+index 6ae206df1..8f59eeef2 100644
+--- a/vllm/models/qwen4_exp/amd/model.py
++++ b/vllm/models/qwen4_exp/amd/model.py
+@@ -63,6 +63,11 @@ from vllm.model_executor.models.utils import (
+     maybe_fuse_shared_experts,
+     maybe_prefix,
+ )
++from vllm.model_executor.offloader.mm_encoder import (
++    VISION_TOWER_PROJECTION_PREFIXES,
++    MMEncoderOffloader,
++    resolve_mm_encoder_offload_mode,
++)
+ from vllm.multimodal import MULTIMODAL_REGISTRY
+ from vllm.multimodal.inputs import MultiModalFeatureSpec
+ from vllm.sequence import IntermediateTensors
+@@ -875,6 +880,15 @@ class Qwen4ExpForConditionalGeneration(
+                     prefix=maybe_prefix(prefix, "visual"),
+                 )
+ 
++        # Resolved here (not in load_weights) so an unsupported combination
++        # fails during construction rather than after the weights are read.
++        self.mm_encoder_offload_mode = (
++            "none"
++            if self.language_model_only
++            else resolve_mm_encoder_offload_mode(vllm_config)
++        )
++        self.mm_encoder_offloader: MMEncoderOffloader | None = None
++
+         self.use_deepstack = (
+             not self.language_model_only
+             and bool(config.vision_config.deepstack_visual_indexes)
+@@ -998,6 +1012,53 @@ class Qwen4ExpForConditionalGeneration(
+         )
+         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+ 
++    def process_weights_after_loading(self) -> None:
++        """Model-level post-load hook, called by the model loader.
++
++        This is the last thing that runs over the weights, which is exactly
++        where the encoder offload belongs: `load_weights` is too early, because
++        every layer's `quant_method.process_weights_after_loading` runs after it
++        and may repack or replace a parameter -- and `device_loading_context`
++        would drag any host-resident parameter back to the device and return it
++        as a fresh, unpinned CPU tensor.
++        """
++        self._maybe_offload_mm_encoder()
++
++    def _maybe_offload_mm_encoder(self) -> None:
++        """Move the vision tower to host RAM once its weights are final.
++
++        The freed blocks are returned to the driver here because vLLM's memory
++        profiler reads free *device* memory, which the caching allocator would
++        otherwise still be holding when the KV cache is sized.
++        """
++        if self.mm_encoder_offload_mode == "none":
++            return
++
++        # Idempotent: a sleep/wake_up reload runs the post-load hooks again,
++        # and offloading an already-host-resident tower would pin a second
++        # copy of every weight and stack a second pair of hooks on it.
++        if self.mm_encoder_offloader is not None:
++            return
++
++        # The tower is a StageMissingLayer -- and owns nothing to offload --
++        # whenever every modality it serves is capped at 0 by
++        # --limit-mm-per-prompt, which `_mark_tower_model` honours
++        # independently of --language-model-only. Reaching `next(...)` on that
++        # empty parameter iterator would abort the load with StopIteration.
++        params = next(self.visual.parameters(), None)
++        if params is None:
++            return
++
++        device = params.device
++        offloader = MMEncoderOffloader(self.mm_encoder_offload_mode, device)
++        offloader.offload(
++            self.visual,
++            include_prefixes=VISION_TOWER_PROJECTION_PREFIXES,
++        )
++        self.mm_encoder_offloader = offloader
++        if device.type != "cpu":
++            torch.cuda.empty_cache()
++
+     @classmethod
+     def get_mamba_state_dtype_from_config(
+         cls,
+diff --git a/vllm/models/qwen4_exp/nvidia/model.py b/vllm/models/qwen4_exp/nvidia/model.py
+index 6ae206df1..8f59eeef2 100644
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -63,6 +63,11 @@ from vllm.model_executor.models.utils import (
+     maybe_fuse_shared_experts,
+     maybe_prefix,
+ )
++from vllm.model_executor.offloader.mm_encoder import (
++    VISION_TOWER_PROJECTION_PREFIXES,
++    MMEncoderOffloader,
++    resolve_mm_encoder_offload_mode,
++)
+ from vllm.multimodal import MULTIMODAL_REGISTRY
+ from vllm.multimodal.inputs import MultiModalFeatureSpec
+ from vllm.sequence import IntermediateTensors
+@@ -875,6 +880,15 @@ class Qwen4ExpForConditionalGeneration(
+                     prefix=maybe_prefix(prefix, "visual"),
+                 )
+ 
++        # Resolved here (not in load_weights) so an unsupported combination
++        # fails during construction rather than after the weights are read.
++        self.mm_encoder_offload_mode = (
++            "none"
++            if self.language_model_only
++            else resolve_mm_encoder_offload_mode(vllm_config)
++        )
++        self.mm_encoder_offloader: MMEncoderOffloader | None = None
++
+         self.use_deepstack = (
+             not self.language_model_only
+             and bool(config.vision_config.deepstack_visual_indexes)
+@@ -998,6 +1012,53 @@ class Qwen4ExpForConditionalGeneration(
+         )
+         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+ 
++    def process_weights_after_loading(self) -> None:
++        """Model-level post-load hook, called by the model loader.
++
++        This is the last thing that runs over the weights, which is exactly
++        where the encoder offload belongs: `load_weights` is too early, because
++        every layer's `quant_method.process_weights_after_loading` runs after it
++        and may repack or replace a parameter -- and `device_loading_context`
++        would drag any host-resident parameter back to the device and return it
++        as a fresh, unpinned CPU tensor.
++        """
++        self._maybe_offload_mm_encoder()
++
++    def _maybe_offload_mm_encoder(self) -> None:
++        """Move the vision tower to host RAM once its weights are final.
++
++        The freed blocks are returned to the driver here because vLLM's memory
++        profiler reads free *device* memory, which the caching allocator would
++        otherwise still be holding when the KV cache is sized.
++        """
++        if self.mm_encoder_offload_mode == "none":
++            return
++
++        # Idempotent: a sleep/wake_up reload runs the post-load hooks again,
++        # and offloading an already-host-resident tower would pin a second
++        # copy of every weight and stack a second pair of hooks on it.
++        if self.mm_encoder_offloader is not None:
++            return
++
++        # The tower is a StageMissingLayer -- and owns nothing to offload --
++        # whenever every modality it serves is capped at 0 by
++        # --limit-mm-per-prompt, which `_mark_tower_model` honours
++        # independently of --language-model-only. Reaching `next(...)` on that
++        # empty parameter iterator would abort the load with StopIteration.
++        params = next(self.visual.parameters(), None)
++        if params is None:
++            return
++
++        device = params.device
++        offloader = MMEncoderOffloader(self.mm_encoder_offload_mode, device)
++        offloader.offload(
++            self.visual,
++            include_prefixes=VISION_TOWER_PROJECTION_PREFIXES,
++        )
++        self.mm_encoder_offloader = offloader
++        if device.type != "cpu":
++            torch.cuda.empty_cache()
++
+     @classmethod
+     def get_mamba_state_dtype_from_config(
+         cls,
+-- 
+2.53.0
+

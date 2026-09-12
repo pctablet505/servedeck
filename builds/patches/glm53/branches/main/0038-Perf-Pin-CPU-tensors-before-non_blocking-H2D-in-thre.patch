@@ -1,0 +1,81 @@
+From 46a83642f686c4ea7efa39d5c1e1b50f373d901a Mon Sep 17 00:00:00 2001
+From: Keyi Li <94494390+JasonKeyiL@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 20:13:40 -0700
+Subject: [PATCH 38/39] [Perf] Pin CPU tensors before non_blocking H2D in three
+ MM paths (#54292)
+
+Signed-off-by: Keyi Li <likey6688@gmail.com>
+Co-authored-by: Keyi Li <likey6688@gmail.com>
+Co-authored-by: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ .../model_executor/layers/attention/mm_encoder_attention.py | 5 +----
+ vllm/model_executor/models/kanana_v.py                      | 6 ++----
+ vllm/model_executor/models/kimi_k25_vit.py                  | 5 ++---
+ 3 files changed, 5 insertions(+), 11 deletions(-)
+
+diff --git a/vllm/model_executor/layers/attention/mm_encoder_attention.py b/vllm/model_executor/layers/attention/mm_encoder_attention.py
+index 85dbd6331..b8f431ed4 100644
+--- a/vllm/model_executor/layers/attention/mm_encoder_attention.py
++++ b/vllm/model_executor/layers/attention/mm_encoder_attention.py
+@@ -259,10 +259,7 @@ class MMEncoderAttention(CustomOp):
+         sequence_lengths = add_padding_to_seqlens(
+             sequence_lengths, len(sequence_lengths), 0
+         )
+-        sequence_lengths = torch.from_numpy(sequence_lengths).to(
+-            device, non_blocking=True
+-        )
+-        return sequence_lengths
++        return async_tensor_h2d(sequence_lengths, device=device)
+ 
+     @classmethod
+     def maybe_recompute_cu_seqlens(
+diff --git a/vllm/model_executor/models/kanana_v.py b/vllm/model_executor/models/kanana_v.py
+index f44ec51a8..c17228aa5 100644
+--- a/vllm/model_executor/models/kanana_v.py
++++ b/vllm/model_executor/models/kanana_v.py
+@@ -38,6 +38,7 @@ from vllm.multimodal.processing import (
+ from vllm.sequence import IntermediateTensors
+ from vllm.utils.import_utils import resolve_obj_by_qualname
+ from vllm.utils.tensor_schema import TensorSchema, TensorShape
++from vllm.utils.torch_utils import async_tensor_h2d
+ 
+ from .interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsPP
+ from .qwen2_vl import Qwen2VisionTransformer
+@@ -323,10 +324,7 @@ class CustomQwen2VLVE(Qwen2VisionTransformer):
+             grid_thw_np[:, 0],
+         ).cumsum(axis=0, dtype=np.int32)
+         cu_seqlens = np.concatenate([np.zeros(1, dtype=np.int32), cu_seqlens])
+-        cu_seqlens = torch.from_numpy(cu_seqlens).to(
+-            self.device,
+-            non_blocking=True,
+-        )
++        cu_seqlens = async_tensor_h2d(cu_seqlens, device=self.device)
+ 
+         # Shape to (S, B, D) with batch dimension 1 as expected by the blocks.
+         x = x.unsqueeze(1)
+diff --git a/vllm/model_executor/models/kimi_k25_vit.py b/vllm/model_executor/models/kimi_k25_vit.py
+index 5e858a129..eb811c9fe 100644
+--- a/vllm/model_executor/models/kimi_k25_vit.py
++++ b/vllm/model_executor/models/kimi_k25_vit.py
+@@ -37,6 +37,7 @@ from vllm.model_executor.models.vision import (
+ )
+ from vllm.platforms import current_platform
+ from vllm.transformers_utils.configs.kimi_k25 import KimiK25VisionConfig
++from vllm.utils.torch_utils import async_tensor_h2d
+ 
+ logger = init_logger(__name__)
+ 
+@@ -821,9 +822,7 @@ class MoonViT3dPretrainedModel(nn.Module):
+         merge_gather_idx = build_image_merge_gather_idx(
+             grid_thw_list, self.merge_kernel_size
+         )
+-        metadata["merge_gather_idx"] = torch.from_numpy(merge_gather_idx).to(
+-            device=device, non_blocking=True
+-        )
++        metadata["merge_gather_idx"] = async_tensor_h2d(merge_gather_idx, device=device)
+         return metadata
+ 
+ 
+-- 
+2.53.0
+

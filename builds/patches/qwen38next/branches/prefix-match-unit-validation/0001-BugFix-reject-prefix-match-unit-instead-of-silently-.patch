@@ -1,0 +1,354 @@
+From fa74d318502712776a4727927b800830e4c3b861 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 10 Sep 2026 06:54:57 +0530
+Subject: [PATCH] [BugFix] reject --prefix-match-unit instead of silently
+ dropping it
+
+`resolve_kv_cache_block_sizes` falls back to the scheduler block size in
+three places: a single KV cache group, block hashing being inactive, and a
+Mamba group outside cache mode "align". Each fallback discarded an
+explicitly requested `cache_config.prefix_match_unit` with no diagnostic,
+so `--prefix-match-unit 208` is echoed by the boot log ("non-default args:
+{... 'prefix_match_unit': 208 ...}") while prefix-cache keys keep being
+computed at the full block size. The only symptom is a lower cache hit
+rate.
+
+Fail loudly instead, with a message that names the legal values (the
+divisors of the GCD of the prefix-cacheable groups' block sizes) and the
+reason the request cannot be applied. A request that already equals the
+fallback still succeeds, so configurations passing
+`--prefix-match-unit <block_size>` are unaffected. The pre-existing
+divisibility error is routed through the same helper so it, too, names
+the legal values.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../core/test_prefix_match_unit_validation.py | 169 ++++++++++++++++++
+ vllm/v1/core/kv_cache_utils.py                |  99 ++++++++--
+ 2 files changed, 251 insertions(+), 17 deletions(-)
+ create mode 100644 tests/v1/core/test_prefix_match_unit_validation.py
+
+diff --git a/tests/v1/core/test_prefix_match_unit_validation.py b/tests/v1/core/test_prefix_match_unit_validation.py
+new file mode 100644
+index 000000000..f73901ebb
+--- /dev/null
++++ b/tests/v1/core/test_prefix_match_unit_validation.py
+@@ -0,0 +1,169 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""``--prefix-match-unit`` must never be accepted and then silently dropped.
++
++``resolve_kv_cache_block_sizes`` has three early returns that fall back to the
++scheduler block size. Each of them discards an explicitly requested
++``cache_config.prefix_match_unit`` without any diagnostic, so a user who passes
++``--prefix-match-unit 208`` sees it echoed in the boot log ("non-default args:
++{... 'prefix_match_unit': 208 ...}") while prefix-cache keys keep being computed
++at the full block size. These tests pin the loud behaviour: an explicit value is
++either honoured or rejected with a message naming the legal values.
++"""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.v1.core import kv_cache_utils
++from vllm.v1.kv_cache_interface import (
++    CircularBufferSpec,
++    FullAttentionSpec,
++    KVCacheConfig,
++    KVCacheGroupSpec,
++    MambaSpec,
++    MLAAttentionSpec,
++)
++
++BLOCK_SIZE = 832  # the shipped Qwen3.8-Flash-Next attention block size
++
++
++def _vllm_config(prefix_match_unit, *, enable_prefix_caching=True, connector=None):
++    return SimpleNamespace(
++        cache_config=SimpleNamespace(
++            block_size=BLOCK_SIZE,
++            enable_prefix_caching=enable_prefix_caching,
++            prefix_match_unit=prefix_match_unit,
++        ),
++        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
++        kv_transfer_config=connector,
++    )
++
++
++def _full_attention_spec(block_size=BLOCK_SIZE):
++    return FullAttentionSpec(
++        block_size=block_size, num_kv_heads=4, head_size=128, dtype=torch.bfloat16
++    )
++
++
++def _mamba_spec(mamba_cache_mode="align", block_size=BLOCK_SIZE):
++    return MambaSpec(
++        block_size=block_size,
++        shapes=((16384,),),
++        dtypes=(torch.bfloat16,),
++        mamba_cache_mode=mamba_cache_mode,
++    )
++
++
++def _config(groups):
++    return KVCacheConfig(num_blocks=1, kv_cache_tensors=[], kv_cache_groups=groups)
++
++
++def _hybrid_groups(mamba_cache_mode="align"):
++    """The shipped QSA + GDN geometry: compressed keys, the raw-key ring
++    (not prefix-cacheable) and the mamba/GDN state."""
++    return [
++        KVCacheGroupSpec(["l0.main_kv"], _full_attention_spec()),
++        KVCacheGroupSpec(
++            ["l0.compressed"],
++            MLAAttentionSpec(
++                block_size=BLOCK_SIZE,
++                num_kv_heads=1,
++                head_size=576,
++                dtype=torch.bfloat16,
++                compress_ratio=4,
++            ),
++        ),
++        KVCacheGroupSpec(
++            ["l0.ring"],
++            CircularBufferSpec(
++                block_size=8,
++                num_kv_heads=1,
++                head_size=128,
++                head_size_v=0,
++                dtype=torch.bfloat16,
++            ),
++        ),
++        KVCacheGroupSpec(["l0.gdn"], _mamba_spec(mamba_cache_mode)),
++    ]
++
++
++def test_legal_unit_is_still_honoured():
++    """The supported path must keep working: 208 divides 832."""
++    assert kv_cache_utils.resolve_kv_cache_block_sizes(
++        _config(_hybrid_groups()), _vllm_config(208)
++    ) == (BLOCK_SIZE, 208)
++
++
++def test_default_none_still_falls_back_silently():
++    """No explicit request => the historical fallbacks stay silent."""
++    assert kv_cache_utils.resolve_kv_cache_block_sizes(
++        _config(_hybrid_groups(mamba_cache_mode="none")), _vllm_config(None)
++    ) == (BLOCK_SIZE, BLOCK_SIZE)
++    assert kv_cache_utils.resolve_kv_cache_block_sizes(
++        _config([KVCacheGroupSpec(["l0.main_kv"], _full_attention_spec())]),
++        _vllm_config(None),
++    ) == (BLOCK_SIZE, BLOCK_SIZE)
++
++
++def test_single_group_rejects_explicit_unit_instead_of_dropping_it():
++    with pytest.raises(ValueError, match="prefix_match_unit"):
++        kv_cache_utils.resolve_kv_cache_block_sizes(
++            _config([KVCacheGroupSpec(["l0.main_kv"], _full_attention_spec())]),
++            _vllm_config(208),
++        )
++
++
++def test_block_hashing_inactive_rejects_explicit_unit():
++    with pytest.raises(ValueError, match="prefix_match_unit"):
++        kv_cache_utils.resolve_kv_cache_block_sizes(
++            _config(_hybrid_groups()),
++            _vllm_config(208, enable_prefix_caching=False),
++        )
++
++
++def test_non_align_mamba_rejects_explicit_unit():
++    with pytest.raises(ValueError, match="prefix_match_unit"):
++        kv_cache_utils.resolve_kv_cache_block_sizes(
++            _config(_hybrid_groups(mamba_cache_mode="none")), _vllm_config(208)
++        )
++
++
++def test_rejection_messages_name_the_legal_values():
++    """A rejection must be actionable: it names what the user may pass."""
++    for config, groups in (
++        (_vllm_config(208), [KVCacheGroupSpec(["l0.main_kv"], _full_attention_spec())]),
++        (_vllm_config(208, enable_prefix_caching=False), _hybrid_groups()),
++        (_vllm_config(208), _hybrid_groups(mamba_cache_mode="none")),
++        (_vllm_config(100), _hybrid_groups()),
++    ):
++        with pytest.raises(ValueError) as excinfo:
++            kv_cache_utils.resolve_kv_cache_block_sizes(_config(groups), config)
++        message = str(excinfo.value)
++        # 832 = 2**6 * 13; every divisor is a legal hash unit.
++        assert "416" in message and "208" in message and "104" in message, message
++
++
++def test_indivisible_unit_still_rejected_and_now_lists_legal_values():
++    with pytest.raises(ValueError, match="prefix_match_unit"):
++        kv_cache_utils.resolve_kv_cache_block_sizes(
++            _config(_hybrid_groups()), _vllm_config(100)
++        )
++
++
++def test_request_equal_to_the_fallback_is_not_an_error():
++    """Over-correction guard: rejecting must be reserved for an actual
++    downgrade. A request that already equals the block size loses nothing, so
++    configurations that pass ``--prefix-match-unit <block_size>`` alongside an
++    unsupported mamba mode must keep working."""
++    assert kv_cache_utils.resolve_kv_cache_block_sizes(
++        _config(_hybrid_groups(mamba_cache_mode="none")), _vllm_config(BLOCK_SIZE)
++    ) == (BLOCK_SIZE, BLOCK_SIZE)
++    assert kv_cache_utils.resolve_kv_cache_block_sizes(
++        _config(_hybrid_groups()), _vllm_config(BLOCK_SIZE, enable_prefix_caching=False)
++    ) == (BLOCK_SIZE, BLOCK_SIZE)
++    assert kv_cache_utils.resolve_kv_cache_block_sizes(
++        _config([KVCacheGroupSpec(["l0.main_kv"], _full_attention_spec())]),
++        _vllm_config(BLOCK_SIZE),
++    ) == (BLOCK_SIZE, BLOCK_SIZE)
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index f18707a69..404c1b363 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -605,6 +605,38 @@ def hash_block_tokens(
+     )
+ 
+ 
++def _legal_prefix_match_units(block_sizes: Sequence[int]) -> list[int]:
++    """Token counts a prefix-cache key may be computed on.
++
++    A hash unit must divide every prefix-cacheable group's block size, so the
++    legal set is the divisors of their GCD.
++    """
++    gcd = math.gcd(*block_sizes)
++    return [d for d in range(1, gcd + 1) if gcd % d == 0]
++
++
++def _reject_unusable_prefix_match_unit(
++    requested: int, reason: str, block_sizes: Sequence[int]
++) -> None:
++    """Fail loudly instead of accepting ``--prefix-match-unit`` and dropping it.
++
++    ``resolve_kv_cache_block_sizes`` has several fallbacks to the scheduler
++    block size. Taking one of them while the user explicitly asked for a finer
++    prefix-match unit would silently serve a coarser prefix cache than
++    requested, which is invisible on the boot log (it echoes the accepted
++    value) and only shows up as a lower cache hit rate.
++    """
++    raise ValueError(
++        f"prefix_match_unit={requested} was requested but cannot be applied: "
++        f"{reason}. Legal values for this model are "
++        f"{_legal_prefix_match_units(block_sizes)} (a value must divide every "
++        f"prefix-cacheable KV cache group block size, and models with a "
++        f"compressed-key indexer additionally require a multiple of the "
++        f"indexer compression ratio). Drop --prefix-match-unit to use the "
++        f"default."
++    )
++
++
+ def resolve_kv_cache_block_sizes(
+     kv_cache_config: KVCacheConfig,
+     vllm_config: VllmConfig,
+@@ -621,14 +653,25 @@ def resolve_kv_cache_block_sizes(
+       ``cache_config.prefix_match_unit`` override if set, else the GCD of
+       group block sizes; every group's block size must be divisible by it.
+       Returns the scheduler block size (i.e. disables finer hashing) if block
+-      hashing is inactive or a mamba group is not using cache mode "align".
++      hashing is inactive or a mamba group is not using cache mode "align" --
++      but only when no ``prefix_match_unit`` was requested. An explicit request
++      that cannot be applied raises rather than being silently downgraded.
+     """
+     cache_config = vllm_config.cache_config
+     dcp = vllm_config.parallel_config.decode_context_parallel_size
+     groups = kv_cache_config.kv_cache_groups
+ 
++    requested = cache_config.prefix_match_unit
++
+     if len(groups) <= 1:
+         bs = cache_config.block_size * dcp
++        if requested is not None and requested != bs:
++            _reject_unusable_prefix_match_unit(
++                requested,
++                "the model has a single KV cache group, whose block size is "
++                f"already the prefix-match granularity ({bs} tokens)",
++                [bs],
++            )
+         return bs, bs
+ 
+     group_block_sizes = [
+@@ -638,37 +681,59 @@ def resolve_kv_cache_block_sizes(
+         for g in groups
+     ]
+     scheduler_block_size = math.lcm(*group_block_sizes)
++    # Only prefix-cacheable groups constrain the hash unit; e.g. a QSA raw-key
++    # ring is a tiny non-cacheable group and must not shrink the legal set.
++    hashing_sizes = [
++        block_size
++        for group, block_size in zip(groups, group_block_sizes)
++        if group.kv_cache_spec.prefix_cacheable
++    ] or group_block_sizes
+ 
+     # Block hashes are only consumed by prefix caching and KV connectors
+     # (P/D, offloading); when neither is active, keep hash_block_size equal
+     # to the scheduler block size.
+     connector_enabled = vllm_config.kv_transfer_config is not None
+     if not (cache_config.enable_prefix_caching or connector_enabled):
++        # A request that already equals the fallback loses nothing.
++        if requested is not None and requested != scheduler_block_size:
++            _reject_unusable_prefix_match_unit(
++                requested,
++                "block hashing is inactive (neither prefix caching nor a KV "
++                "connector is enabled), so prefix-cache keys are never computed",
++                hashing_sizes,
++            )
+         return scheduler_block_size, scheduler_block_size
+ 
+     # Mamba groups outside align mode break divisibility; back off to the
+     # scheduler block size. Read the mode from the resolved group spec because
+     # its block size may have been updated independently of cache_config.
+-    if any(
+-        isinstance(g.kv_cache_spec, MambaSpec)
+-        and g.kv_cache_spec.mamba_cache_mode != "align"
+-        for g in groups
+-    ):
++    non_align_mamba_modes = sorted(
++        {
++            g.kv_cache_spec.mamba_cache_mode
++            for g in groups
++            if isinstance(g.kv_cache_spec, MambaSpec)
++            and g.kv_cache_spec.mamba_cache_mode != "align"
++        }
++    )
++    if non_align_mamba_modes:
++        if requested is not None and requested != scheduler_block_size:
++            _reject_unusable_prefix_match_unit(
++                requested,
++                "this model has Mamba KV cache groups in cache mode "
++                f"{non_align_mamba_modes}; only 'align' materializes state at "
++                "sub-block boundaries (pass --mamba-cache-mode=align)",
++                hashing_sizes,
++            )
+         return scheduler_block_size, scheduler_block_size
+ 
+-    hashing_sizes = [
+-        block_size
+-        for group, block_size in zip(groups, group_block_sizes)
+-        if group.kv_cache_spec.prefix_cacheable
+-    ] or group_block_sizes
+-    requested = cache_config.prefix_match_unit
+     hash_block_size = requested if requested is not None else math.gcd(*hashing_sizes)
+     if any(bs % hash_block_size != 0 for bs in hashing_sizes):
+-        raise ValueError(
+-            f"Invalid prefix_match_unit={hash_block_size}; prefix-cacheable "
+-            "KV cache group block sizes must be divisible by prefix_match_unit. "
+-            f"Got group block sizes={group_block_sizes}, "
+-            f"prefix-cacheable={hashing_sizes}."
++        _reject_unusable_prefix_match_unit(
++            hash_block_size,
++            "it does not divide every prefix-cacheable KV cache group block "
++            f"size (group block sizes={group_block_sizes}, "
++            f"prefix-cacheable={hashing_sizes})",
++            hashing_sizes,
+         )
+     return scheduler_block_size, hash_block_size
+ 
+-- 
+2.53.0
+

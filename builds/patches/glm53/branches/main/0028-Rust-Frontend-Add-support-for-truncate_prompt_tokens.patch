@@ -1,0 +1,869 @@
+From 085e9bb07eb3a1ede9689f4110b6ab35eda3e08f Mon Sep 17 00:00:00 2001
+From: Pranav Thakur <103683515+pranavthakur0-0@users.noreply.github.com>
+Date: Sat, 29 Aug 2026 05:46:37 +0530
+Subject: [PATCH 28/39] [Rust Frontend] Add support for
+ `truncate_prompt_tokens` and `truncation_side` (#48584)
+
+Co-authored-by: Bugen Zhao <i@bugenzhao.com>
+Signed-off-by: pranavthakur0-0 <pranavthakurdew@gmail.com>
+Signed-off-by: Bugen Zhao <i@bugenzhao.com>
+---
+ rust/src/chat/src/lib.rs                      |   1 +
+ rust/src/chat/src/request.rs                  |  10 +-
+ rust/src/server/src/error.rs                  |  25 +++
+ rust/src/server/src/grpc/convert.rs           |  16 +-
+ .../src/routes/inference/generate/convert.rs  |   1 +
+ .../routes/openai/chat_completions/convert.rs |  35 +++-
+ .../routes/openai/chat_completions/types.rs   |   5 +
+ .../openai/chat_completions/validate.rs       |   7 +-
+ .../src/routes/openai/completions/convert.rs  |  37 +++-
+ .../src/routes/openai/completions/types.rs    |   5 +-
+ .../src/routes/openai/completions/validate.rs |   8 +-
+ .../src/server/src/routes/openai/utils/mod.rs |  34 ++++
+ rust/src/server/src/routes/tokenize/types.rs  |   2 +
+ rust/src/text/src/error.rs                    |  12 ++
+ rust/src/text/src/lib.rs                      |  75 ++++++--
+ rust/src/text/src/request.rs                  |   8 +
+ rust/src/text/src/truncation.rs               | 178 ++++++++++++++++++
+ 17 files changed, 424 insertions(+), 35 deletions(-)
+ create mode 100644 rust/src/text/src/truncation.rs
+
+diff --git a/rust/src/chat/src/lib.rs b/rust/src/chat/src/lib.rs
+index 53caf31c3..4c68819d8 100644
+--- a/rust/src/chat/src/lib.rs
++++ b/rust/src/chat/src/lib.rs
+@@ -195,6 +195,7 @@ impl ChatRequestProcessor {
+             sampling_params: request.sampling_params,
+             decode_options: request.decode_options,
+             intermediate: request.intermediate,
++            prompt_truncation: request.prompt_truncation,
+             priority: request.priority,
+             cache_salt: request.cache_salt,
+             add_special_tokens: request.add_special_tokens,
+diff --git a/rust/src/chat/src/request.rs b/rust/src/chat/src/request.rs
+index 44d833eca..50e00bbc4 100644
+--- a/rust/src/chat/src/request.rs
++++ b/rust/src/chat/src/request.rs
+@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
+ use serde_json::Value;
+ use vllm_engine_core_client::protocol::lora::LoraRequest;
+ pub use vllm_parser::tool::Tool as ChatTool;
+-pub use vllm_text::SamplingParams;
+ use vllm_text::TextDecodeOptions;
++pub use vllm_text::{PromptTruncation, SamplingParams};
+ 
+ use crate::AssistantMessageExt;
+ use crate::error::{Error, Result};
+@@ -570,6 +570,8 @@ pub struct ChatRequest {
+     /// output. If `true`, callers may receive zero or more incremental
+     /// content events before the final terminal one.
+     pub intermediate: bool,
++    /// Prompt-truncation policy resolved by the caller.
++    pub prompt_truncation: Option<PromptTruncation>,
+     /// Request scheduling priority (lower means earlier handling; default 0).
+     pub priority: i32,
+     /// Documents for RAG (retrieval-augmented generation), passed to the chat
+@@ -601,6 +603,7 @@ impl ChatRequest {
+             tool_context: ResolvedToolContext::default(),
+             decode_options: TextDecodeOptions::default(),
+             intermediate: true,
++            prompt_truncation: None,
+             priority: 0,
+             documents: None,
+             cache_salt: None,
+@@ -627,6 +630,11 @@ impl ChatRequest {
+             (GenerationPromptMode::NoGenerationPrompt, _)
+             | (GenerationPromptMode::StartNewAssistant, _) => {}
+         }
++        if self.has_multimodal() && self.prompt_truncation.is_some() {
++            return Err(Error::Text(
++                vllm_text::Error::TruncateUnsupportedWithMultimodal,
++            ));
++        }
+         Ok(())
+     }
+ 
+diff --git a/rust/src/server/src/error.rs b/rust/src/server/src/error.rs
+index 3a8c0ae5c..17b102494 100644
+--- a/rust/src/server/src/error.rs
++++ b/rust/src/server/src/error.rs
+@@ -224,6 +224,31 @@ mod tests {
+         assert!(response.error.message.contains("allowed_token_ids"));
+     }
+ 
++    #[test]
++    fn truncate_exceeds_budget_maps_to_invalid_request() {
++        let error = vllm_text::Error::TruncatePromptTokensExceedsBudget {
++            value: 8000,
++            budget: 4000,
++        };
++        let api_error = text_submit_error("failed to submit completion request", error);
++        assert_eq!(api_error.status_code(), StatusCode::BAD_REQUEST);
++        let response = api_error.to_error_response();
++        assert_eq!(response.error.error_type, "invalid_request_error");
++        assert!(response.error.message.contains("truncate_prompt_tokens=8000"));
++        assert!(response.error.message.contains("max_tokens = 4000"));
++    }
++
++    #[test]
++    fn invalid_truncate_prompt_tokens_maps_to_invalid_request() {
++        let error = vllm_text::Error::InvalidTruncatePromptTokens { value: -2 };
++        let api_error = text_submit_error("failed to submit completion request", error);
++        assert_eq!(api_error.status_code(), StatusCode::BAD_REQUEST);
++        let response = api_error.to_error_response();
++        assert_eq!(response.error.error_type, "invalid_request_error");
++        assert!(response.error.message.contains("-2"));
++        assert!(response.error.message.contains("must be >= -1"));
++    }
++
+     #[test]
+     fn other_submit_errors_stay_internal() {
+         let error = vllm_text::Error::Tokenizer("backend exploded".to_string());
+diff --git a/rust/src/server/src/grpc/convert.rs b/rust/src/server/src/grpc/convert.rs
+index 4460f6b22..06ce8010d 100644
+--- a/rust/src/server/src/grpc/convert.rs
++++ b/rust/src/server/src/grpc/convert.rs
+@@ -11,8 +11,8 @@ use vllm_chat::MediaContentPart;
+ use vllm_engine_core_client::protocol::output::StopReason;
+ use vllm_engine_core_client::protocol::structured_outputs::StructuredOutputsParams;
+ use vllm_text::{
+-    DecodedLogprobs, DecodedPromptLogprobs, FinishReason, Finished, Prompt, SamplingParams,
+-    TextDecodeOptions, TextRequest,
++    DecodedLogprobs, DecodedPromptLogprobs, FinishReason, Finished, Prompt, PromptTruncation,
++    PromptTruncationLimit, SamplingParams, TextDecodeOptions, TextRequest, TruncationSide,
+ };
+ 
+ use super::pb;
+@@ -110,11 +110,12 @@ pub fn to_text_request(
+         )));
+     }
+ 
+-    if req.truncate_prompt_tokens != 0 {
+-        return Err(Status::invalid_argument(
+-            "truncate_prompt_tokens is not supported",
+-        ));
+-    }
++    // Proto3 uses zero as unset; positive values select fixed left truncation.
++    // The -1 input-budget sentinel is outside the uint32 field domain.
++    let prompt_truncation = (req.truncate_prompt_tokens != 0).then_some(PromptTruncation {
++        limit: PromptTruncationLimit::Fixed(u64::from(req.truncate_prompt_tokens)),
++        side: TruncationSide::Left,
++    });
+ 
+     let prompt = match req.prompt {
+         Some(pb::generate_request::Prompt::Text(text)) => Prompt::Text(text),
+@@ -173,6 +174,7 @@ pub fn to_text_request(
+         sampling_params,
+         decode_options,
+         intermediate: stream,
++        prompt_truncation,
+         priority: req.priority,
+         cache_salt: kv.map(|k| &k.cache_salt).filter(|s| !s.is_empty()).cloned(),
+         add_special_tokens: true,
+diff --git a/rust/src/server/src/routes/inference/generate/convert.rs b/rust/src/server/src/routes/inference/generate/convert.rs
+index 09c735238..cb06cfe33 100644
+--- a/rust/src/server/src/routes/inference/generate/convert.rs
++++ b/rust/src/server/src/routes/inference/generate/convert.rs
+@@ -73,6 +73,7 @@ pub(super) fn prepare_generate_request(
+         sampling_params,
+         decode_options: TextDecodeOptions::default(),
+         intermediate: false,
++        prompt_truncation: None,
+         priority: request.priority,
+         cache_salt: request.cache_salt,
+         add_special_tokens: false,
+diff --git a/rust/src/server/src/routes/openai/chat_completions/convert.rs b/rust/src/server/src/routes/openai/chat_completions/convert.rs
+index 233d88144..3aaba8df2 100644
+--- a/rust/src/server/src/routes/openai/chat_completions/convert.rs
++++ b/rust/src/server/src/routes/openai/chat_completions/convert.rs
+@@ -10,8 +10,9 @@ use vllm_chat::{
+ 
+ use super::types::ChatCompletionRequest;
+ use super::validate;
+-use crate::error::{ApiError, bail_invalid_request, chat_submit_error};
++use crate::error::{ApiError, bail_invalid_request, chat_submit_error, text_submit_error};
+ use crate::lora::LoraModelResolution;
++use crate::routes::openai::utils::resolve_generation_prompt_truncation;
+ use crate::routes::openai::utils::structured_outputs::convert_from_response_format;
+ use crate::routes::openai::utils::types::{
+     ChatMessage, ContentPart, MessageContent, Tool, ToolChoice, ToolChoiceValue, ToolReference,
+@@ -71,6 +72,12 @@ pub(super) fn prepare_chat_request(
+ ) -> Result<PreparedRequest, ApiError> {
+     validate::validate_request_compat(&request, &lora_resolution.model_names)?;
+ 
++    let prompt_truncation = resolve_generation_prompt_truncation(
++        request.truncate_prompt_tokens,
++        request.truncation_side,
++    )
++    .map_err(|error| text_submit_error("invalid prompt truncation", error))?;
++
+     let request_id = format!("chatcmpl-{}", ctx.request_id);
+     let response_model = lora_resolution
+         .lora_request
+@@ -184,6 +191,7 @@ pub(super) fn prepare_chat_request(
+             min_tokens: request.min_tokens.unwrap_or(0),
+         },
+         intermediate: request.stream,
++        prompt_truncation,
+         priority: ctx.priority.or(request.priority).unwrap_or(0),
+         documents: request.documents,
+         cache_salt: request.cache_salt,
+@@ -439,7 +447,9 @@ mod tests {
+         ChatRenderer, ChatTool as VllmChatTool, ChatToolChoice, GenerationPromptMode,
+         KimiK3ChatRenderer, SamplingParams as VllmSamplingParams,
+     };
+-    use vllm_text::{Prompt, output::TextDecodeOptions};
++    use vllm_text::{
++        Prompt, PromptTruncation, PromptTruncationLimit, TruncationSide, output::TextDecodeOptions,
++    };
+     use vllm_tokenizer::{Tokenizer, test_utils::TestTokenizer};
+ 
+     use super::prepare_chat_request;
+@@ -530,6 +540,27 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn prepare_chat_request_preserves_explicit_truncation_side() {
++        let mut request = base_request();
++        request.truncate_prompt_tokens = Some(2);
++        request.truncation_side = Some(TruncationSide::Right);
++        let prepared = prepare_chat_request(
++            request,
++            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
++            ResolvedRequestContext::default(),
++        )
++        .expect("prepare truncation");
++
++        assert_eq!(
++            prepared.chat_request.prompt_truncation,
++            Some(PromptTruncation {
++                limit: PromptTruncationLimit::Fixed(2),
++                side: TruncationSide::Right,
++            })
++        );
++    }
++
+     #[test]
+     fn prepare_chat_request_accepts_zero_min_tokens() {
+         let request: ChatCompletionRequest = serde_json::from_value(json!({
+diff --git a/rust/src/server/src/routes/openai/chat_completions/types.rs b/rust/src/server/src/routes/openai/chat_completions/types.rs
+index fc3c15021..e4da86c22 100644
+--- a/rust/src/server/src/routes/openai/chat_completions/types.rs
++++ b/rust/src/server/src/routes/openai/chat_completions/types.rs
+@@ -11,6 +11,7 @@ use serde_with::SerializeDisplay;
+ use validator::Validate;
+ use vllm_chat::ReasoningEffort;
+ use vllm_engine_core_client::protocol::sampling::RepetitionDetectionParams;
++use vllm_text::TruncationSide;
+ 
+ use crate::routes::openai::utils::structured_outputs::ResponseFormat;
+ use crate::routes::openai::utils::types::{
+@@ -159,6 +160,9 @@ pub struct ChatCompletionRequest {
+     /// Truncate prompt tokens to this length
+     pub truncate_prompt_tokens: Option<i64>,
+ 
++    /// Which side to truncate from when truncate_prompt_tokens is active
++    pub truncation_side: Option<TruncationSide>,
++
+     /// Number of prompt logprobs to return
+     pub prompt_logprobs: Option<i32>,
+ 
+@@ -290,6 +294,7 @@ impl Default for ChatCompletionRequest {
+             skip_special_tokens: true,
+             spaces_between_special_tokens: true,
+             truncate_prompt_tokens: None,
++            truncation_side: None,
+             prompt_logprobs: None,
+             allowed_token_ids: None,
+             bad_words: None,
+diff --git a/rust/src/server/src/routes/openai/chat_completions/validate.rs b/rust/src/server/src/routes/openai/chat_completions/validate.rs
+index b78ca46ee..726015579 100644
+--- a/rust/src/server/src/routes/openai/chat_completions/validate.rs
++++ b/rust/src/server/src/routes/openai/chat_completions/validate.rs
+@@ -4,6 +4,7 @@
+ use super::types::ChatCompletionRequest;
+ use crate::error::{ApiError, bail_invalid_request};
+ use crate::routes::openai::utils::types::{ChatMessage, Tool};
++use crate::routes::openai::utils::validate_generation_prompt_truncation;
+ 
+ /// Enforce the minimal compatibility contract for the Rust OpenAI server.
+ pub(super) fn validate_request_compat(
+@@ -84,11 +85,7 @@ pub(super) fn validate_request_compat(
+             "spaces_between_special_tokens is not supported."
+         );
+     }
+-    reject_non_default(
+-        request.truncate_prompt_tokens.as_ref(),
+-        "truncate_prompt_tokens",
+-        "truncate_prompt_tokens is not supported.",
+-    )?;
++    validate_generation_prompt_truncation(request.truncate_prompt_tokens, request.echo)?;
+     reject_non_default(
+         request.media_io_kwargs.as_ref(),
+         "media_io_kwargs",
+diff --git a/rust/src/server/src/routes/openai/completions/convert.rs b/rust/src/server/src/routes/openai/completions/convert.rs
+index 813e5c21b..d944dca65 100644
+--- a/rust/src/server/src/routes/openai/completions/convert.rs
++++ b/rust/src/server/src/routes/openai/completions/convert.rs
+@@ -6,9 +6,10 @@ use vllm_text::tokenizer::Tokenizer;
+ use vllm_text::{Prompt, SamplingParams, TextDecodeOptions, TextRequest};
+ 
+ use super::types::CompletionRequest;
+-use crate::error::ApiError;
++use crate::error::{ApiError, text_submit_error};
+ use crate::lora::LoraModelResolution;
+ use crate::routes::openai::completions::validate;
++use crate::routes::openai::utils::resolve_generation_prompt_truncation;
+ use crate::routes::openai::utils::structured_outputs::convert_from_response_format_value;
+ use crate::utils::{
+     ResolvedRequestContext, convert_logit_bias, merge_ec_transfer_params, merge_kv_transfer_params,
+@@ -62,6 +63,12 @@ pub(super) fn prepare_completion_request(
+ ) -> Result<PreparedRequest, ApiError> {
+     validate::validate_request_compat(&request, &lora_resolution.model_names)?;
+ 
++    let prompt_truncation = resolve_generation_prompt_truncation(
++        request.truncate_prompt_tokens,
++        request.truncation_side,
++    )
++    .map_err(|error| text_submit_error("invalid prompt truncation", error))?;
++
+     let request_id = format!("cmpl-{}", ctx.request_id);
+     let response_model = lora_resolution
+         .lora_request
+@@ -141,6 +148,7 @@ pub(super) fn prepare_completion_request(
+             min_tokens: request.min_tokens.unwrap_or(0),
+         },
+         intermediate: request.stream,
++        prompt_truncation,
+         priority: ctx.priority.or(request.priority).unwrap_or(0),
+         cache_salt: request.cache_salt,
+         add_special_tokens: request.add_special_tokens,
+@@ -200,7 +208,7 @@ mod tests {
+     use axum::http::HeaderMap;
+     use serde_json::json;
+     use validator::Validate;
+-    use vllm_text::Prompt;
++    use vllm_text::{Prompt, PromptTruncation, PromptTruncationLimit, TruncationSide};
+     use vllm_tokenizer::test_utils::TestTokenizer;
+ 
+     use super::prepare_completion_request;
+@@ -323,6 +331,31 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn prepare_completion_request_uses_left_when_side_is_omitted() {
++        let mut value = base_request_json();
++        value
++            .as_object_mut()
++            .expect("request object")
++            .insert("truncate_prompt_tokens".to_string(), json!(-1));
++        let request = serde_json::from_value(value).expect("parse truncation");
++        let prepared = prepare_completion_request(
++            request,
++            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
++            ResolvedRequestContext::default(),
++            &test_tokenizer(),
++        )
++        .expect("prepare truncation");
++
++        assert_eq!(
++            prepared.text_request.prompt_truncation,
++            Some(PromptTruncation {
++                limit: PromptTruncationLimit::InputBudget,
++                side: TruncationSide::Left,
++            })
++        );
++    }
++
+     #[test]
+     fn normalize_coerces_null_max_tokens_to_default() {
+         // An absent `max_tokens` already gets the serde default.
+diff --git a/rust/src/server/src/routes/openai/completions/types.rs b/rust/src/server/src/routes/openai/completions/types.rs
+index 92e6119be..8d93a89ed 100644
+--- a/rust/src/server/src/routes/openai/completions/types.rs
++++ b/rust/src/server/src/routes/openai/completions/types.rs
+@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
+ use serde_json::{Map, Value};
+ use validator::Validate;
+ use vllm_engine_core_client::protocol::sampling::RepetitionDetectionParams;
+-use vllm_text::Prompt;
++use vllm_text::{Prompt, TruncationSide};
+ 
+ use crate::routes::openai::utils::types::{
+     LogProbs, Normalizable, PromptLogprobs, StreamOptions, StreamResponseEnvelope, StringOrArray,
+@@ -138,6 +138,9 @@ pub struct CompletionRequest {
+     /// Truncate prompt tokens to this length
+     pub truncate_prompt_tokens: Option<i64>,
+ 
++    /// Which side to truncate from when truncate_prompt_tokens is active
++    pub truncation_side: Option<TruncationSide>,
++
+     /// Restrict output to these token IDs only
+     pub allowed_token_ids: Option<Vec<u32>>,
+ 
+diff --git a/rust/src/server/src/routes/openai/completions/validate.rs b/rust/src/server/src/routes/openai/completions/validate.rs
+index 76fe6a8ea..e41ad7a85 100644
+--- a/rust/src/server/src/routes/openai/completions/validate.rs
++++ b/rust/src/server/src/routes/openai/completions/validate.rs
+@@ -3,6 +3,7 @@
+ 
+ use super::types::CompletionRequest;
+ use crate::error::{ApiError, bail_invalid_request};
++use crate::routes::openai::utils::validate_generation_prompt_truncation;
+ 
+ /// Enforce the minimal compatibility contract for the Rust OpenAI server.
+ pub(super) fn validate_request_compat(
+@@ -85,12 +86,7 @@ pub(super) fn validate_request_compat(
+             "spaces_between_special_tokens is not supported."
+         );
+     }
+-    if request.truncate_prompt_tokens.is_some() {
+-        bail_invalid_request!(
+-            param = "truncate_prompt_tokens",
+-            "truncate_prompt_tokens is not supported."
+-        );
+-    }
++    validate_generation_prompt_truncation(request.truncate_prompt_tokens, request.echo)?;
+ 
+     Ok(())
+ }
+diff --git a/rust/src/server/src/routes/openai/utils/mod.rs b/rust/src/server/src/routes/openai/utils/mod.rs
+index fba435c6d..4bbea924a 100644
+--- a/rust/src/server/src/routes/openai/utils/mod.rs
++++ b/rust/src/server/src/routes/openai/utils/mod.rs
+@@ -6,3 +6,37 @@ pub mod structured_outputs;
+ pub mod types;
+ pub mod usage;
+ pub mod validated_json;
++
++use vllm_text::{PromptTruncation, TruncationSide};
++
++use crate::error::{ApiError, bail_invalid_request};
++
++pub(crate) fn validate_generation_prompt_truncation(
++    limit: Option<i64>,
++    echo: bool,
++) -> Result<(), ApiError> {
++    if let Some(limit) = limit
++        && limit < -1
++    {
++        bail_invalid_request!(
++            param = "truncate_prompt_tokens",
++            "truncate_prompt_tokens must be >= -1."
++        );
++    }
++    if echo && limit.is_some() {
++        bail_invalid_request!(
++            param = "echo",
++            "`echo=true` is not supported with `truncate_prompt_tokens`."
++        );
++    }
++    Ok(())
++}
++
++pub(crate) fn resolve_generation_prompt_truncation(
++    limit: Option<i64>,
++    side: Option<TruncationSide>,
++) -> vllm_text::Result<Option<PromptTruncation>> {
++    limit
++        .map(|limit| PromptTruncation::from_wire(limit, side.unwrap_or(TruncationSide::Left)))
++        .transpose()
++}
+diff --git a/rust/src/server/src/routes/tokenize/types.rs b/rust/src/server/src/routes/tokenize/types.rs
+index 5a2d49b09..35a027c1c 100644
+--- a/rust/src/server/src/routes/tokenize/types.rs
++++ b/rust/src/server/src/routes/tokenize/types.rs
+@@ -50,6 +50,7 @@ impl TokenizeCompletionRequest {
+             intermediate: false,
+             priority: 0,
+             cache_salt: None,
++            prompt_truncation: None,
+             add_special_tokens: self.add_special_tokens,
+             data_parallel_rank: None,
+             session_id: None,
+@@ -116,6 +117,7 @@ impl TokenizeChatRequest {
+             tool_context,
+             decode_options: TextDecodeOptions::default(),
+             intermediate: false,
++            prompt_truncation: None,
+             priority: 0,
+             documents: None,
+             cache_salt: None,
+diff --git a/rust/src/text/src/error.rs b/rust/src/text/src/error.rs
+index 58ed85242..b917fe57c 100644
+--- a/rust/src/text/src/error.rs
++++ b/rust/src/text/src/error.rs
+@@ -35,6 +35,15 @@ pub enum Error {
+     MinTokensExceedsMaxTokens { min_tokens: u32, max_tokens: u32 },
+     #[error("`thinking_token_budget` must be a non-negative integer or -1 for unlimited.")]
+     InvalidThinkingTokenBudget,
++    #[error(
++        "truncate_prompt_tokens={value} cannot be greater than max_model_len - \
++         max_tokens = {budget}. Please request a smaller truncation size."
++    )]
++    TruncatePromptTokensExceedsBudget { value: u64, budget: u32 },
++    #[error("invalid truncate_prompt_tokens={value}; must be >= -1")]
++    InvalidTruncatePromptTokens { value: i64 },
++    #[error("truncate_prompt_tokens is not supported for multimodal requests")]
++    TruncateUnsupportedWithMultimodal,
+     #[error("invalid repetition detection params: {message}")]
+     InvalidRepetitionDetection { message: String },
+     #[error("text request stream `{request_id}` closed before terminal output")]
+@@ -59,6 +68,9 @@ impl Error {
+             | Self::SamplingParams(_)
+             | Self::MinTokensExceedsMaxTokens { .. }
+             | Self::InvalidThinkingTokenBudget
++            | Self::TruncatePromptTokensExceedsBudget { .. }
++            | Self::InvalidTruncatePromptTokens { .. }
++            | Self::TruncateUnsupportedWithMultimodal
+             | Self::InvalidRepetitionDetection { .. }
+             // An empty tokenized prompt detected later, at request prepare
+             // time, surfaces through the transparent Llm wrapper.
+diff --git a/rust/src/text/src/lib.rs b/rust/src/text/src/lib.rs
+index f33700973..8357346b6 100644
+--- a/rust/src/text/src/lib.rs
++++ b/rust/src/text/src/lib.rs
+@@ -33,6 +33,8 @@ mod error;
+ mod lower;
+ pub mod output;
+ mod request;
++mod truncation;
++pub use truncation::{PromptTruncation, PromptTruncationLimit, TruncationSide};
+ pub use vllm_tokenizer as tokenizer;
+ 
+ trait_set! {
+@@ -80,26 +82,35 @@ impl TextRequestProcessor {
+         self.max_model_len
+     }
+ 
+-    fn tokenize_prompt(
+-        tokenizer: &DynTokenizer,
++    fn prepare_prompt_tokens(
++        &self,
+         prompt: Prompt,
+         add_special_tokens: bool,
++        prompt_truncation: Option<PromptTruncation>,
++        max_output_tokens: Option<u32>,
+     ) -> Result<Vec<u32>> {
+-        match prompt {
+-            Prompt::Text(text) => tokenizer.encode(&text, add_special_tokens).map_err(Into::into),
++        let tokenizer = self.backend.tokenizer();
++        let mut prompt_token_ids = match prompt {
++            Prompt::Text(text) => tokenizer.encode(&text, add_special_tokens)?,
+             // Pre-tokenized prompts are the main completions-side escape hatch that lets benchmark
+             // and infra workloads bypass chat rendering and tokenizer overhead entirely.
+-            Prompt::TokenIds(token_ids) => Ok(token_ids),
++            Prompt::TokenIds(token_ids) => token_ids,
++        };
++        if let Some(prompt_truncation) = prompt_truncation {
++            let input_budget = self.max_model_len.saturating_sub(max_output_tokens.unwrap_or(0));
++            prompt_truncation.apply(&mut prompt_token_ids, input_budget)?;
+         }
++        Ok(prompt_token_ids)
+     }
+ 
+-    /// Tokenize one request without generation-specific lowering.
++    /// Prepare one request's prompt tokens without generation-specific lowering.
+     pub fn tokenize(&self, request: TextRequest) -> Result<Vec<u32>> {
+         request.validate()?;
+-        Self::tokenize_prompt(
+-            &self.backend.tokenizer(),
++        self.prepare_prompt_tokens(
+             request.prompt,
+             request.add_special_tokens,
++            request.prompt_truncation,
++            request.sampling_params.max_tokens,
+         )
+     }
+ 
+@@ -111,12 +122,13 @@ impl TextRequestProcessor {
+             request.arrival_time = Some(vllm_llm::current_unix_timestamp_secs());
+         }
+ 
+-        let tokenizer = self.backend.tokenizer();
+-        let prompt_token_ids = Self::tokenize_prompt(
+-            &tokenizer,
++        let prompt_token_ids = self.prepare_prompt_tokens(
+             take(&mut request.prompt),
+             request.add_special_tokens,
++            request.prompt_truncation,
++            request.sampling_params.max_tokens,
+         )?;
++        let tokenizer = self.backend.tokenizer();
+         let sampling_hints = self.backend.sampling_hints()?;
+         let sampling_limits = SamplingLimits {
+             max_model_len: self.max_model_len,
+@@ -247,3 +259,44 @@ impl TextLlm {
+         Ok(())
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use std::sync::Arc;
++
++    use vllm_tokenizer::test_utils::TestTokenizer;
++
++    use super::*;
++
++    #[derive(Debug)]
++    struct TestTextBackend;
++
++    impl TextBackend for TestTextBackend {
++        fn tokenizer(&self) -> DynTokenizer {
++            Arc::new(TestTokenizer::new())
++        }
++
++        fn model_id(&self) -> &str {
++            "test-model"
++        }
++    }
++
++    #[test]
++    fn tokenize_and_prepare_apply_the_same_prompt_truncation() {
++        let processor = TextRequestProcessor::new(Arc::new(TestTextBackend), 10);
++        let request = TextRequest {
++            prompt: Prompt::TokenIds(vec![1, 2, 3, 4, 5]),
++            prompt_truncation: Some(PromptTruncation {
++                limit: PromptTruncationLimit::Fixed(3),
++                side: TruncationSide::Left,
++            }),
++            ..TextRequest::for_test()
++        };
++
++        assert_eq!(processor.tokenize(request.clone()).unwrap(), vec![3, 4, 5]);
++        assert_eq!(
++            processor.prepare(request).unwrap().generate_request.prompt_token_ids,
++            vec![3, 4, 5]
++        );
++    }
++}
+diff --git a/rust/src/text/src/request.rs b/rust/src/text/src/request.rs
+index 4e429201c..182e20c66 100644
+--- a/rust/src/text/src/request.rs
++++ b/rust/src/text/src/request.rs
+@@ -14,6 +14,7 @@ use vllm_engine_core_client::protocol::structured_outputs::StructuredOutputsPara
+ 
+ use crate::error::{Error, Result};
+ use crate::output::TextDecodeOptions;
++use crate::truncation::PromptTruncation;
+ 
+ /// Normalize vLLM's signed `top_k` domain into [`SamplingParams::top_k`].
+ ///
+@@ -196,6 +197,9 @@ pub struct TextRequest {
+     pub priority: i32,
+     /// Salt for prefix cache isolation in multi-user environments.
+     pub cache_salt: Option<String>,
++    /// Prompt-truncation policy resolved by the caller.
++    #[serde(default)]
++    pub prompt_truncation: Option<PromptTruncation>,
+     /// Whether to add special tokens (e.g. BOS) during prompt tokenization.
+     pub add_special_tokens: bool,
+     /// Override data parallel rank.
+@@ -231,6 +235,7 @@ impl TextRequest {
+             intermediate: true,
+             priority: 0,
+             cache_salt: None,
++            prompt_truncation: None,
+             add_special_tokens: false,
+             data_parallel_rank: None,
+             session_id: None,
+@@ -257,6 +262,9 @@ impl TextRequest {
+                 request_id: self.request_id.clone(),
+             });
+         }
++        if self.mm_features.is_some() && self.prompt_truncation.is_some() {
++            return Err(Error::TruncateUnsupportedWithMultimodal);
++        }
+         Ok(())
+     }
+ }
+diff --git a/rust/src/text/src/truncation.rs b/rust/src/text/src/truncation.rs
+new file mode 100644
+index 000000000..91a40ae22
+--- /dev/null
++++ b/rust/src/text/src/truncation.rs
+@@ -0,0 +1,178 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++use serde::{Deserialize, Serialize};
++
++use crate::error::{Error, Result};
++
++/// Which side of the prompt to discard when truncation is active.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "lowercase")]
++pub enum TruncationSide {
++    /// Keep the last N tokens, discarding the prompt prefix.
++    Left,
++    /// Keep the first N tokens, discarding the prompt suffix.
++    Right,
++}
++
++/// Maximum number of prompt tokens to retain.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++pub enum PromptTruncationLimit {
++    /// Use the input budget remaining after reserving output tokens.
++    InputBudget,
++    /// Retain at most the given number of prompt tokens.
++    Fixed(u64),
++}
++
++/// Typed prompt-truncation policy used inside the text frontend.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++pub struct PromptTruncation {
++    /// Maximum number of prompt tokens to retain.
++    pub limit: PromptTruncationLimit,
++    /// Side from which excess prompt tokens are discarded.
++    pub side: TruncationSide,
++}
++
++impl PromptTruncation {
++    /// Convert the OpenAI-compatible integer representation into a typed policy.
++    pub fn from_wire(limit: i64, side: TruncationSide) -> Result<Self> {
++        let limit = match limit {
++            -1 => PromptTruncationLimit::InputBudget,
++            0.. => PromptTruncationLimit::Fixed(limit as u64),
++            _ => return Err(Error::InvalidTruncatePromptTokens { value: limit }),
++        };
++        Ok(Self { limit, side })
++    }
++
++    pub(crate) fn apply(self, prompt_token_ids: &mut Vec<u32>, input_budget: u32) -> Result<()> {
++        let max_input_tokens = match self.limit {
++            PromptTruncationLimit::InputBudget => input_budget,
++            PromptTruncationLimit::Fixed(limit) => {
++                if limit > u64::from(input_budget) {
++                    return Err(Error::TruncatePromptTokensExceedsBudget {
++                        value: limit,
++                        budget: input_budget,
++                    });
++                }
++                limit as u32
++            }
++        } as usize;
++
++        if prompt_token_ids.len() <= max_input_tokens {
++            return Ok(());
++        }
++
++        match self.side {
++            TruncationSide::Left => {
++                let start = prompt_token_ids.len() - max_input_tokens;
++                prompt_token_ids.drain(0..start);
++            }
++            TruncationSide::Right => prompt_token_ids.truncate(max_input_tokens),
++        }
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn parses_wire_limits() {
++        assert_eq!(
++            PromptTruncation::from_wire(-1, TruncationSide::Left).unwrap(),
++            PromptTruncation {
++                limit: PromptTruncationLimit::InputBudget,
++                side: TruncationSide::Left,
++            }
++        );
++        assert_eq!(
++            PromptTruncation::from_wire(0, TruncationSide::Right).unwrap(),
++            PromptTruncation {
++                limit: PromptTruncationLimit::Fixed(0),
++                side: TruncationSide::Right,
++            }
++        );
++        assert!(matches!(
++            PromptTruncation::from_wire(-2, TruncationSide::Left),
++            Err(Error::InvalidTruncatePromptTokens { value: -2 })
++        ));
++    }
++
++    #[test]
++    fn applies_fixed_limit_from_either_side() {
++        let mut left = vec![1, 2, 3, 4, 5];
++        PromptTruncation {
++            limit: PromptTruncationLimit::Fixed(3),
++            side: TruncationSide::Left,
++        }
++        .apply(&mut left, 90)
++        .unwrap();
++        assert_eq!(left, vec![3, 4, 5]);
++
++        let mut right = vec![1, 2, 3, 4, 5];
++        PromptTruncation {
++            limit: PromptTruncationLimit::Fixed(3),
++            side: TruncationSide::Right,
++        }
++        .apply(&mut right, 90)
++        .unwrap();
++        assert_eq!(right, vec![1, 2, 3]);
++    }
++
++    #[test]
++    fn input_budget_reserves_output_tokens() {
++        let mut prompt = vec![0; 100];
++        PromptTruncation {
++            limit: PromptTruncationLimit::InputBudget,
++            side: TruncationSide::Left,
++        }
++        .apply(&mut prompt, 70)
++        .unwrap();
++        assert_eq!(prompt.len(), 70);
++    }
++
++    #[test]
++    fn fixed_limit_cannot_exceed_input_budget() {
++        let mut prompt = vec![1, 2, 3];
++        let error = PromptTruncation {
++            limit: PromptTruncationLimit::Fixed(80),
++            side: TruncationSide::Left,
++        }
++        .apply(&mut prompt, 70)
++        .unwrap_err();
++        assert!(matches!(
++            error,
++            Error::TruncatePromptTokensExceedsBudget {
++                value: 80,
++                budget: 70
++            }
++        ));
++    }
++
++    #[test]
++    fn zero_limit_clears_prompt() {
++        let mut prompt = vec![1, 2, 3];
++        PromptTruncation {
++            limit: PromptTruncationLimit::Fixed(0),
++            side: TruncationSide::Left,
++        }
++        .apply(&mut prompt, 90)
++        .unwrap();
++        assert!(prompt.is_empty());
++    }
++
++    #[test]
++    fn limit_at_or_above_prompt_length_is_a_noop() {
++        for limit in [3, 10] {
++            let mut prompt = vec![1, 2, 3];
++            PromptTruncation {
++                limit: PromptTruncationLimit::Fixed(limit),
++                side: TruncationSide::Left,
++            }
++            .apply(&mut prompt, 90)
++            .unwrap();
++            assert_eq!(prompt, vec![1, 2, 3]);
++        }
++    }
++}
+-- 
+2.53.0
+

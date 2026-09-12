@@ -1,0 +1,1504 @@
+From 7a5229bd1721e1419e58e02d45d1034c4c103a87 Mon Sep 17 00:00:00 2001
+From: pctablet505 <pctablet505@gmail.com>
+Date: Wed, 9 Sep 2026 23:48:00 +0530
+Subject: [PATCH 1/2] [Qwen4Exp] Warm the Triton specialisations that JIT
+ mid-inference
+
+The JIT monitor reports seven Triton kernels compiling after the server is
+ready, each stalling the request that hits it. Their launchers pick constexprs
+from batch-shape buckets that the scheduler-driven warmup never reaches:
+
+- qsa_sparse_paged_attention buckets (BLOCK_N, num_splits, num_warps) on
+  num_rows * num_kv_heads, but warmup_kernels() prompts each warmup request
+  with decode_query_len + 1 tokens, so its batches top out around 80 rows and
+  the two largest buckets are never compiled. _qsa_merge_splitk_kernel keys on
+  the resulting NUM_SPLITS, so it misses the same buckets.
+- _qsa_mqa_paged_kernel flips TILES_PER_PROG at 32 rows, which a small
+  max_num_seqs never crosses.
+- The sampler warms with SamplingParams.for_sampler_warmup(), which sets
+  top_k/top_p and therefore takes the FlashInfer branch; a default API request
+  sets neither and takes the Triton Gumbel branch instead.
+- Triton additionally specialises every runtime integer into one of three
+  classes (== 1, divisible by 16, otherwise), so hitting a bucket at one
+  divisibility class still leaves a compile for serving.
+
+Factor the launch profiles in ops/qsa.py into pure functions, enumerate the
+reachable specialisation set from the running config, and compile it during
+kernel_warmup(). The driver launches with request ids, page tables and
+selection indices set to -1, which every QSA kernel treats as invisible, so it
+compiles the exact binaries serving uses without reading a KV byte.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../test_qwen4_exp_jit_warmup.py              | 316 ++++++
+ vllm/model_executor/warmup/kernel_warmup.py   |   7 +
+ .../warmup/qwen4_exp_jit_warmup.py            | 990 ++++++++++++++++++
+ vllm/models/qwen4_exp/nvidia/ops/qsa.py       |  86 +-
+ 4 files changed, 1377 insertions(+), 22 deletions(-)
+ create mode 100644 tests/model_executor/test_qwen4_exp_jit_warmup.py
+ create mode 100644 vllm/model_executor/warmup/qwen4_exp_jit_warmup.py
+
+diff --git a/tests/model_executor/test_qwen4_exp_jit_warmup.py b/tests/model_executor/test_qwen4_exp_jit_warmup.py
+new file mode 100644
+index 000000000..5140b1e42
+--- /dev/null
++++ b/tests/model_executor/test_qwen4_exp_jit_warmup.py
+@@ -0,0 +1,316 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The Qwen4Exp JIT warmup plan must cover every specialisation serving reaches.
++
++Every Triton specialisation missing from the plan is a kernel that compiles
++mid-request and stalls it, which is exactly what the JIT monitor reports in
++`serve.log`.  These tests sweep the reachable dispatch space on CPU and assert
++the plan's key set is a superset of what the sweep produces.
++"""
++
++import pytest
++
++from vllm.model_executor.warmup.qwen4_exp_jit_warmup import (
++    GUMBEL_KERNEL,
++    LOCAL_LOGITS_STATS_KERNEL,
++    QSA_MERGE_KERNEL,
++    QSA_MQA_KERNEL,
++    QSA_SPARSE_KERNEL,
++    REJECTION_KERNEL,
++    RESAMPLE_KERNEL,
++    SPEC_DIVISIBLE_BY_16,
++    SPEC_EQUAL_TO_1,
++    SPEC_GENERAL,
++    WARMED_KERNELS,
++    Qwen4ExpWarmupConfig,
++    build_warmup_plan,
++    gumbel_key,
++    qsa_mqa_key,
++    qsa_sparse_keys,
++    rejection_keys,
++    triton_int_spec,
++)
++
++# The live Qwen3.8-Flash-Next deployment (24 q heads / 2 kv heads, head_dim 256,
++# indexer budget 2048 at compress ratio 4, MTP-3, max_num_seqs 16).
++LIVE_CONFIG = Qwen4ExpWarmupConfig(
++    num_query_heads=24,
++    num_kv_heads=2,
++    head_dim=256,
++    kv_page_size=64,
++    kv_page_table_width=4096,
++    num_kv_pages=4546,
++    kv_dtype="bfloat16",
++    index_n_heads=4,
++    index_head_dim=128,
++    compress_ratio=4,
++    token_topk=2048,
++    compressed_page_size=64,
++    compressed_page_table_width=1024,
++    num_compressed_pages=1024,
++    max_num_seqs=16,
++    max_num_batched_tokens=8192,
++    num_speculative_tokens=3,
++    vocab_size=248320,
++    logits_dtype="float32",
++    use_fp64_gumbel=False,
++    has_draft_logits=True,
++    use_block_verification=False,
++    use_synthetic_rates=False,
++)
++
++# The pre-tuning single-sequence deployment that produced serve.log.131k.
++SINGLE_SEQ_CONFIG = Qwen4ExpWarmupConfig(
++    **{
++        **LIVE_CONFIG.__dict__,
++        "max_num_seqs": 1,
++        "compressed_page_table_width": 512,
++        "kv_page_table_width": 2048,
++    }
++)
++
++# A TP-shaped variant: one KV head moves every profile bucket boundary.
++SINGLE_KV_HEAD_CONFIG = Qwen4ExpWarmupConfig(
++    **{**LIVE_CONFIG.__dict__, "num_kv_heads": 1, "num_query_heads": 12}
++)
++
++ALL_CONFIGS = [LIVE_CONFIG, SINGLE_SEQ_CONFIG, SINGLE_KV_HEAD_CONFIG]
++CONFIG_IDS = ["live", "single_seq", "single_kv_head"]
++
++# Rows the scheduler can hand the QSA kernels. Dense through every profile
++# boundary, then sparse out to a full 8192-token chunked prefill.
++SWEEP_ROWS = list(range(1, 620)) + [640, 700, 1024, 2047, 4096, 8191, 8192]
++
++
++def _sweep_req_counts(rows: int, max_num_seqs: int) -> list[int]:
++    ceiling = max(1, min(rows, max_num_seqs))
++    return sorted({1, 2, 3, ceiling - 1, ceiling} & set(range(1, ceiling + 1)))
++
++
++@pytest.mark.parametrize("cfg", ALL_CONFIGS, ids=CONFIG_IDS)
++def test_plan_names_every_kernel_the_jit_monitor_reported(cfg):
++    """Each kernel seen compiling mid-inference must appear in the plan."""
++    plan = build_warmup_plan(cfg)
++    assert plan.kernels() == WARMED_KERNELS
++
++
++@pytest.mark.parametrize("cfg", ALL_CONFIGS, ids=CONFIG_IDS)
++def test_plan_covers_every_reachable_sparse_attention_specialisation(cfg):
++    """No `(profile bucket, integer specialisation)` pair may be missing."""
++    plan = build_warmup_plan(cfg)
++    sparse_keys = plan.keys_for(QSA_SPARSE_KERNEL)
++    merge_keys = plan.keys_for(QSA_MERGE_KERNEL)
++
++    missing_sparse = set()
++    missing_merge = set()
++    for rows in SWEEP_ROWS:
++        if rows > cfg.max_num_batched_tokens:
++            continue
++        for num_reqs in _sweep_req_counts(rows, cfg.max_num_seqs):
++            sparse, merge = qsa_sparse_keys(cfg, rows, num_reqs)
++            if sparse not in sparse_keys:
++                missing_sparse.add((rows, num_reqs, sparse))
++            if merge is not None and merge not in merge_keys:
++                missing_merge.add((rows, num_reqs, merge))
++
++    assert not missing_sparse, f"unwarmed sparse specialisations: {missing_sparse}"
++    assert not missing_merge, f"unwarmed merge specialisations: {missing_merge}"
++
++
++@pytest.mark.parametrize("cfg", ALL_CONFIGS, ids=CONFIG_IDS)
++def test_plan_covers_every_reachable_mqa_specialisation(cfg):
++    """`TILES_PER_PROG` and the row/request integer classes must all be warmed."""
++    plan = build_warmup_plan(cfg)
++    mqa_keys = plan.keys_for(QSA_MQA_KERNEL)
++
++    missing = set()
++    for rows in SWEEP_ROWS:
++        if rows > cfg.mqa_max_rows:
++            continue
++        for num_reqs in _sweep_req_counts(rows, cfg.max_num_seqs):
++            key = qsa_mqa_key(cfg, rows, num_reqs)
++            if key not in mqa_keys:
++                missing.add((rows, num_reqs, key))
++
++    assert not missing, f"unwarmed MQA specialisations: {missing}"
++
++
++def test_sweep_actually_reaches_the_buckets_warmup_missed():
++    """Guard the guard: the sweep must exercise every profile bucket.
++
++    A sweep that only produced one bucket would make the coverage tests above
++    pass vacuously.
++    """
++    cfg = LIVE_CONFIG
++    buckets = {
++        (k.block_n, k.num_splits, k.num_warps)
++        for rows in SWEEP_ROWS
++        if rows <= cfg.max_num_batched_tokens
++        for k in [qsa_sparse_keys(cfg, rows, 1)[0]]
++    }
++    assert len(buckets) == 5, buckets
++
++    tiles = {
++        qsa_mqa_key(cfg, rows, 1).tiles_per_prog
++        for rows in SWEEP_ROWS
++        if rows <= cfg.mqa_max_rows
++    }
++    assert tiles == {1, 8}
++
++    specs = {
++        qsa_sparse_keys(cfg, rows, 1)[0].rows_spec
++        for rows in SWEEP_ROWS
++        if rows <= cfg.max_num_batched_tokens
++    }
++    assert specs == {SPEC_EQUAL_TO_1, SPEC_DIVISIBLE_BY_16, SPEC_GENERAL}
++
++
++@pytest.mark.parametrize("cfg", ALL_CONFIGS, ids=CONFIG_IDS)
++def test_plan_covers_both_gumbel_call_sites(cfg):
++    """Sampler (no logits cache) and draft sampling (cached) are distinct binaries."""
++    plan = build_warmup_plan(cfg)
++    gumbel = plan.keys_for(GUMBEL_KERNEL)
++    sampler_site = gumbel_key(
++        cfg, apply_temperature=False, has_logits_cache=False, per_token_col=False
++    )
++    assert sampler_site in gumbel
++    if cfg.has_draft_logits:
++        draft_site = gumbel_key(
++            cfg, apply_temperature=True, has_logits_cache=True, per_token_col=False
++        )
++        assert draft_site in gumbel
++
++
++@pytest.mark.parametrize("cfg", ALL_CONFIGS, ids=CONFIG_IDS)
++def test_plan_covers_the_speculation_verification_kernels(cfg):
++    plan = build_warmup_plan(cfg)
++    stats, rejection, resample = rejection_keys(cfg)
++    assert stats in plan.keys_for(LOCAL_LOGITS_STATS_KERNEL)
++    assert rejection in plan.keys_for(REJECTION_KERNEL)
++    assert resample in plan.keys_for(RESAMPLE_KERNEL)
++
++
++def test_speculation_kernels_are_dropped_without_a_drafter():
++    cfg = Qwen4ExpWarmupConfig(
++        **{
++            **LIVE_CONFIG.__dict__,
++            "num_speculative_tokens": 0,
++            "has_draft_logits": False,
++        }
++    )
++    plan = build_warmup_plan(cfg)
++    assert LOCAL_LOGITS_STATS_KERNEL not in plan.kernels()
++    assert REJECTION_KERNEL not in plan.kernels()
++    assert RESAMPLE_KERNEL not in plan.kernels()
++    assert QSA_SPARSE_KERNEL in plan.kernels()
++
++
++@pytest.mark.parametrize("cfg", ALL_CONFIGS, ids=CONFIG_IDS)
++def test_plan_stays_small_enough_to_run_at_boot(cfg):
++    """Over-correction guard: covering everything must not mean compiling everything.
++
++    Warmup runs on the boot path, so a plan that simply enumerated the whole
++    row space would trade one problem for another.
++    """
++    plan = build_warmup_plan(cfg)
++    assert len(plan.launches()) <= 64, len(plan.launches())
++    assert len(plan.entries) <= 80, len(plan.entries)
++
++
++def test_triton_int_spec_matches_triton():
++    """Our model of Triton's runtime-integer specialisation must be the real one."""
++    triton_c = pytest.importorskip("triton._C.libtriton")
++    from triton.backends.compiler import BaseBackend
++
++    for value in (0, 1, 2, 5, 15, 16, 17, 31, 32, 64, 248320, 8192, 2051):
++        dtype, attr = triton_c.native_specialize_impl(
++            BaseBackend, value, False, True, True
++        )
++        if dtype == "constexpr":
++            expected = SPEC_EQUAL_TO_1
++        elif attr == "D":
++            expected = SPEC_DIVISIBLE_BY_16
++        else:
++            expected = SPEC_GENERAL
++        assert triton_int_spec(value) == expected, value
++
++
++# ---------------------------------------------------------------------------
++# Driver input contracts
++#
++# The warmup driver hand-builds the tensors it launches with. These assertions
++# mirror the guards at the top of `qsa_mqa_paged` and
++# `qsa_sparse_paged_attention`: if the driver violates one it raises at boot
++# instead of warming anything, and if it gets a dtype wrong it warms a binary
++# serving never uses.
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("rows,num_reqs", [(1, 1), (5, 2), (48, 16), (272, 16)])
++def test_sparse_driver_inputs_satisfy_the_launcher_contract(rows, num_reqs):
++    torch = pytest.importorskip("torch")
++    from vllm.model_executor.warmup.qwen4_exp_jit_warmup import (
++        QsaDispatch,
++        build_qsa_sparse_inputs,
++    )
++
++    cfg = LIVE_CONFIG
++    cache = torch.zeros(
++        (4, cfg.kv_page_size, cfg.num_kv_heads, cfg.head_dim), dtype=torch.bfloat16
++    )
++    args = build_qsa_sparse_inputs(cfg, cache, cache, QsaDispatch(rows, num_reqs))
++
++    q, out = args["q"], args["out"]
++    indices, block_table = args["logical_indices"], args["block_table"]
++    token_to_req = args["token_to_req"]
++
++    assert q.shape == (rows, cfg.num_query_heads, cfg.head_dim)
++    assert q.dtype == cache.dtype == torch.bfloat16
++    assert q.stride(2) == 1
++    assert out.shape == q.shape and out.dtype == q.dtype and out.stride(2) == 1
++    assert indices.shape == (rows, cfg.selection_width)
++    assert indices.dtype == torch.int32 and indices.stride(1) == 1
++    assert block_table.shape == (num_reqs, cfg.kv_page_table_width)
++    assert block_table.dtype == torch.int32 and block_table.stride(1) == 1
++    assert token_to_req.shape == (rows,)
++    assert token_to_req.dtype == torch.int32 and token_to_req.stride(0) == 1
++    assert cfg.num_query_heads % cfg.num_kv_heads == 0
++    assert cfg.head_dim >= 16 and cfg.head_dim & (cfg.head_dim - 1) == 0
++    # Every K/V load must be masked: no valid request and no valid selection.
++    assert bool((token_to_req < 0).all()) and bool((indices < 0).all())
++    assert bool((block_table < 0).all())
++
++
++@pytest.mark.parametrize("rows,num_reqs", [(1, 1), (5, 2), (48, 16)])
++def test_mqa_driver_inputs_satisfy_the_launcher_contract(rows, num_reqs):
++    torch = pytest.importorskip("torch")
++    from vllm.model_executor.warmup.qwen4_exp_jit_warmup import (
++        QsaDispatch,
++        build_qsa_mqa_inputs,
++    )
++
++    cfg = LIVE_CONFIG
++    cache = torch.zeros(
++        (4, cfg.compressed_page_size, 1, cfg.index_head_dim), dtype=torch.bfloat16
++    )
++    args = build_qsa_mqa_inputs(cfg, cache, QsaDispatch(rows, num_reqs))
++
++    q = args["q"]
++    assert q.shape == (rows, cfg.index_n_heads, cfg.index_head_dim)
++    assert q.dtype == cache.dtype
++    assert args["k_cache"].shape[2] == 1
++    assert args["k_cache"].shape[3] == q.shape[2]
++    assert args["page_table"].shape == (num_reqs, cfg.compressed_page_table_width)
++    assert args["page_table"].dtype == torch.int32
++    assert args["token_to_req"].shape == (rows,)
++    assert args["token_to_req"].dtype == torch.int32
++    assert args["query_positions"].shape == (rows,)
++    # QSAMetadataBuilder allocates logical_positions as int64; a narrower dtype
++    # would warm a kernel binary the server never launches.
++    assert args["query_positions"].dtype == torch.int64
++    assert args["sequence_lengths"].shape == (num_reqs,)
++    assert args["sequence_lengths"].dtype == torch.int32
++    assert args["compress_ratio"] == cfg.compress_ratio
++    # sequence_lengths == 0 makes `visible` zero, so the kernel returns before
++    # its first cache load.
++    assert bool((args["sequence_lengths"] == 0).all())
+diff --git a/vllm/model_executor/warmup/kernel_warmup.py b/vllm/model_executor/warmup/kernel_warmup.py
+index cd16c63b5..5669cfa04 100644
+--- a/vllm/model_executor/warmup/kernel_warmup.py
++++ b/vllm/model_executor/warmup/kernel_warmup.py
+@@ -32,6 +32,9 @@ from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
+ from vllm.model_executor.warmup.kimi_k3_triton_warmup import (
+     kimi_k3_triton_warmup,
+ )
++from vllm.model_executor.warmup.qwen4_exp_jit_warmup import (
++    qwen4_exp_jit_warmup,
++)
+ from vllm.model_executor.warmup.qwen_triton_warmup import qwen_triton_warmup
+ from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
+     sparse_mla_triton_warmup,
+@@ -128,6 +131,10 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
+ 
+     # Run next so input-prep kernels JIT against pristine runner state.
+     if worker.vllm_config.kernel_config.enable_jit_warmup:
++        # Qwen4Exp's QSA and speculation kernels specialise on batch-shape
++        # buckets the scheduler-driven warmup never reaches; compile them
++        # explicitly so no request pays the JIT cost.
++        qwen4_exp_jit_warmup(worker)
+         kimi_k3_triton_warmup(worker)
+         fa4_cutedsl_warmup(worker)
+         sparse_mla_triton_warmup(worker)
+diff --git a/vllm/model_executor/warmup/qwen4_exp_jit_warmup.py b/vllm/model_executor/warmup/qwen4_exp_jit_warmup.py
+new file mode 100644
+index 000000000..effcde3e3
+--- /dev/null
++++ b/vllm/model_executor/warmup/qwen4_exp_jit_warmup.py
+@@ -0,0 +1,990 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Enumerate and compile the Qwen4Exp Triton specialisations warmup misses.
++
++The JIT monitor (`vllm.utils.jit_monitor`) reports Triton kernels that compile
++*after* the server reports ready.  Every such compile stalls the request that
++triggered it.  On Qwen4Exp the offenders are:
++
++* ``_qsa_sparse_paged_gqa_splitk_kernel`` / ``_qsa_merge_splitk_kernel`` --
++  `qsa_sparse_paged_attention` picks `(BLOCK_N, num_splits, num_warps)` from a
++  five-way bucket on ``num_rows * num_kv_heads``.  The scheduler-driven warmup
++  in `vllm/v1/worker/gpu/warmup.py` prompts each warmup request with only
++  ``decode_query_len + 1`` tokens, so its batches never exceed a couple of
++  hundred rows and the two *large* buckets are never compiled.  The merge
++  kernel additionally keys on ``NUM_SPLITS``, which follows the same bucket.
++* ``_qsa_mqa_paged_kernel`` -- ``TILES_PER_PROG`` flips at 32 rows.  With a
++  small ``max_num_seqs`` warmup never reaches 33 rows at all.
++* ``_gumbel_sample_kernel`` -- warmup samples with
++  `SamplingParams.for_sampler_warmup()`, which sets ``top_k``/``top_p``, so the
++  sampler takes the FlashInfer branch.  A default API request sets neither and
++  takes the Triton Gumbel branch instead.
++* ``_compute_local_logits_stats_kernel`` / ``_rejection_kernel`` /
++  ``_resample_kernel`` -- speculation-path kernels reached only through
++  `rejection_sample`.
++
++On top of the constexprs, Triton specialises every *runtime* integer argument
++into one of three classes (``== 1``, divisible by 16, otherwise), so a warmup
++that hits a bucket at only one divisibility class still leaves a compile for
++serving.  :func:`build_warmup_plan` enumerates the resulting key set from the
++running config; :func:`qwen4_exp_jit_warmup` compiles it.
++
++The driver deliberately launches with *masked-off* inputs: request ids and
++logical token indices are ``-1``, which every QSA kernel treats as "not
++visible" and skips, and page tables are ``-1`` so no cache load is ever
++unmasked.  Triton compiles on shapes and specialisation classes, not on data,
++so this warms the exact binaries serving will use while touching no KV bytes.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import TYPE_CHECKING, Any
++
++from vllm.logger import init_logger
++
++if TYPE_CHECKING:
++    import torch
++
++    from vllm.v1.worker.gpu_worker import Worker
++
++logger = init_logger(__name__)
++
++# Kernel names exactly as the JIT monitor reports them.
++QSA_MQA_KERNEL = "_qsa_mqa_paged_kernel"
++QSA_SPARSE_KERNEL = "_qsa_sparse_paged_gqa_splitk_kernel"
++QSA_MERGE_KERNEL = "_qsa_merge_splitk_kernel"
++GUMBEL_KERNEL = "_gumbel_sample_kernel"
++LOCAL_LOGITS_STATS_KERNEL = "_compute_local_logits_stats_kernel"
++REJECTION_KERNEL = "_rejection_kernel"
++RESAMPLE_KERNEL = "_resample_kernel"
++
++#: Every kernel this module promises to compile before the server reports ready.
++WARMED_KERNELS = frozenset(
++    {
++        QSA_MQA_KERNEL,
++        QSA_SPARSE_KERNEL,
++        QSA_MERGE_KERNEL,
++        GUMBEL_KERNEL,
++        LOCAL_LOGITS_STATS_KERNEL,
++        REJECTION_KERNEL,
++        RESAMPLE_KERNEL,
++    }
++)
++
++# Triton runtime-integer specialisation classes. Mirrors
++# `triton._C.libtriton.native_specialize_impl`, which returns a `constexpr`
++# binding for 1, the "divisible by 16" attribute for multiples of 16 (0
++# included), and no attribute otherwise.
++SPEC_EQUAL_TO_1 = "eq1"
++SPEC_DIVISIBLE_BY_16 = "div16"
++SPEC_GENERAL = "general"
++
++
++def triton_int_spec(value: int) -> str:
++    """Specialisation class Triton assigns to a runtime integer argument."""
++    if value == 1:
++        return SPEC_EQUAL_TO_1
++    if value % 16 == 0:
++        return SPEC_DIVISIBLE_BY_16
++    return SPEC_GENERAL
++
++
++def _next_power_of_2(value: int) -> int:
++    if value <= 1:
++        return 1
++    return 1 << (value - 1).bit_length()
++
++
++def _cdiv(a: int, b: int) -> int:
++    return -(-a // b)
++
++
++# ---------------------------------------------------------------------------
++# Config
++# ---------------------------------------------------------------------------
++
++
++@dataclass(frozen=True)
++class Qwen4ExpWarmupConfig:
++    """Everything the plan keys on, read off the running engine config."""
++
++    # Main (sparse GQA) attention geometry.
++    num_query_heads: int
++    num_kv_heads: int
++    head_dim: int
++    kv_page_size: int
++    kv_page_table_width: int
++    num_kv_pages: int
++    kv_dtype: str
++
++    # QSA indexer geometry.
++    index_n_heads: int
++    index_head_dim: int
++    compress_ratio: int
++    token_topk: int
++    compressed_page_size: int
++    compressed_page_table_width: int
++    num_compressed_pages: int
++
++    # Scheduler.
++    max_num_seqs: int
++    max_num_batched_tokens: int
++
++    # Sampler / speculation.
++    num_speculative_tokens: int
++    vocab_size: int
++    logits_dtype: str
++    use_fp64_gumbel: bool
++    has_draft_logits: bool
++    use_block_verification: bool
++    use_synthetic_rates: bool
++
++    @property
++    def selection_width(self) -> int:
++        """``TOPK`` seen by the sparse kernel (indexer output width)."""
++        return self.token_topk + self.compress_ratio - 1
++
++    @property
++    def group_size(self) -> int:
++        return self.num_query_heads // self.num_kv_heads
++
++    @property
++    def block_m(self) -> int:
++        return _next_power_of_2(self.group_size)
++
++    @property
++    def mqa_columns(self) -> int:
++        return self.compressed_page_table_width * self.compressed_page_size
++
++    @property
++    def mqa_max_rows(self) -> int:
++        """Largest row count `qsa_select_paged_tokens` ever hands the MQA kernel."""
++        from vllm.models.qwen4_exp.nvidia.ops.qsa import qsa_mqa_rows_per_chunk
++
++        return min(
++            self.max_num_batched_tokens,
++            qsa_mqa_rows_per_chunk(self.mqa_columns),
++        )
++
++
++# ---------------------------------------------------------------------------
++# Compile keys
++# ---------------------------------------------------------------------------
++
++
++@dataclass(frozen=True)
++class QsaMqaKey:
++    page_size: int
++    page_table_width: int
++    num_heads: int
++    head_dim: int
++    block_n: int
++    block_d: int
++    tiles_per_prog: int
++    stages: int
++    max_n: int
++    compress_ratio: int
++    num_warps: int
++    q_dtype: str
++    rows_spec: str
++    columns_spec: str
++    num_pages_spec: str
++    num_requests_spec: str
++
++
++@dataclass(frozen=True)
++class QsaSparseKey:
++    topk: int
++    page_size: int
++    page_table_width: int
++    group_size: int
++    head_dim: int
++    num_query_heads: int
++    num_splits: int
++    num_tiles: int
++    block_m: int
++    block_n: int
++    num_warps: int
++    num_stages: int
++    q_dtype: str
++    rows_spec: str
++    num_cache_blocks_spec: str
++    num_requests_spec: str
++
++
++@dataclass(frozen=True)
++class QsaMergeKey:
++    head_dim: int
++    num_query_heads: int
++    num_splits: int
++    block_splits: int
++    num_warps: int
++    num_stages: int
++    out_dtype: str
++    rows_spec: str
++
++
++@dataclass(frozen=True)
++class GumbelKey:
++    block_size: int
++    apply_temperature: bool
++    use_fp64: bool
++    per_token_col: bool
++    has_logits_cache: bool
++    logits_dtype: str
++    vocab_spec: str
++    logits_stride_spec: str
++    local_argmax_stride_spec: str
++
++
++@dataclass(frozen=True)
++class LocalLogitsStatsKey:
++    block_size: int
++    has_draft_logits: bool
++    logits_dtype: str
++    vocab_spec: str
++    num_spec_steps_spec: str
++
++
++@dataclass(frozen=True)
++class RejectionKey:
++    padded_vocab_num_blocks: int
++    has_draft_logits: bool
++    synthetic_mode: bool
++    use_block_verification: bool
++    num_warps: int
++    logits_dtype: str
++    vocab_num_blocks_spec: str
++    sampled_stride_spec: str
++
++
++@dataclass(frozen=True)
++class ResampleKey:
++    block_size: int
++    has_draft_logits: bool
++    use_fp64: bool
++    use_block_verification: bool
++    logits_dtype: str
++    vocab_spec: str
++
++
++# ---------------------------------------------------------------------------
++# Dispatch: one batch shape -> the compile keys it would produce
++# ---------------------------------------------------------------------------
++
++_VOCAB_BLOCK_SIZE = 8192
++_RESAMPLE_BLOCK_SIZE = 1024
++_GUMBEL_BLOCK_SIZE = 1024
++
++
++def qsa_mqa_key(cfg: Qwen4ExpWarmupConfig, rows: int, num_reqs: int) -> QsaMqaKey:
++    """Key `qsa_mqa_paged` produces for a `rows`-row, `num_reqs`-request chunk."""
++    from vllm.models.qwen4_exp.nvidia.ops.qsa import qsa_mqa_tiles_per_program
++
++    return QsaMqaKey(
++        page_size=cfg.compressed_page_size,
++        page_table_width=cfg.compressed_page_table_width,
++        num_heads=cfg.index_n_heads,
++        head_dim=cfg.index_head_dim,
++        block_n=64,
++        block_d=max(16, _next_power_of_2(cfg.index_head_dim)),
++        tiles_per_prog=qsa_mqa_tiles_per_program(rows),
++        stages=2,
++        max_n=max(16, _next_power_of_2(cfg.index_n_heads)),
++        compress_ratio=cfg.compress_ratio,
++        num_warps=2,
++        q_dtype=cfg.kv_dtype,
++        rows_spec=triton_int_spec(rows),
++        columns_spec=triton_int_spec(cfg.mqa_columns),
++        num_pages_spec=triton_int_spec(cfg.num_compressed_pages),
++        num_requests_spec=triton_int_spec(num_reqs),
++    )
++
++
++def qsa_sparse_keys(
++    cfg: Qwen4ExpWarmupConfig, rows: int, num_reqs: int
++) -> tuple[QsaSparseKey, QsaMergeKey | None]:
++    """Keys `qsa_sparse_paged_attention` produces for one batch shape."""
++    from vllm.models.qwen4_exp.nvidia.ops.qsa import (
++        qsa_sparse_launch_profile,
++        qsa_sparse_split_plan,
++    )
++
++    block_m = cfg.block_m
++    block_n, target_splits, partial_warps = qsa_sparse_launch_profile(
++        rows * cfg.num_kv_heads, block_m
++    )
++    num_tiles, num_splits = qsa_sparse_split_plan(
++        cfg.selection_width, block_n, target_splits
++    )
++    sparse = QsaSparseKey(
++        topk=cfg.selection_width,
++        page_size=cfg.kv_page_size,
++        page_table_width=cfg.kv_page_table_width,
++        group_size=cfg.group_size,
++        head_dim=cfg.head_dim,
++        num_query_heads=cfg.num_query_heads,
++        num_splits=num_splits,
++        num_tiles=num_tiles,
++        block_m=block_m,
++        block_n=block_n,
++        num_warps=partial_warps,
++        num_stages=2,
++        q_dtype=cfg.kv_dtype,
++        rows_spec=triton_int_spec(rows),
++        num_cache_blocks_spec=triton_int_spec(cfg.num_kv_pages),
++        num_requests_spec=triton_int_spec(num_reqs),
++    )
++    if num_splits == 1:
++        # Split=1 writes the output directly; the merge kernel is not launched.
++        return sparse, None
++    merge = QsaMergeKey(
++        head_dim=cfg.head_dim,
++        num_query_heads=cfg.num_query_heads,
++        num_splits=num_splits,
++        block_splits=_next_power_of_2(num_splits),
++        num_warps=2,
++        num_stages=1,
++        out_dtype=cfg.kv_dtype,
++        rows_spec=triton_int_spec(rows),
++    )
++    return sparse, merge
++
++
++def gumbel_key(
++    cfg: Qwen4ExpWarmupConfig,
++    *,
++    apply_temperature: bool,
++    has_logits_cache: bool,
++    per_token_col: bool,
++) -> GumbelKey:
++    num_blocks = _cdiv(cfg.vocab_size, _GUMBEL_BLOCK_SIZE)
++    return GumbelKey(
++        block_size=_GUMBEL_BLOCK_SIZE,
++        apply_temperature=apply_temperature,
++        use_fp64=cfg.use_fp64_gumbel,
++        per_token_col=per_token_col,
++        has_logits_cache=has_logits_cache,
++        logits_dtype=cfg.logits_dtype,
++        vocab_spec=triton_int_spec(cfg.vocab_size),
++        logits_stride_spec=triton_int_spec(cfg.vocab_size),
++        local_argmax_stride_spec=triton_int_spec(num_blocks),
++    )
++
++
++def rejection_keys(
++    cfg: Qwen4ExpWarmupConfig,
++) -> tuple[LocalLogitsStatsKey, RejectionKey, ResampleKey]:
++    vocab_num_blocks = _cdiv(cfg.vocab_size, _VOCAB_BLOCK_SIZE)
++    stats = LocalLogitsStatsKey(
++        block_size=_VOCAB_BLOCK_SIZE,
++        has_draft_logits=cfg.has_draft_logits,
++        logits_dtype=cfg.logits_dtype,
++        vocab_spec=triton_int_spec(cfg.vocab_size),
++        num_spec_steps_spec=triton_int_spec(cfg.num_speculative_tokens),
++    )
++    rejection = RejectionKey(
++        padded_vocab_num_blocks=_next_power_of_2(vocab_num_blocks),
++        has_draft_logits=cfg.has_draft_logits,
++        synthetic_mode=cfg.use_synthetic_rates,
++        use_block_verification=cfg.use_block_verification,
++        num_warps=1,
++        logits_dtype=cfg.logits_dtype,
++        vocab_num_blocks_spec=triton_int_spec(vocab_num_blocks),
++        sampled_stride_spec=triton_int_spec(cfg.num_speculative_tokens + 1),
++    )
++    resample = ResampleKey(
++        block_size=_RESAMPLE_BLOCK_SIZE,
++        has_draft_logits=cfg.has_draft_logits,
++        use_fp64=cfg.use_fp64_gumbel,
++        use_block_verification=cfg.use_block_verification,
++        logits_dtype=cfg.logits_dtype,
++        vocab_spec=triton_int_spec(cfg.vocab_size),
++    )
++    return stats, rejection, resample
++
++
++# ---------------------------------------------------------------------------
++# Plan
++# ---------------------------------------------------------------------------
++
++
++@dataclass(frozen=True)
++class QsaDispatch:
++    """A QSA batch shape the driver has to launch."""
++
++    rows: int
++    num_reqs: int
++
++
++@dataclass(frozen=True)
++class GumbelDispatch:
++    apply_temperature: bool
++    has_logits_cache: bool
++    per_token_col: bool
++
++
++@dataclass(frozen=True)
++class RejectionDispatch:
++    pass
++
++
++@dataclass(frozen=True)
++class WarmupEntry:
++    kernel: str
++    key: Any
++    driver: str
++    dispatch: Any
++
++
++@dataclass(frozen=True)
++class WarmupPlan:
++    config: Qwen4ExpWarmupConfig
++    entries: tuple[WarmupEntry, ...]
++
++    def kernels(self) -> frozenset[str]:
++        return frozenset(entry.kernel for entry in self.entries)
++
++    def keys_for(self, kernel: str) -> frozenset[Any]:
++        return frozenset(e.key for e in self.entries if e.kernel == kernel)
++
++    def launches(self) -> tuple[tuple[str, Any], ...]:
++        """Deduplicated `(driver, dispatch)` pairs, in plan order."""
++        seen: dict[tuple[str, Any], None] = {}
++        for entry in self.entries:
++            seen[(entry.driver, entry.dispatch)] = None
++        return tuple(seen)
++
++
++# Row counts chosen to straddle every profile boundary in `qsa.py` at each of
++# the three Triton integer-specialisation classes. Values above the limits are
++# clamped away in `_row_candidates`.
++_ROW_CANDIDATES = (
++    1, 2, 3, 4, 5, 15, 16, 17, 31, 32, 33, 48, 49, 63, 64, 65,
++    127, 128, 129, 144, 145, 255, 256, 257, 272, 273, 511, 512, 513, 528,
++)  # fmt: skip
++
++# `page_table.shape[0]` is the batch's request count; it is an independent
++# runtime integer, so each of its specialisation classes needs covering too.
++_REQ_CANDIDATES = (1, 2, 16, 17)
++
++
++#: Above this row count no QSA specialisation changes: the largest profile
++#: bucket is already reached and both remaining integer-specialisation classes
++#: are covered, so the plan stops here instead of allocating serving-sized
++#: dummy tensors during warmup.
++_MAX_PLANNED_ROWS = max(_ROW_CANDIDATES)
++#: `_qsa_mqa_paged_kernel` only switches on `TILES_PER_PROG`, which flips at 32.
++_MAX_PLANNED_MQA_ROWS = 65
++
++
++def _row_candidates(limit: int, cap: int = _MAX_PLANNED_ROWS) -> tuple[int, ...]:
++    limit = max(1, min(limit, cap))
++    rows = {r for r in _ROW_CANDIDATES if r <= limit}
++    # Always cover the extremes the scheduler can actually produce.
++    rows.add(1)
++    rows.add(limit)
++    return tuple(sorted(rows))
++
++
++def _req_candidates(rows: int, max_num_seqs: int) -> tuple[int, ...]:
++    ceiling = max(1, min(rows, max_num_seqs))
++    reqs = {r for r in _REQ_CANDIDATES if r <= ceiling}
++    reqs.add(1)
++    reqs.add(ceiling)
++    return tuple(sorted(reqs))
++
++
++def build_warmup_plan(cfg: Qwen4ExpWarmupConfig) -> WarmupPlan:
++    """Enumerate the Triton specialisations Qwen4Exp serving can reach."""
++    entries: list[WarmupEntry] = []
++    seen_keys: set[tuple[str, Any]] = set()
++
++    def add(kernel: str, key: Any, driver: str, dispatch: Any) -> None:
++        if (kernel, key) in seen_keys:
++            return
++        seen_keys.add((kernel, key))
++        entries.append(WarmupEntry(kernel, key, driver, dispatch))
++
++    # --- QSA scoring (indexer) -------------------------------------------
++    for rows in _row_candidates(cfg.mqa_max_rows, _MAX_PLANNED_MQA_ROWS):
++        for num_reqs in _req_candidates(rows, cfg.max_num_seqs):
++            add(
++                QSA_MQA_KERNEL,
++                qsa_mqa_key(cfg, rows, num_reqs),
++                "qsa_mqa",
++                QsaDispatch(rows, num_reqs),
++            )
++
++    # --- QSA sparse attention + split-k merge ----------------------------
++    for rows in _row_candidates(cfg.max_num_batched_tokens):
++        for num_reqs in _req_candidates(rows, cfg.max_num_seqs):
++            sparse, merge = qsa_sparse_keys(cfg, rows, num_reqs)
++            dispatch = QsaDispatch(rows, num_reqs)
++            add(QSA_SPARSE_KERNEL, sparse, "qsa_sparse", dispatch)
++            if merge is not None:
++                add(QSA_MERGE_KERNEL, merge, "qsa_sparse", dispatch)
++
++    # --- Gumbel sampling --------------------------------------------------
++    # Two call sites: `Sampler` (no logits cache, temperature pre-applied) and
++    # `Speculator.sample_draft` (caches pre-temperature logits per draft step).
++    gumbel_points = [GumbelDispatch(False, False, False)]
++    if cfg.has_draft_logits:
++        gumbel_points.append(GumbelDispatch(True, True, False))
++        gumbel_points.append(GumbelDispatch(True, True, True))
++    for point in gumbel_points:
++        add(
++            GUMBEL_KERNEL,
++            gumbel_key(
++                cfg,
++                apply_temperature=point.apply_temperature,
++                has_logits_cache=point.has_logits_cache,
++                per_token_col=point.per_token_col,
++            ),
++            "gumbel",
++            point,
++        )
++
++    # --- Speculation verification ----------------------------------------
++    if cfg.num_speculative_tokens > 0:
++        stats, rejection, resample = rejection_keys(cfg)
++        add(LOCAL_LOGITS_STATS_KERNEL, stats, "rejection", RejectionDispatch())
++        add(REJECTION_KERNEL, rejection, "rejection", RejectionDispatch())
++        add(RESAMPLE_KERNEL, resample, "rejection", RejectionDispatch())
++
++    return WarmupPlan(config=cfg, entries=tuple(entries))
++
++
++# ---------------------------------------------------------------------------
++# Reading the config off a live worker
++# ---------------------------------------------------------------------------
++
++
++def _dtype_name(dtype: "torch.dtype") -> str:
++    return str(dtype).removeprefix("torch.")
++
++
++def _block_table_widths(worker: "Worker") -> dict[str, int]:
++    """Map layer name -> its block table's width (the `PAGE_TABLE_WIDTH` constexpr)."""
++    runner = getattr(worker, "model_runner", None)
++    tables = getattr(runner, "block_tables", None)
++    kv_cache_config = getattr(runner, "kv_cache_config", None)
++    widths: dict[str, int] = {}
++    if tables is None or kv_cache_config is None:
++        return widths
++    group_tables = getattr(tables, "block_tables", None)
++    groups = getattr(kv_cache_config, "kv_cache_groups", None)
++    if group_tables is None or groups is None:
++        return widths
++    for group, table in zip(groups, group_tables):
++        tensor = getattr(table, "gpu", table)
++        shape = getattr(tensor, "shape", None)
++        if shape is None or len(shape) < 2:
++            continue
++        for layer_name in group.layer_names:
++            widths[layer_name] = int(shape[1])
++    return widths
++
++
++def _find_qsa_layers(worker: "Worker") -> list[Any]:
++    compilation_config = worker.vllm_config.compilation_config
++    context = getattr(compilation_config, "static_forward_context", None)
++    if not isinstance(context, dict):
++        return []
++    layers = []
++    for module in context.values():
++        if type(module).__name__ == "Qwen4ExpQSAAttention":
++            layers.append(module)
++    return layers
++
++
++def is_qwen4_exp(worker: "Worker") -> bool:
++    architectures = getattr(worker.vllm_config.model_config, "architectures", []) or []
++    return any(str(arch).startswith("Qwen4Exp") for arch in architectures)
++
++
++def collect_warmup_config(worker: "Worker") -> tuple[Qwen4ExpWarmupConfig, Any] | None:
++    """Read the plan's inputs off the loaded model; ``None`` if unavailable."""
++    import torch
++
++    layers = _find_qsa_layers(worker)
++    if not layers:
++        logger.info("Skipping Qwen4Exp JIT warmup: no QSA attention layer found.")
++        return None
++    layer = layers[0]
++
++    indexer = getattr(layer, "indexer", None) or getattr(layer, "qsa_indexer", None)
++    if indexer is None:
++        for attr in vars(layer).values():
++            if type(attr).__name__ == "QSAIndexer":
++                indexer = attr
++                break
++    if indexer is None:
++        logger.info("Skipping Qwen4Exp JIT warmup: QSA indexer not reachable.")
++        return None
++
++    kv_cache = getattr(layer, "kv_cache", None)
++    if isinstance(kv_cache, (list, tuple)):
++        kv_cache = kv_cache[0] if kv_cache else None
++    if not isinstance(kv_cache, torch.Tensor) or kv_cache.numel() == 0:
++        logger.info("Skipping Qwen4Exp JIT warmup: QSA KV cache is not bound.")
++        return None
++
++    compressed = getattr(indexer, "compressed_key_cache", None)
++    compressed_cache = getattr(compressed, "kv_cache", None)
++    if not isinstance(compressed_cache, torch.Tensor) or compressed_cache.numel() == 0:
++        logger.info("Skipping Qwen4Exp JIT warmup: compressed KV cache is not bound.")
++        return None
++
++    model_config = worker.vllm_config.model_config
++    scheduler_config = worker.vllm_config.scheduler_config
++    cache_config = worker.vllm_config.cache_config
++    spec_config = worker.vllm_config.speculative_config
++
++    block_size = int(cache_config.block_size)
++    max_model_len = int(model_config.max_model_len)
++    compress_ratio = int(indexer.compress_ratio)
++    compressed_page_size = int(compressed_cache.shape[1])
++
++    # PAGE_TABLE_WIDTH is a constexpr, so it must be the width the served
++    # kernels actually see. Read it off the allocated block tables and only
++    # fall back to deriving it if the runner does not expose them.
++    widths = _block_table_widths(worker)
++    kv_page_table_width = widths.get(
++        getattr(layer, "layer_name", None), _cdiv(max_model_len, block_size)
++    )
++    compressed_page_table_width = widths.get(
++        getattr(compressed, "prefix", None),
++        _cdiv(_cdiv(max_model_len, compress_ratio), compressed_page_size),
++    )
++
++    num_speculative_tokens = 0
++    draft_sample_method = None
++    rejection_sample_method = None
++    if spec_config is not None:
++        num_speculative_tokens = int(spec_config.num_speculative_tokens or 0)
++        draft_sample_method = getattr(spec_config, "draft_sample_method", None)
++        rejection_sample_method = getattr(spec_config, "rejection_sample_method", None)
++
++    cfg = Qwen4ExpWarmupConfig(
++        num_query_heads=int(layer.num_heads),
++        num_kv_heads=int(layer.num_kv_heads),
++        head_dim=int(layer.head_dim),
++        kv_page_size=block_size,
++        kv_page_table_width=kv_page_table_width,
++        num_kv_pages=int(kv_cache.shape[0]),
++        kv_dtype=_dtype_name(kv_cache.dtype),
++        index_n_heads=int(indexer.index_n_heads),
++        index_head_dim=int(indexer.index_head_dim),
++        compress_ratio=compress_ratio,
++        token_topk=int(indexer.token_topk),
++        compressed_page_size=compressed_page_size,
++        compressed_page_table_width=compressed_page_table_width,
++        num_compressed_pages=int(compressed_cache.shape[0]),
++        max_num_seqs=int(scheduler_config.max_num_seqs),
++        max_num_batched_tokens=int(scheduler_config.max_num_batched_tokens),
++        num_speculative_tokens=num_speculative_tokens,
++        vocab_size=int(model_config.get_vocab_size()),
++        logits_dtype=_dtype_name(model_config.head_dtype),
++        use_fp64_gumbel=bool(model_config.use_fp64_gumbel),
++        has_draft_logits=draft_sample_method == "probabilistic",
++        use_block_verification=rejection_sample_method == "block",
++        use_synthetic_rates=rejection_sample_method == "synthetic",
++    )
++    return cfg, (layer, indexer, kv_cache, compressed_cache)
++
++
++# ---------------------------------------------------------------------------
++# Driver
++# ---------------------------------------------------------------------------
++
++
++def _split_qsa_kv_cache(layer: Any, kv_cache: "torch.Tensor"):
++    """Reproduce the K/V views `Qwen4ExpQSAFlashAttentionImpl` passes down."""
++    from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
++
++    head_size = int(layer.head_dim)
++    key_cache, value_cache = kv_cache.transpose(1, 2).split(head_size, dim=-1)
++    return (
++        canonicalize_singleton_dim_strides(key_cache),
++        canonicalize_singleton_dim_strides(value_cache),
++    )
++
++
++def build_qsa_mqa_inputs(
++    cfg: Qwen4ExpWarmupConfig,
++    compressed_cache: "torch.Tensor",
++    dispatch: QsaDispatch,
++) -> dict[str, Any]:
++    """Arguments for one `qsa_mqa_paged` warmup launch.
++
++    `token_to_req` is ``-1`` so the kernel resolves ``visible = 0`` and returns
++    before its first cache load; the page table is ``-1`` so no page would be
++    dereferenced even if it did not.
++    """
++    import torch
++
++    device = compressed_cache.device
++    rows, num_reqs = dispatch.rows, dispatch.num_reqs
++    return dict(
++        q=torch.zeros(
++            (rows, cfg.index_n_heads, cfg.index_head_dim),
++            dtype=compressed_cache.dtype,
++            device=device,
++        ),
++        k_cache=compressed_cache,
++        page_table=torch.full(
++            (num_reqs, cfg.compressed_page_table_width),
++            -1,
++            dtype=torch.int32,
++            device=device,
++        ),
++        token_to_req=torch.full((rows,), -1, dtype=torch.int32, device=device),
++        # QSAMetadataBuilder.logical_positions_buffer is int64; a narrower
++        # dtype here would compile a binary serving never uses.
++        query_positions=torch.zeros(rows, dtype=torch.int64, device=device),
++        sequence_lengths=torch.zeros(num_reqs, dtype=torch.int32, device=device),
++        compress_ratio=cfg.compress_ratio,
++    )
++
++
++def build_qsa_sparse_inputs(
++    cfg: Qwen4ExpWarmupConfig,
++    key_cache: "torch.Tensor",
++    value_cache: "torch.Tensor",
++    dispatch: QsaDispatch,
++) -> dict[str, Any]:
++    """Arguments for one `qsa_sparse_paged_attention` warmup launch.
++
++    Both the selected token indices and the request ids are ``-1``, which makes
++    the split-k kernel's `valid` predicate false for every column, so every K/V
++    load is masked off.
++    """
++    import torch
++
++    device = key_cache.device
++    rows, num_reqs = dispatch.rows, dispatch.num_reqs
++    q = torch.zeros(
++        (rows, cfg.num_query_heads, cfg.head_dim),
++        dtype=key_cache.dtype,
++        device=device,
++    )
++    return dict(
++        q=q,
++        k_cache=key_cache,
++        v_cache=value_cache,
++        logical_indices=torch.full(
++            (rows, cfg.selection_width), -1, dtype=torch.int32, device=device
++        ),
++        block_table=torch.full(
++            (num_reqs, cfg.kv_page_table_width), -1, dtype=torch.int32, device=device
++        ),
++        token_to_req=torch.full((rows,), -1, dtype=torch.int32, device=device),
++        out=torch.zeros_like(q),
++    )
++
++
++def _run_qsa_mqa(
++    cfg: Qwen4ExpWarmupConfig,
++    compressed_cache: "torch.Tensor",
++    dispatch: QsaDispatch,
++) -> None:
++    from vllm.models.qwen4_exp.nvidia.ops.qsa import qsa_mqa_paged
++
++    args = build_qsa_mqa_inputs(cfg, compressed_cache, dispatch)
++    qsa_mqa_paged(
++        args["q"],
++        args["k_cache"],
++        args["page_table"],
++        args["token_to_req"],
++        args["query_positions"],
++        args["sequence_lengths"],
++        args["compress_ratio"],
++    )
++
++
++def _run_qsa_sparse(
++    cfg: Qwen4ExpWarmupConfig,
++    layer: Any,
++    kv_cache: "torch.Tensor",
++    dispatch: QsaDispatch,
++) -> None:
++    from vllm.models.qwen4_exp.nvidia.ops.qsa import qsa_sparse_paged_attention
++
++    key_cache, value_cache = _split_qsa_kv_cache(layer, kv_cache)
++    args = build_qsa_sparse_inputs(cfg, key_cache, value_cache, dispatch)
++    qsa_sparse_paged_attention(
++        args["q"],
++        args["k_cache"],
++        args["v_cache"],
++        args["logical_indices"],
++        args["block_table"],
++        args["token_to_req"],
++        args["out"],
++    )
++
++
++def _run_gumbel(
++    cfg: Qwen4ExpWarmupConfig, worker: "Worker", dispatch: GumbelDispatch
++) -> None:
++    import torch
++
++    from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
++
++    device = worker.device
++    logits_dtype = getattr(torch, cfg.logits_dtype)
++    num_tokens = 2
++    logits = torch.zeros(
++        (num_tokens, cfg.vocab_size), dtype=logits_dtype, device=device
++    )
++    idx_mapping = torch.zeros(num_tokens, dtype=torch.int64, device=device)
++    temperature = torch.ones(cfg.max_num_seqs, dtype=torch.float32, device=device)
++    seeds = torch.zeros(cfg.max_num_seqs, dtype=torch.int64, device=device)
++    pos = torch.zeros(num_tokens, dtype=torch.int64, device=device)
++
++    logits_cache = None
++    logits_cache_col = None
++    if dispatch.has_logits_cache:
++        steps = max(1, cfg.num_speculative_tokens)
++        logits_cache = torch.zeros(
++            (cfg.max_num_seqs, steps, cfg.vocab_size),
++            dtype=logits_dtype,
++            device=device,
++        )
++        if dispatch.per_token_col:
++            logits_cache_col = torch.zeros(
++                num_tokens, dtype=torch.int32, device=device
++            )
++        else:
++            logits_cache_col = torch.zeros((), dtype=torch.int32, device=device)
++
++    gumbel_sample(
++        logits,
++        idx_mapping,
++        temperature,
++        seeds,
++        pos,
++        apply_temperature=dispatch.apply_temperature,
++        logits_cache=logits_cache,
++        logits_cache_col=logits_cache_col,
++        use_fp64=cfg.use_fp64_gumbel,
++    )
++
++
++def _run_rejection(cfg: Qwen4ExpWarmupConfig, worker: "Worker") -> None:
++    import torch
++
++    from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
++        rejection_sample,
++    )
++
++    device = worker.device
++    logits_dtype = getattr(torch, cfg.logits_dtype)
++    steps = cfg.num_speculative_tokens
++    num_reqs = 1
++    num_logits = num_reqs * (steps + 1)
++
++    target_logits = torch.zeros(
++        (num_logits, cfg.vocab_size), dtype=logits_dtype, device=device
++    )
++    draft_logits = None
++    if cfg.has_draft_logits:
++        draft_logits = torch.zeros(
++            (cfg.max_num_seqs, steps, cfg.vocab_size),
++            dtype=logits_dtype,
++            device=device,
++        )
++    draft_sampled = torch.zeros(num_logits, dtype=torch.int64, device=device)
++    cu_num_logits = torch.tensor(
++        [0, num_logits], dtype=torch.int32, device=device
++    )
++    pos = torch.zeros(num_logits, dtype=torch.int64, device=device)
++    idx_mapping = torch.zeros(num_reqs, dtype=torch.int64, device=device)
++    expanded_idx_mapping = torch.zeros(num_logits, dtype=torch.int64, device=device)
++    expanded_local_pos = torch.arange(
++        num_logits, dtype=torch.int32, device=device
++    )
++    temperature = torch.ones(cfg.max_num_seqs, dtype=torch.float32, device=device)
++    seeds = torch.zeros(cfg.max_num_seqs, dtype=torch.int64, device=device)
++
++    rejection_sample(
++        target_logits,
++        draft_logits,
++        draft_sampled,
++        cu_num_logits,
++        pos,
++        idx_mapping,
++        expanded_idx_mapping,
++        expanded_local_pos,
++        temperature,
++        seeds,
++        steps,
++        None,
++        use_fp64=cfg.use_fp64_gumbel,
++        use_block_verification=cfg.use_block_verification,
++    )
++
++
++def qwen4_exp_jit_warmup(worker: "Worker") -> WarmupPlan | None:
++    """Compile every Qwen4Exp Triton specialisation serving can reach.
++
++    Returns the executed plan, or ``None`` when the model is not Qwen4Exp or
++    the caches are not bound yet.  Never raises: a failure here degrades to
++    today's behaviour (a JIT stall on the first request that needs the shape),
++    which is strictly better than failing the boot.
++    """
++    import torch
++
++    if not is_qwen4_exp(worker):
++        return None
++
++    try:
++        collected = collect_warmup_config(worker)
++    except Exception:
++        logger.warning(
++            "Skipping Qwen4Exp JIT warmup: config collection failed.",
++            exc_info=True,
++        )
++        return None
++    if collected is None:
++        return None
++    cfg, (layer, _indexer, kv_cache, compressed_cache) = collected
++
++    plan = build_warmup_plan(cfg)
++    launches = plan.launches()
++    logger.info(
++        "Warming %d Qwen4Exp Triton specialisations across %d kernels "
++        "with %d launches.",
++        len(plan.entries),
++        len(plan.kernels()),
++        len(launches),
++    )
++
++    failures: dict[str, str] = {}
++    with torch.inference_mode():
++        for driver, dispatch in launches:
++            try:
++                if driver == "qsa_mqa":
++                    _run_qsa_mqa(cfg, compressed_cache, dispatch)
++                elif driver == "qsa_sparse":
++                    _run_qsa_sparse(cfg, layer, kv_cache, dispatch)
++                elif driver == "gumbel":
++                    _run_gumbel(cfg, worker, dispatch)
++                elif driver == "rejection":
++                    _run_rejection(cfg, worker)
++            except Exception as exc:  # pragma: no cover - GPU-only path
++                failures.setdefault(driver, f"{type(exc).__name__}: {exc}")
++        if kv_cache.is_cuda:
++            torch.accelerator.synchronize(kv_cache.device)
++
++    if failures:
++        logger.warning(
++            "Qwen4Exp JIT warmup could not compile every specialisation; "
++            "affected drivers: %s. The first request needing a missing shape "
++            "will still JIT.",
++            failures,
++        )
++    else:
++        logger.info("Qwen4Exp JIT warmup complete: %s.", sorted(plan.kernels()))
++    return plan
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa.py b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+index d6aa06f3a..6989f46a2 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+@@ -15,6 +15,62 @@ _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
+ _TOPK_WORKSPACE_BYTES = 1024 * 1024
+ 
+ 
++# ---------------------------------------------------------------------------
++# Launch profiles.
++#
++# These are the only inputs that pick a *different* Triton specialisation of
++# the QSA kernels below, so they are factored out as pure functions: the JIT
++# warmup planner (`vllm.model_executor.warmup.qwen4_exp_jit_warmup`) imports
++# them to enumerate the specialisations it must compile before the server
++# reports ready.  Keep them free of tensors and CUDA so the planner and its
++# CPU tests can call them.
++# ---------------------------------------------------------------------------
++
++
++def qsa_mqa_tiles_per_program(rows: int) -> int:
++    """`TILES_PER_PROG` constexpr used by `_qsa_mqa_paged_kernel`."""
++    # Tuned on GB300: larger row batches provide enough parallelism to reuse Q.
++    return 1 if rows <= 32 else 8
++
++
++def qsa_sparse_launch_profile(
++    base_programs: int, block_m: int
++) -> tuple[int, int, int]:
++    """`(BLOCK_N, target_splits, num_warps)` for `_qsa_sparse_paged_gqa_splitk_kernel`.
++
++    `base_programs` is `num_rows * num_kv_heads`; `block_m` is
++    `next_power_of_2(group_size)`.
++    """
++    small_profile_limit = 8 if block_m <= 8 else 4
++
++    # Tuned on GB300 for the Qwen-Air TP1, TP2, and TP4 attention shapes.
++    # Narrow tiles favor decode; wide tiles improve throughput for prefill.
++    if base_programs <= small_profile_limit:
++        return 16, 64, 4
++    if base_programs < 32:
++        return 16, 32, 4
++    if base_programs <= 256:
++        return 64, 8, 2
++    if base_programs <= 512:
++        return 64, 4, 2
++    return 64, 1, 2
++
++
++def qsa_sparse_split_plan(
++    topk: int, block_n: int, target_splits: int
++) -> tuple[int, int]:
++    """`(NUM_TILES, NUM_SPLITS)` constexprs for the split-k QSA kernel."""
++    num_tiles = -(-topk // block_n)
++    # Avoid empty splits when the selection width is smaller than the profile.
++    max_useful_splits = 1 << (num_tiles.bit_length() - 1)
++    return num_tiles, min(max_useful_splits, target_splits)
++
++
++def qsa_mqa_rows_per_chunk(columns: int) -> int:
++    """Row-chunk size `qsa_select_paged_tokens` feeds to `qsa_mqa_paged`."""
++    return max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))
++
++
+ @triton.jit
+ def _qsa_mqa_paged_kernel(
+     q_ptr,
+@@ -640,8 +696,7 @@ def qsa_mqa_paged(
+     BLOCK_N = 64
+     BLOCK_D = max(16, triton.next_power_of_2(q.shape[2]))
+     MAX_N = max(16, triton.next_power_of_2(q.shape[1]))
+-    # Tuned on GB300: larger row batches provide enough parallelism to reuse Q.
+-    tiles_per_program = 1 if q.shape[0] <= 32 else 8
++    tiles_per_program = qsa_mqa_tiles_per_program(q.shape[0])
+     _qsa_mqa_paged_kernel[
+         (q.shape[0], triton.cdiv(columns, BLOCK_N * tiles_per_program))
+     ](
+@@ -764,7 +819,7 @@ def qsa_select_paged_tokens(
+ 
+     columns = page_table.shape[1] * k_cache.shape[1]
+     block_topk = token_topk // compress_ratio
+-    rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))
++    rows_per_chunk = qsa_mqa_rows_per_chunk(columns)
+     chunk_rows = min(rows, rows_per_chunk)
+     blocks_buffer = torch.empty(
+         (chunk_rows, block_topk), dtype=torch.int32, device=q.device
+@@ -857,25 +912,12 @@ def qsa_sparse_paged_attention(
+     group_size = q.shape[1] // k_cache.shape[2]
+     block_m = triton.next_power_of_2(group_size)
+     base_programs = q.shape[0] * k_cache.shape[2]
+-    small_profile_limit = 8 if block_m <= 8 else 4
+-
+-    # Tuned on GB300 for the Qwen-Air TP1, TP2, and TP4 attention shapes.
+-    # Narrow tiles favor decode; wide tiles improve throughput for prefill.
+-    if base_programs <= small_profile_limit:
+-        block_n, target_splits, partial_warps = 16, 64, 4
+-    elif base_programs < 32:
+-        block_n, target_splits, partial_warps = 16, 32, 4
+-    elif base_programs <= 256:
+-        block_n, target_splits, partial_warps = 64, 8, 2
+-    elif base_programs <= 512:
+-        block_n, target_splits, partial_warps = 64, 4, 2
+-    else:
+-        block_n, target_splits, partial_warps = 64, 1, 2
+-
+-    num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
+-    # Avoid empty splits when the selection width is smaller than the profile.
+-    max_useful_splits = 1 << (num_tiles.bit_length() - 1)
+-    num_splits = min(max_useful_splits, target_splits)
++    block_n, target_splits, partial_warps = qsa_sparse_launch_profile(
++        base_programs, block_m
++    )
++    num_tiles, num_splits = qsa_sparse_split_plan(
++        logical_indices.shape[1], block_n, target_splits
++    )
+ 
+     # Split=1 writes output directly and compiles out all workspace accesses.
+     if num_splits == 1:
+-- 
+2.53.0
+

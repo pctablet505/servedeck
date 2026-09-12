@@ -1,0 +1,26 @@
+From fd98d32f732674b63705494ba3965f21aa449aba Mon Sep 17 00:00:00 2001
+From: Charlie Fu <charlifu@amd.com>
+Date: Fri, 28 Aug 2026 17:11:42 -0500
+Subject: [PATCH 22/39] [ROCm][CI] Fix test_ray_v2_executor (#54249)
+
+Signed-off-by: charlifu <charlifu@amd.com>
+---
+ vllm/v1/executor/ray_utils.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/vllm/v1/executor/ray_utils.py b/vllm/v1/executor/ray_utils.py
+index 6cfc0c516..071a8eb88 100644
+--- a/vllm/v1/executor/ray_utils.py
++++ b/vllm/v1/executor/ray_utils.py
+@@ -590,7 +590,7 @@ def initialize_ray_cluster(
+             )
+             ray.init(
+                 address=ray_address,
+-                num_gpus=parallel_config.world_size,
++                num_gpus=current_platform.device_count(),
+                 runtime_env=parallel_config.ray_runtime_env,
+             )
+     else:
+-- 
+2.53.0
+
