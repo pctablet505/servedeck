@@ -1,0 +1,89 @@
+# builds/glm53/MANIFEST.toml — captured 2026-09-12 (servedeck v2 packet P5).
+# Serves [models.glm53] per models.toml [builds].glm53.
+
+[venv]
+path   = "~/Projects/vllm-glm53/.venv-glm53"
+python = "3.13.15"
+vllm   = "0.29.0.dev0+glm53.cu132"
+
+[packages]
+torch              = "2.13.0+cu130"
+transformers       = "5.16.1"
+flashinfer_python  = "0.6.18"
+triton             = "3.7.1"
+numpy              = "2.4.6"
+
+[install]
+kind            = "editable-source"
+# from <venv>/lib/python3.13/site-packages/vllm-0.29.0.dev0+glm53.cu132.dist-info/direct_url.json
+editable_target = "/home/pctablet505/Projects/vllm-glm53/src"
+source = "uv pip install --python \"$VENV/bin/python\" -e . --no-build-isolation --no-deps  (~/Projects/vllm-glm53/build.sh:110, verbatim; the surrounding script pins torch/CUDA env first -- see [cuda] below)"
+
+[tree]
+checkout = "/home/pctablet505/Projects/vllm-glm53/src"
+# "outer" ~/Projects/vllm-glm53 (no /src) is a second, dead vLLM checkout,
+# 20,825 commits behind its own remote, that nothing imports -- see
+# REDESIGN-2026-09-12.md §4 "Forks". Its build.sh/FINDINGS.md are still the
+# right place to read the source-install recipe from (cited above and in
+# build.sh), they just don't live next to a venv that matters.
+remote   = "fork https://github.com/pctablet505/vllm.git  (also configured: origin https://github.com/vllm-project/vllm.git [blob:none partial clone], zjy https://github.com/ZJY0516/vllm.git)"
+branch   = "glm53"
+head     = "878631b6079d2cf9fb80830ef9cb41b43aded098"
+describe = "v0.28.1rc0-56-g878631b60"
+
+[base]
+anchor        = "v0.28.1rc0"
+commits_ahead = 56
+note = """
+PR #53906 on vllm-project/vllm (FINDINGS.md: "vLLM built from PR #53906 \
+(0.29.0.dev0+glm53)"). The local branch 'glm53' has NO configured upstream \
+(`git rev-parse @{u}` fails: "no upstream configured for branch 'glm53'"), so \
+it is not confirmed pushed under that name to any remote. It IS reachable \
+from the fork remote (https://github.com/pctablet505/vllm.git) some other \
+way: `git branch -r --contains 878631b6...` lists fork/glm53-nope-mla-sm12x, \
+i.e. that remote branch's history has this commit as an ancestor. A full \
+(non-shallow) clone of the fork should therefore contain the object even \
+though 'glm53' itself was never pushed -- but the exact pushed ref, if any, \
+is unconfirmed. No fetch was performed to verify this further (read-only \
+constraint); build.sh checks out the SHA directly rather than any branch
+name, so this uncertainty does not block reproducing the commit -- only the
+convenience of a named ref.
+"""
+
+[patches]
+files = [
+    "working-tree-tracked.patch",
+    "working-tree-untracked.patch",
+]
+# Confirmed against this tree's live `git status --porcelain=v1` on 2026-09-12:
+# 10 modified tracked files and 1 new untracked file
+# (vllm/model_executor/offloader/dma_stage.py). The untracked list also shows
+# marlin_moe.py.bak, dma_stage.py.bak2/.bak3/.bak4/.reviewed, uva.py.bak --
+# all *.bak*/*.reviewed scratch files, deliberately excluded from both the
+# patch export and from what check.sh treats as drift.
+excluded_branches = [
+    "branches/main/0001..0039-*.patch (39 commits over c01b50e390e6d3d0019aa53f41ff1198c8105e5a, on a local branch literally named 'main' -- unrelated to the installed 'glm53' branch; NOT part of the running tree)",
+    "glm53-nope-mla-sm12x: skipped at export time entirely -- builds/patches/glm53/MANIFEST.txt: 'skip glm53-nope-mla-sm12x (258 commits, not a topic branch)'. No patch files exist for it under builds/patches/glm53/; it is named here only so its absence is not mistaken for an oversight.",
+]
+note = """
+builds/patches/glm53/GLM53-SM120-2026-08-29.patch is historical, not in \
+`files` above. It touches 9 files: csrc/libtorch_stable/cache_kernels.cu, \
+vllm/model_executor/layers/attention/mla_attention.py, \
+vllm/model_executor/layers/mhc.py, \
+vllm/model_executor/layers/sparse_attn_indexer_kpool.py, \
+vllm/model_executor/offloader/uva.py, vllm/platforms/cuda.py, \
+vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py, \
+vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py, \
+vllm/v1/attention/backends/mla/prefill/flash_attn.py -- every one of which is \
+also in working-tree-tracked.patch's 10-file list (the extra tenth file is \
+marlin_moe.py, added later). Comparing `grep '^diff --git'` output between \
+the two files (2026-09-12) is what established this; superseded, dated \
+2026-08-29, predates the September tuning pass recorded in \
+working-tree-tracked.patch. Kept in builds/patches/glm53/ for history only.
+"""
+
+[cuda]
+driver_header = "NVIDIA-SMI 595.84   Driver Version: 595.84   CUDA Version: 13.2"
+nvcc = "no system CUDA toolkit. build.sh requires its own pip nvidia-cuda-nvcc at exactly the version its CUDA headers agree with (nvcc_ver == hdr_ver check in build.sh, lines ~59-68) -- torch's bundled cudart/nvrtc default to 13.0, which does not compile against this host's glibc 2.43, while the driver caps at 13.2; build.sh fails closed with the exact `uv pip install` line to realign them if they drift."
+flashinfer_sampler = "VLLM_USE_FLASHINFER_SAMPLER=0 (serve-opt.sh:178; also models.toml [defaults.env]) -- no nvcc on the host PATH, so FlashInfer's JIT top-k/top-p sampler cannot compile."
+lib64_shim = "$CUDA_HOME/lib64 -> lib, created by serve-opt.sh:170-175 ('[ -e \"$CUDA_HOME/lib64\" ] || ln -sfn lib \"$CUDA_HOME/lib64\"'). Present today: .venv-glm53/lib/python3.13/site-packages/nvidia/cu13/lib64 -> lib (checked 2026-09-12). Same reason as the qwen38next build: FlashInfer's JIT hardcodes -L$CUDA_HOME/lib64, pip CUDA wheels only ship lib/, and without the symlink the fused-MoE kernel fails to LINK at first forward pass ('ld: cannot find -lcudart/-lnvrtc')."
