@@ -1,0 +1,203 @@
+# servedeck v2 model registry — the single source of truth (REDESIGN-2026-09-12.md §2.1).
+#
+# Every model this box can serve is one [models.<key>] table. Everything a client, a
+# launcher or the gateway needs (public name, aliases, port, context, reasoning/tool
+# parsers, launch flags/env) is derived from here — see servedeck/models.py.
+#
+# `flags` and `env` are transcribed from the LIVE legacy launchers on 2026-09-12
+# (file:line citations below); they do NOT include:
+#   * `--served-model-name`, `--host`, `--max-model-len`, `--gpu-memory-utilization`,
+#     `--port` — servedeck/models.py:render_argv computes these.
+#   * CUDA_HOME / PATH venv wiring, the FlashInfer lib64 symlink shim, the HF_TOKEN
+#     extraction from ~/.bashrc, or the ptrace_scope sudo relax — those are launcher
+#     *mechanics*, not model properties, and are out of scope for this registry (see
+#     the P1 report's "cannot express" list).
+#   * GLM's `--kv-cache-memory-bytes`, which vllm-glm53/serve-opt.sh:315 derives as
+#     `MAX_LEN * 17200` at launch time — a value that depends on the resolved context
+#     length, which this static file cannot compute. Left out; see the P1 report.
+
+[gpu]
+total_mib  = 97887
+margin_mib = 1024          # never handed to any model
+
+# Every launcher exports this because the box has no CUDA toolkit (no nvcc), so
+# FlashInfer's JIT top-k/top-p sampler cannot compile.
+#   ~/Projects/local_llm/bin/qwen-server-run.sh:263
+#   ~/Projects/vllm-qwen38next/serve.sh:73
+#   ~/Projects/vllm-glm53/serve-opt.sh:178
+#   ~/.config/systemd/user/lfm2-350m.service (Environment=)
+[defaults.env]
+VLLM_USE_FLASHINFER_SAMPLER = "0"
+
+[builds]
+stock      = "~/Projects/local_llm/.venv-llm-029"
+qwen38next = "~/Projects/vllm-qwen38next/.venv-next"
+glm53      = "~/Projects/vllm-glm53/.venv-glm53"
+
+# --------------------------------------------------------------------------------
+# Qwen3.8-27B-NVFP4 ("inline") — ~/Projects/local_llm/bin/qwen-server-run.sh
+# --------------------------------------------------------------------------------
+[models.qwen27b]
+id      = "Qwen3.8-27B-NVFP4"
+aliases = ["RadixArk/Qwen3.8-27B-NVFP4", "qwen27b", "inline"]
+repo    = "RadixArk/Qwen3.8-27B-NVFP4"
+slot    = "main"
+port    = 8004
+build   = "stock"
+ctx     = "native"                 # config.json max_position_embeddings = 262144
+vision  = true
+max_output_tokens = 36000
+
+# qwen-server-run.sh:299-307. --max-num-seqs 16 matches the LIVE .config override
+# (default in the script is 128; .config currently sets MAX_NUM_SEQS="16").
+flags = [
+    "--speculative-config", '{"method": "mtp", "num_speculative_tokens": 4}',
+    "--max-num-seqs", "16",
+    "--enable-prefix-caching",
+    "--mamba-cache-mode", "all",
+]
+
+[models.qwen27b.reasoning]
+parser = "qwen3"
+mirror_content = true
+
+[models.qwen27b.tools]
+parser = "qwen3_xml"
+
+# --------------------------------------------------------------------------------
+# Qwen3.8-Flash-Next-Uncensored-NVFP4 — ~/Projects/vllm-qwen38next/serve.sh
+# --------------------------------------------------------------------------------
+[models.flashnext]
+id      = "Qwen3.8-Flash-Next-Uncensored-NVFP4"
+aliases = ["qwen38-flash-next", "flashnext"]
+repo    = "mazinb/Qwen3.8-Flash-Next-Uncensored-NVFP4"
+slot    = "main"
+port    = 8001
+build   = "qwen38next"
+ctx     = "native"                 # config.json max_position_embeddings = 262144
+vision  = true
+max_output_tokens = 32000
+# serve.sh relaxes kernel.yama.ptrace_scope via sudo for the PLE-offload CUDA IPC
+# handoff (serve.sh:106-131). No sudo in servedeck v2 today, so this model needs a
+# human at a TTY until that is replaced (tracked, not solved, by this packet).
+needs_tty = true
+
+# serve.sh:218-236, at the script's own defaults (MAX_SEQS=1, MAX_BATCHED=8192,
+# MM_LIMIT_JSON images-on, KV_DTYPE=auto, SPEC_TOKENS=3).
+flags = [
+    "--tensor-parallel-size", "1",
+    "--distributed-executor-backend", "mp",
+    "--max-num-seqs", "1",
+    "--max-num-batched-tokens", "8192",
+    "--limit-mm-per-prompt", '{"image":2,"video":0}',
+    "--kv-cache-dtype", "auto",
+    "--enable-prefix-caching",
+    "--speculative-config", '{"method":"mtp","num_speculative_tokens":3}',
+]
+
+[models.flashnext.reasoning]
+parser = "qwen3"
+mirror_content = true
+
+[models.flashnext.tools]
+parser = "qwen3_coder"
+
+# serve.sh:76,90-91.
+[models.flashnext.env]
+VLLM_PLE_CPU_OFFLOAD = "1"
+# This checkpoint's PLE n-gram table is the FP8 build (model-plefp8-*.safetensors
+# in the hub cache, confirmed 2026-09-12) — serve.sh:83-89 selects this env var
+# from that same check.
+VLLM_PLE_FP8_CHECKPOINT = "1"
+PYTORCH_ALLOC_CONF = "expandable_segments:True"
+TORCH_CUDA_ARCH_LIST = "12.0f"
+
+# --------------------------------------------------------------------------------
+# GLM-5.3-Flash (ABLITERATED, NVFP4) — ~/Projects/vllm-glm53/serve-opt.sh
+# --------------------------------------------------------------------------------
+[models.glm53]
+id      = "glm53-flash"
+aliases = ["glm53", "GLM-5.3-Flash"]
+repo    = "dealignai/GLM-5.3-Flash-ABLITERATED-NVFP4"
+slot    = "main"
+port    = 8002
+build   = "glm53"
+ctx     = "native"                 # config.json max_position_embeddings = 1048576
+vision  = false
+max_output_tokens = 32768
+# The GLM thinking-budget floor (glm53-effort-proxy today): a small max_tokens
+# truncates mid-<think> and both content and reasoning_content come back empty.
+min_output_tokens = 8192
+
+# serve-opt.sh:324-352, at the script's own defaults (MAX_SEQS=1, MAX_BATCHED=8192,
+# MOE_BACKEND=marlin, LOAD_FORMAT=auto, KV_DTYPE=auto, SPEC=1/SPEC_TOKENS=2, images
+# off, AUTOTUNE=1 i.e. no flag, ENFORCE_EAGER=0 i.e. no flag, BLOCK_SIZE unset i.e.
+# no flag, ATTN_BACKEND unset i.e. no flag).
+# NOT included: --kv-cache-memory-bytes (serve-opt.sh:315-316) — see the file header.
+flags = [
+    "--tensor-parallel-size", "1",
+    "--distributed-executor-backend", "mp",
+    "--offload-backend", "uva",
+    "--cpu-offload-gb", "125",
+    "--cpu-offload-params", "experts",
+    "--max-num-seqs", "1",
+    "--max-num-batched-tokens", "8192",
+    "--limit-mm-per-prompt", '{"image":0,"video":0}',
+    "--kernel-config", '{"moe_backend":"marlin"}',
+    "--load-format", "auto",
+    "--kv-cache-dtype", "auto",
+    "--enable-prefix-caching",
+    "--speculative-config", '{"method":"mtp","num_speculative_tokens":2}',
+]
+
+[models.glm53.reasoning]
+parser = "glm47"
+mirror_content = true
+
+[models.glm53.tools]
+parser = "glm47"
+
+[models.glm53.presets]
+glm53-flash-low  = { reasoning_effort = "low" }
+glm53-flash-high = { reasoning_effort = "high" }
+glm53-flash-max  = {}
+
+# serve-opt.sh:78-202, "the measured-best configuration".
+[models.glm53.env]
+CPU_OFFLOAD_GB = "125"
+VLLM_MOE_HOT_SLOTS = "54"
+VLLM_USE_BREAKABLE_CUDAGRAPH = "0"
+VLLM_MOE_PREFILL_GROUPS = "1"
+VLLM_MOE_HOT_PROFILE = "/home/pctablet505/Projects/vllm-glm53/hot-profile-125.json"
+VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY = "1"
+VLLM_USE_DEEP_GEMM = "0"
+PYTORCH_ALLOC_CONF = "expandable_segments:True,pinned_use_cuda_host_register:True,pinned_num_register_threads:8"
+TORCH_CUDA_ARCH_LIST = "12.0f"
+
+# --------------------------------------------------------------------------------
+# LFM2.5-350M (always-on resident) — ~/.config/systemd/user/lfm2-350m.service
+# --------------------------------------------------------------------------------
+[models.lfm2]
+id       = "LFM2.5-350M"
+repo     = "LiquidAI/LFM2.5-350M"
+slot     = "resident"
+vram_mib = 3300
+port     = 8007
+build    = "stock"
+ctx      = 32768
+vision   = false
+max_output_tokens = 4096
+# No reasoning: LFM2.5 has no thinking mode, so there is no `reasoning` field to
+# mirror into `reasoning_content` (lfm2-350m.service header comment).
+
+# lfm2-350m.service ExecStart. NOTE: the live unit actually runs from
+# vllm-qwen38next/.venv-next's python -m vllm.entrypoints.openai.api_server, not
+# `<build>/bin/vllm serve` — build="stock" here is this packet's consolidation
+# decision, not a transcription of the live unit. See the P1 report.
+flags = [
+    "--max-num-seqs", "64",
+    "--dtype", "bfloat16",
+]
+
+[models.lfm2.tools]
+parser = "lfm2"
