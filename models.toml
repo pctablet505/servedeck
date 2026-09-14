@@ -144,6 +144,40 @@ max_output_tokens = 32768
 # truncates mid-<think> and both content and reasoning_content come back empty.
 min_output_tokens = 8192
 
+# --- GLM-5.3 client-compatibility switches (P9, servedeck/glm_policies.py) ---
+# ON. GLM's streaming tool-call parser can miss a closing tag that straddles a
+# token boundary and the tag then leaks into the parsed argument. Captured from
+# a real VS Code Copilot turn:
+#     list_dir({"path</arg_key>": "/Users/user/Desktop/project"})
+# The client rejects the call ("must have required property 'path'"), the agent
+# loses its step and starts inventing paths. Stripping markup that is never
+# valid argument text is a repair, not a guess, so it is on by default -- and
+# it is also what switches on the answerless-turn COUNT for this route.
+sanitize_tool_tags = true
+
+# OFF, and it must stay off until somebody turns it on with evidence.
+# What it does: Copilot echoes tool_call ids back verbatim but drops the
+# reasoning, so GLM's template renders the in-flight assistant turn as an empty
+# <think></think> and the model reads the thread as fresh. Restoring the
+# reasoning by tool_call id fixes that, and the gateway's output-side mirror
+# cannot -- the mirror makes the thinking available to a client, it cannot make
+# a client send it back.
+# Why off: glm53-effort-proxy/proxy.py's own comment on the switch reads
+# "three Xid 31 GPU faults followed within 40 minutes of it first firing,
+# after 14 hours clean". That is correlation, not proof; but this box has an
+# active and unrelated GPU-fault problem (Xid 79/154 on 2026-09-12), so nothing
+# that plausibly perturbs the GPU gets to default to on. Turn it on for one
+# session, watch state/telemetry, and decide.
+restore_reasoning = false
+
+# OFF. Consent only: with SERVEDECK_GLM_CAPTURE=1 in the environment as well,
+# the gateway keeps the last 6 turns of this route's request/response bodies
+# under state/captures/<model>/ (mode 0700, credential headers redacted) for
+# debugging a live failure. Bodies contain everything the user typed, which is
+# why one flag lives here and the other cannot: the predecessor defaulted this
+# to ON, writing full bodies to /tmp/glm-capture with no retention policy.
+capture = false
+
 # serve-opt.sh:324-352, at the script's own defaults (MAX_SEQS=1, MAX_BATCHED=8192,
 # MOE_BACKEND=marlin, LOAD_FORMAT=auto, KV_DTYPE=auto, SPEC=1/SPEC_TOKENS=2, images
 # off, AUTOTUNE=1 i.e. no flag, ENFORCE_EAGER=0 i.e. no flag, BLOCK_SIZE unset i.e.
