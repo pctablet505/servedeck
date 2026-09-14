@@ -114,6 +114,30 @@ class Model:
     max_output_tokens: int | None = None
     vision: bool = False
     needs_tty: bool = False
+    #: P9 — the GLM-5.3 client-compatibility switches (servedeck/glm_policies.py).
+    #: They live on the MODEL, not in an env var, so they travel with the model
+    #: through `servedeck wire`, `doctor` and a machine move; the gateway reads
+    #: them straight onto `gateway.RoutePolicies`.
+    #:
+    #: `sanitize_tool_tags` — strip GLM template markup its tool-call parser
+    #: leaks into parsed arguments (captured live: `list_dir({"path</arg_key>":
+    #: ...})`, which the client then rejects). A pure repair of text that is
+    #: never valid argument content, so it defaults TRUE for glm53.
+    sanitize_tool_tags: bool = False
+    #: `restore_reasoning` — put reasoning back on the in-flight assistant turns
+    #: of a request whose client echoed the tool_call ids but dropped the
+    #: thinking. Defaults FALSE, glm53 included, and must stay false until
+    #: somebody decides otherwise with evidence: the source it is ported from
+    #: records "three Xid 31 GPU faults followed within 40 minutes of it first
+    #: firing, after 14 hours clean", and this box has an active, unrelated
+    #: GPU-fault problem. Correlation, not proof — but nothing that plausibly
+    #: perturbs the GPU may default to on.
+    restore_reasoning: bool = False
+    #: `capture` — this model CONSENTS to request/response capture. Not an
+    #: enable on its own: capture writes whatever the user typed to disk, so it
+    #: also needs the master switch `SERVEDECK_GLM_CAPTURE=1`
+    #: (glm_policies.CAPTURE_ENV), which deliberately is not a registry field.
+    capture: bool = False
 
     def served_names(self) -> list[str]:
         """``[id, *aliases, *presets]`` — REDESIGN §2.4/§2.1: every name a client
@@ -197,6 +221,24 @@ def _as_str_tuple(value: Any, where: str) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _as_bool(raw: dict[str, Any], key: str, field_name: str) -> bool:
+    """A registry switch must be a real TOML boolean.
+
+    Not ``bool(value)``: ``capture = "false"`` is a truthy string, and a switch
+    that turns *on* when its config says "false" is the worst possible failure
+    for a flag whose whole job is to keep request bodies off the disk unless
+    somebody asked for that.
+    """
+    if field_name not in raw:
+        return False
+    value = raw[field_name]
+    if not isinstance(value, bool):
+        raise RegistryError(
+            f"models.{key}.{field_name} must be true or false, got {value!r}"
+        )
+    return value
+
+
 def _load_model(key: str, raw: dict[str, Any], defaults_env: dict[str, str]) -> Model:
     for required in ("id", "repo", "slot", "port", "build", "ctx"):
         if required not in raw:
@@ -262,6 +304,9 @@ def _load_model(key: str, raw: dict[str, Any], defaults_env: dict[str, str]) -> 
         max_output_tokens=raw.get("max_output_tokens"),
         vision=bool(raw.get("vision", False)),
         needs_tty=bool(raw.get("needs_tty", False)),
+        sanitize_tool_tags=_as_bool(raw, key, "sanitize_tool_tags"),
+        restore_reasoning=_as_bool(raw, key, "restore_reasoning"),
+        capture=_as_bool(raw, key, "capture"),
     )
 
 

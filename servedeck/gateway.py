@@ -53,7 +53,7 @@ import httpx
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from servedeck import policies
+from servedeck import glm_policies, policies
 
 # ---------------------------------------------------------------------------
 # The route table contract — implemented by the registry (P1/P3), not here
@@ -85,12 +85,32 @@ class RoutePolicies:
     clamp to nothing — the GLM thinking-budget fix would read as configured and
     do nothing at all.  A registry that cannot say how long a model's context
     is has not finished loading that model.
+
+    The last three are P9's GLM-5.3 client-compatibility switches; every one of
+    them is implemented in ``glm_policies.py`` and every one is off here, so a
+    route that does not set them is byte-for-byte unaffected.  Registry fields
+    ``sanitize_tool_tags`` / ``restore_reasoning`` / ``capture``.
+
+    ``sanitize_tool_tags``
+        Strip GLM template markup (``</arg_key>`` and friends) that its
+        tool-call parser leaks into parsed arguments.  Default true for glm53
+        in ``models.toml``: a recorded failure, and a pure repair.
+    ``restore_reasoning``
+        Put reasoning back on the in-flight assistant turns of a request whose
+        client dropped it.  Default **false**, including for glm53 — see
+        ``glm_policies`` for the Xid-31 correlation that made it switchable.
+    ``capture``
+        This route *consents* to request/response capture.  It is not an
+        enable: capture also needs ``SERVEDECK_GLM_CAPTURE=1``.
     """
 
     ctx: int
     mirror_reasoning: bool = False
     effort_overlay: Mapping[str, Any] | None = None
     min_output_tokens: int | None = None
+    sanitize_tool_tags: bool = False
+    restore_reasoning: bool = False
+    capture: bool = False
 
 
 @dataclass(frozen=True)
@@ -390,6 +410,7 @@ async def _drain(rest: AsyncIterator[bytes] | None) -> bytes:
 async def _proxy(
     request: Request, route: Route, client: httpx.AsyncClient, prefix: bytes,
     rest: AsyncIterator[bytes] | None, *, rewrite_model_to: str | None,
+    glm_state: glm_policies.GlmState | None = None,
 ) -> Response:
     pol = route.policies
     # /v1/responses: mirroring OFF (reasoning is already a first-class output
@@ -401,10 +422,24 @@ async def _proxy(
     # `glm53-flash-high` to `glm53-flash` and silently deliver max effort.
     is_responses = _is_responses_path(request.url.path)
 
+    # --- P9 hook: GLM-5.3 client-compatibility policies --------------------
+    # One object per request, or None when this route has all three switches
+    # off — which is every route but glm53, so nothing below changes for them.
+    # Everything it does lives in glm_policies.py; the five call sites here are
+    # all one-liners, marked "P9".
+    glm = glm_policies.begin(
+        pol,
+        model_id=route.model_id,
+        state=glm_state,
+        responses_api=is_responses,
+        headers=request.headers,
+    )
+
     needs_body = (
         rewrite_model_to is not None
         or bool(pol.effort_overlay)
         or bool(pol.min_output_tokens)
+        or (glm is not None and glm.needs_request_body)  # P9
     )
     content: Any
     if needs_body and request.method in _BODY_METHODS:
@@ -416,6 +451,8 @@ async def _proxy(
             floor=pol.min_output_tokens,
             ctx=pol.ctx,
         )
+        if glm is not None:  # P9
+            content = glm.on_request_body(content)
     elif prefix or rest is not None:
         content = policies.chain_body(prefix, rest)
     else:
@@ -443,6 +480,8 @@ async def _proxy(
 
     if media.startswith("text/event-stream"):
         source = policies.sse_stream(upstream.aiter_bytes()) if mirror else upstream.aiter_bytes()
+        if glm is not None:  # P9 — composes on top of the mirror, line by line
+            source = glm.sse(source)
 
         async def sse_body() -> AsyncIterator[bytes]:
             try:
@@ -455,15 +494,20 @@ async def _proxy(
             sse_body(), status_code=upstream.status_code, headers=headers, media_type=media
         )
 
-    if mirror and (media.startswith("application/json") or media.startswith("application/vnd")):
+    if (mirror or glm is not None) and (  # P9 adds the second reason to buffer
+        media.startswith("application/json") or media.startswith("application/vnd")
+    ):
         # The only place a response body is held in full, and only because a
         # complete JSON object cannot be mirrored a chunk at a time.
         try:
             payload = await upstream.aread()
         finally:
             await upstream.aclose()
+        body = policies.transform_json_body(payload) if mirror else payload
+        if glm is not None:  # P9
+            body = glm.on_json_body(body)
         return Response(
-            content=policies.transform_json_body(payload),
+            content=body,
             status_code=upstream.status_code,
             headers=headers,
             media_type=media or None,
@@ -491,7 +535,12 @@ def _model_less_route(routes: RouteTable) -> Route | None:
     return live[0] if live else None
 
 
-async def _dispatch(request: Request, routes: RouteTable, client: httpx.AsyncClient) -> Response:
+async def _dispatch(
+    request: Request,
+    routes: RouteTable,
+    client: httpx.AsyncClient,
+    glm_state: glm_policies.GlmState | None = None,  # P9
+) -> Response:
     model, prefix, rest = await _peek_model(request)
 
     if model is None:
@@ -518,7 +567,9 @@ async def _dispatch(request: Request, routes: RouteTable, client: httpx.AsyncCli
     # The requested name is an alias or a preset, not the name vLLM was started
     # with: rewrite it, or upstream answers 404 for a model it is serving.
     rewrite = route.model_id if (model is not None and model != route.model_id) else None
-    return await _proxy(request, route, client, prefix, rest, rewrite_model_to=rewrite)
+    return await _proxy(
+        request, route, client, prefix, rest, rewrite_model_to=rewrite, glm_state=glm_state
+    )
 
 
 def models_payload(routes: RouteTable, *, created: int | None = None) -> dict:
@@ -576,6 +627,12 @@ def build_router(
     # Not an APIRouter field; attached deliberately so the owner can close it.
     router.gateway_client = client  # type: ignore[attr-defined]
     router.gateway_owns_client = owned  # type: ignore[attr-defined]
+    # P9: this router's GLM policy state — one bounded reasoning bucket and one
+    # set of counters per route. Attached, not module-global, so two gateways in
+    # one process (the :8011 rehearsal of cutover step 1) share nothing. Its
+    # ``stats()`` is what the dashboard reads for the answerless-turn count.
+    glm_state = glm_policies.GlmState()
+    router.glm_state = glm_state  # type: ignore[attr-defined]
 
     @router.get("/v1/models")
     async def list_models() -> JSONResponse:
@@ -583,11 +640,11 @@ def build_router(
 
     @router.api_route("/v1/{path:path}", methods=_METHODS)
     async def v1(path: str, request: Request) -> Response:
-        return await _dispatch(request, routes, client)
+        return await _dispatch(request, routes, client, glm_state)
 
     def _make_handler():
         async def handler(request: Request) -> Response:
-            return await _dispatch(request, routes, client)
+            return await _dispatch(request, routes, client, glm_state)
 
         return handler
 

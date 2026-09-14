@@ -1,0 +1,18 @@
+data: {"id":"chatcmpl-a1b2c3d4e5f60718","object":"chat.completion.chunk","created":1788990001,"model":"glm53-flash","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-a1b2c3d4e5f60718","object":"chat.completion.chunk","created":1788990001,"model":"glm53-flash","choices":[{"index":0,"delta":{"reasoning":"They want a directory listing"},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-a1b2c3d4e5f60718","object":"chat.completion.chunk","created":1788990001,"model":"glm53-flash","choices":[{"index":0,"delta":{"reasoning":". I will call list_dir.\n"},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-a1b2c3d4e5f60718","object":"chat.completion.chunk","created":1788990001,"model":"glm53-flash","choices":[{"index":0,"delta":{"tool_calls":[{"id":"chatcmpl-tool-3d1f0c9a77b24e18","type":"function","index":0,"function":{"name":"list_dir"}}]},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-a1b2c3d4e5f60718","object":"chat.completion.chunk","created":1788990001,"model":"glm53-flash","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path</arg"}}]},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-a1b2c3d4e5f60718","object":"chat.completion.chunk","created":1788990001,"model":"glm53-flash","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"_key>\": \"/Users/user/Desktop"}}]},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-a1b2c3d4e5f60718","object":"chat.completion.chunk","created":1788990001,"model":"glm53-flash","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"/project\"}"}}]},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-a1b2c3d4e5f60718","object":"chat.completion.chunk","created":1788990001,"model":"glm53-flash","choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
