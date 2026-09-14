@@ -76,10 +76,10 @@ def test_client_config_vscode_ok_when_id_present(tmp_path):
     p = tmp_path / "chatLanguageModels.json"
     p.write_text(
         json.dumps(
-            [{"name": "servedeck", "models": [{"id": "A", "url": "http://x/v1/chat/completions"}]}]
+            [{"name": "servedeck", "models": [{"id": "A", "url": "http://127.0.0.1:8099/v1/chat/completions"}]}]
         )
     )
-    get = _stub_get({"http://x/v1/models": _models_response("A", "B")})
+    get = _stub_get({"http://127.0.0.1:8099/v1/models": _models_response("A", "B")})
     results = doctor.check_client_config("vscode", p, http_get=get)
     assert len(results) == 1
     assert results[0].ok is True
@@ -90,10 +90,10 @@ def test_client_config_vscode_missing_when_id_absent(tmp_path):
     p = tmp_path / "chatLanguageModels.json"
     p.write_text(
         json.dumps(
-            [{"name": "servedeck", "models": [{"id": "A", "url": "http://x/v1/chat/completions"}]}]
+            [{"name": "servedeck", "models": [{"id": "A", "url": "http://127.0.0.1:8099/v1/chat/completions"}]}]
         )
     )
-    get = _stub_get({"http://x/v1/models": _models_response("SOMETHING-ELSE")})
+    get = _stub_get({"http://127.0.0.1:8099/v1/models": _models_response("SOMETHING-ELSE")})
     results = doctor.check_client_config("vscode", p, http_get=get)
     assert results[0].ok is False
     assert "missing" in results[0].detail
@@ -103,10 +103,10 @@ def test_client_config_unreachable(tmp_path):
     p = tmp_path / "chatLanguageModels.json"
     p.write_text(
         json.dumps(
-            [{"name": "servedeck", "models": [{"id": "A", "url": "http://x/v1/chat/completions"}]}]
+            [{"name": "servedeck", "models": [{"id": "A", "url": "http://127.0.0.1:8099/v1/chat/completions"}]}]
         )
     )
-    get = _stub_get({"http://x/v1/models": httpx.ConnectError("refused")})
+    get = _stub_get({"http://127.0.0.1:8099/v1/models": httpx.ConnectError("refused")})
     results = doctor.check_client_config("vscode", p, http_get=get)
     assert results[0].ok is False
     assert "unreachable" in results[0].detail
@@ -115,10 +115,10 @@ def test_client_config_unreachable(tmp_path):
 def test_client_config_codex_resolves_provider_indirection(tmp_path):
     p = tmp_path / "config.toml"
     p.write_text(
-        '[model_providers.servedeck]\nbase_url = "http://x/v1"\n\n'
+        '[model_providers.servedeck]\nbase_url = "http://127.0.0.1:8099/v1"\n\n'
         '[profiles.qwen27b]\nmodel_provider = "servedeck"\nmodel = "Qwen3.8-27B-NVFP4"\n'
     )
-    get = _stub_get({"http://x/v1/models": _models_response("Qwen3.8-27B-NVFP4")})
+    get = _stub_get({"http://127.0.0.1:8099/v1/models": _models_response("Qwen3.8-27B-NVFP4")})
     results = doctor.check_client_config("codex", p, http_get=get)
     assert len(results) == 1 and results[0].ok is True
 
@@ -126,10 +126,10 @@ def test_client_config_codex_resolves_provider_indirection(tmp_path):
 def test_client_config_kimi_resolves_provider_indirection(tmp_path):
     p = tmp_path / "config.toml"
     p.write_text(
-        '[providers.servedeck]\nbase_url = "http://x/v1"\n\n'
+        '[providers.servedeck]\nbase_url = "http://127.0.0.1:8099/v1"\n\n'
         '[models."servedeck/lfm2"]\nprovider = "servedeck"\nmodel = "LFM2.5-350M"\n'
     )
-    get = _stub_get({"http://x/v1/models": _models_response("LFM2.5-350M")})
+    get = _stub_get({"http://127.0.0.1:8099/v1/models": _models_response("LFM2.5-350M")})
     results = doctor.check_client_config("kimi", p, http_get=get)
     assert len(results) == 1 and results[0].ok is True
 
@@ -214,6 +214,102 @@ def test_check_port_live_gateway_on_8010():
     else:
         assert "HTTP" in r.detail or "expected one of" in r.detail, r.detail
         assert "503" in r.detail or "expected one of" in r.detail, r.detail
+def test_a_client_reference_to_a_remote_host_is_reported_but_never_probed(tmp_path):
+    """doctor must not send a request off this box.
+
+    Measured on this box: ``~/.kimi-code/config.toml`` declares four
+    ``managed:kimi-code`` models behind ``https://api.kimi.com/coding/v1``.
+    Before the filter, ``doctor`` sent an unauthenticated GET there on every
+    run and reported each 401 as a servedeck failure — four permanent red
+    lines for four correct entries, plus an outbound request from a local
+    diagnostic. ``http_get`` raising here is the proof that the check did not
+    call it: nothing stubs those URLs, so a probe would surface as the
+    exception rather than as a passing assertion.
+    """
+
+    def must_not_be_called(url: str, timeout: float):  # pragma: no cover
+        raise AssertionError(f"doctor probed a remote endpoint: {url}")
+
+    p = tmp_path / "chatLanguageModels.json"
+    p.write_text(
+        json.dumps(
+            [
+                {
+                    "name": "servedeck",
+                    "models": [
+                        {"id": "cloud", "url": "https://api.kimi.com/coding/v1/chat/completions"}
+                    ],
+                }
+            ]
+        )
+    )
+    results = doctor.check_client_config("vscode", p, http_get=must_not_be_called)
+    assert len(results) == 1
+    assert results[0].ok is True
+    assert results[0].name == "vscode config (remote)"
+    assert "api.kimi.com" in results[0].detail
+    assert "cloud" in results[0].detail
+
+
+def test_a_config_mixing_local_and_remote_checks_only_the_local_one(tmp_path):
+    p = tmp_path / "chatLanguageModels.json"
+    p.write_text(
+        json.dumps(
+            [
+                {
+                    "name": "servedeck",
+                    "models": [
+                        {"id": "cloud", "url": "https://api.kimi.com/coding/v1/chat/completions"},
+                        {"id": "A", "url": "http://localhost:8099/v1/chat/completions"},
+                    ],
+                }
+            ]
+        )
+    )
+    get = _stub_get({"http://localhost:8099/v1/models": _models_response("A")})
+    names = {r.name: r for r in doctor.check_client_config("vscode", p, http_get=get)}
+    assert set(names) == {"vscode config (remote)", "vscode: A"}
+    assert names["vscode: A"].ok is True
+    # "localhost" counts as this box, the way VS Code's generated URL spells it.
+    assert doctor.is_local_ref("http://localhost:8010/v1/models")
+    assert doctor.is_local_ref("http://127.0.0.1:8010/v1/models")
+    assert not doctor.is_local_ref("https://api.openai.com/v1/models")
+
+
+def test_check_port_against_the_real_live_gateway_on_8010():
+    """``check_port``'s three states against a REAL socket, not a stub.
+
+    The claim under test is doctor's, not the box's: whatever :8010 answers
+    right now, doctor must classify it into the right one of the three states
+    and say which. The previous version of this test asserted ``ok is True``
+    unconditionally, which made it a claim about whether the production 27B
+    happened to be up — it fails today with "answers but response is unusable:
+    HTTP 503", because the v1 gateway on :8010 is proxying to a :8004 that is
+    not running. A test that goes red when a model is stopped is a broken
+    instrument, and a broken instrument reports whatever the box is doing as a
+    defect.
+    """
+    m = _fake_model(key="gw", id="Qwen3.8-27B-NVFP4", port=8010)
+    r = doctor.check_port(m, timeout=2.0)
+
+    try:
+        live = httpx.get("http://127.0.0.1:8010/v1/models", timeout=2.0)
+    except httpx.TransportError:
+        assert r.ok is True and r.detail == "not listening", r
+        return
+
+    if live.status_code != 200:
+        # Answering, but not with a model list: a real failure, and doctor must
+        # name the status rather than call it "not listening".
+        assert r.ok is False, r
+        assert str(live.status_code) in r.detail, r.detail
+        return
+
+    ids = [e.get("id") for e in live.json().get("data", [])]
+    if m.id in ids:
+        assert r.ok is True and "listening" in r.detail, r
+    else:
+        assert r.ok is False and "expected one of" in r.detail, r
 
 
 def test_check_port_not_listening_real_socket():

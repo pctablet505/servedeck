@@ -586,8 +586,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_models.set_defaults(func=_cmd_models)
 
     p_wire = sub.add_parser("wire", parents=[common], help="generate/update client configs")
-    p_wire.add_argument(
+    # Dry run is the DEFAULT, and `--dry-run` is the spelling REDESIGN §2.4 and
+    # §3 step 1 both use ("`servedeck wire --dry-run` diff"). Without the flag
+    # argparse answered "unrecognized arguments: --dry-run" with exit 2 — which,
+    # to an operator following the design doc during a cutover, reads as "wire is
+    # broken" rather than "the flag is spelled differently".
+    #
+    # Mutually exclusive rather than two independent booleans: `--dry-run
+    # --apply` has no correct resolution, and picking one silently would either
+    # write when the operator asked not to or refuse when they asked to.
+    mode = p_wire.add_mutually_exclusive_group()
+    mode.add_argument(
         "--apply", action="store_true", help="write changes (default: dry-run diff only)"
+    )
+    mode.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="show the diff and write nothing (the default; accepted explicitly)",
     )
     p_wire.set_defaults(func=_cmd_wire)
 
