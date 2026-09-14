@@ -45,6 +45,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import secrets
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
@@ -234,8 +235,23 @@ class Runtime:
     #: other started; one lock makes "the main slot is exclusive" true of the
     #: API and not only of the GPU.
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    busy: str | None = None
+    #: The mutation in flight, as ``{"action", "key", "label"}``, or None.
+    #: A dict rather than the label string alone: the page needs to know WHICH
+    #: model is booting so it can put the progress line on the right row, and
+    #: parsing that back out of "start flashnext" would be a client reading
+    #: English.
+    busy: dict[str, str] | None = None
     first_state: asyncio.Event = field(default_factory=asyncio.Event)
+    #: A nonce this process invents at startup and echoes from /api/health.
+    #: ``_reconcile_after_bind`` requires it back before it will start a model.
+    #:
+    #: A 200 alone does not prove we won the port: on 2026-09-11 a
+    #: hand-started copy of servedeck held :8010, and it answers /api/health
+    #: with 200 too. Believing that answer is precisely what turned one lost
+    #: bind into 70 real vLLM launches (REDESIGN §4 R4) — the losing process
+    #: concluded it was listening and reconciled. The nonce makes "is that me"
+    #: answerable instead of assumed.
+    instance_id: str = field(default_factory=lambda: secrets.token_hex(8))
 
     def poller_for(self, key: str, port: int) -> _metrics.MetricsPoller:
         base = f"http://127.0.0.1:{port}"
@@ -331,6 +347,13 @@ def _headroom(
         "source": None,
         "unavailable": None,
         "note": None,
+        # Present on EVERY branch, null when unknown. A key that only appears
+        # in the available case makes the document's shape depend on its
+        # content: a client (or a contract test) reading the unavailable branch
+        # concludes these are never sent, and a renderer written against the
+        # available branch throws on the other one.
+        "full_cost_tokens": None,
+        "small_cost_tokens": None,
     }
     if main_key is None:
         base["unavailable"] = "no model holds the main slot"
@@ -509,12 +532,32 @@ async def _poll_loop(rt: Runtime) -> None:
         await asyncio.sleep(POLL_INTERVAL_S)
 
 
-async def _port_answers(client: httpx.AsyncClient, url: str) -> bool:
+async def _own_port_answers(client: httpx.AsyncClient, url: str, instance_id: str) -> bool:
+    """Is the thing answering ``url`` THIS process?
+
+    Three distinct answers collapse into False, and all three mean "do not
+    start a model yet":
+
+    * nothing is listening (the normal case, for the first few hundred ms);
+    * something is listening but is not a servedeck (a 404, a 503);
+    * something is listening and IS a servedeck — just not us.
+
+    The third is the one that mattered: a hand-started copy held :8010 on
+    2026-09-11 and answers ``/api/health`` with a perfectly good 200. A check
+    on the status code alone cannot see the difference, so the process that
+    LOST the bind reconciled anyway and launched the 27B on every restart.
+    """
     try:
         response = await client.get(url, timeout=2.0)
     except Exception:  # noqa: BLE001 - not listening yet is the expected case
         return False
-    return response.status_code == 200
+    if response.status_code != 200:
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("instance") == instance_id
 
 
 async def _reconcile_after_bind(
@@ -537,7 +580,7 @@ async def _reconcile_after_bind(
     """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        if await _port_answers(rt.client, rt.settings.health_url):
+        if await _own_port_answers(rt.client, rt.settings.health_url, rt.instance_id):
             break
         await asyncio.sleep(interval_s)
     else:
@@ -547,8 +590,9 @@ async def _reconcile_after_bind(
                 "level": "error",
                 "reason": "bind_timeout",
                 "message": (
-                    f"{rt.settings.base_url} did not answer within {timeout_s:.0f}s; "
-                    "not reconciling. Something else is probably holding the port."
+                    f"{rt.settings.base_url} did not answer as THIS process within "
+                    f"{timeout_s:.0f}s; not reconciling. Either the bind failed, or "
+                    "another servedeck is holding the port."
                 ),
             },
         )
@@ -650,7 +694,12 @@ def _precheck(rt: Runtime, key: str, action: str) -> JSONResponse | None:
         )
     live = rt.routes.live()
     if rt.busy is not None:
-        return _refusal(409, "busy", f"servedeck is already running {rt.busy}", busy=rt.busy)
+        return _refusal(
+            409,
+            "busy",
+            f"servedeck is already running {rt.busy['label']}",
+            busy=rt.busy,
+        )
     if action in ("start", "switch") and key in live:
         return _refusal(
             409,
@@ -697,29 +746,49 @@ def _main_holder(rt: Runtime, live: dict[str, _routes.LiveView]) -> str | None:
     return None
 
 
-async def _run_mutation(rt: Runtime, label: str, work: Callable[[], Any]) -> None:
+async def _run_mutation(
+    rt: Runtime, label: str, work: Callable[[], Any], *, action: str = "", key: str = ""
+) -> None:
     """Run one blocking Control call in a thread, reporting whatever it says.
 
     Holds ``rt.lock`` for the whole operation and advertises it as ``busy`` in
     ``/api/state``, so a second start cannot interleave with a switch that is
     between its stop and its start — the window in which the card is empty and
     every precheck would say "go ahead".
+
+    ``busy`` is cleared only AFTER the outcome has been published. Clearing it
+    first (in a ``finally`` before the publish) left a tick in which
+    ``/api/state`` said nothing was running while the notice stream was still
+    about to announce the result — two views of the same instant disagreeing,
+    which is the shape of every bug this rewrite exists to remove.
     """
     async with rt.lock:
-        rt.busy = label
-        rt.hub.publish("notice", {"level": "info", "reason": "started", "message": f"{label}: running"})
+        rt.busy = {"action": action or label, "key": key, "label": label}
+        rt.hub.publish(
+            "notice",
+            {"level": "info", "reason": "started", "message": f"{label}: running", "key": key or None},
+        )
         try:
             result = await asyncio.to_thread(work)
         except Exception as exc:  # noqa: BLE001 - a failed mutation is a notice
             log.exception("%s failed", label)
             rt.hub.publish(
                 "notice",
-                {"level": "error", "reason": "exception", "message": f"{label}: {type(exc).__name__}: {exc}"},
+                {
+                    "level": "error",
+                    "reason": "exception",
+                    "message": f"{label}: {type(exc).__name__}: {exc}",
+                    "key": key or None,
+                },
             )
             return
+        else:
+            _publish_result(rt.hub, label, result)
         finally:
+            # `else` runs before `finally`, and the except branch publishes
+            # before returning, so every exit path has announced its outcome by
+            # the time `busy` clears. That ordering is the whole fix.
             rt.busy = None
-        _publish_result(rt.hub, label, result)
     with contextlib.suppress(Exception):
         state = await build_state(rt)
         rt.state = state
@@ -850,20 +919,18 @@ def build_runtime(
     )
 
 
-def _build_venv_bin(registry: _models.Registry, build: str) -> str:
-    """``<venv>/bin`` for a named build in ``[builds]``.
+def _build_venv_bin(build: _models.Build | None) -> str:
+    """``<venv>/bin`` for one ``[builds.<name>]`` table.
 
-    ``[builds]`` is in the middle of growing from ``name = "<path>"`` to
-    ``[builds.<name>] venv = "..." cuda_home = "..."``. Both shapes are read
-    here rather than pinned to one, because this adapter and models.toml are
-    owned by different packets and a mismatch between them is a boot that
-    fails with an empty argv[0] — the least legible failure available.
+    ``~`` is expanded here rather than passed through: this string becomes
+    argv[0]'s directory, and ``execve`` does not expand ``~`` — a literal one
+    produces "No such file or directory" naming a path that plainly exists,
+    which is among the least legible failures available. ``render_env`` expands
+    the same two paths for ``PATH``/``CUDA_HOME``, for the same reason.
     """
-    entry: Any = registry.builds.get(build, "")
-    raw = entry.get("venv", "") if isinstance(entry, dict) else entry
-    root = Path(str(raw)).expanduser() if raw else None
-    if root is None:
+    if build is None:
         return ""
+    root = Path(build.venv).expanduser()
     return str(root if root.name == "bin" else root / "bin")
 
 
@@ -885,6 +952,11 @@ class ModelSpecAdapter:
     """
 
     model: _models.Model
+    #: The resolved ``[builds.<name>]`` table this model launches from. Carried
+    #: rather than looked up per call because ``render_env`` needs it on every
+    #: launch and a registry lookup inside the Protocol's methods would put the
+    #: registry back into the supervisor's dependency set.
+    build: _models.Build | None
     key: str
     id: str
     slot: str
@@ -895,7 +967,14 @@ class ModelSpecAdapter:
     ctx_error: str | None = None
 
     @classmethod
-    def build(cls, model: _models.Model, registry: _models.Registry) -> ModelSpecAdapter:
+    def from_model(cls, model: _models.Model, registry: _models.Registry) -> ModelSpecAdapter:
+        """Resolve one registry model into a launchable spec.
+
+        NOT named ``build``: that is the name of the field above, and a
+        classmethod sharing a field's name becomes that field's default as far
+        as ``dataclasses`` is concerned — every field after it then raises
+        "non-default argument follows default argument" at import time.
+        """
         ctx, error = 0, None
         if isinstance(model.ctx, int):
             ctx = model.ctx
@@ -904,15 +983,17 @@ class ModelSpecAdapter:
                 ctx = _models.native_ctx(model.repo)
             except _models.RegistryError as exc:
                 error = str(exc)
+        build = registry.builds.get(model.build)
         return cls(
             model=model,
+            build=build,
             key=model.key,
             id=model.id,
             slot=model.slot,
             port=model.port,
             vram_mib=model.vram_mib,
             ctx_tokens=ctx,
-            venv_bin=_build_venv_bin(registry, model.build),
+            venv_bin=_build_venv_bin(build),
             ctx_error=error,
         )
 
@@ -927,16 +1008,30 @@ class ModelSpecAdapter:
             raise _models.RegistryError(
                 f"{self.key}: {self.ctx_error or 'no context length is known'}"
             )
-        if not self.venv_bin:
+        if self.build is None or not self.venv_bin:
             raise _models.RegistryError(
-                f"{self.key}: build {self.model.build!r} has no venv in [builds]"
+                f"{self.key}: build {self.model.build!r} is not in [builds], so "
+                "there is no venv to launch from"
             )
         return _models.render_argv(
             self.model, str(Path(self.venv_bin) / "vllm"), util, self.ctx_tokens, port
         )
 
     def render_env(self) -> dict[str, str]:
-        return _models.render_env(self.model)
+        """The COMPLETE launch environment, including ``CUDA_HOME`` and a full
+        ``PATH`` built from this model's build.
+
+        A transient unit inherits the USER MANAGER's environment, never the
+        caller's shell, so anything missing here is missing at boot — and
+        FlashInfer's JIT needs nvcc/ptxas on ``PATH`` at *request* time, not
+        only at process start.
+        """
+        if self.build is None:
+            raise _models.RegistryError(
+                f"{self.key}: build {self.model.build!r} is not in [builds], so "
+                "CUDA_HOME and PATH cannot be derived"
+            )
+        return _models.render_env(self.model, self.build)
 
 
 class _RegistryAdapter:
@@ -951,7 +1046,7 @@ class _RegistryAdapter:
     def __init__(self, registry: _models.Registry) -> None:
         self.registry = registry
         self.specs: dict[str, ModelSpecAdapter] = {
-            key: ModelSpecAdapter.build(model, registry)
+            key: ModelSpecAdapter.from_model(model, registry)
             for key, model in registry.models.items()
         }
 
@@ -1035,7 +1130,12 @@ def _register_api(app: FastAPI, rt: Runtime) -> None:
         registry walk. ``_reconcile_after_bind`` polls this to learn whether we
         won the port, and a health check that could itself fail would make the
         reconcile decision depend on something other than the bind."""
-        return {"ok": True, "service": "servedeck", "port": rt.settings.listen_port}
+        return {
+            "ok": True,
+            "service": "servedeck",
+            "port": rt.settings.listen_port,
+            "instance": rt.instance_id,
+        }
 
     @app.get("/api/state")
     async def state() -> dict[str, Any]:
@@ -1094,6 +1194,8 @@ def _register_api(app: FastAPI, rt: Runtime) -> None:
                 rt,
                 f"start {key}",
                 lambda: rt.control.start(key, on_progress=_progress_publisher(rt.hub, key)),
+                action="start",
+                key=key,
             )
         )
         return _accepted("start", key)
@@ -1103,7 +1205,9 @@ def _register_api(app: FastAPI, rt: Runtime) -> None:
         refusal = _precheck(rt, key, "stop")
         if refusal is not None:
             return refusal
-        asyncio.create_task(_run_mutation(rt, f"stop {key}", lambda: rt.control.stop(key)))
+        asyncio.create_task(
+            _run_mutation(rt, f"stop {key}", lambda: rt.control.stop(key), action="stop", key=key)
+        )
         return _accepted("stop", key)
 
     @app.post("/api/switch/{key}")
@@ -1116,13 +1220,17 @@ def _register_api(app: FastAPI, rt: Runtime) -> None:
                 rt,
                 f"switch {key}",
                 lambda: rt.control.switch(key, on_progress=_progress_publisher(rt.hub, key)),
+                action="switch",
+                key=key,
             )
         )
         return _accepted("switch", key)
 
     @app.post("/api/adopt")
     async def adopt() -> JSONResponse:
-        asyncio.create_task(_run_mutation(rt, "adopt", lambda: rt.control.adopt()))
+        asyncio.create_task(
+            _run_mutation(rt, "adopt", lambda: rt.control.adopt(), action="adopt")
+        )
         return _accepted("adopt", "")
 
     @app.get("/api/log/{key}")

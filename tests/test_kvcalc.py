@@ -258,8 +258,9 @@ def test_a_models_cache_flags_have_exactly_one_source(tmp_path: Path) -> None:
 [gpu]
 total_mib = 100000
 margin_mib = 1000
-[builds]
-stock = "/opt/stock"
+[builds.stock]
+venv = "/opt/stock"
+cuda_home = "/opt/stock/lib/python3.13/site-packages/nvidia/cu13"
 [models.m]
 id = "M"
 repo = "org/m"

@@ -179,8 +179,9 @@ _MODELS_TOML = """
 total_mib = 97887
 margin_mib = 1024
 
-[builds]
-stock = "/nonexistent/venv"
+[builds.stock]
+venv = "/nonexistent/venv"
+cuda_home = "/nonexistent/venv/cuda"
 
 [models.tinymain]
 id      = "tiny-main"

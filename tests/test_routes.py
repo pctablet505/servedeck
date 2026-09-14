@@ -22,8 +22,9 @@ TOML = """
 total_mib = 100000
 margin_mib = 1024
 
-[builds]
-stock = "/opt/stock"
+[builds.stock]
+venv = "/opt/stock"
+cuda_home = "/opt/stock/lib/python3.13/site-packages/nvidia/cu13"
 
 [defaults.env]
 SHARED = "1"

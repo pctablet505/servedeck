@@ -8,7 +8,10 @@ this; a terminal runs the CLI.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import sys
+
+import uvicorn
 
 from . import settings as _settings
 
@@ -25,12 +28,6 @@ def main(argv: list[str] | None = None) -> int:
         help="serve, but do not start anything from desired.json",
     )
     args = ap.parse_args(argv)
-
-    try:
-        import uvicorn
-    except ImportError:  # pragma: no cover - packaging failure
-        print("uvicorn is not installed. Try: pip install -e '.[dev]'", file=sys.stderr)
-        return 1
 
     if not cfg.models_path.is_file():
         print(
@@ -52,17 +49,82 @@ def main(argv: list[str] | None = None) -> int:
 
     from . import app as _app
 
-    factory = (lambda: _app.create_app(reconcile=not args.no_reconcile)) if not args.reload else None
     if args.reload:
         # --reload needs an import string, and the string form cannot carry
         # --no-reconcile; say so rather than silently ignoring the flag.
         if args.no_reconcile:
             print("--no-reconcile is not supported with --reload", file=sys.stderr)
             return 2
-        uvicorn.run("servedeck.app:create_app", factory=True, host=args.host, port=args.port, reload=True)
-    else:
-        uvicorn.run(factory, factory=True, host=args.host, port=args.port)
+        uvicorn.run(
+            "servedeck.app:create_app",
+            factory=True,
+            host=args.host,
+            port=args.port,
+            reload=True,
+            # --reload is given an import string, so there is no app instance
+            # to take a hub from and the early close below cannot be installed.
+            # The bound still applies, which is all a dev-only flag needs.
+            timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S,
+        )
+        return 0
+
+    application = _app.create_app(reconcile=not args.no_reconcile)
+    config = uvicorn.Config(
+        application,
+        host=args.host,
+        port=args.port,
+        # The hard bound. Nothing below can make a stop exceed this, and the
+        # unit's TimeoutStopSec=15 is comfortably above it, so systemd never
+        # reaches the SIGKILL that used to end every single stop.
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S,
+    )
+    _ShutdownClosesTheHub(config, application.state.rt.hub).run()
     return 0
+
+
+#: How long uvicorn may spend draining connections. A streaming chat completion
+#: relayed through the gateway is cut off at this point — correct on a stop: the
+#: MODEL keeps running in its own transient unit, only the relay stops, and the
+#: client retries against a dashboard that is back in seconds.
+GRACEFUL_SHUTDOWN_S = 5
+
+
+class _ShutdownClosesTheHub(uvicorn.Server):
+    """Close the SSE hub on the way into shutdown, not on the way out.
+
+    MEASURED, 2026-09-12: with one ``/api/events`` connection open, a plain
+    ``uvicorn.Server`` did not exit at all — still running after 40 s — while
+    the same server with the hub closed first exits in 1.2 s.
+
+    The reason is the order of uvicorn's own shutdown. It (1) stops accepting,
+    (2) asks each live connection to finish, (3) WAITS for them, and only then
+    (4) runs the ASGI lifespan's shutdown. ``app.py`` closes the hub in the
+    lifespan — step 4 — which is after the wait it was supposed to shorten. An
+    SSE response never finishes on its own, so step 3 blocked forever.
+
+    ``handle_exit`` is the earliest hook: it is what the signal handler calls,
+    so closing the hub here happens before step 2. Every parked subscriber gets
+    its sentinel, every generator returns, and the drain has nothing to wait
+    for. The lifespan still closes the hub as well — that path covers a
+    shutdown this override does not see (a test driving ``should_exit``
+    directly), and closing twice is idempotent.
+    """
+
+    def __init__(self, config: uvicorn.Config, hub: object) -> None:
+        super().__init__(config)
+        # Handed in, not discovered. `config.loaded_app` is only populated once
+        # `run()` has called `config.load()`, and it is the MIDDLEWARE-WRAPPED
+        # app by then, so `loaded_app.state` does not exist — the first cut
+        # looked there, found nothing, silently closed no hub, and every
+        # shutdown quietly fell back to the 5 s timeout instead of 1.2 s. A
+        # missing hub that degrades to "slower but still correct" is exactly
+        # the kind of failure nothing reports.
+        self._hub = hub
+
+    def handle_exit(self, sig: int, frame: object) -> None:  # type: ignore[override]
+        with contextlib.suppress(Exception):
+            self._hub.close()  # type: ignore[attr-defined]
+        super().handle_exit(sig, frame)  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

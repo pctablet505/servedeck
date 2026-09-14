@@ -12,8 +12,10 @@ here to pin are the two that cost outages:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -33,8 +35,9 @@ TOML = """
 total_mib = 100000
 margin_mib = 1024
 
-[builds]
-stock = "/opt/stock"
+[builds.stock]
+venv = "/opt/stock"
+cuda_home = "/opt/stock/lib/python3.13/site-packages/nvidia/cu13"
 
 [models.big]
 id = "Big-Model"
@@ -719,6 +722,11 @@ class BindRecorder:
     events: list[str] = field(default_factory=list)
     answer_after: int = 3
     probes: int = 0
+    #: What the port says once it answers. "us" is this process; "impostor" is
+    #: another servedeck (a valid 200 with a different nonce) — the 09-11 case;
+    #: "stranger" is something that is not a servedeck at all.
+    answers_as: str = "us"
+    instance_id: str = ""
 
     def transport(self) -> httpx.MockTransport:
         def handler(request: httpx.Request) -> httpx.Response:
@@ -726,8 +734,14 @@ class BindRecorder:
             if self.probes <= self.answer_after:
                 self.events.append("port-refused")
                 raise httpx.ConnectError("connection refused", request=request)
+            if self.answers_as == "impostor":
+                self.events.append("impostor-answered")
+                return httpx.Response(200, json={"ok": True, "instance": "someone-else"})
+            if self.answers_as == "stranger":
+                self.events.append("stranger-answered")
+                return httpx.Response(503, text="not me")
             self.events.append("port-answered")
-            return httpx.Response(200, json={"ok": True})
+            return httpx.Response(200, json={"ok": True, "instance": self.instance_id})
 
         return httpx.MockTransport(handler)
 
@@ -741,6 +755,9 @@ def bind_runtime(settings, registry, control):
             control=control,
             client=httpx.AsyncClient(transport=recorder.transport()),
         )
+        # The recorder has to know the nonce it is meant to echo; a fixture
+        # that echoed a constant would pass whatever the check did.
+        recorder.instance_id = rt.instance_id
         original = control.reconcile
 
         def recording_reconcile(*args, **kwargs):
@@ -889,10 +906,16 @@ async def test_two_mutations_cannot_interleave(runtime) -> None:
 
 def test_a_mutation_in_flight_refuses_the_next_one(client) -> None:
     set_live(client)
-    client.rt.busy = "switch big"
+    client.rt.busy = {"action": "switch", "key": "big", "label": "switch big"}
     response = client.post("/api/models/small/start")
     assert response.status_code == 409
-    assert response.json()["error"]["reason"] == "busy"
+    error = response.json()["error"]
+    assert error["reason"] == "busy"
+    # Structured, not prose. The page puts the progress line on the row of the
+    # model that is booting; recovering that from "switch big" would be a
+    # client parsing English.
+    assert error["busy"]["key"] == "big"
+    assert error["busy"]["action"] == "switch"
 
 
 # ==========================================================================
@@ -921,3 +944,375 @@ def test_only_a_real_change_publishes_a_state_frame() -> None:
     busier = json.loads(json.dumps(later))
     busier["models"][0]["metrics"]["running"] = 4
     assert _app._state_changed(base, busier) is True
+
+
+# ==========================================================================
+# The card is gone  (measured: GSP RPC failure, 2026-09-12 14:26)
+# ==========================================================================
+
+
+def test_state_still_renders_when_nvidia_smi_reports_no_devices(
+    settings, registry, control, monkeypatch
+) -> None:
+    """A GPU fault must not read as a servedeck fault.
+
+    On 2026-09-12 the card fell off the bus mid-session (kernel NVRM GSP RPC
+    failures; ``nvidia-smi`` then printed "No devices were found" and exited
+    non-zero). ``gpu.free_mib()``/``total_mib()`` answer ``None`` for that, and
+    None is deliberately NOT 0: zero free memory is a full card, which is a
+    completely different situation from an absent one, and a dashboard that
+    conflated them would tell an operator to stop a model that is not running.
+
+    What must survive: ``/api/state`` answers 200, every registry row is still
+    there, and the GPU block carries nulls rather than the route 500ing.
+    """
+    monkeypatch.setattr(_app._gpu, "total_mib", lambda: None)
+    monkeypatch.setattr(_app._gpu, "free_mib", lambda: None)
+
+    app = _app.create_app(
+        settings, registry=registry, control=control, reconcile=False, poll=False
+    )
+    with TestClient(app) as test_client:
+        response = test_client.get("/api/state")
+        assert response.status_code == 200
+        state = response.json()
+
+    assert state["gpu"] == {"total_mib": None, "free_mib": None}
+    assert [m["key"] for m in state["models"]] == ["big", "other", "small"]
+    assert state["headroom"]["free_mib"] is None
+    # Still a reason, not a blank: the panel prints why rather than nothing.
+    assert state["headroom"]["unavailable"]
+
+
+def test_a_dead_card_never_becomes_a_zero(settings, registry, control, monkeypatch) -> None:
+    """Over-correction guard. The obvious "fix" for a None that breaks a
+    format string is ``or 0`` — and that is the bug: 0 MiB free renders as a
+    full card, so the page would report the exact opposite of the truth while
+    looking entirely healthy."""
+    monkeypatch.setattr(_app._gpu, "total_mib", lambda: None)
+    monkeypatch.setattr(_app._gpu, "free_mib", lambda: None)
+    app = _app.create_app(
+        settings, registry=registry, control=control, reconcile=False, poll=False
+    )
+    with TestClient(app) as test_client:
+        state = test_client.get("/api/state").json()
+    assert state["gpu"]["free_mib"] is not 0  # noqa: F632 - identity is the point
+    assert state["gpu"]["free_mib"] is None
+    assert state["gpu"]["total_mib"] is None
+
+
+def test_headroom_with_no_gpu_reading_still_reports_the_measured_pool() -> None:
+    """The KV pool comes from the ENGINE's own /metrics, not from nvidia-smi.
+
+    So a dead card does not invalidate the capacity figures of a model that is
+    still serving — which is the realistic mid-fault state, and exactly when an
+    operator most wants to know what the engine can still take.
+    """
+    head = _app._headroom(
+        main_key="big",
+        main_id="Big-Model",
+        snapshot={"kv_cache_size_tokens": 400_000},
+        full_ctx=32768,
+        free_mib=None,
+    )
+    assert head["free_mib"] is None
+    assert head["source"] == "measured from the running engine"
+    assert head["full_context_requests"] is not None
+    assert head["unavailable"] is None
+
+
+def test_a_failing_gpu_query_does_not_break_the_poller(runtime, monkeypatch) -> None:
+    """`_collect_facts` runs in a worker thread on a timer. If an nvidia-smi
+    that raises took the poller down, /api/state would freeze at whatever it
+    last said and go on looking authoritative."""
+
+    def boom() -> int:
+        raise OSError("nvidia-smi: no devices were found")
+
+    monkeypatch.setattr(_app._gpu, "total_mib", boom)
+    with pytest.raises(OSError):
+        _app._collect_facts(runtime)
+    # ...and the loop around it swallows that, which is what keeps it polling.
+    assert "log.exception" in _poll_loop_source()
+
+
+def _poll_loop_source() -> str:
+    import inspect
+
+    return inspect.getsource(_app._poll_loop)
+
+
+# ==========================================================================
+# busy / notice ordering, and the headroom key set
+# ==========================================================================
+
+
+@pytest.mark.anyio
+async def test_busy_is_still_set_when_the_outcome_is_published(runtime) -> None:
+    """/api/state and the notice stream must never disagree about the same
+    instant.
+
+    The first cut cleared ``busy`` in a ``finally`` that ran BEFORE
+    ``_publish_result``, so there was a tick in which the state document said
+    nothing was running while the result notice was still in flight. Two views
+    of one instant contradicting each other is the shape of every bug this
+    rewrite exists to remove.
+    """
+    runtime.hub.bind(asyncio.get_running_loop())
+    seen: list[Any] = []
+
+    def publish(event_type: str, data: Any) -> None:
+        if event_type == "notice" and data.get("reason") in ("stopped", "ready", "exception"):
+            seen.append(runtime.busy)
+
+    monkey = runtime.hub.publish
+    runtime.hub.publish = publish  # type: ignore[method-assign]
+    try:
+        await _app._run_mutation(
+            runtime, "stop small", lambda: runtime.control.stop("small"), action="stop", key="small"
+        )
+    finally:
+        runtime.hub.publish = monkey  # type: ignore[method-assign]
+
+    assert seen, "no terminal notice was published"
+    assert seen[0] is not None, "busy was cleared before the outcome was announced"
+    assert seen[0]["key"] == "small"
+    assert runtime.busy is None, "busy must clear once the outcome is out"
+
+
+@pytest.mark.anyio
+async def test_busy_clears_even_when_the_work_raises(runtime) -> None:
+    runtime.hub.bind(asyncio.get_running_loop())
+
+    def boom():
+        raise RuntimeError("systemd exploded")
+
+    await _app._run_mutation(runtime, "start big", boom, action="start", key="big")
+    assert runtime.busy is None
+    reasons = [n["data"]["reason"] for n in runtime.hub.notices]
+    assert "exception" in reasons
+    assert reasons.count("exception") == 1, "the outcome was published twice"
+
+
+def test_headroom_has_the_same_keys_whether_or_not_it_is_available() -> None:
+    """A key that appears only in one branch makes the document's SHAPE depend
+    on its content: a renderer written against the available branch throws on
+    the other, and a contract test built from the unavailable one concludes
+    those fields are never sent."""
+    available = _app._headroom(
+        main_key="big", main_id="Big-Model", snapshot={"kv_cache_size_tokens": 400_000},
+        full_ctx=32768, free_mib=4200,
+    )
+    no_main = _app._headroom(
+        main_key=None, main_id=None, snapshot=None, full_ctx=0, free_mib=4200
+    )
+    no_pool = _app._headroom(
+        main_key="big", main_id="Big-Model", snapshot={}, full_ctx=32768, free_mib=4200
+    )
+    no_ctx = _app._headroom(
+        main_key="big", main_id="Big-Model", snapshot={"kv_cache_size_tokens": 1},
+        full_ctx=0, free_mib=4200,
+    )
+    assert set(available) == set(no_main) == set(no_pool) == set(no_ctx)
+    for branch in (no_main, no_pool, no_ctx):
+        assert branch["full_cost_tokens"] is None
+        assert branch["small_cost_tokens"] is None
+        assert branch["unavailable"], "an unavailable branch must say why"
+    assert available["full_cost_tokens"] and available["small_cost_tokens"]
+
+
+# ==========================================================================
+# Shutdown, measured against a real uvicorn
+# ==========================================================================
+
+
+def test_closing_the_hub_before_the_drain_is_what_lets_uvicorn_exit() -> None:
+    """MEASURED, and the reason ``__main__`` subclasses ``uvicorn.Server``.
+
+    ``Hub.close()`` in the ASGI lifespan is NOT sufficient on its own, which is
+    the thing this test exists to record. uvicorn's shutdown order is:
+
+      1. stop accepting
+      2. ask each live connection to finish
+      3. WAIT for them
+      4. run the lifespan's shutdown
+
+    ``app.py`` closes the hub at step 4 — after the wait it was meant to
+    shorten. An SSE response never finishes by itself, so step 3 blocked
+    forever: with one ``/api/events`` connection open, a plain
+    ``uvicorn.Server`` was still running after 40 s. Closing the hub from
+    ``handle_exit`` (before step 2) brings the same shutdown down to ~1.2 s.
+
+    Measured here with the real server and a real socket, because the whole
+    defect lives in the interaction between uvicorn's ordering and ours — no
+    in-process assertion about ``Hub.close`` could have seen it.
+    """
+    import threading
+    import time
+
+    import uvicorn
+
+    from servedeck import __main__ as entry
+
+    port = 8044
+    app = _app.create_app(
+        Settings(
+            listen_host="127.0.0.1",
+            listen_port=port,
+            models_path=Path(__file__).resolve().parent.parent / "models.toml",
+            state_dir=Path("/nonexistent-state-dir-for-this-test"),
+            unit_prefix="sd-test-",
+        ),
+        registry=_models.load(Path(__file__).resolve().parent.parent / "models.toml"),
+        control=FakeControl(),
+        reconcile=False,
+        poll=False,
+    )
+    config = uvicorn.Config(
+        app, host="127.0.0.1", port=port, log_level="error",
+        timeout_graceful_shutdown=entry.GRACEFUL_SHUTDOWN_S,
+    )
+    server = entry._ShutdownClosesTheHub(config, app.state.rt.hub)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            try:
+                if httpx.get(f"http://127.0.0.1:{port}/api/health", timeout=1.0).status_code == 200:
+                    break
+            except httpx.HTTPError:
+                time.sleep(0.05)
+        else:  # pragma: no cover
+            pytest.fail("the test server never came up")
+
+        # Park a real SSE connection, the way an open dashboard tab does.
+        def hold() -> None:
+            with contextlib.suppress(Exception):
+                with httpx.Client(timeout=httpx.Timeout(5.0, read=None)) as c:
+                    with c.stream("GET", f"http://127.0.0.1:{port}/api/events") as r:
+                        for _line in r.iter_lines():
+                            pass
+
+        threading.Thread(target=hold, daemon=True).start()
+        time.sleep(1.0)
+        assert app.state.rt.hub.subscriber_count == 1, "the stream did not register"
+
+        started = time.monotonic()
+        server.handle_exit(15, None)  # SIGTERM, exactly as systemd sends it
+        thread.join(timeout=entry.GRACEFUL_SHUTDOWN_S + 10)
+        elapsed = time.monotonic() - started
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+
+    assert not thread.is_alive(), "uvicorn never exited"
+    assert elapsed < 5.0, (
+        f"shutdown took {elapsed:.1f}s with one SSE stream open; the unit's "
+        "TimeoutStopSec is 15s and this used to hit it every single time"
+    )
+
+
+def test_the_graceful_timeout_is_below_the_units_stop_timeout() -> None:
+    """Belt and braces, checked as an arithmetic fact rather than a comment.
+
+    ``GRACEFUL_SHUTDOWN_S`` is the bound nothing can exceed; TimeoutStopSec in
+    the unit is what systemd does when something does. If the first ever rose
+    above the second, every stop would end in SIGKILL again — and the symptom
+    (a dashboard that "sometimes does not come back") points nowhere near
+    either number.
+    """
+    import re
+
+    from servedeck import __main__ as entry
+
+    unit = (Path(__file__).resolve().parent.parent / "systemd" / "servedeck.service").read_text()
+    match = re.search(r"^TimeoutStopSec=(\d+)", unit, re.M)
+    assert match, "the unit no longer declares TimeoutStopSec"
+    assert entry.GRACEFUL_SHUTDOWN_S < int(match.group(1))
+
+
+# ==========================================================================
+# "Did I win the port?" is not "is something answering?"
+# ==========================================================================
+
+
+def test_health_carries_a_per_process_nonce(client) -> None:
+    payload = client.get("/api/health").json()
+    assert payload["instance"] == client.rt.instance_id
+    assert len(payload["instance"]) >= 8
+
+
+def test_two_runtimes_get_different_instance_ids(settings, registry, control) -> None:
+    a = _app.build_runtime(settings, registry=registry, control=control)
+    b = _app.build_runtime(settings, registry=registry, control=control)
+    assert a.instance_id != b.instance_id
+
+
+@pytest.mark.anyio
+async def test_another_servedeck_holding_the_port_does_not_count_as_bound(
+    bind_runtime,
+) -> None:
+    """The 2026-09-11 failure, exactly.
+
+    A hand-started copy of servedeck held :8010. It answers ``/api/health``
+    with a perfectly good 200, so the process that LOST the bind concluded it
+    was listening, reconciled, and launched the 27B — 70 times in 9 minutes
+    under ``Restart=on-failure``.
+
+    A status-code check cannot see the difference between that and success.
+    The nonce can: the answer has to be OUR answer.
+    """
+    recorder = BindRecorder(answer_after=0, answers_as="impostor")
+    rt = bind_runtime(recorder)
+    rt.hub.bind(asyncio.get_running_loop())
+
+    result = await _app._reconcile_after_bind(rt, timeout_s=0.05, interval_s=0.001)
+
+    assert result is None, "reconciled while another servedeck held the port"
+    assert "reconcile" not in recorder.events
+    assert "impostor-answered" in recorder.events
+    reasons = [n["data"]["reason"] for n in rt.hub.notices]
+    assert "bind_timeout" in reasons
+    assert "another servedeck" in rt.hub.notices[-1]["data"]["message"]
+
+
+@pytest.mark.anyio
+async def test_a_non_servedeck_on_the_port_does_not_count_as_bound(bind_runtime) -> None:
+    recorder = BindRecorder(answer_after=0, answers_as="stranger")
+    rt = bind_runtime(recorder)
+    rt.hub.bind(asyncio.get_running_loop())
+    result = await _app._reconcile_after_bind(rt, timeout_s=0.05, interval_s=0.001)
+    assert result is None
+    assert "reconcile" not in recorder.events
+
+
+@pytest.mark.anyio
+async def test_our_own_answer_does_count(bind_runtime) -> None:
+    """Over-correction guard. A check this strict could reject everything —
+    including the success it exists to detect — and the symptom would be a
+    dashboard that never starts anything, blaming a bind that worked."""
+    recorder = BindRecorder(answer_after=0, answers_as="us")
+    rt = bind_runtime(recorder)
+    rt.hub.bind(asyncio.get_running_loop())
+    result = await _app._reconcile_after_bind(rt, timeout_s=5.0, interval_s=0.001)
+    assert result is not None
+    assert "reconcile" in recorder.events
+
+
+@pytest.mark.anyio
+async def test_a_malformed_health_body_does_not_count_as_bound(settings, registry, control) -> None:
+    """A 200 whose body is not JSON, or is JSON without the nonce. Both are
+    "something else is there", and neither may be read as success."""
+    for body in ({"json": {"ok": True}}, {"text": "not json at all"}):
+        rt = _app.build_runtime(
+            settings,
+            registry=registry,
+            control=control,
+            client=httpx.AsyncClient(
+                transport=httpx.MockTransport(lambda _r, b=body: httpx.Response(200, **b))
+            ),
+        )
+        assert (
+            await _app._own_port_answers(rt.client, rt.settings.health_url, rt.instance_id)
+        ) is False

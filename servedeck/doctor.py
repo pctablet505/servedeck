@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import json
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import NamedTuple
 
@@ -316,7 +316,7 @@ PTRACE_PATH = Path("/proc/sys/kernel/yama/ptrace_scope")
 PTRACE_SCOPE_REQUIRED = 0
 
 
-def check_training_marker() -> CheckResult:
+def check_training_marker(marker_paths: Sequence[str] | None = None) -> CheckResult:
     """Is something else claiming the GPU right now?
 
     ``qwen-server-run.sh``'s own guard 1, kept because the marker files are
@@ -325,7 +325,7 @@ def check_training_marker() -> CheckResult:
     correct response is to leave the card alone, and a warning is what gets
     scrolled past.
     """
-    candidates = _limits.training_markers()
+    candidates = _limits.training_markers() if marker_paths is None else tuple(marker_paths)
     hits = [p for p in candidates if Path(p).exists()]
     if not hits:
         return CheckResult(
@@ -341,6 +341,14 @@ def check_training_marker() -> CheckResult:
     )
 
 
+class _Unset:
+    """Sentinel: ``scope=None`` means "unreadable", which is a real and
+    reportable state, so it cannot double as "not supplied"."""
+
+
+_UNSET = _Unset()
+
+
 def _read_ptrace_scope() -> int | None:
     try:
         return int(PTRACE_PATH.read_text().strip())
@@ -348,7 +356,9 @@ def _read_ptrace_scope() -> int | None:
         return None
 
 
-def check_ptrace_scope(registry: _models.Registry) -> list[CheckResult]:
+def check_ptrace_scope(
+    registry: _models.Registry, scope: int | None | _Unset = _UNSET
+) -> list[CheckResult]:
     """``kernel.yama.ptrace_scope`` for every model that declares ``needs_tty``.
 
     Flash-Next relaxes this sysctl itself, through ``sudo sysctl`` — which
@@ -363,7 +373,8 @@ def check_ptrace_scope(registry: _models.Registry) -> list[CheckResult]:
     needy = [m for m in registry.models.values() if m.needs_tty]
     if not needy:
         return []
-    scope = _read_ptrace_scope()
+    if isinstance(scope, _Unset):
+        scope = _read_ptrace_scope()
     results: list[CheckResult] = []
     for m in needy:
         name = f"ptrace_scope ({m.key})"
@@ -399,6 +410,8 @@ def run_doctor(
     unit_run: _units.Runner | None = None,
     timeout: float = 2.0,
     http_get: HttpGet | None = None,
+    marker_paths: Sequence[str] | None = None,
+    ptrace_scope: int | None | _Unset = _UNSET,
 ) -> list[CheckResult]:
     results: list[CheckResult] = [check_registry(models_path)]
     if not results[0].ok:
@@ -422,8 +435,12 @@ def run_doctor(
         results.append(check_port(m, timeout=timeout, http_get=http_get))
 
     results.extend(check_model_units(registry, run=unit_run))
-    results.append(check_training_marker())
-    results.extend(check_ptrace_scope(registry))
+    # Both host checks take their input rather than reading it, for the same
+    # reason `http_get` exists: a test cannot set this box's
+    # kernel.yama.ptrace_scope, and a check that reads it directly makes
+    # `run_doctor`'s result depend on the machine the suite happens to run on.
+    results.append(check_training_marker(marker_paths))
+    results.extend(check_ptrace_scope(registry, ptrace_scope))
     return results
 
 

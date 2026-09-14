@@ -32,6 +32,7 @@ loopback and both inside the range this packet owns. The fixture stops every
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -45,6 +46,7 @@ import httpx
 import pytest
 import uvicorn
 
+from servedeck import __main__ as _entry
 from servedeck import app as _app
 from servedeck import control as _control
 from servedeck import models as _models
@@ -71,8 +73,9 @@ MODELS_TOML = f"""
 total_mib = 97887
 margin_mib = 1024
 
-[builds]
-stub = "{{build_root}}"
+[builds.stub]
+venv = "{{build_root}}"
+cuda_home = "{{build_root}}/cuda"
 
 [models.stub]
 id = "{STUB_ID}"
@@ -174,8 +177,15 @@ def server(workspace):
     app = _app.create_app(
         settings, registry=registry, control=control, reconcile=False, poll=True
     )
-    config = uvicorn.Config(app, host="127.0.0.1", port=APP_PORT, log_level="error")
-    uv = uvicorn.Server(config)
+    # The production server class, so this e2e also covers the stop path an
+    # operator actually triggers (SIGTERM -> handle_exit -> hub closed before
+    # uvicorn starts draining). A plain uvicorn.Server here would pass the
+    # lifecycle assertions and tell us nothing about the shutdown.
+    config = uvicorn.Config(
+        app, host="127.0.0.1", port=APP_PORT, log_level="error",
+        timeout_graceful_shutdown=_entry.GRACEFUL_SHUTDOWN_S,
+    )
+    uv = _entry._ShutdownClosesTheHub(config, app.state.rt.hub)
     thread = threading.Thread(target=uv.run, daemon=True)
     thread.start()
 
@@ -195,7 +205,7 @@ def server(workspace):
     finally:
         _app._wire.WIRE_TARGETS = original_targets
         started = time.monotonic()
-        uv.should_exit = True
+        uv.handle_exit(15, None)  # SIGTERM, exactly as systemd sends it
         thread.join(timeout=10)
         elapsed = time.monotonic() - started
         assert not thread.is_alive(), "uvicorn did not exit"
@@ -203,6 +213,22 @@ def server(workspace):
         # because each open SSE generator was parked on a queue nothing would
         # fill again; systemd SIGKILLed the unit 15 s later.
         assert elapsed < 5.0, f"shutdown took {elapsed:.1f}s with an SSE stream open"
+
+
+@pytest.fixture(autouse=True)
+def _stub_is_stopped_between_tests(server):
+    """Leave the stub stopped, before AND after every test.
+
+    Without this a test that fails mid-lifecycle leaves the unit running, and
+    every test after it reports 409 — so one real defect is reported as five,
+    four of them at the wrong place.
+    """
+    yield
+    if _units.exists(STUB_UNIT):
+        with contextlib.suppress(Exception):
+            httpx.post(f"{BASE}/api/models/stub/stop", timeout=10.0)
+        wait_until(lambda: not _units.exists(STUB_UNIT), 60)
+    wait_until(lambda: state().get("busy") is None, 30)
 
 
 def wait_until(predicate, timeout_s: float = 60.0, interval_s: float = 0.2):
@@ -289,11 +315,32 @@ def test_the_whole_lifecycle_through_the_api(server) -> None:
         # The boot markers arrived AS PROGRESS, in vLLM's own order. This is
         # the thing the 462-line phase machine used to do.
         markers = [p["text"] for p in events.of("progress") if p["kind"] == "marker"]
-        assert markers[:3] == [
+        expected = [
             "Loading weights took 0.01 seconds",
             "GPU KV cache size: 4,096 tokens",
             "Capturing CUDA graphs (mixed prefill-decode, PIECEWISE)",
-        ], markers
+        ]
+        if markers[:3] != expected:
+            # Two very different failures produce an empty marker list, and the
+            # message has to say which. If the journal HAS the lines, the
+            # follower missed them, and the cause seen on this box was inotify
+            # watch exhaustion — systemd logs "Failed to add control inotify
+            # watch descriptor ... No space left on device" right beside them
+            # and `journalctl -f` then never learns about new entries. That is
+            # the machine, not the code. If the journal does NOT have them, the
+            # model never got that far and this is a real regression.
+            tail = _units.journal_tail(STUB_UNIT, 200)
+            logged = [m for m in expected if any(m in line for line in tail)]
+            inotify = [line for line in tail if "inotify watch descriptor" in line]
+            raise AssertionError(
+                f"progress markers were {markers[:3]}, expected {expected}.\n"
+                f"markers present in the journal: {logged}\n"
+                f"inotify exhaustion lines: {len(inotify)}\n"
+                + ("The journal HAS the lines, so the follower missed them "
+                   "(see the inotify count above)." if len(logged) == 3
+                   else "The journal does NOT have the lines: the stub never "
+                        "reached that point. This is a real failure.")
+            )
 
     # The unit is real, and it is not in our cgroup.
     assert _units.exists(STUB_UNIT)
@@ -391,6 +438,11 @@ def test_starting_it_twice_is_refused_without_touching_the_unit(server) -> None:
     httpx.post(f"{BASE}/api/models/stub/start", timeout=10.0)
     try:
         assert wait_until(lambda: stub_row(state())["ready"], timeout_s=90)
+        # `busy` outranks `already_live` in the precheck, and the first start
+        # holds it until its outcome has been published — which can be after
+        # the poller has already seen the model answer. Wait for the mutation
+        # to finish, so this asserts the refusal it means to.
+        assert wait_until(lambda: state().get("busy") is None, 30), state().get("busy")
         pid = stub_row(state())["pid"]
         again = httpx.post(f"{BASE}/api/models/stub/start", timeout=10.0)
         assert again.status_code == 409
@@ -406,9 +458,14 @@ def test_the_journal_route_reads_the_real_journal(server) -> None:
     httpx.post(f"{BASE}/api/models/stub/start", timeout=10.0)
     try:
         assert wait_until(lambda: stub_row(state())["ready"], timeout_s=90)
-        payload = httpx.get(f"{BASE}/api/log/stub?lines=40", timeout=20.0).json()
+        # 1000, not 40: the dashboard polls /v1/models and /metrics every two
+        # seconds and the stub logs both, so the boot lines scroll out of a
+        # short tail within a minute. A journal route that could only show the
+        # last 40 lines of a chatty unit would never show a boot failure.
+        payload = httpx.get(f"{BASE}/api/log/stub?lines=1000", timeout=20.0).json()
         assert payload["unit"] == STUB_UNIT
-        assert any("stub listening" in line for line in payload["lines"]), payload["lines"]
+        assert any("stub listening" in line for line in payload["lines"]), payload["lines"][:10]
+        assert any("Loading weights took" in line for line in payload["lines"])
     finally:
         httpx.post(f"{BASE}/api/models/stub/stop", timeout=10.0)
         wait_until(lambda: not _units.exists(STUB_UNIT), 60)

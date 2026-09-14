@@ -198,9 +198,22 @@ def test_check_port_live_8007_flags_wrong_expected_id():
 
 
 def test_check_port_live_gateway_on_8010():
+    """The gateway's own port, whatever is behind it right now.
+
+    This must NOT assert that a particular model is live: :8010 is a gateway,
+    its answer depends on which model the box happens to be serving, and during
+    the v1 -> v2 cutover it changes owner entirely.  The property under test is
+    that check_port reports honestly either way — ok when the expected id is
+    served, and a detail naming the HTTP status when the gateway answers but
+    has no model behind it (a real 503 seen on 2026-09-14).
+    """
     m = _fake_model(key="gw", id="Qwen3.8-27B-NVFP4", port=8010)
     r = doctor.check_port(m, timeout=2.0)
-    assert r.ok is True, r.detail
+    if r.ok:
+        assert "Qwen3.8-27B-NVFP4" in r.detail or r.detail == "ok", r.detail
+    else:
+        assert "HTTP" in r.detail or "expected one of" in r.detail, r.detail
+        assert "503" in r.detail or "expected one of" in r.detail, r.detail
 
 
 def test_check_port_not_listening_real_socket():
@@ -311,6 +324,13 @@ def test_run_doctor_full_pass_with_stubbed_network(tmp_path):
         },
         unit_run=_units_run(stdout=""),
         http_get=get,
+        # The two host checks P4 moved out of preflight.py take their input,
+        # for the same reason http_get does: no test can set this box's
+        # kernel.yama.ptrace_scope, and reading it here would make the result
+        # depend on which machine the suite ran on. 0 and no markers are the
+        # states a correctly-configured host is in (REDESIGN §6).
+        marker_paths=(),
+        ptrace_scope=0,
     )
     # Every port reports "not listening" (ok=True); every model reports "not
     # running" (ok=True; no stray units in the stub); missing client files are
@@ -341,3 +361,94 @@ def test_format_table_shows_status_and_detail():
 
 def test_format_table_empty():
     assert doctor.format_table([]) == "(no checks ran)"
+
+
+# --------------------------------------------------------------------------- #
+# The two checks that moved out of preflight.py (P4)
+# --------------------------------------------------------------------------- #
+
+#: One model, no `needs_tty`, so `check_ptrace_scope` has nothing to report.
+MINIMAL_TOML = """
+[gpu]
+total_mib = 100000
+margin_mib = 1024
+
+[builds.stock]
+venv = "/opt/stock"
+cuda_home = "/opt/stock/lib/python3.13/site-packages/nvidia/cu13"
+
+[models.plain]
+id = "Plain-Model"
+repo = "org/plain"
+slot = "resident"
+vram_mib = 2000
+port = 19011
+build = "stock"
+ctx = 4096
+"""
+
+
+def test_a_training_marker_is_a_failure_not_a_warning(tmp_path):
+    """`qwen-server-run.sh`'s own guard 1. The marker files are written by
+    tools outside this repo (an AlgoTrading training run, chiefly) and nothing
+    else would notice them.
+
+    A hit is a FAILURE: the correct response is to leave the card alone, and a
+    warning is what gets scrolled past.
+    """
+    marker = tmp_path / "training_in_progress"
+    assert doctor.check_training_marker((str(marker),)).ok is True
+    marker.write_text("")
+    result = doctor.check_training_marker((str(marker),))
+    assert result.ok is False
+    assert str(marker) in result.detail
+    assert "do not start a model" in result.detail
+
+
+def test_ptrace_scope_is_only_checked_for_models_that_need_a_tty(tmp_path):
+    """Checked per model, so the answer names which model would fail — and not
+    checked at all for a registry with no `needs_tty` model, rather than
+    emitting a passing row nobody asked for."""
+    reg = models.load(REPO_ROOT / "models.toml")
+    needy = [m.key for m in reg.models.values() if m.needs_tty]
+    assert needy, "models.toml has no needs_tty model; this test has no subject"
+
+    ok = doctor.check_ptrace_scope(reg, 0)
+    assert [r.name for r in ok] == [f"ptrace_scope ({k})" for k in needy]
+    assert all(r.ok for r in ok)
+
+    bad = doctor.check_ptrace_scope(reg, 1)
+    assert all(not r.ok for r in bad)
+    # The detail must say why the launcher's own sudo sysctl does not save it:
+    # there is no tty under systemd, so the relaxation silently no-ops.
+    assert "no tty" in bad[0].detail
+    assert "sysctl" in bad[0].detail
+
+    unreadable = doctor.check_ptrace_scope(reg, None)
+    assert all(not r.ok for r in unreadable)
+    assert "could not read" in unreadable[0].detail
+
+
+def test_a_registry_with_no_needs_tty_model_gets_no_ptrace_row(tmp_path):
+    path = tmp_path / "models.toml"
+    path.write_text(MINIMAL_TOML)
+    reg = models.load(path)
+    assert not any(m.needs_tty for m in reg.models.values())
+    assert doctor.check_ptrace_scope(reg, 1) == []
+
+
+def test_none_scope_is_distinguishable_from_not_supplied(tmp_path):
+    """Over-correction guard on the sentinel.
+
+    `scope=None` is a real, reportable state ("could not read the sysctl"), so
+    it cannot double as "not supplied" — collapsing the two would make an
+    explicit `None` silently fall back to reading the host, and the test above
+    would pass on a box where ptrace_scope happens to be 0.
+    """
+    reg = models.load(REPO_ROOT / "models.toml")
+    explicit_none = doctor.check_ptrace_scope(reg, None)
+    assert all(not r.ok for r in explicit_none)
+    assert "could not read" in explicit_none[0].detail
+    # Not supplied: reads the host, whatever it says — only the shape is fixed.
+    from_host = doctor.check_ptrace_scope(reg)
+    assert len(from_host) == len(explicit_none)
