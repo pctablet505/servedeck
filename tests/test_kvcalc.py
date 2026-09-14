@@ -72,6 +72,22 @@ GROUND_TRUTHS = [
         375_543,
         327_680,
     ),
+    # Measured by tests/test_e2e_real.py on 2026-09-12: LFM2.5-350M booted
+    # through servedeck.control at --gpu-memory-utilization 0.03 and 8,192 ctx,
+    # vLLM 0.29.0 reporting "Available KV cache memory: 1.42 GiB" and
+    # "GPU KV cache size: 123,229 tokens" (kv_cache_size_tokens="123229" on
+    # vllm:cache_config_info). The FOURTH architecture, and the one that caught
+    # the layer-classification bug: 10 of its 16 layers are short-conv layers
+    # spelled plainly "conv", which the old `"linear" in layer_type` test did
+    # not recognise, so all 16 were counted as K/V-bearing.
+    (
+        "LFM2.5-350M at util 0.03",
+        "LiquidAI/LFM2.5-350M",
+        None,
+        1.42,
+        123_229,
+        8_192,
+    ),
 ]
 
 
@@ -100,9 +116,61 @@ def test_calculator_reproduces_every_measured_boot(
     )
 
 
+def test_a_short_conv_hybrid_is_not_mistaken_for_a_dense_model() -> None:
+    """The defect the LFM2 ground truth above caught, stated directly.
+
+    ``geometry`` decided which layers bear a K/V cache with one test:
+    ``"linear" in layer_type``. That recognises Qwen's ``linear_attention`` and
+    nothing else, so LFM2.5's ten ``"conv"`` layers were counted as attention
+    layers alongside its six real ones. The consequences compound in the same
+    direction: the family came out ``dense_gqa`` (wrong), the per-token rate
+    came out 32,768 B instead of 12,288 B (2.67x), and capacity was therefore
+    under-predicted by 62% — 46,530 tokens where the engine reported 123,229.
+
+    Under-prediction is the dangerous direction: the panel says the box holds
+    fewer requests than it does, which looks like prudence and is never
+    questioned.
+    """
+    geo = kvcalc.geometry(_cfg("LiquidAI/LFM2.5-350M"))
+    assert geo.family == "hybrid_conv", "a conv hybrid must not be sized as dense"
+    # 6 full_attention layers x 2 (K and V) x 8 KV heads x 64 head dim x 2 B.
+    assert geo.terms["attention_kv"] == 6 * 2 * 8 * 64 * 2 == 12_288
+    assert "conv_state_per_seq" in geo.terms
+    # Uncalibrated, and it says so: one boot is a calibration point, not a
+    # validation of proportionality.
+    assert geo.calibrated is False
+    assert geo.allocator_factor == 1.0
+    assert any("short-conv" in n for n in geo.notes)
+
+
+def test_linear_attention_is_still_counted_as_recurrent_not_as_attention() -> None:
+    """The over-correction guard for the fix above.
+
+    The obvious repair — "an attention layer is one whose type contains
+    'attention'" — silently breaks the two calibrated families, because Qwen's
+    recurrent layers are spelled ``linear_attention`` and contain it. The four
+    measured boots in ``GROUND_TRUTHS`` would drift by the ratio of total
+    layers to attention layers and still be within nobody's eye. So the
+    predicate is asserted here directly, on the spellings that actually occur.
+    """
+    for spelling in ("linear_attention", "conv", "short_conv", "mamba2", "recurrent"):
+        assert kvcalc._is_recurrent_layer(spelling), spelling
+    for spelling in ("full_attention", "sliding_attention", "attention"):
+        assert not kvcalc._is_recurrent_layer(spelling), spelling
+
+    # And the two calibrated families still see exactly the attention-layer
+    # count their factors were measured against.
+    qwen = kvcalc.geometry(_cfg("RadixArk/Qwen3.8-27B-NVFP4"))
+    assert qwen.family == "hybrid_gdn" and qwen.allocator_factor == 1.1663
+    assert qwen.terms["gdn_state_per_seq"] > 0
+    flash = kvcalc.geometry(_cfg("mazinb/Qwen3.8-Flash-Next-Uncensored-NVFP4"))
+    assert flash.family == "qsa_hybrid" and flash.allocator_factor == 1.1858
+
+
 def test_each_architecture_is_recognised_as_its_own_family() -> None:
     """A family median is wrong because KV size is a property of the layer
-    stack, not of the family name. These three stacks must not be conflated."""
+    stack, not of the family name. These four stacks must not be conflated."""
+    assert kvcalc.geometry(_cfg("LiquidAI/LFM2.5-350M")).family == "hybrid_conv"
     assert kvcalc.geometry(_cfg("RadixArk/Qwen3.8-27B-NVFP4")).family == "hybrid_gdn"
     assert (
         kvcalc.geometry(_cfg("mazinb/Qwen3.8-Flash-Next-Uncensored-NVFP4")).family

@@ -186,6 +186,42 @@ _PARSERS: dict[str, Callable[[str], list[tuple[str, str]]]] = {
     "kimi": _refs_from_kimi,
 }
 
+#: Hosts that are this box. A client reference to anything else is somebody
+#: else's service and none of servedeck's business.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0"})
+
+
+def is_local_ref(url: str) -> bool:
+    """True iff ``url``'s host is this machine's loopback.
+
+    Measured on this box: ``~/.kimi-code/config.toml`` declares four
+    ``managed:kimi-code`` models behind ``https://api.kimi.com/coding/v1``, and
+    without this filter ``doctor`` sent an unauthenticated request to that host
+    on every run and reported each 401 as a servedeck failure — four permanent
+    red lines for four entries that are perfectly correct, and a doctor with
+    four permanent red lines is a doctor nobody reads.
+
+    Two independent reasons the filter belongs here, not in the report:
+
+    * **Scope.** REDESIGN §2.4's claim is about *generated* entries: "for every
+      generated entry, GET /v1/models at the configured URL must list that exact
+      id", and everything ``servedeck wire`` generates points at
+      ``127.0.0.1:8010``. A cloud provider a user configured by hand is not
+      drift servedeck can create or fix.
+    * **It is an outbound request.** ``doctor`` is a local diagnostic an
+      operator runs freely, including in a loop. Reaching a third-party
+      endpoint from it tells that endpoint the box exists on every run, and any
+      day a client config gains an inline key in a header or query string, the
+      same code path would carry it there.
+    """
+    from urllib.parse import urlsplit
+
+    try:
+        host = urlsplit(url).hostname
+    except ValueError:
+        return False
+    return host is not None and host.lower() in _LOOPBACK_HOSTS
+
 
 def check_client_config(
     kind: str, path: str | Path, *, timeout: float = 2.0, http_get: HttpGet | None = None
@@ -202,6 +238,24 @@ def check_client_config(
         return [CheckResult(f"{kind} config", True, f"{p} present, no model references found")]
 
     results: list[CheckResult] = []
+    remote = [(m, u) for m, u in refs if not is_local_ref(u)]
+    refs = [(m, u) for m, u in refs if is_local_ref(u)]
+    if remote:
+        # Reported, not silently dropped: an operator reading the table must be
+        # able to see that these entries exist and were deliberately not probed.
+        results.append(
+            CheckResult(
+                f"{kind} config (remote)",
+                True,
+                f"{len(remote)} entr{'y' if len(remote) == 1 else 'ies'} point off this box "
+                f"and were not probed: "
+                + ", ".join(f"{m} @ {u.rsplit('/models', 1)[0]}" for m, u in remote),
+            )
+        )
+    if not refs:
+        return results or [
+            CheckResult(f"{kind} config", True, f"{p} present, no local model references found")
+        ]
     for model_id, models_url in refs:
         name = f"{kind}: {model_id}"
         try:

@@ -41,7 +41,34 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-Family = Literal["dense_gqa", "hybrid_gdn", "qsa_hybrid", "mla", "unknown"]
+Family = Literal["dense_gqa", "hybrid_conv", "hybrid_gdn", "qsa_hybrid", "mla", "unknown"]
+
+#: Substrings that mark a layer as RECURRENT rather than attention — a layer
+#: that keeps a fixed-size state per sequence instead of a K/V entry per token,
+#: and therefore contributes nothing to the per-token rate.
+#:
+#: This used to be the single test ``"linear" in layer_type``, which recognises
+#: Qwen's ``linear_attention`` and nothing else. LFM2.5's short-conv layers are
+#: spelled plainly ``"conv"``, so 10 of its 16 layers were counted as
+#: attention layers: 32,768 B/token against the 12,373 B/token the engine's own
+#: accounting gives (measured 2026-09-12, ``--gpu-memory-utilization 0.03``,
+#: 8,192 ctx: 1.42 GiB of cache holding 123,229 tokens where this module
+#: predicted 46,530). A 2.65x over-estimate of the rate is a 62% under-estimate
+#: of capacity, and it fails in the direction nobody checks — the panel says a
+#: model fits fewer requests than it does, so the box looks smaller than it is
+#: and nothing ever contradicts it.
+#:
+#: Matched as substrings against the whole layer-type string, so
+#: ``linear_attention``, ``short_conv``, ``mamba2`` and ``recurrent`` are all
+#: recognised. ``full_attention`` and ``sliding_attention`` contain none of
+#: them, which is why the test is written this way round rather than as "does
+#: it contain 'attention'" — ``linear_attention`` does.
+_RECURRENT_LAYER_MARKERS = ("linear", "conv", "mamba", "recurrent", "ssm")
+
+
+def _is_recurrent_layer(layer_type: object) -> bool:
+    name = str(layer_type).lower()
+    return any(mark in name for mark in _RECURRENT_LAYER_MARKERS)
 
 #: Bytes per element, by the name vLLM/HF use for the dtype.
 _DTYPE_BYTES: dict[str, int] = {
@@ -80,6 +107,14 @@ _FACTORS: dict[str, tuple[float, bool, str]] = {
     "qsa_hybrid": (1.1858, True, "mean of 3 boots, residuals -3.0%..+1.7%"),
     "mla": (1.0332, True, "1 boot (GLM-5.3-Flash, 5.25 GiB -> 375,543 tokens)"),
     "dense_gqa": (1.0, False, "no dense model has booted on this machine"),
+    # hybrid_conv — ONE boot: LFM2.5-350M at 8,192 ctx, util 0.03, a 1.42 GiB
+    # cache giving 123,229 tokens (2026-09-12). The attention arithmetic alone
+    # (6 full-attention layers x 8 KV heads x 64 head dim x 2 B x 2) predicts
+    # 12,288 B/token against the 12,373 the engine implies, so the residual is
+    # +0.7% and within the rounding of the "1.42 GiB" the log prints. A factor
+    # of 1.0 is therefore what the measurement supports, and `calibrated` stays
+    # False because one point cannot validate a proportionality.
+    "hybrid_conv": (1.0, False, "1 boot (LFM2.5-350M, 1.42 GiB -> 123,229 tokens, +0.7%)"),
     "unknown": (1.0, False, "architecture not recognised"),
 }
 
@@ -204,7 +239,7 @@ def geometry(
     notes: list[str] = []
     terms: dict[str, float] = {}
 
-    n_linear = sum(1 for t in layer_types if "linear" in str(t))
+    n_linear = sum(1 for t in layer_types if _is_recurrent_layer(t))
     n_layers = int(tc.get("num_hidden_layers") or len(layer_types) or 0)
     n_attn = (len(layer_types) - n_linear) if layer_types else n_layers
 
@@ -265,7 +300,47 @@ def geometry(
         return KvGeometry("dense_gqa", attn, 0.0, f, cal, why, terms, tuple(notes))
 
     ssm_b = dtype_bytes(mamba_ssm_dtype or tc.get("mamba_ssm_dtype"), 4)
-    state = float(n_linear * _gdn_state_bytes(tc, ssm_b))
+    gdn_per_layer = _gdn_state_bytes(tc, ssm_b)
+
+    if gdn_per_layer <= 0.0 and tc.get("conv_dim"):
+        # A short-conv hybrid (LFM2.5): attention layers interleaved with plain
+        # convolution layers. Its recurrent layers are NOT Gated DeltaNet, so
+        # `_gdn_state_bytes` finds none of the keys it needs and returns 0 —
+        # and taking `hybrid_gdn`'s calibrated 1.1663 allocator factor for it
+        # would be borrowing a correction measured on a different layer stack.
+        #
+        # The conv cache term below is derived from config.json only. Unlike
+        # `_gdn_state_bytes`, it has NOT been confirmed against a vLLM page
+        # size, so it is labelled. It is also ~0.06% of the per-token rate at
+        # 8k context (61 KiB/seq over 8,192 tokens against 12 KiB/token), so
+        # even a wrong shape here cannot move the estimate — the layer COUNT
+        # above is what mattered, and that is now measured.
+        conv_state = float(
+            n_linear
+            * int(tc["conv_dim"])
+            * int(tc.get("conv_L_cache") or 0)
+            * dtype_bytes(tc.get("dtype") or cfg.get("dtype"))
+        )
+        terms["conv_state_per_seq"] = conv_state
+        f, cal, why = _FACTORS["hybrid_conv"]
+        return KvGeometry(
+            "hybrid_conv",
+            attn,
+            conv_state,
+            f,
+            cal,
+            why,
+            terms,
+            (
+                *notes,
+                f"{n_attn} of {len(layer_types)} layers keep a K/V cache; the other "
+                f"{n_linear} are short-conv layers whose state is per-sequence",
+                "the conv-cache term is derived from config.json and has not been "
+                "confirmed against a vLLM page size (it is ~0.1% of the rate)",
+            ),
+        )
+
+    state = float(n_linear * gdn_per_layer)
     terms["gdn_state_per_seq"] = state
 
     family: Family = "hybrid_gdn"
