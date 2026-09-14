@@ -23,6 +23,11 @@ editor an hour later." Four kinds of check, each yielding one or more
    ``/run/user/<uid>/systemd/transient`` and are enumerated with
    ``systemctl --user list-units``, never as files in that directory — a
    file-existence check there can never pass after the cutover.
+5. the two host-state checks that survived ``preflight.py``: no training
+   marker claims the GPU, and ``ptrace_scope`` is 0 for any model that
+   declares ``needs_tty``. Both are about the HOST, not about a model's
+   configuration, which is why neither had anywhere else to go when
+   ``preflight.py`` was deleted.
 
 All network access is a plain ``httpx.get`` with a 2 s timeout, injectable via
 ``http_get`` so tests never need a real server — except the two tests that are
@@ -35,12 +40,13 @@ from __future__ import annotations
 
 import json
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import NamedTuple
 
 import httpx
 
+from . import limits as _limits
 from . import models as _models
 from . import units as _units
 from . import wire as _wire
@@ -52,6 +58,8 @@ __all__ = [
     "check_client_config",
     "check_port",
     "check_model_units",
+    "check_training_marker",
+    "check_ptrace_scope",
     "run_doctor",
     "all_ok",
     "format_table",
@@ -289,6 +297,108 @@ def check_model_units(
 
 
 # --------------------------------------------------------------------------- #
+# 5. The two preflight checks that survived
+# --------------------------------------------------------------------------- #
+#
+# ``preflight.py`` was 382 lines of launch gating built around a supervisor
+# that no longer exists: venv presence, launcher scripts, log paths, GPU
+# health, a Codex subagent cap. systemd, the registry and ``control`` cover all
+# of it now. Two checks had no other home, and both share doctor's shape —
+# something on this box is in a state that will make a boot fail, and an
+# operator wants to know *before* burning four minutes discovering it.
+
+#: A "lock file" convention: if one of these exists, something else wants the
+#: GPU (a training run, a benchmark) and servedeck must stand down.
+#: ``$SERVEDECK_TRAINING_MARKERS`` (colon-separated) overrides the defaults.
+PTRACE_PATH = Path("/proc/sys/kernel/yama/ptrace_scope")
+
+#: Flash-Next's PLE CUDA-IPC handoff needs ``pidfd_getfd``, which needs this.
+PTRACE_SCOPE_REQUIRED = 0
+
+
+def check_training_marker(marker_paths: Sequence[str] | None = None) -> CheckResult:
+    """Is something else claiming the GPU right now?
+
+    ``qwen-server-run.sh``'s own guard 1, kept because the marker files are
+    written by tools outside this repo (an AlgoTrading training run, chiefly)
+    and nothing else would notice them. A hit is a FAILURE, not a warning: the
+    correct response is to leave the card alone, and a warning is what gets
+    scrolled past.
+    """
+    candidates = _limits.training_markers() if marker_paths is None else tuple(marker_paths)
+    hits = [p for p in candidates if Path(p).exists()]
+    if not hits:
+        return CheckResult(
+            "training marker",
+            True,
+            f"none of the {len(candidates)} training-marker paths exist",
+        )
+    return CheckResult(
+        "training marker",
+        False,
+        f"{hits[0]} exists — something else wants the GPU; do not start a model "
+        f"(remove it only once that run has actually finished)",
+    )
+
+
+class _Unset:
+    """Sentinel: ``scope=None`` means "unreadable", which is a real and
+    reportable state, so it cannot double as "not supplied"."""
+
+
+_UNSET = _Unset()
+
+
+def _read_ptrace_scope() -> int | None:
+    try:
+        return int(PTRACE_PATH.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def check_ptrace_scope(
+    registry: _models.Registry, scope: int | None | _Unset = _UNSET
+) -> list[CheckResult]:
+    """``kernel.yama.ptrace_scope`` for every model that declares ``needs_tty``.
+
+    Flash-Next relaxes this sysctl itself, through ``sudo sysctl`` — which
+    silently no-ops without an interactive tty, and a systemd ``ExecStart`` has
+    none. So "it works when I run it by hand" and "it works as a unit" are
+    different facts, and the model only appears to work today because
+    ptrace_scope happens to be 0 on this boot. Checked per model rather than
+    globally so the answer names which model would fail; a registry with no
+    ``needs_tty`` model gets no row at all rather than a passing check nobody
+    asked for.
+    """
+    needy = [m for m in registry.models.values() if m.needs_tty]
+    if not needy:
+        return []
+    if isinstance(scope, _Unset):
+        scope = _read_ptrace_scope()
+    results: list[CheckResult] = []
+    for m in needy:
+        name = f"ptrace_scope ({m.key})"
+        if scope is None:
+            results.append(
+                CheckResult(name, False, f"could not read {PTRACE_PATH}")
+            )
+        elif scope != PTRACE_SCOPE_REQUIRED:
+            results.append(
+                CheckResult(
+                    name,
+                    False,
+                    f"kernel.yama.ptrace_scope={scope}; {m.id} needs 0 for its PLE "
+                    f"handoff (pidfd_getfd). Its launcher's own `sudo sysctl` does "
+                    f"NOT fix this under systemd — there is no tty. Owner action: "
+                    f"/etc/sysctl.d/90-vllm.conf",
+                )
+            )
+        else:
+            results.append(CheckResult(name, True, f"0 — {m.id} can do its PLE handoff"))
+    return results
+
+
+# --------------------------------------------------------------------------- #
 # Orchestration + presentation
 # --------------------------------------------------------------------------- #
 
@@ -300,6 +410,8 @@ def run_doctor(
     unit_run: _units.Runner | None = None,
     timeout: float = 2.0,
     http_get: HttpGet | None = None,
+    marker_paths: Sequence[str] | None = None,
+    ptrace_scope: int | None | _Unset = _UNSET,
 ) -> list[CheckResult]:
     results: list[CheckResult] = [check_registry(models_path)]
     if not results[0].ok:
@@ -323,6 +435,12 @@ def run_doctor(
         results.append(check_port(m, timeout=timeout, http_get=http_get))
 
     results.extend(check_model_units(registry, run=unit_run))
+    # Both host checks take their input rather than reading it, for the same
+    # reason `http_get` exists: a test cannot set this box's
+    # kernel.yama.ptrace_scope, and a check that reads it directly makes
+    # `run_doctor`'s result depend on the machine the suite happens to run on.
+    results.append(check_training_marker(marker_paths))
+    results.extend(check_ptrace_scope(registry, ptrace_scope))
     return results
 
 

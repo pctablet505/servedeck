@@ -32,7 +32,7 @@ from typing import Any
 import tomli_w
 
 from . import models as _models
-from . import paths as _paths
+from . import settings as _settings
 
 __all__ = [
     "GATEWAY_BASE_URL",
@@ -64,7 +64,7 @@ KIMI_CONFIG_PATH = Path.home() / ".kimi-code" / "config.toml"
 
 #: Where `servedeck wire --apply` backs up a file before overwriting it:
 #: state/backups/<YYYY-MM-DD>/<safe-name>.
-BACKUP_ROOT = _paths.STATE_DIR / "backups"
+BACKUP_ROOT = _settings.get().state_dir / "backups"
 
 #: Prepended to every table servedeck owns, so a human editing the file by hand
 #: knows a `wire --apply` will overwrite it.

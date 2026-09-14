@@ -109,23 +109,15 @@ def test_constants_match_spec():
     assert FLASHNEXT_MIN_UTIL == 0.90
 
 
-def test_training_markers_are_configurable_not_hardcoded():
-    """Marker paths come from config, so this works on any machine.
+def test_training_markers_are_configurable_not_hardcoded(monkeypatch):
+    """Marker paths come from the environment, so this works on any machine.
 
     They used to be three literals from one developer's home directory.
     """
-    import os
-
     from servedeck import capacity as cap
-    from servedeck import config
 
-    os.environ["SERVEDECK_TRAINING_MARKERS"] = "/tmp/a-marker:/tmp/b-marker"
-    try:
-        config.reset()
-        assert tuple(cap._cfg_markers()) == ("/tmp/a-marker", "/tmp/b-marker")
-    finally:
-        del os.environ["SERVEDECK_TRAINING_MARKERS"]
-        config.reset()
+    monkeypatch.setenv("SERVEDECK_TRAINING_MARKERS", "/var/tmp/a-marker:/var/tmp/b-marker")
+    assert tuple(cap._cfg_markers()) == ("/var/tmp/a-marker", "/var/tmp/b-marker")
 
 
 # ---------------------------------------------------------------------------
@@ -791,30 +783,30 @@ def test_unknown_weights_do_not_block_the_launch():
     )
 
 
-def test_training_markers_come_from_the_config_file_too(config_path):
-    """`training_markers` in servedeck.toml was parsed into Config and then
-    read by nothing: the only source was $SERVEDECK_TRAINING_MARKERS.
+def test_the_built_in_markers_are_used_when_nothing_is_configured(monkeypatch):
+    """servedeck.toml is gone; the defaults live in servedeck.limits.
 
-    A configured guard that cannot fire is worse than an absent one — it reads
-    as switched on. `~` is expanded, because a config file is exactly where
-    someone writes `~/run/training_in_progress`.
+    A guard whose default is the empty tuple reads as switched on and fires
+    never, which is the failure this list exists to avoid -- so the fallback
+    has to be the real marker paths, not nothing.
     """
     from servedeck import capacity as cap
+    from servedeck import limits
 
-    config_path('training_markers = ["~/a-marker", "/tmp/b-marker"]\n')
-    got = tuple(cap._cfg_markers())
-    assert got == (str(Path.home() / "a-marker"), "/tmp/b-marker"), got
-    assert cap.TRAINING_MARKER_PATHS == got, "refresh_limits() must re-read them"
+    monkeypatch.delenv("SERVEDECK_TRAINING_MARKERS", raising=False)
+    assert tuple(cap._cfg_markers()) == limits.DEFAULT_TRAINING_MARKERS
+    assert limits.DEFAULT_TRAINING_MARKERS, "an empty marker list is a guard that never fires"
+    assert all(m.endswith("training_in_progress") for m in limits.DEFAULT_TRAINING_MARKERS)
 
 
-def test_env_var_overrides_the_configured_markers(config_path, monkeypatch):
-    """A test or a one-off run must be able to override without editing the
-    file that describes the machine."""
+def test_refresh_limits_re_reads_the_markers(monkeypatch):
+    """`TRAINING_MARKER_PATHS` is read at import time; a long-lived process
+    that changes the environment must be able to make it true again."""
     from servedeck import capacity as cap
 
-    config_path('training_markers = ["/tmp/from-file"]\n')
-    monkeypatch.setenv("SERVEDECK_TRAINING_MARKERS", "/tmp/x:/tmp/y")
-    assert tuple(cap._cfg_markers()) == ("/tmp/x", "/tmp/y")
+    monkeypatch.setenv("SERVEDECK_TRAINING_MARKERS", "/var/tmp/x:/var/tmp/y")
+    cap.refresh_limits()
+    assert cap.TRAINING_MARKER_PATHS == ("/var/tmp/x", "/var/tmp/y")
 
 
 # ---------------------------------------------------------------------------

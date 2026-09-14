@@ -1,174 +1,164 @@
-# Configuration
+# Configuration (v2)
 
-Servedeck reads settings in this order — first match wins:
+**`models.toml` in the repo root is the single source of truth.** Every model's
+public name, aliases, port, context, parsers, launch flags and environment come
+from it, and everything else — the gateway's routing table, the `vllm serve`
+argv, the generated client configs, `doctor` — is derived. The reason it is one
+file is root cause R1 in [REDESIGN-2026-09-12.md](REDESIGN-2026-09-12.md).
 
-1. `SERVEDECK_*` environment variables
-2. `servedeck.toml` (working directory, or `$SERVEDECK_CONFIG`)
-3. Auto-detection
-4. Defaults
-
-Everything is optional except a backend.
-
----
-
-## Backends
-
-A backend is a script you already use to start a model server.
-
-```toml
-[backends.vllm]
-launcher = "~/serve.sh"        # required
-port     = 8000                # required
-venv     = "~/venvs/vllm"      # optional
-log_path = "~/serve.log"       # optional
-writes_own_log = false         # optional
-architectures = ["Qwen3ForCausalLM", "LlamaForCausalLM"]
-needs_tty = false
-```
-
-**`architectures`** lists what this backend can load, matched against
-`architectures[0]` in a model's `config.json`. Models no backend claims are
-shown but not startable, with the reason. This is also how you teach Servedeck
-a model family it does not know — no code change.
-
-**`venv`** is checked before every start (a stale venv path is the largest
-single boot-failure class there is) and is how Servedeck recognises a server
-you started by hand, so it can adopt and supervise it.
-
-**`log_path`** is where a *hand-started* run of this backend writes its log.
-Servedeck reads it to recover an adopted server's boot numbers. **Leave it out
-if your launcher has no fixed log** — Servedeck then falls back to the log it
-opened itself, under `state/boot_logs/<backend>-*.log`, and to nothing at all
-if there is none. Never point it at another backend's log: the phase machine
-would match that model's error lines and file them as this backend's failure.
-
-**`writes_own_log = true`** says the launcher redirects its *own* output into
-`log_path` (`exec >> "$LOG" 2>&1`). Servedeck then tails that file during a
-launch too, because the boot output stops arriving on the pipe it opened.
-Leave it false when `log_path` is only a hand-launch convention — tailing it
-during a fresh launch would replay a previous boot into the phase machine.
-
-**`needs_tty = true`** means starting it requires a terminal — an interactive
-`sudo` prompt, for example. Servedeck will not attempt an unattended restart;
-it reports `blocked-needs-human` instead of looping.
-
-### Passing settings to your launcher
-
-Servedeck never builds a `vllm serve` command line. It sets environment
-variables and runs your script, so your script keeps owning the flags.
-
-```toml
-[backends.vllm.env_map]
-repo_id       = "MODEL"
-port          = "PORT"
-max_model_len = "MAX_LEN"
-util          = "GPU_UTIL"
-max_num_seqs  = "MAX_SEQS"
-served_name   = "SERVED_NAME"
-kv_dtype      = "KV_DTYPE"
-```
-
-Left side is Servedeck's setting name; right side is your variable. Your
-launcher then reads them:
-
-```bash
-vllm serve "$MODEL" \
-  --port "${PORT:-8000}" \
-  --max-model-len "${MAX_LEN:-32768}" \
-  --gpu-memory-utilization "${GPU_UTIL:-0.90}"
-```
-
-Those seven are the whole set of settings Servedeck knows how to pass, and the
-table above is also the default — omit `env_map` entirely and you get it. An
-**empty** table is different from an omitted one: it means "this launcher reads
-no environment", which is right for a launcher that takes its settings from a
-file of its own.
-
-`repo_id` matters more than it looks. Without it your launcher boots whatever
-model its own `${MODEL:-...}` default names, no matter what was selected in the
-UI.
-
-### Machine-specific tuning
-
-Anything else your launcher reads goes in a fixed `env` table, passed through
-verbatim on every start:
-
-```toml
-[backends.vllm.env]
-CPU_OFFLOAD_GB = "104"
-KV_BYTES       = "8053063680"
-```
-
-Servedeck never interprets these — a knob it understands is a knob it can get
-wrong. Two rules of thumb: put *sizing* knobs here, and leave *correctness*
-knobs to your launcher's own defaults. A flag that decides which kernel gets
-compiled is not something a dashboard should be able to override; if it is
-wrong the server still loads, still serves, and quietly produces garbage.
+**`servedeck.toml` is gone.** So is `local_llm/.config`, the `[backends.*]`
+tables, `env_map`, `launcher`, `log_path` and `writes_own_log`. Servedeck now
+builds the command line itself; there is no launcher script to pass settings to.
 
 ---
 
-## Hardware
+## `models.toml`
+
+Loaded and validated by `servedeck/models.py`. A problem is one
+`RegistryError` with one line saying what and where — never a bare `KeyError`.
+
+### `[gpu]` — required
 
 ```toml
-gpu_total_mib = 24564    # detected via nvidia-smi if unset
-overhead_gib  = 4.7      # VRAM that is neither weights nor KV
-frag_margin_mib = 4096   # below this free, a config is "thin", not impossible
+[gpu]
+total_mib  = 97887
+margin_mib = 1024          # never handed to any model
 ```
 
-**`overhead_gib`** covers activations and CUDA graphs. Measured 4.3–4.5 GiB
-across two very different models; 4.7 errs high so predictions stay
-conservative. If yours come out optimistic, raise it.
+Both keys are required. `margin_mib` is subtracted from free VRAM before a
+`main` model's utilisation is computed.
 
-**`frag_margin_mib`** is a warning threshold, never part of the requirement.
-Adding it to the requirement makes any utilization above ~0.958 look
-impossible on a card that runs 0.95 fine.
-
-If GPU detection fails, `gpu_total_mib` is 0 and Servedeck refuses to compute
-capacity rather than guessing.
-
----
-
-## Paths
+### `[builds]` — build name → venv location
 
 ```toml
-state_dir   = "./state"                       # desired state, history, measurements
-model_cache = "~/.cache/huggingface/hub"      # from HF_HUB_CACHE / HF_HOME if unset
+[builds]
+stock      = "~/Projects/local_llm/.venv-llm-029"
+qwen38next = "~/Projects/vllm-qwen38next/.venv-next"
 ```
 
----
+Each model's `build` must be a key here. The value is the build's **venv**, and
+the `vllm` binary is looked for at `<value>/bin/vllm` — unless the value's last
+path segment is already `bin`, in which case it is used as written. `~` is
+expanded.
 
-## Standing down for other GPU work
+The longer table form is also read, so a build can carry more than a path:
 
 ```toml
-training_markers = ["~/run/training_in_progress"]
+[builds.glm53]
+venv = "~/Projects/vllm-glm53/.venv-glm53"
 ```
 
-If any listed file exists, Servedeck refuses to start a server. Useful when a
-training job needs the card. `~` is expanded; every listed path is checked on
-each capacity estimate, and the ones that exist are named in the block reason
-so you know what to remove.
-
-`SERVEDECK_TRAINING_MARKERS` (colon-separated) overrides the list entirely,
-for a one-off run.
-
----
-
-## Serving
+### `[defaults.env]` — merged into every model
 
 ```toml
-listen_host = "127.0.0.1"    # do not expose this; there is no auth
-listen_port = 8010
+[defaults.env]
+VLLM_USE_FLASHINFER_SAMPLER = "0"
 ```
+
+Merged at load time into each model's own `env`; a model's own key wins on
+conflict. Downstream code only ever sees the merged result.
+
+### `[models.<key>]`
+
+The table key is the registry key: it is the CLI argument, the `/api/*` path
+segment and the unit name suffix (`model-<key>`), so it must match
+`[a-z0-9-]+` or `units.py` refuses to start it.
+
+| Field | Required | Meaning |
+|---|---|---|
+| `id` | yes | The canonical public name. First entry in `--served-model-name`. |
+| `repo` | yes | Hugging Face repo id; `vllm serve`'s positional argument. |
+| `slot` | yes | `"main"` (exclusive, one at a time) or `"resident"` (co-resident, budgeted). |
+| `port` | yes | Loopback port this model's own vLLM listens on. Clients never see it. |
+| `build` | yes | A key in `[builds]`. |
+| `ctx` | yes | An integer, or `"native"` → the checkpoint's own `max_position_embeddings`. |
+| `aliases` | no | List of strings. Every name a client has ever used. Added to `--served-model-name`. |
+| `reasoning` | no | `{ parser = "...", mirror_content = true }`. `parser` required if the table is present. |
+| `tools` | no | `{ parser = "..." }`. `parser` required if the table is present. Enables `--enable-auto-tool-choice`. |
+| `flags` | no | List of strings appended verbatim to the argv, after the computed flags. |
+| `env` | no | Table of string env vars for the unit. |
+| `presets` | no | `{ <name> = { <request overlay> } }`. Each preset is a served name carrying a `chat_template_kwargs` overlay. |
+| `vram_mib` | residents only | The resident's VRAM budget, from which its utilisation is derived. |
+| `min_output_tokens` | no | Floor the gateway raises an explicitly-small output budget to. |
+| `max_output_tokens` | no | Advertised to clients by `servedeck wire` (VS Code's `maxOutputTokens`). |
+| `vision` | no | Advertised to clients by `servedeck wire`. Default `false`. |
+| `needs_tty` | no | This model cannot boot unattended. `doctor` checks `ptrace_scope` for it. Default `false`. |
+
+`servedeck` never writes `--served-model-name`, `--host`, `--max-model-len`,
+`--gpu-memory-utilization` or `--port` from `flags`: it computes all five.
+
+### Validation rules `_validate` enforces
+
+- `[gpu]` is present with both `total_mib` and `margin_mib`.
+- At least one `[models.*]` table exists.
+- Every required field above is present; `slot` is `main` or `resident`;
+  `ctx` is an int or `"native"`; `aliases` and `flags` are lists of strings;
+  `presets` and each preset's overlay are tables.
+- A `resident` has a `vram_mib`.
+- **Every id, alias and preset name is unique across the whole file**, and a
+  preset may not shadow any id or alias, including its own model's.
+- **Ports are unique**, and never `8000` (ats-optimizer) or `8010` (the gateway).
+- Every model's `build` is a key in `[builds]`.
+- `sum(resident vram_mib) + margin_mib < total_mib`, so a main model always has
+  room.
+
+### Utilisation is computed, never configured
+
+There is no `util` field. At launch, `control.py` asks `nvidia-smi`:
+
+```
+main:      floor2((free_mib - margin_mib) / total_mib)      # everything free
+resident:  floor2(vram_mib / total_mib)                     # its own budget
+```
+
+Always floored to two decimals, never rounded up. This is decision 4 of the
+design: a resident can no longer make a big model refuse to boot, because its
+memory is simply not free.
 
 ---
 
 ## Environment variables
 
-| Variable | Overrides |
-|---|---|
-| `SERVEDECK_CONFIG` | config file location |
-| `SERVEDECK_STATE_DIR` | `state_dir` |
-| `SERVEDECK_MODEL_CACHE` | `model_cache` |
-| `SERVEDECK_GPU_TOTAL_MIB` | `gpu_total_mib` |
-| `SERVEDECK_HOST` / `SERVEDECK_PORT` | listen address |
-| `SERVEDECK_TRAINING_MARKERS` | `training_markers` (colon-separated) |
+Five, and that is the whole surface (`servedeck/settings.py`):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SERVEDECK_MODELS` | `<repo>/models.toml` | Path to the registry. (`SERVEDECK_MODELS_TOML` is accepted as a synonym.) |
+| `SERVEDECK_STATE_DIR` | `<repo>/state` | `desired.json`, `wire`'s dated backups, the measurement store. |
+| `SERVEDECK_UNIT_PREFIX` | `model-` | The systemd namespace servedeck owns. **Only `model-` or `sd-test-`**; anything else is rejected at startup. |
+| `SERVEDECK_HOST` | `127.0.0.1` | Listen address. Do not expose this; there is no auth. |
+| `SERVEDECK_PORT` | `8010` | Listen port. |
+
+A bad `SERVEDECK_UNIT_PREFIX` fails loudly at startup rather than producing a
+`Control` whose discovery glob matches nothing — which would report a serving
+box as empty.
+
+Three capacity overrides plus the marker list live in `servedeck/limits.py`,
+because they describe the *card*, not any model:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SERVEDECK_GPU_TOTAL_MIB` | `nvidia-smi`, else `0` | Total VRAM. `0` means "cannot compute", and capacity refuses to guess. |
+| `SERVEDECK_OVERHEAD_GIB` | `4.7` | VRAM that is neither weights nor KV (activations, CUDA graphs). Measured 4.3–4.5 GiB on two very different models; 4.7 errs high on purpose. |
+| `SERVEDECK_FRAG_MARGIN_MIB` | `4096` | Fragmentation margin. A *warning* threshold, never part of the requirement — adding it to the requirement makes any util above ~0.958 look impossible. |
+| `SERVEDECK_TRAINING_MARKERS` | two built-in paths | Colon-separated lock files. If one exists, something else wants the GPU and `doctor` fails. |
+
+The two built-in marker paths are `~/Projects/local_llm/run/training_in_progress`
+and `~/.cache/algotrading/training_in_progress`.
+
+---
+
+## Client configs
+
+Generated, not hand-written. `servedeck wire` rewrites, idempotently and with a
+dated backup under `<state_dir>/backups/<YYYY-MM-DD>/`:
+
+- `~/.config/Code/User/chatLanguageModels.json` — one `servedeck` group, one
+  entry per served name and per preset, pointing at
+  `http://localhost:8010/v1/chat/completions`.
+- `~/.codex/config.toml` — one provider at `http://127.0.0.1:8010/v1`.
+- `~/.kimi-code/config.toml` — same shape.
+
+Only the tables servedeck owns are rewritten; every other group, provider and
+hand-written comment is left byte-for-byte intact. Run `servedeck wire` with no
+flags for the diff, `--apply` to write it. Then `servedeck doctor` proves it.

@@ -1,54 +1,64 @@
 [Unit]
-# Servedeck — local web GUI + API + gateway proxy managing the vLLM server.
-# Runs as a systemd --user unit (no sudo anywhere in this project).
+# servedeck v2 — the registry, the supervisor, the /v1 gateway and the page.
+# A systemd --user unit: no sudo anywhere in this project.
 #
-# ASSUMPTION FLAGGED: ExecStart below imports `servedeck.app:app` as the
-# FastAPI application object. SPEC.md names every endpoint (§8) and every
-# module up through gateway.py/supervisor.py but never states the filename
-# that assembles them into one ASGI `app` — that wiring is owned by
-# whichever agent builds the API layer, not by this file's owner. If that
-# module ends up named something other than servedeck/app.py, update the
-# ExecStart line below (and run.sh) to match before enabling this unit.
-Description=Servedeck — vLLM server manager (GUI + API + gateway)
-
-# Deliberately NOT ordered after/wants network-online.target — SPEC.md
-# correction C9 notes that target is inert for a *user* unit anyway, and
-# Servedeck's own job (reconciling desired/actual server state, serving a
-# loopback-only GUI) needs no network. graphical-session.target matches the
-# sibling qwen-vllm.service unit's own choice for a desktop-session box.
+# Install:
+#   cp systemd/servedeck.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now servedeck
+#
+# Models are NOT started from here. servedeck launches each one as its own
+# transient unit (systemd-run --user --unit=model-<key> --collect), so nothing
+# below can reach a model.
+Description=servedeck — local model registry, supervisor and gateway
+Documentation=https://github.com/pctablet505/servedeck
 After=graphical-session.target
 
-# Same spirit as qwen-vllm.service's own StartLimitBurst: give up loudly
-# rather than hot-loop forever against a persistently broken install (e.g.
-# a missing servedeck.app import) — 20 restarts in 30s means something is
-# actually broken, not a transient hiccup RestartSec=1 should ride out.
-StartLimitIntervalSec=30
-StartLimitBurst=20
+# --- Observed failure R4 (REDESIGN-2026-09-12.md §4): a crash loop with a
+# real vLLM boot on every lap. On 2026-09-11 this unit could not bind :8010
+# (a hand-started copy held it), had no StartLimit* at all, and looped 67
+# times in 9 minutes. Three attempts in a minute and then a loud, visible
+# `failed` is the correct behaviour for an install that is actually broken:
+# a fourth attempt has never once been the thing that fixed it.
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=exec
-# %h is the user's home. Adjust WorkingDirectory if you cloned elsewhere.
-WorkingDirectory=%h/servedeck
-ExecStart=%h/servedeck/.venv/bin/uvicorn servedeck.app:app --host 127.0.0.1 --port 8010
 
-# Always, not on-failure: SPEC.md §11's honest-limits list says outright
-# "If Servedeck dies the gateway dies (~1s RestartSec window)" — the whole
-# point of this unit is that a clean exit is exactly as worth restarting
-# from as a crash, since either one means the GUI/gateway/supervisor loop
-# is gone and the desired/actual reconciliation on the next start is what
-# puts things back together (SPEC.md §6's "Startup reconciliation").
-Restart=always
-RestartSec=1
+# --- The checkout is the deployment: models.toml, state/ and the venv are all
+# resolved relative to it. %h is the user's home; edit both this and ExecStart
+# if you cloned elsewhere. Declared exactly once — systemd keeps the LAST
+# value of a non-repeatable directive and says nothing, so a second copy of
+# this line further down would be the one that applies while the one an
+# operator can see above it would not.
+WorkingDirectory=%h/Projects/servedeck
+ExecStart=%h/Projects/servedeck/.venv/bin/python -m servedeck
 
-TimeoutStartSec=30
-TimeoutStopSec=15
-# KillMode=mixed, NOT control-group. start_new_session=True gives the vLLM tree
-# its own session but does NOT move it out of this unit's cgroup, so
-# control-group would SIGKILL the model server on every Servedeck restart --
-# destroying exactly the survive-a-restart property procctl detaches for.
-# mixed signals only the main process; the detached tree is left alone.
-KillMode=mixed
+# --- Observed failure R4: KillMode's default is control-group, which SIGKILLs
+# everything in the unit's cgroup on stop. With v1's in-process launcher that
+# took the model down with the dashboard on every restart (journal 2026-09-11
+# 21:38:12). v2's models live in their own cgroups so this is now belt and
+# braces, but `process` states the intent: this stop signals uvicorn, and
+# nothing else.
+KillMode=process
 KillSignal=SIGTERM
+
+# --- Observed failure: every single stop took the full timeout and ended in a
+# SIGKILL, because each open page held an SSE generator parked on a queue that
+# nothing would ever fill again and uvicorn waited for them. Hub.close() hands
+# every subscriber a sentinel now, so a clean shutdown is well under a second
+# and this is only a backstop — 15s, not the 90s default, because a servedeck
+# that has not exited in 15s is not going to.
+TimeoutStopSec=15
+TimeoutStartSec=30
+
+# --- Observed failure R4, the other half: `Restart=always` plus a failing
+# bind is what turns one lost race for :8010 into an unbounded loop. A clean
+# exit is an operator stopping the process and must stay stopped; only a
+# failure is worth retrying, and only StartLimitBurst-many times.
+Restart=on-failure
+RestartSec=5
 
 StandardOutput=journal
 StandardError=journal
