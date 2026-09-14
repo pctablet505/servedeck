@@ -1690,11 +1690,24 @@ def test_9a_doctor_reports_the_real_box_honestly():
     MEASURED["item9_doctor_exit_code"] = code
     failures = [r for r in results if not r.ok]
     assert code == (0 if not failures else 1), f"exit {code} with {len(failures)} failures"
-    assert all(
-        r.name.split(":")[0] in ("vscode", "codex", "kimi") for r in failures
-    ), (
-        "doctor exits non-zero for something other than client-config drift: "
-        + str([(r.name, r.detail) for r in failures])
+    # Every failure must fall in a category somebody can explain. Two are
+    # legitimate on this box BEFORE the cutover:
+    #   * a client entry pointing at a model that is not running right now --
+    #     the drift REDESIGN §4 R1 measured, and what `wire` fixes at step 5;
+    #   * a documented owner action (ptrace_scope for Flash-Next's PLE handoff,
+    #     which needs /etc/sysctl.d/90-vllm.conf and cannot be fixed here).
+    # Anything else means doctor is failing for a reason nobody has named, and
+    # a gate nobody can explain is the "broken measurement" this project keeps
+    # being bitten by.
+    EXPLAINED = ("vscode", "codex", "kimi", "ptrace_scope")
+    unexplained = [
+        (r.name, r.detail)
+        for r in failures
+        if not r.name.split(":")[0].split(" ")[0].startswith(EXPLAINED)
+    ]
+    assert unexplained == [], (
+        "doctor exits non-zero for a reason outside the explained set: "
+        + str(unexplained)
     )
     assert "[OK  ]" in out or "[FAIL]" in out, out
 
