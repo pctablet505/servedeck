@@ -1265,7 +1265,7 @@ def test_10_predicted_kv_size_versus_what_vllm_reports(stack):
     "Measured beats estimated" (§2.5) is only a rule if somebody checks the
     estimate, and nothing in the repository did.
     """
-    from servedeck import registry as registry_mod
+    from servedeck import discovery as registry_mod
 
     metrics = httpx.get(f"http://127.0.0.1:{PORT_MAIN_A}/metrics", timeout=15).text
     labels = _prom_labels(metrics, "vllm:cache_config_info")

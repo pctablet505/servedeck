@@ -722,9 +722,9 @@ class GlmState:
         if ring is None:
             base = self._capture_dir
             if base is None:
-                from . import paths  # local: importing paths must stay cheap
+                from . import settings as _settings  # local: keep import cheap
 
-                base = paths.STATE_DIR / "captures"
+                base = _settings.get().state_dir / "captures"
             safe = "".join(c if (c.isalnum() or c in "-._") else "_" for c in model_id)
             ring = CaptureRing(Path(base) / safe, size=self._capture_size)
             self._rings[model_id] = ring

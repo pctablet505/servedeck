@@ -195,19 +195,18 @@ def default_runner(timeout_s: float = _NVIDIA_SMI_TIMEOUT_S) -> Runner:
 
 
 def default_state_dir() -> Path:
-    """The configured state directory, same resolution as ``history.py``'s
-    ``default_history_path()`` — ``config.get().state_dir`` if config loads,
-    else ``paths.STATE_DIR`` (the directory next to the package). An
-    unreadable config must not hide telemetry, hence the broad except.
+    """The configured state directory, from ``settings.get()``.
+
+    v2 replaced ``config``/``paths`` with ``settings`` (P4); the fallback below
+    keeps telemetry recording even if settings cannot load, because a box whose
+    configuration is broken is exactly when a GPU fault record matters most.
     """
     try:
-        from . import config as _config
+        from . import settings as _settings
 
-        return _config.get().state_dir
-    except Exception:  # noqa: BLE001 - see history.default_history_path()
-        from . import paths
-
-        return paths.STATE_DIR
+        return _settings.get().state_dir
+    except Exception:  # noqa: BLE001 - a broken config must not silence telemetry
+        return Path(__file__).resolve().parent.parent / "state"
 
 
 def default_telemetry_dir() -> Path:
