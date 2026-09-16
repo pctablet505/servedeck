@@ -23,7 +23,7 @@ Every unit created here is named ``sd-test-vfy-*``: ``units.py`` refuses every
 other shape before spawning anything, every ``Control`` is constructed with
 ``unit_prefix="sd-test-"`` so even its discovery glob cannot see a ``model-*``
 unit, and the module finaliser stops every ``sd-test-*`` unit whether the tests
-passed, failed or raised.  Only 127.0.0.1 ports 8050-8055 are bound.  No
+passed, failed or raised.  Only 127.0.0.1 ports 8050-8056 are bound.  No
 existing unit is touched, nothing is enabled or disabled, and no process this
 file did not start is ever signalled.
 
@@ -61,6 +61,13 @@ from fastapi import FastAPI
 from servedeck import control, gateway, gpu, kvcalc, models as models_mod, units
 from servedeck.control import Control, Refusal
 from servedeck.gateway import Route, RoutePolicies
+from tests.test_models_golden import (
+    QWEN27B_ARGV_FIXTURE,
+    QWEN27B_ENV_FIXTURE,
+    _load_argv_fixture,
+    _load_env_fixture,
+    _run_dry_run_launcher,
+)
 
 pytestmark = pytest.mark.skipif(
     shutil.which("systemd-run") is None or not os.environ.get("XDG_RUNTIME_DIR"),
@@ -86,6 +93,10 @@ PORT_RESIDENT = 8052
 PORT_QWEN = 8053
 PORT_BAD = 8054
 PORT_GATEWAY = 8055
+#: A standalone Control instance, independent of the shared `stack` fixture
+#: below (see test_real_lfm2_boots_serves_and_gives_the_memory_back, moved
+#: here from tests/test_control_e2e.py 2026-09-16).
+PORT_SOLO_LFM2 = 8056
 
 #: Per-instance footprint at util 0.03 on a 97,887 MiB card: ~2.9 GiB of
 #: declared budget plus the worker's CUDA context.  Measured 3,130 MiB.
@@ -396,6 +407,7 @@ OUR_UNITS = (
     "sd-test-vfy-res",
     "sd-test-vfy-bad",
     "sd-test-vfy-qwen",
+    "sd-test-vfy-lfm2solo",
 )
 
 
@@ -1782,3 +1794,192 @@ def test_9c_the_documented_dry_run_flag_exists():
     )
     assert code2 != 0, "--dry-run --apply was accepted; one of them silently lost"
     assert "not allowed with" in err2 or "argument" in err2, err2
+
+
+# --------------------------------------------------------------------------
+# 11. Control's own start/stop/VRAM-release contract, standalone
+#
+# Moved from tests/test_control_e2e.py on 2026-09-16: it needs a real,
+# currently-free GPU (>= 2560 MiB), which the always-run unit suite must not
+# depend on -- the suite is `pytest --ignore=tests/test_e2e_real.py`, so a
+# GPU-needing test can only be kept honest (not turned into a silent skip) by
+# living in this file. It is deliberately independent of the `stack` fixture
+# above: this proves Control's own start -> serve -> stop -> VRAM-back
+# contract in isolation, not the joined registry/gateway story `stack`
+# exercises, so it gets its own tiny fake registry/spec rather than reusing
+# the shared one.
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class _SoloLfm2Spec:
+    key: str = "vfy-lfm2solo"
+    id: str = "LFM2.5-350M"
+    slot: str = "resident"
+    port: int = PORT_SOLO_LFM2
+    #: 2000/97887 floors to 0.02 -- the utilisation the packet specifies, but
+    #: DERIVED from a budget rather than written down, so this is the same
+    #: arithmetic a real resident goes through.
+    vram_mib: int | None = 2000
+    ctx_tokens: int = 4096
+    venv_bin: str = str(VENV_BIN)
+
+    def served_names(self) -> list[str]:
+        return ["LFM2.5-350M"]
+
+    def render_argv(self, util: float, port: int) -> list[str]:
+        return [
+            str(VENV_BIN / "vllm"),
+            "serve",
+            LFM2_REPO,
+            "--served-model-name",
+            self.id,
+            "--gpu-memory-utilization",
+            str(util),
+            "--max-model-len",
+            str(self.ctx_tokens),  # never None: the Protocol requires a number
+            "--max-num-seqs",
+            "4",
+            "--dtype",
+            "bfloat16",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ]
+
+    def render_env(self) -> dict[str, str]:
+        # VLLM_USE_FLASHINFER_SAMPLER=0 is required on this box: there is no
+        # nvcc, so FlashInfer's sampler cannot JIT and the boot dies at the
+        # first sample. Owner rule: never --enforce-eager as a fix, so CUDA
+        # graphs stay on and the third marker is genuinely exercised.
+        return {
+            "VLLM_USE_FLASHINFER_SAMPLER": "0",
+            "HOME": str(Path.home()),
+            "HF_HOME": str(Path.home() / ".cache" / "huggingface"),
+        }
+
+
+class _SoloRegistry:
+    def __init__(self, spec: _SoloLfm2Spec) -> None:
+        self._spec = spec
+
+    def get(self, key: str) -> _SoloLfm2Spec:
+        if key != self._spec.key:
+            raise KeyError(key)
+        return self._spec
+
+
+@pytest.mark.slow
+def test_real_lfm2_boots_serves_and_gives_the_memory_back(tmp_path: Path) -> None:
+    """The whole packet, once, against a real model, standalone.
+
+    start -> four journal markers in order -> /v1/models lists the id -> a
+    chat completion answers -> stop -> the VRAM comes back -> the unit is
+    gone. `unit_prefix` must be exactly `"sd-test-"` (Control refuses any
+    other value) so the `vfy-` namespacing lives in the KEY instead, giving
+    the unit its `sd-test-vfy-lfm2solo` name -- which is what lets this
+    file's own `_no_units_left_behind` fixture sweep it like every other unit
+    here.
+    """
+    free_at_start = require_gpu_room(2560)
+    spec = _SoloLfm2Spec()
+    unit = f"sd-test-{spec.key}"
+    ctl = Control(_SoloRegistry(spec), unit_prefix="sd-test-", desired_path=tmp_path / "desired.json")
+
+    progress: list[control.Progress] = []
+    result = ctl.start(spec.key, timeout_s=900, on_progress=progress.append)
+    try:
+        assert not isinstance(result, Refusal), result
+        assert result.ready, f"{result.failure}\n" + "\n".join(result.journal)
+
+        # Utilisation was derived from the budget, not configured.
+        assert result.util == 0.02
+        command = result.argv
+        assert command[command.index("--gpu-memory-utilization") + 1] == "0.02"
+        assert "--enforce-eager" not in command
+
+        # All four markers, in the order vLLM emits them.
+        assert result.markers == list(control.READY_MARKERS), (
+            f"saw {result.markers}; tail:\n" + "\n".join(units.journal_tail(unit, 40))
+        )
+
+        # The model is actually servable, under the name clients will use.
+        model_list = http_json(f"http://127.0.0.1:{spec.port}/v1/models")
+        assert model_list is not None
+        assert "LFM2.5-350M" in [entry["id"] for entry in model_list["data"]]
+
+        completion = http_json(
+            f"http://127.0.0.1:{spec.port}/v1/chat/completions",
+            {
+                "model": "LFM2.5-350M",
+                "messages": [{"role": "user", "content": "Say the word ok."}],
+                "max_tokens": 16,
+                "temperature": 0.0,
+            },
+            timeout_s=120,
+        )
+        assert completion is not None, "chat completion did not answer"
+        assert completion["choices"][0]["message"]["content"] is not None
+
+        # It is discoverable the way servedeck will discover it after a restart.
+        live = {model.key: model for model in ctl.live()}
+        assert live[spec.key].ready and live[spec.key].pid > 0
+    finally:
+        stop_result = ctl.stop(spec.key)
+
+    assert not isinstance(stop_result, Refusal), stop_result
+    assert stop_result.was_live
+    held = stop_result.held_mib
+    assert held and held > 500, f"the model held {held} MiB by the driver's own accounting"
+
+    # The memory actually comes back — the wait `switch` depends on.
+    target = (stop_result.free_before_mib or 0) + control.RELEASE_FRACTION * held
+    freed = wait_until(lambda: (gpu.free_mib() or 0) >= target, 120)
+    assert freed, (
+        f"after the stop, free VRAM was {gpu.free_mib()} MiB; expected >= {int(target)} "
+        f"(was {stop_result.free_before_mib} with {held} MiB held)"
+    )
+    assert units.gone(unit) is True
+    assert (gpu.free_mib() or 0) >= free_at_start - 256
+
+
+# --------------------------------------------------------------------------
+# 12. The 27B launcher snapshot vs. the live, mutable ~/Projects/local_llm/.config
+#
+# Moved from tests/test_models_golden.py on 2026-09-16. This test's entire job
+# is comparing tests/fixtures/qwen27b-launcher-{argv,env}.txt against what the
+# REAL launcher renders from the box's live .config right now -- replacing
+# that live read with another committed snapshot would make it compare the
+# frozen fixture against itself, a comparison that can never fail. That is
+# not survivable as a hermetic unit test, so it stays a live test, just not in
+# the always-run suite: it lives here, next to this file's other
+# must-touch-the-real-box tests, where `pytest --ignore=tests/test_e2e_real.py`
+# never collects it. It skips cleanly (via _run_dry_run_launcher's own guards,
+# imported from tests.test_models_golden) on a box without the launcher or
+# .config; a failure here means .config or qwen-server-run.sh's own defaults
+# changed and tests/fixtures/qwen27b-launcher-{argv,env}.txt need
+# regenerating.
+# --------------------------------------------------------------------------
+
+
+def test_qwen27b_launcher_snapshot_is_current(tmp_path: Path) -> None:
+    live_argv, live_env = _run_dry_run_launcher(tmp_path)
+    frozen_argv = _load_argv_fixture(QWEN27B_ARGV_FIXTURE)
+    frozen_env = _load_env_fixture(QWEN27B_ENV_FIXTURE)
+
+    assert live_argv == frozen_argv, (
+        "the live launcher's argv no longer matches the frozen snapshot — "
+        "regenerate tests/fixtures/qwen27b-launcher-argv.txt"
+    )
+    assert set(live_env) == set(frozen_env)
+    assert live_env["CUDA_HOME"] == frozen_env["CUDA_HOME"]
+    assert live_env["VLLM_USE_FLASHINFER_SAMPLER"] == frozen_env["VLLM_USE_FLASHINFER_SAMPLER"]
+    # Only the stable venv/bin:CUDA_HOME/bin prefix of PATH is expected to
+    # agree between two captures — the tail is the capturing shell's own PATH,
+    # which legitimately differs run to run (see the env fixture's header).
+    live_prefix = live_env["PATH"].split(":")[:2]
+    frozen_prefix = frozen_env["PATH"].split(":")[:2]
+    assert live_prefix == frozen_prefix, (
+        "the launcher's venv/CUDA_HOME prefix changed; regenerate the env snapshot"
+    )

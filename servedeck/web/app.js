@@ -162,6 +162,17 @@ function progressText(p) {
   return text ? head + " — " + text : head;
 }
 
+/* The primary panel's state word. A holder beats everything else -- once the
+ * unit is live, its own `ready` flag is the truth, not what the page
+ * remembers about how it got there. `bootActive` and `failed` only matter
+ * while nothing holds the slot yet. */
+function mainStateText(holder, bootActive, failed) {
+  if (holder) return holder.ready ? "READY" : "booting";
+  if (bootActive) return "booting";
+  if (failed) return "FAILED";
+  return "stopped";
+}
+
 function doctorCells(c) {
   return { name: c.name, ok: c.ok ? "ok" : "FAIL", detail: c.detail ? String(c.detail) : "" };
 }
@@ -217,9 +228,11 @@ let WIRE = null;       // the last /api/wire payload
 let NOTICES = [];      // newest first, capped at 50
 let BOOT = null;       // { key } while a boot is in flight
 let LOG_TIMER = null;  // journal poll while BOOT is set
+let LOG_FAILED = false; // the last tracked boot ended in boot_failed/exception
 let ES = null;
 let BACKOFF = 1000;
 const RESTARTING = {}; // key -> timer id, while waiting for its unit to leave /api/state
+let SUPPRESS_PERSIST = null; // a block name while app.js itself is setting .open
 
 const MAX_NOTICES = 50;
 const JOURNAL_LINES = 20;
@@ -384,11 +397,14 @@ async function wireApply() {
 
 function setBoot(key) {
   BOOT = key ? { key: key } : null;
+  if (key) LOG_FAILED = false; // a fresh attempt supersedes the last failure
   if (LOG_TIMER) { clearInterval(LOG_TIMER); LOG_TIMER = null; }
-  if (!BOOT) return;
-  $("mainLog").textContent = "";
-  pollJournal();
-  LOG_TIMER = setInterval(pollJournal, LOG_POLL_MS);
+  if (BOOT) {
+    $("mainLog").textContent = "";
+    pollJournal();
+    LOG_TIMER = setInterval(pollJournal, LOG_POLL_MS);
+  }
+  applyBlockOpen();
 }
 
 async function pollJournal() {
@@ -412,6 +428,7 @@ function paintAll() {
   paintMain();
   paintResidents();
   paintHeadroom();
+  applyBlockOpen();
 }
 
 function paintHeader() {
@@ -453,6 +470,9 @@ function paintLive() {
     }).join(", "));
   }
   $("liveNote").textContent = bits.join(" · ");
+  // The primary panel already covers a single live unit; the table earns its
+  // place only once there is more than one thing to compare.
+  $("liveWrap").hidden = (rows.length + unknown.length) <= 1;
 }
 
 /* The select's options change only when /api/models is re-read, so they are
@@ -478,11 +498,18 @@ function mainHolder() {
 
 function paintMain() {
   const sel = $("mainSel");
-  const btn = $("mainBtn");
   const chosen = sel.value;
   const holder = mainHolder();
-  btn.textContent = holder ? "Switch" : "Start";
-  btn.disabled = !chosen || busy() || !!(holder && holder.key === chosen);
+
+  const startBtn = $("mainBtn");
+  startBtn.textContent = holder ? "Switch" : "Start";
+  startBtn.disabled = !chosen || busy() || !!(holder && holder.key === chosen);
+  $("mainStopBtn").disabled = !holder || busy();
+  $("mainRestartBtn").disabled = !holder || busy();
+
+  $("mainName").textContent = holder ? holder.id : "";
+  $("mainState").textContent = mainStateText(holder, !!BOOT, LOG_FAILED);
+
   let text;
   if (!holder) {
     text = "nothing holds the main slot";
@@ -491,6 +518,16 @@ function paintMain() {
     if (holder.key === chosen) text += " — it is already the selection";
   }
   $("mainNote").textContent = text;
+
+  // Same columns the Live table shows, computed the same way -- no second
+  // formula, just the same pure helper pointed at the holder's own row.
+  const row = holder ? liveRow(holder) : null;
+  $("mainCtx").textContent = row ? row.ctx : EM;
+  $("mainKv").textContent = row ? row.kv : EM;
+  $("mainQueue").textContent = row ? row.queue : EM;
+  $("mainRate").textContent = row ? row.rate : EM;
+  $("mainUptime").textContent = row ? row.uptime : EM;
+  $("mainRestarts").textContent = row ? row.restarts : EM;
 }
 
 function paintResidents() {
@@ -560,6 +597,73 @@ function setConn(cls, text) {
 
 
 // --------------------------------------------------------------------------
+// Collapsed blocks: open/closed persists per block in localStorage, except
+// while an auto-open condition holds -- that always wins, and releasing it
+// falls back to whatever the user last chose (closed, by default).
+// --------------------------------------------------------------------------
+
+function detailsEl(name) {
+  switch (name) {
+    case "more": return $("moreDetails");
+    case "log": return $("logDetails");
+    case "headroom": return $("headroomDetails");
+    case "wiring": return $("wiringDetails");
+    case "events": return $("eventsDetails");
+    default: return null;
+  }
+}
+
+function blockPrefKey(name) { return "servedeck.block." + name; }
+
+function loadBlockPref(name) {
+  try {
+    return localStorage.getItem(blockPrefKey(name)) === "1";
+  } catch (e) {
+    return false;
+  }
+}
+
+function saveBlockPref(name, open) {
+  try {
+    localStorage.setItem(blockPrefKey(name), open ? "1" : "0");
+  } catch (e) { /* private window, blocked storage -- the block still works */ }
+}
+
+/* Set a block's open state without that change itself being recorded as the
+ * user's preference -- otherwise an auto-open would overwrite what the user
+ * actually asked for the moment the auto-open condition lets go. */
+function setBlockOpen(name, open) {
+  const node = detailsEl(name);
+  if (!node || node.open === open) return;
+  SUPPRESS_PERSIST = name;
+  node.open = open;
+  SUPPRESS_PERSIST = null;
+}
+
+function applyBlockOpen() {
+  const models = STATE && STATE.models ? STATE.models : [];
+  const residentRunning = models.some(function (m) { return m.slot === "resident" && !!m.live; });
+  setBlockOpen("more", residentRunning || loadBlockPref("more"));
+  setBlockOpen("log", !!BOOT || LOG_FAILED || loadBlockPref("log"));
+  setBlockOpen("headroom", loadBlockPref("headroom"));
+  setBlockOpen("wiring", loadBlockPref("wiring"));
+  setBlockOpen("events", loadBlockPref("events"));
+}
+
+function initBlocks() {
+  ["more", "log", "headroom", "wiring", "events"].forEach(function (name) {
+    const node = detailsEl(name);
+    if (!node) return;
+    node.addEventListener("toggle", function () {
+      if (SUPPRESS_PERSIST === name) return;
+      saveBlockPref(name, node.open);
+    });
+  });
+  applyBlockOpen();
+}
+
+
+// --------------------------------------------------------------------------
 // SSE
 // --------------------------------------------------------------------------
 
@@ -584,6 +688,7 @@ const BOOT_DONE = { ready: 1, boot_failed: 1, exception: 1 };
 function onNotice(n) {
   pushNotice(n);
   if (BOOT && n.key === BOOT.key && BOOT_DONE[n.reason]) {
+    LOG_FAILED = n.reason !== "ready";
     if (n.journal && n.journal.length) $("mainLog").textContent = n.journal.join("\n");
     setBoot(null);
   }
@@ -636,11 +741,12 @@ function init() {
   $("gwChip").textContent = `${location.origin}/v1`;
 
   $("doctorBtn").addEventListener("click", function () {
-    const wrap = $("docWrap");
-    wrap.hidden = !wrap.hidden;
-    if (!wrap.hidden) {
+    const node = $("wiringDetails");
+    if (!node) return;
+    node.open = !node.open;
+    if (node.open) {
       loadDoctor();
-      wrap.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      node.scrollIntoView({ behavior: "smooth", block: "nearest" });
     }
   });
   $("mainSel").addEventListener("change", paintMain);
@@ -649,9 +755,18 @@ function init() {
     if (!key) return;
     if (mainHolder()) switchMain(key); else startModel(key);
   });
+  $("mainStopBtn").addEventListener("click", function () {
+    const holder = mainHolder();
+    if (holder) stopModel(holder.key);
+  });
+  $("mainRestartBtn").addEventListener("click", function () {
+    const holder = mainHolder();
+    if (holder) restartModel(holder.key);
+  });
   $("wireBtn").addEventListener("click", wireDiff);
   $("wireApply").addEventListener("click", wireApply);
 
+  initBlocks();
   paintAll();
   loadState();
   loadModels();

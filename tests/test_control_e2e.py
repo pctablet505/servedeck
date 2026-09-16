@@ -1,10 +1,13 @@
-"""End to end against the REAL systemd user manager, and — when the card has
-room — a real vLLM.
+"""End to end against the REAL systemd user manager, with a stub standing in
+for vLLM.
 
 §2.7: "the live boot/switch/adopt paths, the ones that actually fail, have no
 end-to-end test". This is that test. Everything here runs against the real
-thing: real `systemd-run --user`, real journald, a real HTTP probe, and a real
-LFM2.5-350M when at least 2.5 GiB of VRAM is free.
+thing: real `systemd-run --user`, real journald, a real HTTP probe — served by
+`stub_openai.py`, never a real model, so nothing here needs GPU room. (The one
+test that used to boot a real LFM2.5-350M here now lives in
+tests/test_e2e_real.py, which is where a GPU-needing test belongs — see the
+2026-09-16 note near STUB_MODEL below.)
 
 Blast radius. Every unit created here is named `sd-test-*`; `units.py` refuses
 every other shape before spawning anything, `Control` is constructed with
@@ -12,7 +15,7 @@ every other shape before spawning anything, `Control` is constructed with
 unit, and the module-scoped fixture below stops every `sd-test-*` unit on the
 way out whether the tests passed, failed or raised. No existing unit is
 touched, nothing is enabled or disabled, no process this file did not start is
-ever signalled, and the only ports bound are 8030/8031 on loopback.
+ever signalled, and the only port bound is 8030 on loopback.
 """
 
 from __future__ import annotations
@@ -43,13 +46,12 @@ STUB_UNIT = "sd-test-stub"
 STUB_PORT = 8030
 STUB_MODEL = "sd-test-stub-model"
 
-LFM2_UNIT = "sd-test-lfm2"
-LFM2_PORT = 8031
-LFM2_VENV_BIN = Path("/home/pctablet505/Projects/local_llm/.venv-llm-029/bin")
-#: The e2e needs the model to fit AND the margin to be respected; 2.5 GiB is
-#: the floor the packet was given. Below it the test SKIPS: a 90 GiB model is
-#: serving on this card and an OOM here would be an outage, not a test failure.
-MIN_FREE_MIB = 2560
+# The real-LFM2, needs-a-free-GPU test that used to live here (LFM2_UNIT,
+# LFM2_PORT, LFM2_VENV_BIN, MIN_FREE_MIB, _Lfm2Spec, _skip_unless_gpu_has_room)
+# moved to tests/test_e2e_real.py on 2026-09-16 as
+# test_real_lfm2_boots_serves_and_gives_the_memory_back: the always-run unit
+# suite (pytest --ignore=tests/test_e2e_real.py) must not depend on GPU room
+# being free, and this file has no such gate of its own.
 
 
 # --------------------------------------------------------------------------
@@ -476,147 +478,6 @@ class _OneModelRegistry:
 def _tmp_for_desired(tmp_path, monkeypatch):
     """Desired state goes to a tmp dir, never to the worktree's state/."""
     monkeypatch.setenv("PYTEST_TMP", str(tmp_path))
-
-
-# --------------------------------------------------------------------------
-# 2. A real vLLM, when the card has room
-# --------------------------------------------------------------------------
-
-
-@dataclass
-class _Lfm2Spec:
-    key: str = "lfm2"
-    id: str = "LFM2.5-350M"
-    slot: str = "resident"
-    port: int = LFM2_PORT
-    #: 2000/97887 floors to 0.02 — the utilisation the packet specifies, but
-    #: DERIVED from a budget rather than written down, so this is the same
-    #: arithmetic a real resident goes through.
-    vram_mib: int | None = 2000
-    ctx_tokens: int = 4096
-    venv_bin: str = str(LFM2_VENV_BIN)
-
-    def served_names(self) -> list[str]:
-        return ["LFM2.5-350M"]
-
-    def render_argv(self, util: float, port: int) -> list[str]:
-        return [
-            str(LFM2_VENV_BIN / "vllm"),
-            "serve",
-            "LiquidAI/LFM2.5-350M",
-            "--served-model-name",
-            self.id,
-            "--gpu-memory-utilization",
-            str(util),
-            "--max-model-len",
-            str(self.ctx_tokens),  # never None: the Protocol requires a number
-            "--max-num-seqs",
-            "4",
-            "--dtype",
-            "bfloat16",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-        ]
-
-    def render_env(self) -> dict[str, str]:
-        # VLLM_USE_FLASHINFER_SAMPLER=0 is required on this box: there is no
-        # nvcc, so FlashInfer's sampler cannot JIT and the boot dies at the
-        # first sample. Owner rule: never --enforce-eager as a fix, so CUDA
-        # graphs stay on and the third marker is genuinely exercised.
-        return {
-            "VLLM_USE_FLASHINFER_SAMPLER": "0",
-            "HOME": str(Path.home()),
-            "HF_HOME": str(Path.home() / ".cache" / "huggingface"),
-        }
-
-
-def _skip_unless_gpu_has_room() -> int:
-    free = gpu.free_mib()
-    if free is None:
-        pytest.skip("nvidia-smi did not report free VRAM")
-    if free < MIN_FREE_MIB:
-        pytest.skip(
-            f"only {free} MiB VRAM free, need >= {MIN_FREE_MIB} MiB. A 90 GiB "
-            f"model is serving on this card; booting into the remainder would "
-            f"be an outage, not a test failure."
-        )
-    if not (LFM2_VENV_BIN / "vllm").exists():
-        pytest.skip(f"{LFM2_VENV_BIN / 'vllm'} not present")
-    return free
-
-
-@pytest.mark.slow
-def test_real_lfm2_boots_serves_and_gives_the_memory_back() -> None:
-    """The whole packet, once, against a real model.
-
-    start -> four journal markers in order -> /v1/models lists the id -> a chat
-    completion answers -> stop -> the VRAM comes back -> the unit is gone.
-    """
-    free_at_start = _skip_unless_gpu_has_room()
-    spec = _Lfm2Spec()
-    ctl = Control(
-        _OneModelRegistry(spec),
-        unit_prefix="sd-test-",
-        desired_path=Path(os.environ["PYTEST_TMP"]) / "desired.json",
-    )
-
-    progress: list[control.Progress] = []
-    result = ctl.start("lfm2", timeout_s=900, on_progress=progress.append)
-    try:
-        assert not isinstance(result, Refusal), result
-        assert result.ready, f"{result.failure}\n" + "\n".join(result.journal)
-
-        # Utilisation was derived from the budget, not configured.
-        assert result.util == 0.02
-        command = result.argv
-        assert command[command.index("--gpu-memory-utilization") + 1] == "0.02"
-        assert "--enforce-eager" not in command
-
-        # All four markers, in the order vLLM emits them.
-        assert result.markers == list(control.READY_MARKERS), (
-            f"saw {result.markers}; tail:\n" + "\n".join(units.journal_tail(LFM2_UNIT, 40))
-        )
-
-        # The model is actually servable, under the name clients will use.
-        models = http_json(f"http://127.0.0.1:{LFM2_PORT}/v1/models")
-        assert models is not None
-        assert "LFM2.5-350M" in [entry["id"] for entry in models["data"]]
-
-        completion = http_json(
-            f"http://127.0.0.1:{LFM2_PORT}/v1/chat/completions",
-            {
-                "model": "LFM2.5-350M",
-                "messages": [{"role": "user", "content": "Say the word ok."}],
-                "max_tokens": 16,
-                "temperature": 0.0,
-            },
-            timeout_s=120,
-        )
-        assert completion is not None, "chat completion did not answer"
-        assert completion["choices"][0]["message"]["content"] is not None
-
-        # It is discoverable the way servedeck will discover it after a restart.
-        live = {model.key: model for model in ctl.live()}
-        assert live["lfm2"].ready and live["lfm2"].pid > 0
-    finally:
-        stop_result = ctl.stop("lfm2")
-
-    assert not isinstance(stop_result, Refusal), stop_result
-    assert stop_result.was_live
-    held = stop_result.held_mib
-    assert held and held > 500, f"the model held {held} MiB by the driver's own accounting"
-
-    # The memory actually comes back — the wait `switch` depends on.
-    target = (stop_result.free_before_mib or 0) + control.RELEASE_FRACTION * held
-    freed = wait_until(lambda: (gpu.free_mib() or 0) >= target, 120)
-    assert freed, (
-        f"after the stop, free VRAM was {gpu.free_mib()} MiB; expected >= {int(target)} "
-        f"(was {stop_result.free_before_mib} with {held} MiB held)"
-    )
-    assert units.gone(LFM2_UNIT) is True
-    assert (gpu.free_mib() or 0) >= free_at_start - 256
 
 
 def test_gpu_module_reports_numbers_or_none_but_never_raises() -> None:

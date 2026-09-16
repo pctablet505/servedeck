@@ -226,7 +226,11 @@ PYTORCH_ALLOC_CONF = "expandable_segments:True,pinned_use_cuda_host_register:Tru
 TORCH_CUDA_ARCH_LIST = "12.0f"
 
 # --------------------------------------------------------------------------------
-# LFM2.5-350M (always-on resident) — ~/.config/systemd/user/lfm2-350m.service
+# LFM2.5-350M — opt-in resident for mechanical, no-intelligence work (and the
+# e2e gate). Owner directive 2026-09-16: by default servedeck runs one model;
+# this resident is NOT started by default and nothing auto-adds it to
+# desired.json — an operator turns it on explicitly (`servedeck start lfm2` /
+# the "More models" card) when it is actually needed.
 # --------------------------------------------------------------------------------
 [models.lfm2]
 id       = "LFM2.5-350M"

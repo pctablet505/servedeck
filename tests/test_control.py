@@ -1221,6 +1221,19 @@ def test_reconcile_never_writes_desired_state(tmp_path) -> None:
     assert path.read_text() == before
 
 
+def test_reconcile_does_not_start_registry_residents_by_default(tmp_path) -> None:
+    """Owner directive 2026-09-16: a resident in models.toml is opt-in, not
+    always-on. reconcile only ever starts what desired.json names (`want.residents`
+    / `want.main`) — it must never walk the registry looking for slot="resident"
+    entries to bring up on its own, even when one is defined and would fit."""
+    systemd = FakeSystemd()
+    ctl = make_control(systemd, FakeRegistry(BIG27, LFM2), tmp_path, free=(94587,),
+                       probe=lambda port: None)
+    result = ctl.reconcile(Desired())
+    assert result.started == [] and result.already_live == [] and result.booting == []
+    assert systemd.started == []
+
+
 # --------------------------------------------------------------------------
 # desired.json — schema and migration
 # --------------------------------------------------------------------------
@@ -1280,6 +1293,16 @@ def test_an_unreadable_desired_file_degrades_to_wanting_nothing(tmp_path, body) 
 
 def test_a_missing_desired_file_is_not_an_error(tmp_path) -> None:
     assert desired_mod.load(tmp_path / "nothing.json") == Desired()
+
+
+def test_fresh_desired_has_no_residents(tmp_path) -> None:
+    """Owner directive 2026-09-16: residents are opt-in, never on by default.
+    A fresh install (no desired.json on disk at all) must want nothing running
+    — in particular no resident — regardless of how many `slot = "resident"`
+    entries live in models.toml. Nothing about this file's shape lets a
+    registry entry opt itself in."""
+    assert desired_mod.load(tmp_path / "desired.json") == Desired(main=None, residents=[])
+    assert desired_mod.load(tmp_path / "desired.json").residents == []
 
 
 def test_save_is_atomic_and_leaves_no_temp_files(tmp_path) -> None:

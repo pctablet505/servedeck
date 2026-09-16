@@ -43,10 +43,12 @@ RUNS — it reads ``tests/fixtures/qwen27b-launcher-{argv,env}.txt`` (captured
 2026-09-12; see those files' headers for exactly which ``.config`` values
 produced them) and never shells out, so it has no dependency on the live,
 mutable ``~/Projects/local_llm/.config`` that R2 (REDESIGN §1) is retiring.
-``test_qwen27b_snapshot_is_current`` is the live half: it re-runs the real
-launcher and asserts the snapshot has not gone stale — it skips cleanly (via
-``_run_dry_run_launcher``'s own guards) on a box without the launcher/.config,
-and it is the test to consult (and the fixture files to regenerate) if
+``test_qwen27b_launcher_snapshot_is_current`` (tests/test_e2e_real.py, moved
+there 2026-09-16 so the always-run unit suite has no live dependency at all)
+is the live half: it re-runs the real launcher and asserts the snapshot has
+not gone stale — it skips cleanly (via ``_run_dry_run_launcher``'s own
+guards, imported from this module) on a box without the launcher/.config, and
+it is the test to consult (and the fixture files to regenerate) if
 ``.config`` or the script's own defaults change.
 
 ENV COMPARISON: v2 now renders ``CUDA_HOME``, ``PATH`` and
@@ -258,31 +260,15 @@ def test_qwen27b_argv_and_env_match_frozen_snapshot(registry):
     _assert_path_prefix_matches("v2", v2_env["PATH"], expected_prefix)
 
 
-def test_qwen27b_snapshot_is_current(tmp_path):
-    """The skippable, live half: re-runs the REAL launcher (skips cleanly per
-    _run_dry_run_launcher's own guards if it or .config are not on this box)
-    and proves tests/fixtures/qwen27b-launcher-{argv,env}.txt have not gone
-    stale. A failure here means ~/Projects/local_llm/.config or
-    qwen-server-run.sh's own defaults changed — regenerate those two files."""
-    live_argv, live_env = _run_dry_run_launcher(tmp_path)
-    frozen_argv = _load_argv_fixture(QWEN27B_ARGV_FIXTURE)
-    frozen_env = _load_env_fixture(QWEN27B_ENV_FIXTURE)
-
-    assert live_argv == frozen_argv, (
-        "the live launcher's argv no longer matches the frozen snapshot — "
-        "regenerate tests/fixtures/qwen27b-launcher-argv.txt"
-    )
-    assert set(live_env) == set(frozen_env)
-    assert live_env["CUDA_HOME"] == frozen_env["CUDA_HOME"]
-    assert live_env["VLLM_USE_FLASHINFER_SAMPLER"] == frozen_env["VLLM_USE_FLASHINFER_SAMPLER"]
-    # Only the stable venv/bin:CUDA_HOME/bin prefix of PATH is expected to
-    # agree between two captures — the tail is the capturing shell's own PATH,
-    # which legitimately differs run to run (see the env fixture's header).
-    live_prefix = live_env["PATH"].split(":")[:2]
-    frozen_prefix = frozen_env["PATH"].split(":")[:2]
-    assert live_prefix == frozen_prefix, (
-        "the launcher's venv/CUDA_HOME prefix changed; regenerate the env snapshot"
-    )
+# test_qwen27b_snapshot_is_current — the live half that re-runs the real
+# launcher against ~/Projects/local_llm/.config — moved to tests/test_e2e_real.py
+# on 2026-09-16. Its whole job is comparing the frozen fixtures above against
+# that LIVE, mutable file; replacing the live read with another committed
+# snapshot would make it compare the frozen fixture against itself, which can
+# never fail. That is a hermetic test's failure mode, not this one's job, so
+# per the "genuinely requires the live file" case it stays a live test — just
+# not in the always-run unit suite. See test_e2e_real.py for the moved test
+# and why living there (not here) is what keeps it able to actually fail.
 
 
 # --------------------------------------------------------------------------- #

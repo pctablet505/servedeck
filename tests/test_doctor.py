@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import httpx
@@ -145,6 +147,58 @@ def _fake_model(**kw) -> models.Model:
     return models.Model(**base)
 
 
+class _ModelsHandler(BaseHTTPRequestHandler):
+    """A real /v1/models — a stdlib HTTP server on an ephemeral port, standing
+    in for a vLLM engine so the mismatch branch of check_port is proven
+    against real HTTP transport and a real JSON body, not a stubbed
+    ``http_get`` — without depending on the box's own :8007, which is not
+    live by default any more (the LFM2 resident is opt-in, per the
+    2026-09-16 owner directive)."""
+
+    served_ids: tuple[str, ...] = ("Some-Other-Model",)
+
+    def do_GET(self) -> None:  # noqa: N802 - stdlib method name
+        if self.path != "/v1/models":
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = json.dumps(
+            {"object": "list", "data": [{"id": i, "object": "model"} for i in self.served_ids]}
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002 - stdlib signature
+        pass  # keep test output clean
+
+
+class _RealModelsServer:
+    """Context manager: a real HTTP server serving ``served_ids`` at
+    /v1/models on an ephemeral 127.0.0.1 port, in a daemon thread."""
+
+    def __init__(self, *served_ids: str) -> None:
+        self._served_ids = served_ids or ("Some-Other-Model",)
+
+    def __enter__(self) -> int:
+        ids = self._served_ids
+
+        class _Handler(_ModelsHandler):
+            served_ids = ids
+
+        self._server = HTTPServer(("127.0.0.1", 0), _Handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        return self._server.server_address[1]
+
+    def __exit__(self, *exc: object) -> None:
+        self._server.shutdown()
+        self._thread.join(timeout=5)
+        self._server.server_close()
+
+
 def test_check_port_ok_when_id_listed():
     m = _fake_model(port=9001, id="M")
     get = _stub_get({"http://127.0.0.1:9001/v1/models": _models_response("M", "other")})
@@ -176,6 +230,19 @@ def test_check_port_alias_counts_as_match():
     assert r.ok is True
 
 
+def test_check_port_flags_wrong_expected_id_against_a_real_http_server():
+    """Same shape as check_port's mismatch branch, proven against a real HTTP
+    response instead of a stubbed http_get -- but hermetic: an in-test stdlib
+    server stands in for the vLLM engine, on an ephemeral port, so this does
+    not depend on anything actually listening on the box's own :8007 (moved
+    off that dependency 2026-09-16; see _RealModelsServer above)."""
+    with _RealModelsServer("Some-Other-Model") as port:
+        m = _fake_model(key="lfm2", id="Not-The-Real-Model", port=port)
+        r = doctor.check_port(m, timeout=2.0)
+    assert r.ok is False
+    assert "expected one of" in r.detail
+
+
 # --------------------------------------------------------------------------- #
 # check_port — against the box's own live, read-only :8007 / :8010
 # --------------------------------------------------------------------------- #
@@ -186,15 +253,6 @@ def test_check_port_live_lfm2_on_8007():
     r = doctor.check_port(m, timeout=2.0)
     assert r.ok is True, r.detail
     assert "listening" in r.detail
-
-
-def test_check_port_live_8007_flags_wrong_expected_id():
-    """Same live server, wrong expectation — proves the drift-detection branch
-    against a real vLLM /v1/models response, not just a stub."""
-    m = _fake_model(key="lfm2", id="Not-The-Real-Model", port=8007)
-    r = doctor.check_port(m, timeout=2.0)
-    assert r.ok is False
-    assert "expected one of" in r.detail
 
 
 def test_check_port_live_gateway_on_8010():
