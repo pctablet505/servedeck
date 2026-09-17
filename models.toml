@@ -92,6 +92,12 @@ id      = "Qwen3.8-Flash-Next-Uncensored-NVFP4"
 # concurrency; 0.98 (what free-VRAM arithmetic yields on an idle card) boots
 # and then dies with agents in flight — measured 2026-09-03.
 util    = 0.96
+# 48 GiB of FP8 PLE table (VLLM_PLE_CPU_OFFLOAD=1, host-side and pinned) plus
+# the 40 GiB KV-offload buffer in /dev/shm, plus slack for the loader's
+# transient copies; measured resident host use for this model is ~114 GiB
+# (2026-09-17). There is no swap on this box, so a shortfall is an OOM kill of
+# the desktop, not a slowdown.
+host_ram_gib = 95
 aliases = ["qwen38-flash-next", "flashnext"]
 repo    = "mazinb/Qwen3.8-Flash-Next-Uncensored-NVFP4"
 slot    = "main"
@@ -170,6 +176,10 @@ util    = 0.95
 # serve-opt.sh:315-316 derives the KV cap as MAX_LEN * 17200 at launch time;
 # servedeck emits --kv-cache-memory-bytes from this and the launch ctx.
 kv_cache_bytes_per_token = 17200
+# serve-opt.sh:218 — CPU_OFFLOAD_GB + 30, calibrated against a measured
+# 168 GiB peak at 110 GiB of offload (the loader's transient copies cost far
+# more than the pinned weights alone).
+host_ram_gib = 155
 aliases = ["glm53", "GLM-5.3-Flash"]
 repo    = "dealignai/GLM-5.3-Flash-ABLITERATED-NVFP4"
 slot    = "main"

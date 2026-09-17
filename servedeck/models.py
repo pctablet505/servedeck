@@ -126,6 +126,14 @@ class Model:
     #: left the KV cap sized for the old length and vLLM refused to start
     #: after a six-minute load. Derived here, the two can never disagree.
     kv_cache_bytes_per_token: int | None = None
+    #: Host RAM (GiB of MemAvailable) this model needs before it may launch.
+    #: This box has NO swap, and pinned pages cannot be reclaimed, so
+    #: overshooting host RAM is an OOM kill of the desktop rather than a
+    #: slowdown — one happened on 2026-08-28. GLM's launcher refused to start
+    #: below CPU_OFFLOAD_GB + 30 (serve-opt.sh:204-226, calibrated against a
+    #: measured 168 GiB peak at 110 GiB of offload); nothing carried that
+    #: guard into servedeck, so a badly timed switch could take the box down.
+    host_ram_gib: int | None = None
     min_output_tokens: int | None = None
     max_output_tokens: int | None = None
     vision: bool = False
@@ -331,6 +339,9 @@ def _load_model(key: str, raw: dict[str, Any], defaults_env: dict[str, str]) -> 
         presets=presets,
         vram_mib=int(vram_mib) if vram_mib is not None else None,
         util=_as_util(raw, key),
+        host_ram_gib=(
+            int(raw["host_ram_gib"]) if raw.get("host_ram_gib") is not None else None
+        ),
         kv_cache_bytes_per_token=(
             int(raw["kv_cache_bytes_per_token"])
             if raw.get("kv_cache_bytes_per_token") is not None

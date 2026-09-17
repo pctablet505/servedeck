@@ -253,6 +253,11 @@ class Runtime:
     #: concluded it was listening and reconciled. The nonce makes "is that me"
     #: answerable instead of assumed.
     instance_id: str = field(default_factory=lambda: secrets.token_hex(8))
+    #: key -> (attempts_made, last_attempt_monotonic). What the poll's
+    #: desired-vs-live check has already tried, so a model that cannot boot is
+    #: retried a few times and then left alone with a notice, rather than
+    #: relaunched every two seconds forever.
+    recovery: dict[str, tuple[int, float]] = field(default_factory=dict)
     #: Boot progress folded into the phase bar the page draws (legacy_page).
     boot: _legacy.BootTracker = field(default_factory=_legacy.BootTracker)
 
@@ -574,7 +579,76 @@ async def _poll_loop(rt: Runtime) -> None:
             rt.hub.publish("state", state)
         # v1's page paints the live strip from this every poll, changed or not.
         rt.hub.publish("telemetry", _legacy.telemetry_payload(state))
+        _recover_desired(rt)
         await asyncio.sleep(POLL_INTERVAL_S)
+
+
+#: How many times the poll will relaunch a model that is wanted but absent
+#: before it stops and leaves the notice standing. Three, because the failure
+#: this exists for is a transient one (an Xid fault, a driver hiccup); a model
+#: that cannot boot at all must not be launched every two seconds forever.
+RECOVERY_ATTEMPTS = 3
+#: Minimum gap between those attempts.
+RECOVERY_BACKOFF_S = 60.0
+
+
+def _recover_desired(rt: Runtime) -> None:
+    """Relaunch a model that desired state names but nothing is running.
+
+    This is the gap systemd cannot close. When vLLM's engine dies the process
+    exits 0, and even with ``Restart=always`` systemd gives up after
+    ``StartLimitBurst`` attempts — at which point ``--collect`` removes the
+    unit, so ``systemctl show`` reports an unknown unit's defaults and a
+    crashed model becomes indistinguishable from one nobody wanted. Reconcile
+    runs once, at startup, so nothing looked again: on this card, which has a
+    documented Xid history, one persistent fault meant the box served nothing
+    until somebody noticed.
+    """
+    if rt.busy is not None:  # a mutation is already in flight
+        return
+    try:
+        want = _desired.load(rt.settings.desired_path)
+    except Exception:  # noqa: BLE001 - never break the poll over this
+        log.exception("desired state could not be read for the recovery check")
+        return
+    live = rt.routes.live()
+    now = time.monotonic()
+    for key in [*want.residents, *([want.main] if want.main else [])]:
+        if key in live:
+            rt.recovery.pop(key, None)  # it is up: forget the attempts
+            continue
+        if key not in rt.registry.models:
+            continue
+        attempts, last = rt.recovery.get(key, (0, 0.0))
+        if attempts >= RECOVERY_ATTEMPTS:
+            continue
+        if last and now - last < RECOVERY_BACKOFF_S:
+            continue
+        rt.recovery[key] = (attempts + 1, now)
+        left = RECOVERY_ATTEMPTS - attempts - 1
+        log.warning(
+            "%s is wanted but not running; relaunching (attempt %d of %d)",
+            key, attempts + 1, RECOVERY_ATTEMPTS,
+        )
+        rt.hub.publish("notice", {
+            "level": "warn", "reason": "recovering", "key": key,
+            "message": (
+                f"{key} is wanted but nothing is running it — its engine died or its unit "
+                f"was collected. Relaunching (attempt {attempts + 1} of {RECOVERY_ATTEMPTS}"
+                + (f", {left} left after this)" if left else ", the last one)")
+            ),
+        })
+        _claim(rt, "start", key, f"recover {key}")
+        asyncio.create_task(
+            _run_mutation(
+                rt,
+                f"recover {key}",
+                lambda k=key: rt.control.start(k, on_progress=_progress_publisher(rt.hub, k, rt.boot)),
+                action="start",
+                key=key,
+            )
+        )
+        return  # one at a time; the next poll takes the next model
 
 
 async def _own_port_answers(client: httpx.AsyncClient, url: str, instance_id: str) -> bool:
@@ -793,6 +867,72 @@ def _main_holder(rt: Runtime, live: dict[str, _routes.LiveView]) -> str | None:
         if model.slot == "main" and key in live:
             return key
     return None
+
+
+#: Methods that change something. GET/HEAD/OPTIONS are readable by anyone who
+#: can reach the port, which on loopback is the operator.
+_UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+async def _same_origin_only(request: Request, call_next: Callable[[Request], Any]) -> Any:
+    """Refuse a cross-origin write to the control API.
+
+    Every mutation route takes its key in the PATH and no body, so
+    ``POST /api/models/flashnext/stop`` is a CORS "simple request": any page
+    in the operator's browser — any tab, any ad frame — can send it with
+    ``fetch(..., {mode: "no-cors"})``, get an opaque response back, and stop
+    the model, switch the card or rewrite every client's config, with nothing
+    in the journal but an access line. There is no API key and no CORS
+    middleware, so the only thing distinguishing "the dashboard" from "some
+    web page" is the Origin header the browser attaches to both.
+
+    Non-browser callers (the CLI, curl, a script) send no Origin at all and
+    are unaffected; the gateway under ``/v1`` is deliberately NOT covered,
+    because a local tool calling the OpenAI API from a browser page is a use
+    case, not an attack, and it cannot change anything.
+    """
+    origin = request.headers.get("origin")
+    if (
+        origin
+        and request.method in _UNSAFE_METHODS
+        and request.url.path.startswith("/api/")
+        and not _origin_is_ours(request, origin)
+    ):
+        return JSONResponse(
+            {
+                "error": "cross_origin",
+                "message": (
+                    f"refusing a {request.method} from {origin}: the servedeck control API "
+                    "is only writable from its own page or from a terminal"
+                ),
+            },
+            status_code=403,
+        )
+    return await call_next(request)
+
+
+def _origin_is_ours(request: Request, origin: str) -> bool:
+    """True when ``origin`` names this server's own host:port.
+
+    Both loopback spellings count: the page is served at 127.0.0.1 but VS Code
+    and the operator's bookmarks reach it as localhost, and a browser sends
+    whichever one is in the address bar.
+    """
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(origin)
+    if parts.scheme not in ("http", "https"):
+        return False
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    # The configured listen port, not only the request URL's: behind a test
+    # client (and behind any proxy) the request URL carries no port at all,
+    # and a guard that then rejected the page's own origin would break the
+    # dashboard instead of protecting it.
+    own_ports = {request.url.port or 0}
+    rt = getattr(request.app.state, "rt", None)
+    if rt is not None:
+        own_ports.add(rt.settings.listen_port)
+    return parts.hostname in ("127.0.0.1", "::1", "localhost") and port in own_ports
 
 
 def _claim(rt: Runtime, action: str, key: str, label: str) -> None:
@@ -1169,6 +1309,7 @@ def create_app(
 
     app = FastAPI(title="servedeck", docs_url=None, redoc_url=None, lifespan=lifespan)
     app.state.rt = rt
+    app.middleware("http")(_same_origin_only)
 
     gw = _gateway.build_router(rt.routes, transport=gateway_transport)
     app.state.gateway_client = gw.gateway_client

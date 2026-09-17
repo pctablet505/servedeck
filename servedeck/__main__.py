@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import logging
 import os
 import sys
 
@@ -17,7 +18,41 @@ import uvicorn
 from . import settings as _settings
 
 
+#: Everything servedeck's own modules log, at this level, goes to the journal.
+#: Without it the ``servedeck.*`` loggers had no handler at all, so only
+#: WARNING+ escaped (via logging.lastResort) and the unit's journal held
+#: nothing but uvicorn access lines: which model reconcile decided to start at
+#: boot, the utilisation it chose, every refusal reason the code takes care to
+#: word well — none of it was recorded anywhere a person could read later.
+LOG_LEVEL_ENV = "SERVEDECK_LOG_LEVEL"
+
+
+def _configure_logging() -> None:
+    """One stderr handler for the ``servedeck`` logger tree.
+
+    stderr because systemd captures it into the journal with the unit's
+    identifier; no timestamp in the format because journald already stamps
+    every line, and two timestamps per line is how a log becomes unreadable.
+    """
+    level_name = os.environ.get(LOG_LEVEL_ENV, "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logger = logging.getLogger("servedeck")
+    logger.setLevel(level)
+    if not any(getattr(h, "_servedeck", False) for h in logger.handlers):
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+        handler._servedeck = True  # type: ignore[attr-defined]
+        logger.addHandler(handler)
+    # uvicorn's access log stays ON. It is noisy (900+ lines an hour here) and
+    # thin — method, path, status, nothing about the model or the tokens — but
+    # it is the only durable record that the gateway was used at all, and
+    # silencing it to make room for these lines would trade one gap for
+    # another. servedeck's own decisions are greppable by their prefix:
+    #     journalctl --user -u servedeck | grep 'servedeck\.'
+
+
 def main(argv: list[str] | None = None) -> int:
+    _configure_logging()
     cfg = _settings.get()
     ap = argparse.ArgumentParser(prog="python -m servedeck", description="servedeck v2 server")
     ap.add_argument("--host", default=cfg.listen_host)

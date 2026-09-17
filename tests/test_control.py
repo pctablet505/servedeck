@@ -45,6 +45,8 @@ class FakeSpec:
     vram_mib: int | None = None
     ctx_tokens: int = 4096
     venv_bin: str = "/opt/venv/bin"
+    #: Flags the model's own registry entry carries, appended to render_argv.
+    extra_flags: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.names:
@@ -62,6 +64,7 @@ class FakeSpec:
             str(util),
             "--port",
             str(port),
+            *self.extra_flags,
         ]
 
     def render_env(self) -> dict[str, str]:
@@ -215,7 +218,7 @@ BOOT_LINES = [
 ]
 
 
-def make_control(systemd, registry, tmp_path, *, probe=None, free=(50000,),
+def make_control(systemd, registry, tmp_path, *, mem_available=None, probe=None, free=(50000,),
                  total=97887, margin=1024, lines=None, cgroup_pids=None, used=None):
     free_values = list(free)
 
@@ -243,6 +246,8 @@ def make_control(systemd, registry, tmp_path, *, probe=None, free=(50000,),
         # unit's port, never an adoption, unless the test installs a listener.
         listener_pid=lambda port: None,
         reap_offload=lambda **_kw: [],
+        # Deterministic: the real one reads this box's /proc/meminfo.
+        mem_available_gib_fn=mem_available or (lambda: 500.0),
     )
 
 
@@ -1719,3 +1724,97 @@ def test_stop_reaps_after_the_unit_is_gone_and_start_reaps_before_launch(tmp_pat
     calls.clear()
     ctl.start("flashnext")
     assert calls and calls[0] == "reap", "reaped before the launch"
+
+
+# --------------------------------------------------------------------------
+# Launch preflights (2026-09-18 audit): refusals that cost a second instead
+# of a model outage
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class HungrySpec(FakeSpec):
+    """A model that parks part of itself in host RAM, like glm53/flashnext."""
+
+    host_ram_gib: int | None = 155
+
+
+def test_a_launch_is_refused_when_host_ram_is_short(tmp_path) -> None:
+    """serve-opt.sh refused below CPU_OFFLOAD_GB + 30 because this box has no
+    swap and pinned pages cannot be reclaimed: an overshoot OOM-kills the
+    session, and one did on 2026-08-28. The guard was not carried into v2."""
+    spec = HungrySpec(key="glm53", id="glm53-flash", slot="main", port=8002)
+    systemd = FakeSystemd()
+    ctl = make_control(systemd, FakeRegistry(spec), tmp_path, mem_available=lambda: 130.0)
+    refusal = ctl.start("glm53")
+    assert isinstance(refusal, Refusal) and refusal.reason == "not_enough_host_ram"
+    assert "155" in refusal.message and "130" in refusal.message
+    assert systemd.started == [], "nothing may reach systemd-run"
+
+
+def test_a_launch_proceeds_when_host_ram_is_there(tmp_path) -> None:
+    spec = HungrySpec(key="glm53", id="glm53-flash", slot="main", port=8002)
+    ctl = make_control(FakeSystemd(), FakeRegistry(spec), tmp_path, mem_available=lambda: 160.0,
+                       probe=lambda port: ["glm53-flash"])
+    assert not isinstance(ctl.start("glm53"), Refusal)
+
+
+def test_unreadable_meminfo_does_not_block_a_launch(tmp_path) -> None:
+    """Fail OPEN here: /proc/meminfo being unreadable is not evidence of a
+    shortage, and refusing every launch over it would be worse than the risk."""
+    spec = HungrySpec(key="glm53", id="glm53-flash", slot="main", port=8002)
+    ctl = make_control(FakeSystemd(), FakeRegistry(spec), tmp_path, mem_available=lambda: None,
+                       probe=lambda port: ["glm53-flash"])
+    assert not isinstance(ctl.start("glm53"), Refusal)
+
+
+def test_two_host_memory_offloads_at_once_are_refused(tmp_path) -> None:
+    """The page can add --kv-offloading-size to any model; on one that already
+    parks its experts in host RAM the two add up to more than the box has."""
+    spec = FakeSpec(key="glm53", id="glm53-flash", slot="main", port=8002,
+                    extra_flags=("--cpu-offload-gb", "125"))
+    ctl = make_control(FakeSystemd(), FakeRegistry(spec), tmp_path)
+    refusal = ctl.start("glm53", argv_overrides={"--kv-offloading-size": "40"})
+    assert isinstance(refusal, Refusal) and refusal.reason == "conflicting_offload"
+
+
+def test_a_squatted_port_is_refused_before_the_engine_loads(tmp_path) -> None:
+    """Without this, a switch stops the running model, waits for VRAM, loads a
+    90 GiB engine for minutes and only then fails to bind — card empty, every
+    client on a 503. Registry ports :8002/:8003 get squatted by unrelated
+    projects on this box, repeatedly."""
+    systemd = FakeSystemd()
+    ctl = make_control(systemd, FakeRegistry(FLASH), tmp_path)
+    ctl._listener_pid = lambda port: 4242 if port == 8001 else None
+    refusal = ctl.start("flashnext")
+    assert isinstance(refusal, Refusal) and refusal.reason == "port_busy"
+    assert "8001" in refusal.message and "4242" in refusal.message
+    assert systemd.started == []
+
+
+def test_mem_available_reads_meminfo(tmp_path) -> None:
+    f = tmp_path / "meminfo"
+    f.write_text("MemTotal:       190865028 kB\nMemAvailable:    74448896 kB\nSwapFree:  1048576 kB\n")
+    assert round(control.mem_available_gib(f), 2) == round((74448896 + 1048576) / 1048576, 2)
+    assert control.mem_available_gib(tmp_path / "nope") is None
+
+
+def test_a_switch_whose_replacement_fails_keeps_the_desired_model(tmp_path) -> None:
+    """A failed Apply & restart used to leave main: null — nothing serving, no
+    record of what had been serving, and a reboot that started nothing. The
+    stop inside a switch must not erase the intent (2026-09-18 audit)."""
+    systemd = FakeSystemd()
+    systemd.add("model-flashnext", main_pid=1000)
+    desired_mod.save(Desired(main="flashnext"), tmp_path / "desired.json")
+    # The replacement never answers its port, so its start fails.
+    ctl = make_control(systemd, FakeRegistry(FLASH, BIG27), tmp_path, free=(94587,),
+                       probe=lambda port: ["Qwen3.8-Flash-Next"] if port == 8001 else None)
+    result = ctl.switch("qwen27b")
+    assert not isinstance(result, Refusal)
+    # The replacement did not come up (here: the card never freed up), which
+    # is exactly the case where the intent must survive.
+    assert result.stopped is not None and result.started is not None
+    assert isinstance(result.started, Refusal) or not result.started.ready
+    assert desired_mod.load(tmp_path / "desired.json").main == "flashnext", (
+        "the box must still know which model it wants"
+    )

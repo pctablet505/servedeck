@@ -23,6 +23,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from servedeck import app as _app
+from servedeck import desired as _desired
 from servedeck import control as _control
 from servedeck import gpu as _gpu
 from servedeck import models as _models
@@ -1330,3 +1331,102 @@ def test_the_poll_reaps_orphaned_offload_buffers_and_says_so(settings, registry)
     _app._collect_facts(rt)
     notes = [e["data"] for e in rt.hub.notices]
     assert any(n.get("reason") == "offload_reaped" and "40.0 GiB" in n["message"] for n in notes)
+
+
+def test_servedeck_loggers_reach_the_journal(caplog) -> None:
+    """Before 2026-09-18 the `servedeck.*` loggers had no handler anywhere, so
+    only WARNING+ escaped via logging.lastResort: which model reconcile chose
+    at boot, the utilisation it used and every refusal reason were recorded
+    nowhere a person could read later."""
+    import logging
+
+    from servedeck import __main__ as entry
+
+    entry._configure_logging()
+    logger = logging.getLogger("servedeck.control")
+    assert logger.getEffectiveLevel() <= logging.INFO
+    handlers = logging.getLogger("servedeck").handlers
+    assert any(getattr(h, "_servedeck", False) for h in handlers)
+    entry._configure_logging()  # idempotent: no duplicate lines per restart
+    assert sum(getattr(h, "_servedeck", False) for h in logging.getLogger("servedeck").handlers) == 1
+
+
+def test_the_poll_relaunches_a_desired_model_that_is_gone_then_gives_up(settings, registry) -> None:
+    """The gap systemd cannot close (2026-09-18 audit): vLLM exits 0 when its
+    engine dies, systemd stops retrying after StartLimitBurst, --collect then
+    deletes the unit — and reconcile only ever ran at startup, so the box
+    served nothing until somebody noticed. On a card with this one's Xid
+    history that is one fault away."""
+    import asyncio as _asyncio
+
+    control = FakeControl()  # live() is empty: nothing is running
+    rt = _app.build_runtime(settings, registry=registry, control=control)
+    key = next(iter(registry.models))
+    _desired.save(_desired.Desired(main=key), settings.desired_path)
+    rt.routes.refresh()
+
+    async def poll_once() -> None:
+        _app._recover_desired(rt)
+        await _asyncio.sleep(0)  # let the mutation task run
+        rt.busy = None           # the mutation finished
+
+    for attempt in range(1, _app.RECOVERY_ATTEMPTS + 1):
+        rt.recovery = {key: (attempt - 1, 0.0)} if attempt > 1 else {}
+        _asyncio.run(poll_once())
+        assert rt.recovery[key][0] == attempt
+
+    # Exhausted: it stops trying, and the notices say what happened.
+    rt.recovery = {key: (_app.RECOVERY_ATTEMPTS, 0.0)}
+    before = len(control.calls)
+    _asyncio.run(poll_once())
+    assert len(control.calls) == before, "a model that cannot boot must not relaunch forever"
+    notes = [e["data"] for e in rt.hub.notices if e["data"].get("reason") == "recovering"]
+    assert len(notes) == _app.RECOVERY_ATTEMPTS
+    assert "the last one" in notes[-1]["message"]
+
+
+def test_the_poll_leaves_a_live_model_alone_and_forgets_its_attempts(settings, registry) -> None:
+    key = next(iter(registry.models))
+    control = FakeControl([FakeLive(key=key, unit=f"model-{key}", ready=True)])
+    rt = _app.build_runtime(settings, registry=registry, control=control)
+    _desired.save(_desired.Desired(main=key), settings.desired_path)
+    rt.routes.refresh()
+    rt.recovery = {key: (2, 0.0)}
+    _app._recover_desired(rt)
+    assert control.calls == [] and key not in rt.recovery
+
+
+def test_the_poll_does_not_relaunch_while_a_mutation_is_in_flight(settings, registry) -> None:
+    key = next(iter(registry.models))
+    control = FakeControl()
+    rt = _app.build_runtime(settings, registry=registry, control=control)
+    _desired.save(_desired.Desired(main=key), settings.desired_path)
+    rt.routes.refresh()
+    rt.busy = {"action": "switch", "key": key, "label": f"switch {key}"}
+    _app._recover_desired(rt)
+    assert control.calls == []
+
+
+def test_a_cross_origin_write_to_the_control_api_is_refused(settings, registry) -> None:
+    """Every mutation route takes its key in the path and no body, so any page
+    in the operator's browser could stop the model with a CORS simple request
+    and read nothing back. There is no API key and no CORS middleware, so
+    Origin is the only thing that distinguishes the dashboard from a random
+    tab (2026-09-18 audit gap)."""
+    from fastapi.testclient import TestClient
+
+    app = _app.create_app(settings, registry=registry, control=FakeControl(),
+                          reconcile=False, poll=False)
+    key = next(iter(registry.models))
+    with TestClient(app) as c:
+        evil = c.post(f"/api/models/{key}/stop", headers={"Origin": "https://evil.example"})
+        assert evil.status_code == 403 and evil.json()["error"] == "cross_origin"
+        # The page's own origin, both spellings a browser may use.
+        port = settings.listen_port
+        for own in (f"http://127.0.0.1:{port}", f"http://localhost:{port}"):
+            assert c.post(f"/api/models/{key}/stop", headers={"Origin": own}).status_code != 403
+        # A terminal sends no Origin at all.
+        assert c.post(f"/api/models/{key}/stop").status_code != 403
+        # Reads are not writes, and the gateway is deliberately left open: a
+        # local tool calling /v1 from a browser page cannot change anything.
+        assert c.get("/api/state", headers={"Origin": "https://evil.example"}).status_code == 200

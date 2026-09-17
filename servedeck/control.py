@@ -537,6 +537,39 @@ def listener_pid(port: int) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def _cmdline_of(pid: int) -> str:
+    """``/proc/<pid>/cmdline``, flattened and clipped — for naming the process
+    that is holding a port in a refusal an operator has to act on."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return " ".join(raw.decode("utf-8", "replace").split("\0")).strip()[:120]
+
+
+def mem_available_gib(meminfo: Path = Path("/proc/meminfo")) -> float | None:
+    """MemAvailable + SwapFree, in GiB. None when /proc/meminfo is unreadable.
+
+    Both terms, because a box WITH swap can survive an overshoot; this one has
+    none, which is why the guard that uses this exists at all.
+    """
+    try:
+        text = meminfo.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    kib = {}
+    for line in text.splitlines():
+        name, _, rest = line.partition(":")
+        if name in ("MemAvailable", "SwapFree"):
+            try:
+                kib[name] = int(rest.split()[0])
+            except (IndexError, ValueError):
+                return None
+    if "MemAvailable" not in kib:
+        return None
+    return (kib["MemAvailable"] + kib.get("SwapFree", 0)) / 1048576
+
+
 def descendants(pid: int) -> list[int]:
     """``pid``'s descendants from ``/proc/*/task/*/children`` (empty off Linux)."""
     out: list[int] = []
@@ -613,6 +646,7 @@ class Control:
         kill: Callable[[int, int], None] | None = None,
         descendants: Callable[[int], list[int]] | None = None,
         reap_offload: Callable[[], list[tuple[str, int]]] | None = None,
+        mem_available_gib_fn: Callable[[], float | None] | None = None,
     ) -> None:
         if unit_prefix not in (UNIT_PREFIX, "sd-test-"):
             raise ValueError(
@@ -641,6 +675,7 @@ class Control:
         self._kill = kill or os.kill
         self._descendants = descendants or globals()["descendants"]
         self._reap_offload = reap_offload or reap_offload_regions
+        self._mem_available_gib = mem_available_gib_fn or mem_available_gib
 
     def offload_witnesses(self, live: Sequence[LiveModel] | None = None) -> list[int] | None:
         """The pids that must be visible before a buffer counts as orphaned.
@@ -1025,6 +1060,62 @@ class Control:
                 ", ".join(unset_env),  # names only; values are never read
             )
 
+        # --- preflight: refusals that cost a second instead of a model outage --
+        #
+        # Everything below was learned the expensive way and then lost in the
+        # port from the shell launchers (2026-09-18 audit).
+
+        # Host RAM. No swap on this box and pinned pages cannot be reclaimed,
+        # so overshooting is an OOM kill of the desktop, not a slowdown; one
+        # happened on 2026-08-28. serve-opt.sh refused to launch below
+        # CPU_OFFLOAD_GB + 30 and servedeck had no equivalent.
+        need_ram = getattr(spec, "host_ram_gib", None)
+        if need_ram:
+            have = self._mem_available_gib()
+            if have is not None and have < need_ram:
+                return Refusal(
+                    reason="not_enough_host_ram",
+                    message=(
+                        f"{key} needs about {need_ram} GiB of host RAM (its pinned host-side "
+                        f"caches plus the loader's transient copies) and only {have:.0f} GiB is "
+                        f"available. There is no swap on this box, so starting anyway risks an "
+                        f"OOM kill of the session rather than a slow launch"
+                    ),
+                    key=key,
+                )
+
+        # Two host-memory offloads at once. The page can add
+        # --kv-offloading-size to any model; on one that already parks its
+        # experts in host RAM via --cpu-offload-gb, the two add up to more
+        # than the box has.
+        if "--cpu-offload-gb" in argv and "--kv-offloading-size" in argv:
+            return Refusal(
+                reason="conflicting_offload",
+                message=(
+                    f"{key} already offloads to host RAM with --cpu-offload-gb; adding "
+                    f"--kv-offloading-size on top of it double-books memory this box "
+                    f"does not have"
+                ),
+                key=key,
+            )
+
+        # The port. Without this, a switch stops the running model, waits for
+        # VRAM, loads a 90 GiB engine for minutes and only then fails to bind
+        # — leaving the card empty and every client on a 503. Registry ports
+        # get squatted by unrelated projects on this box (:8002 and :8003 by
+        # cvi-scratch servers, repeatedly).
+        holder_pid = self._listener_pid(spec.port)
+        if holder_pid is not None:
+            return Refusal(
+                reason="port_busy",
+                message=(
+                    f"port {spec.port} is already held by pid {holder_pid} "
+                    f"({_cmdline_of(holder_pid) or 'unknown process'}), so {key} could not "
+                    f"bind it. Stop that process, or change this model's port in models.toml"
+                ),
+                key=key,
+            )
+
         # Start the follower BEFORE the unit, from a timestamp a couple of
         # seconds in the past: journalctl --since has one-second granularity,
         # so anchoring at "now" can drop the first lines of a fast boot. Seeing
@@ -1224,18 +1315,29 @@ class Control:
 
     # -- stop -------------------------------------------------------------
 
-    def stop(self, key: str, timeout_s: float = units.DEFAULT_STOP_TIMEOUT_S) -> StopResult | Refusal:
+    def stop(
+        self,
+        key: str,
+        timeout_s: float = units.DEFAULT_STOP_TIMEOUT_S,
+        forget_intent: bool = True,
+    ) -> StopResult | Refusal:
         """Stop ``model-<key>`` and record that it is no longer wanted.
 
         The VRAM accounting is captured *before* the stop, because after it the
         pids are gone and there is nothing left to attribute memory to.
+
+        ``forget_intent=False`` stops the unit WITHOUT erasing desired state,
+        which is what a switch needs: a switch whose replacement then fails to
+        boot must leave a box that still knows which model it wants. Erasing
+        it first meant a failed Apply & restart left ``main: null`` — nothing
+        serving, no record of what had been, and a reboot that started nothing.
         """
         unit = self.unit_for(key)
         if not units.valid_unit_name(unit):
             return Refusal(reason="bad_key", message=f"{key!r} is not a usable model key", key=key)
         adopted = next((m for m in self.live() if m.key == key and m.adopted), None)
         if adopted is not None:
-            return self._stop_adopted(key, adopted, timeout_s)
+            return self._stop_adopted(key, adopted, timeout_s, forget_intent=forget_intent)
         # Confirmed, because a false "not there" skips the VRAM accounting
         # below and would let the next switch boot into an occupied card.
         was_live = not units.gone(unit, run=self._run, sleep=self._sleep)
@@ -1246,17 +1348,20 @@ class Control:
         except UnitError as exc:
             return Refusal(reason="stop_failed", message=str(exc), key=key)
 
-        current = self.load_desired()
-        if current.main == key:
-            current = current.with_main(None)
-        current = current.without_resident(key)
-        self._save_desired(current)
+        if forget_intent:
+            current = self.load_desired()
+            if current.main == key:
+                current = current.with_main(None)
+            current = current.without_resident(key)
+            self._save_desired(current)
         return StopResult(
             key=key, unit=unit, was_live=was_live, held_mib=held, free_before_mib=free_before,
             reaped=tuple(self.reap_offload()),
         )
 
-    def _stop_adopted(self, key: str, model: LiveModel, timeout_s: float) -> StopResult | Refusal:
+    def _stop_adopted(
+        self, key: str, model: LiveModel, timeout_s: float, forget_intent: bool = True
+    ) -> StopResult | Refusal:
         """Stop a model no unit owns: SIGTERM its listener pid, wait for the
         port to stop answering, SIGKILL the tree if it will not. The VRAM
         accounting sums the pid and its descendants, because vLLM's API
@@ -1281,11 +1386,12 @@ class Control:
                         pass
                 break
             self._sleep(0.5)
-        current = self.load_desired()
-        if current.main == key:
-            current = current.with_main(None)
-        current = current.without_resident(key)
-        self._save_desired(current)
+        if forget_intent:
+            current = self.load_desired()
+            if current.main == key:
+                current = current.with_main(None)
+            current = current.without_resident(key)
+            self._save_desired(current)
         return StopResult(
             key=key, unit=ADOPTED_UNIT, was_live=True, held_mib=held, free_before_mib=free_before,
             reaped=tuple(self.reap_offload()),
@@ -1360,7 +1466,10 @@ class Control:
         # Without it this branch refused "already holds the main slot", the
         # POST was accepted, and nothing restarted.
         if holder is not None and (holder.key != key or relaunch):
-            result = self.stop(holder.key)
+            # forget_intent=False: if the replacement fails to boot, desired
+            # state must still name a model, so reconcile and the next reboot
+            # have something to bring back.
+            result = self.stop(holder.key, forget_intent=False)
             if isinstance(result, Refusal):
                 return result
             stopped = result
