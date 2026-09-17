@@ -15,29 +15,12 @@
       <span class="sub">local model control</span>
     </div>
     <button type="button" class="urlchip mono" id="serverUrl" title="Codex base URL — click to copy">—</button>
-    <div class="gpuchip mono">
+    <div class="gpuchip mono" title="GPU memory in use right now, from nvidia-smi">
       <span class="dot"></span>
-      <span id="gpuName">GPU</span> · <span id="gpuUsed">—</span> / <span id="gpuTotal">—</span> MiB
+      GPU <span id="gpuUsed">—</span> / <span id="gpuTotal">—</span> MiB
     </div>
   </div>
 
-  <div class="vram">
-    <div class="vram-head">
-      <span class="lbl">VRAM allocation</span>
-      <span class="val mono" id="vramTxt">—</span>
-    </div>
-    <div class="bar" id="bar">
-      <div class="seg weights" id="segW">weights</div>
-      <div class="seg kv" id="segK">KV</div>
-      <div class="seg overhead" id="segO"></div>
-      <div class="seg free" id="segF"></div>
-    </div>
-    <div class="legend">
-      <span><i style="background:var(--accent)"></i>model weights</span>
-      <span><i style="background:var(--ok)"></i>KV cache — this is what buys context &amp; agents</span>
-      <span><i style="background:var(--line-strong)"></i>activations, CUDA graphs</span>
-      <span><i style="border:1px solid var(--line-strong)"></i>unallocated</span>
-    </div>
   </div>
 
   <div class="grid">
@@ -53,39 +36,17 @@
       <div class="mlist" id="mlist" role="listbox" aria-label="Models in the local hub cache"></div>
     </div>
 
-      <!-- The live KV picture sits under the rail: it is the one
-           live figure that belongs beside the models, and it fills the
-           column the rail used to leave empty. -->
+      <!-- What the box is: the GPU by name, and the host RAM the KV offload
+           control is set against. Live figures, no estimates. -->
       <div class="panel">
-        <div class="panel-h"><span>KV cache in use <span style="text-transform:none;font-weight:400;letter-spacing:0">(in flight, 0 when idle)</span></span><span class="mono" style="font-size:10px">/metrics · 2s</span></div>
+        <div class="panel-h"><span>Machine</span><span class="mono" style="font-size:10px">nvidia-smi · /proc</span></div>
         <div class="lcol">
-        <div class="lbig mono" id="kvPct">—</div>
-        <div class="lsub mono" id="kvTok">—</div>
-        <canvas id="spark" width="420" height="42" aria-label="KV cache usage over time"></canvas>
-        <!-- Each counter names its own time base. Running/Waiting are
-             instantaneous; Preemptions and Prefix cache are lifetime counters
-             that never reset, and drawing them in one row at one size made a
-             593-since-boot preemption read identically to "preempting now". -->
-        <div class="lrow">
-          <div><div class="lk">Preemptions <span class="tb">since boot</span></div><div class="n mono" id="mPre">—</div></div>
-          <div><div class="lk">Prefix cache <span class="tb">lifetime</span></div><div class="n mono" id="hitRate">—</div></div>
+          <div class="lk">GPU</div>
+          <div class="lsub mono" id="gpuName">—</div>
+          <div class="lk" style="margin-top:10px">Host RAM</div>
+          <div class="lsub mono" id="hostRam">—</div>
+          <div class="lsub mono" id="hostPinned"></div>
         </div>
-      </div>
-
-      <!-- Was "Average context per request": one lifetime mean, sum/count over
-           every request since the engine booted. It could not answer the
-           question people actually ask it ("how many agents?") because sizing
-           is set by the TAIL -- a p90 that does not fit is a preemption -- and
-           a mean has no tail. Replaced by the distribution over a rolling
-           window of the last 100 finished requests.
-
-           The distribution is DRAWN, not described. The bars are vLLM's own
-           buckets, so the quantisation is visible in the picture -- a wide bar
-           with nothing beside it says "we cannot tell you more than this" --
-           and the percentiles are marked at the place they fall. The sentences
-           that explained all of that are gone: the column used to carry four
-           percentile intervals, a sample-count line, a generated-token line
-           and a provenance paragraph, and each restated what the bars show. -->
       </div>
     </div>
 
@@ -102,6 +63,12 @@
                  a bare number -- and a figure shown twice is a figure that can
                  disagree with itself. -->
             <div class="status-meta smeta mono" id="sMeta">connecting…</div>
+          </div>
+          <div class="kvgauge" title="KV cache blocks in use right now: in-flight requests only, 0 when idle">
+            <span class="lk">KV in use</span>
+            <span class="gbig mono" id="kvPct">—</span>
+            <span class="lsub mono" id="kvTok">—</span>
+            <canvas id="spark" width="180" height="28" aria-label="KV cache usage over time"></canvas>
           </div>
           <span class="queued mono" id="queued" role="status"><span id="qN">—</span> running · <span id="qW">—</span> waiting</span>
         </div>
@@ -184,6 +151,7 @@
             <div class="n mono" id="tkCache">n/a</div>
             <div class="s" id="tkCacheS">—</div>
             <div class="l" id="tkCacheW">—</div>
+            <div class="s" title="vllm:prefix_cache_hits ÷ queries, lifetime: a query is counted every time the scheduler looks a request up">lookups served by the cache, lifetime: <span id="hitRate">—</span></div>
           </div>
         </div>
 
@@ -246,15 +214,24 @@
           </div>
         </div>
         <div class="ctxnote" id="ctxNote" role="status"></div>
-        <!-- One line, not a box: the pool this configuration buys, its
-             provenance, and what the KV offload parks in host RAM beside it. -->
-        <div class="kvline">
-          <span class="k">KV budget</span>
-          <span class="tag" id="dBadge">—</span>
-          <span class="mono big" id="dKv">—</span>
-          <span class="mono" id="dKvTok">—</span>
-          <span class="mono" id="kvOffload"></span>
-        </div>
+        <div class="vram">
+          <div class="vram-head">
+            <span class="lbl">VRAM for this configuration <span class="tag" id="dBadge">—</span></span>
+            <span class="val mono" id="vramTxt">—</span>
+          </div>
+          <div class="bar" id="bar">
+            <div class="seg weights" id="segW">weights</div>
+            <div class="seg kv" id="segK">KV</div>
+            <div class="seg overhead" id="segO"></div>
+            <div class="seg free" id="segF"></div>
+          </div>
+          <div class="legend">
+            <span><i style="background:var(--accent)"></i>model weights</span>
+            <span><i style="background:var(--ok)"></i>KV cache — this is what buys context &amp; agents</span>
+            <span><i style="background:var(--line-strong)"></i>activations, CUDA graphs</span>
+            <span><i style="border:1px solid var(--line-strong)"></i>unallocated</span>
+          </div>
+        <span id="kvOffload" hidden></span>
         <div class="alert crit" id="alertC" role="alert"><b>⚠</b><span id="alertCT"></span></div>
         <div class="alert warn" id="alertW" role="alert"><b>!</b><span id="alertWT"></span></div>
       </div>
@@ -287,6 +264,9 @@
         <div class="lsub">p90 — the agent count is sized on this</div>
         <canvas id="reqHist" width="440" height="96" aria-label="Prompt-token counts over the last 100 finished requests. Exact requests are drawn in fine bins; requests known only to a vLLM bucket are drawn as a translucent band over that bucket's range. Median, p90 and p99 are marked."></canvas>
         <div class="lsub mono" id="winMeta">—</div>
+        <div class="lrow">
+          <div><div class="lk">Preemptions <span class="tb">since boot</span></div><div class="n mono" id="mPre">—</div></div>
+        </div>
   
         </div>
         <div class="oversub" id="oversub"></div>

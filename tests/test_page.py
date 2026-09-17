@@ -82,10 +82,11 @@ def test_the_2026_09_17_ux_pass_holds() -> None:
     recommendation column and the dead Smoke button are gone, running and
     waiting are on the status chip and nowhere else."""
     ids = set(re.findall(r'id="([A-Za-z0-9_]+)"', INDEX))
-    for present in ("util", "ctx", "agents", "useRec", "agentsRec", "dBadge", "dKv", "dKvTok",
-                    "kvOffload", "qN", "qW", "mPre", "hitRate", "pctP90", "oversub", "apply", "stop"):
+    for present in ("util", "ctx", "agents", "useRec", "agentsRec", "dBadge", "vramTxt", "segW",
+                    "kvOffload", "qN", "qW", "mPre", "hitRate", "pctP90", "oversub", "apply", "stop",
+                    "kvPct", "spark", "gpuName", "hostRam"):
         assert present in ids, present
-    for gone in ("smoke", "mRun", "mWait", "recN", "recMath", "mixTbl", "recCal"):
+    for gone in ("smoke", "mRun", "mWait", "recN", "recMath", "mixTbl", "recCal", "dKv", "dKvTok"):
         assert gone not in ids, gone
     assert INDEX.count('class="acell"') == 4
     for present in ("offload", "offloadNote"):
@@ -101,3 +102,20 @@ def test_every_div_is_closed() -> None:
     """A missing </div> nests the rest of the page inside the grid (seen
     2026-09-17: the server log and footer rendered as grid cells)."""
     assert len(re.findall(r"<div\b", INDEX)) == INDEX.count("</div>"), "div_nesting"
+
+
+def test_information_sits_with_its_question() -> None:
+    """The IA pass (2026-09-17): the VRAM bar is inside the allocator it
+    describes; the KV gauge is in the status row; preemptions are in the
+    request-size panel; the prefix-cache hit rate is in the prefix-cache cell;
+    the GPU name is in the Machine panel, not the header."""
+    alloc = INDEX.split('<div class="alloc">')[1].split('<div class="pref"')[0]
+    assert 'class="vram"' in alloc and INDEX.count('class="vram"') == 1
+    status = INDEX.split('<div class="status-row">')[1].split('<div class="thru"')[0]
+    assert 'id="kvPct"' in status and 'id="queued"' in status
+    req = INDEX.split("Request size")[1]
+    assert 'id="mPre"' in req and 'id="oversub"' in req
+    cache_cell = INDEX.split('id="tkCacheK"')[1].split("</div>\n          </div>")[0]
+    assert 'id="hitRate"' in cache_cell
+    header = INDEX.split('<div class="top">')[1].split('<div class="grid">')[0]
+    assert 'id="gpuName"' not in header and 'id="gpuUsed"' in header

@@ -904,8 +904,9 @@ function paintEstimate(d) {
   // can drift away from it. These are VRAM gibibytes from capacity.compute(),
   // already in GiB — NOT bytes, so bytesTxt is the wrong formatter here.
   const gib = (v) => (typeof v === "number" ? `${v.toFixed(1)} GiB` : "—");
+  const poolTok = measured ? `${fmt(measured)} tokens` : `${fmt(d.kv_tokens)} tokens`;
   set("vramTxt",
-    `weights ${gib(d.weights_gib)} · KV ${gib(d.kv_gib)} · budget ${gib(d.budget_gib)}`);
+    `weights ${gib(d.weights_gib)} · KV ${gib(d.kv_gib)} (${poolTok}) · budget ${gib(d.budget_gib)}`);
   // The offload field: what this many GiB parks, and how much host RAM is
   // free for it. First estimate seeds the field from the registry's flag.
   if (offloadGib === null && typeof d.offload_gib === "number") {
@@ -1857,6 +1858,12 @@ function paintState(s) {
   }
   const sm = $("sModel");
   if (sm) sm.textContent = up.model || "—";
+  const host = s.host || {};
+  if (typeof host.available_gib === "number") {
+    set("hostRam", `${fmt(host.available_gib)} GiB free of ${fmt(host.total_gib)} GiB`);
+    set("hostPinned", typeof liveFacts.kv_offload_gib === "number"
+      ? `${fmt(liveFacts.kv_offload_gib)} GiB pinned for the running server's KV offload` : "");
+  }
   const urlChip = $("serverUrl");
   if (urlChip) urlChip.title = `Codex base URL — click to copy · upstream ${up.url || "—"}`;
   paintServingMeta();

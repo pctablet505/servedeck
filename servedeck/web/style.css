@@ -443,3 +443,10 @@ input[type=range]:focus-visible{outline:2px solid var(--accent);outline-offset:3
 @media (max-width: 1180px){.agrid{grid-template-columns:1fr 1fr}}
 @media (max-width: 900px){.agrid{grid-template-columns:1fr}}
 .acell .s{white-space:normal}
+
+/* -- 2026-09-17 IA pass -------------------------------------------------- */
+.alloc .vram{margin:14px 0 6px}
+.kvgauge{display:flex;align-items:baseline;gap:8px;margin-left:auto}
+.kvgauge .gbig{font-size:18px;font-weight:600;letter-spacing:-.02em}
+.kvgauge canvas{align-self:center;width:180px;height:28px}
+.status-row .queued{margin-left:0}
