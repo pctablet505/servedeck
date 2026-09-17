@@ -43,9 +43,9 @@ it will actually take is `ceil(97887 x 0.03)` = **2,937 MiB**, and `compute_util
 a 512 MiB CUDA-context cushion (`RESIDENT_CUSHION_MIB`) to be free — **3,449 MiB**.
 
 The cushion, not the global `margin_mib = 1024`, is the correct charge: the margin is the *main*
-model's context cushion and has already been spent by the main model that is running. Charging the
-resident for it too (budget 3,300 + margin 1,024 = 4,324 MiB against 3,735 MiB free) refused the
-launch in exactly the situation the resident exists for. Fixed 2026-09-18.
+model's context cushion and is already spent by the main model that is running. Charging the
+resident for it too (3,300 + 1,024 = 4,324 MiB against 3,735 MiB free) refused the launch in exactly
+the situation the resident exists for. Fixed 2026-09-18.
 
 Boot order decides whether both fit, because vLLM refuses to start when free VRAM < util x total:
 

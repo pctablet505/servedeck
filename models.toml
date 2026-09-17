@@ -1,4 +1,5 @@
-# servedeck v2 model registry — the single source of truth (REDESIGN-2026-09-12.md §2.1).
+# servedeck model registry — the single source of truth.
+# Reference for every key: docs/CONFIGURATION.md. Why it exists: docs/DECISIONS.md.
 #
 # Every model this box can serve is one [models.<key>] table. Everything a client, a
 # launcher or the gateway needs (public name, aliases, port, context, reasoning/tool

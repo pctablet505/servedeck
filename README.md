@@ -72,7 +72,22 @@ Playbooks: [docs/OPERATIONS.md](docs/OPERATIONS.md#recovery).
 | [docs/models/lfm2.md](docs/models/lfm2.md) | LFM2.5-350M: same |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | The owner's standing rules, dated, each with its reason |
 
-Development: `uv venv .venv && uv pip install -e '.[dev]'`, then
-`.venv/bin/python -m pytest -q`. The end-to-end tests drive the real
-`systemd-run` path under the `sd-test-` unit namespace, so they can never
-create, adopt or stop a real model unit. MIT — see [LICENSE](LICENSE).
+## Tests
+
+`uv venv .venv && uv pip install -e '.[dev]'`, then the everyday run, which
+touches nothing on the box:
+
+```bash
+.venv/bin/python -m pytest -q -n 12 \
+  --ignore=tests/test_e2e_real.py --ignore=tests/test_app_e2e.py \
+  --ignore=tests/test_control_e2e.py --ignore=tests/test_gateway_e2e.py
+```
+
+The four excluded files are the gate, and they are not free. Three drive the
+real `systemd-run` path — safely, under the `sd-test-` unit namespace, which
+cannot name a real `model-*` unit — but they bind fixed ports, so they must run
+one at a time (`-n 0`) or they contend with each other. `test_e2e_real.py`
+boots real models on the GPU and needs the card to have room. Run the gate
+deliberately, on an idle card, not as part of a normal check.
+
+MIT — see [LICENSE](LICENSE).
