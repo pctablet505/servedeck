@@ -76,6 +76,35 @@ def test_a_dead_configured_port_never_beats_a_live_one() -> None:
     assert "8002" in got.reason and "8001" in got.reason, got.reason
 
 
+def test_a_foreign_listener_on_a_configured_port_is_not_serving() -> None:
+    """2026-09-17: nothing vLLM was running, an unrelated project's web app
+    held :8002 (the glm53 port), and the page said "serving". A listener the
+    caller identifies as foreign is reported, but never followed as live."""
+    got = _resolve(
+        probe=lambda port: {8002: 1011710}.get(port),
+        foreign=lambda pid: pid == 1011710,
+        shell_port="8001", shell_backend="flashnext",
+    )
+    assert got.live is False
+    assert got.source != updetect.LIVE_PORT
+    assert got.port == 8001, "the page keeps watching the configured port"
+    assert "1011710" in got.reason and "not a vLLM server" in got.reason
+    held = [c for c in got.candidates if c.port == 8002]
+    assert held and held[0].listening is True and held[0].pid == 1011710, (
+        "the foreign holder is still a fact on the page, just not a model"
+    )
+
+
+def test_a_vllm_listener_is_still_followed_when_a_foreign_check_is_supplied() -> None:
+    """Over-correction guard: the foreign check must only drop what it names."""
+    got = _resolve(
+        probe=lambda port: {8002: 777}.get(port),
+        foreign=lambda pid: False,
+        shell_port="8001", shell_backend="flashnext",
+    )
+    assert got.live is True and got.source == updetect.LIVE_PORT and got.pid == 777
+
+
 def test_the_shell_config_wins_when_it_is_the_live_one() -> None:
     """Over-correction guard: discovery must not drag the dashboard off a
     perfectly good port just because it did the discovering."""

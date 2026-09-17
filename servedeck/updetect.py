@@ -174,6 +174,7 @@ def resolve(
     backends: Sequence[tuple[str, int]] = (),
     current_port: int | None = None,
     fallback_port: int = DEFAULT_PORT,
+    foreign: Callable[[int], bool] | None = None,
 ) -> Upstream:
     """Pick the upstream port, following the precedence in the module docstring.
 
@@ -292,8 +293,19 @@ def resolve(
         pid = probe(c.port)
         checked_list.append(Candidate(c.port, c.source, c.backend, pid is not None, pid))
     probed = tuple(checked_list)
+    # ``foreign`` answers "is this listening pid something other than a vLLM
+    # server". A configured port held by an unrelated program (2026-09-17: a
+    # scratch web app on :8002) is *listening* but not *live*; following it
+    # put a non-model on the page as "serving". None trusts every listener.
+    foreign_pids = {
+        c.pid for c in probed if c.listening and foreign is not None and foreign(c.pid)
+    }
+
+    def _ours(c: Candidate) -> bool:
+        return bool(c.listening) and c.pid not in foreign_pids
+
     first = probed[0]
-    if first.listening:
+    if _ours(first):
         return Upstream(
             port=first.port,
             source=first.source,
@@ -310,7 +322,7 @@ def resolve(
     # The port a file named is dead. Following a live one two ports away is the
     # whole point: reporting the box as dead while a server answers is the
     # failure, and doing it silently is the second failure.
-    alive = next((c for c in probed[1:] if c.listening), None)
+    alive = next((c for c in probed[1:] if _ours(c)), None)
     if alive is not None:
         return Upstream(
             port=alive.port,
@@ -327,12 +339,17 @@ def resolve(
         )
 
     checked = ", ".join(_label(c.port, backends) for c in probed)
+    held = "; ".join(
+        f"{_label(c.port, backends)} is held by pid {c.pid}, which is not a vLLM server"
+        for c in probed if c.listening and c.pid in foreign_pids
+    )
     return Upstream(
         port=first.port,
         source=first.source,
         reason=(
-            f"nothing is listening on any known port (checked {checked}); "
-            f"showing {_label(first.port, backends)}, {_NAMED_BY[first.source]}"
+            f"no vLLM server is listening on any known port (checked {checked}"
+            + (f"; {held}" if held else "")
+            + f"); showing {_label(first.port, backends)}, {_NAMED_BY[first.source]}"
         ),
         backend=first.backend,
         live=False,

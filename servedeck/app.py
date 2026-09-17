@@ -206,6 +206,21 @@ def _port_probe():
     return lambda port: table.get(port)
 
 
+def _foreign_pid(pid: int) -> bool:
+    """True when ``pid`` holds a port but is not a vLLM server.
+
+    2026-09-17: an unrelated project's web app took :8002 (the glm53 port)
+    and the page said "serving" with no model up. The socket table says who
+    holds a port; only the process's own cmdline says whether it is vLLM.
+    """
+    from . import procctl
+
+    raw = procctl._read_cmdline_raw(pid)
+    if raw is None:
+        return True  # gone between the socket read and now: not ours either way
+    return "vllm" not in raw.lower()
+
+
 def _resolve_upstream(
     *, discover: bool = True, current_port: int | None = None
 ) -> updetect.Upstream:
@@ -228,6 +243,7 @@ def _resolve_upstream(
         backends=_configured_ports(),
         current_port=current_port,
         fallback_port=_default_port(),
+        foreign=_foreign_pid if discover else None,
     )
 
 
