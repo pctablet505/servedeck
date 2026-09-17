@@ -569,6 +569,7 @@ def estimate_payload(
         own_mib=own_gpu_mib(own_pids),
         training_markers=training_marker_hits(),
         ptrace_scope=ptrace_scope,
+        ptrace_scope_pinned=ptrace_scope_pinned(),
         actual_state=state,
     )
     r = capacity.compute(mi, util=util, ctx=ctx, max_num_seqs=seqs, live=live)
@@ -818,6 +819,25 @@ def register(app: FastAPI, rt: Any) -> None:
             "pid": view.pid if view else None,
             "key": holder,
         }
+
+
+def ptrace_scope_pinned(sysctl_dir: str | Path = "/etc/sysctl.d") -> bool:
+    """Does a sysctl.d file set ``kernel.yama.ptrace_scope = 0``? Then 0 is the
+    box's configured state (the owner's 90-servedeck.conf) and no finding
+    should call it "left relaxed"."""
+    try:
+        files = sorted(Path(sysctl_dir).glob("*.conf"))
+    except OSError:
+        return False
+    for f in files:
+        try:
+            for line in f.read_text().splitlines():
+                bare = line.split("#", 1)[0].replace(" ", "")
+                if bare == "kernel.yama.ptrace_scope=0":
+                    return True
+        except OSError:
+            continue
+    return False
 
 
 def _read_ptrace_scope() -> int | None:

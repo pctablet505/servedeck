@@ -191,3 +191,20 @@ def test_process_uptime_reads_proc_stat_for_an_adopted_pid() -> None:
     up = lp.process_uptime_s(os.getpid())
     assert up is not None and 0 <= up < 24 * 3600
     assert lp.process_uptime_s(0) is None and lp.process_uptime_s(2**22 + 12345) is None
+
+
+def test_a_pinned_ptrace_scope_is_the_configured_state(tmp_path) -> None:
+    from servedeck import capacity
+    (tmp_path / "90-servedeck.conf").write_text("kernel.yama.ptrace_scope = 0  # flash-next PLE\n")
+    assert lp.ptrace_scope_pinned(tmp_path) is True
+    (tmp_path / "90-servedeck.conf").write_text("kernel.yama.ptrace_scope = 1\n")
+    assert lp.ptrace_scope_pinned(tmp_path) is False
+    assert lp.ptrace_scope_pinned(tmp_path / "missing") is False
+    m = capacity.ModelInputs(repo_id="org/M", backend="flashnext", model_max_ctx=4096,
+                             weights_gib=10.0, kv_kib_per_token=24.0)
+    codes = lambda live: {f.code for f in capacity.compute(m, util=0.5, ctx=4096, max_num_seqs=1, live=live).findings}  # noqa: E731
+    loose = capacity.LiveFacts(ptrace_scope=0, actual_state="READY")
+    pinned = capacity.LiveFacts(ptrace_scope=0, actual_state="READY", ptrace_scope_pinned=True)
+    relaxed = [c for c in codes(loose) if "PTRACE" in c and c != "PTRACE_BLOCKS_PLE"]
+    assert relaxed, "the unpinned case still warns (guard against silencing everything)"
+    assert not any(c in codes(pinned) for c in relaxed)

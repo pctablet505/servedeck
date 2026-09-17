@@ -176,6 +176,9 @@ class LiveFacts:
     own_mib: int = 0  # VRAM held by our own vllm processes (discounted)
     training_markers: list[str] | None = None  # paths found present
     ptrace_scope: int | None = None  # current kernel.yama.ptrace_scope
+    #: True when a sysctl.d file pins ptrace_scope=0 (2026-09-17): then 0 is
+    #: the configured state, not something a launcher forgot to restore.
+    ptrace_scope_pinned: bool = False
     actual_state: str | None = None  # supervisor.actual_state, duck-typed
     codex_max_subagents: int | None = None  # CODEX_MAX_SUBAGENTS, if known
 
@@ -481,7 +484,11 @@ def compute(
                 )
             )
 
-        if live.ptrace_scope == 0 and live.actual_state in ("READY", "STOPPED"):
+        if (
+            live.ptrace_scope == 0
+            and not live.ptrace_scope_pinned
+            and live.actual_state in ("READY", "STOPPED")
+        ):
             findings.append(
                 Finding(
                     code="PTRACE_LEFT_RELAXED",
