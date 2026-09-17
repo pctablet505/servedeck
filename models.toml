@@ -1,6 +1,12 @@
 # servedeck model registry — the single source of truth.
 # Reference for every key: docs/CONFIGURATION.md. Why it exists: docs/DECISIONS.md.
 #
+# The file:line citations below name the legacy launchers each flag and env var
+# was transcribed from. Those scripts still sit in their own trees, none of
+# which is a git repository, so a verbatim copy of each is committed under
+# docs/imported-2026-09/ — when local_llm is archived, that copy is the
+# referent.
+#
 # Every model this box can serve is one [models.<key>] table. Everything a client, a
 # launcher or the gateway needs (public name, aliases, port, context, reasoning/tool
 # parsers, launch flags/env) is derived from here — see servedeck/models.py.
