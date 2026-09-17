@@ -573,3 +573,17 @@ def test_scan_model_survives_utf8_split_mid_character():
         # No truncation may ever produce a *wrong* answer; only None or "real".
         assert scan_model(body[:cut]).model in (None, "real")
     assert scan_model(body) == ModelScan("real", True)
+
+
+def test_a_terminal_sse_error_frame_is_parseable_and_ends_the_stream() -> None:
+    """An upstream that dies mid-stream can only be reported in-band: status
+    and headers are already on the wire. A stream that merely stops looks
+    exactly like a finished answer, and the agent keeps its half-sentence."""
+    import json as _json
+
+    raw = policies.sse_error_chunk("the upstream for X stopped mid-response").decode()
+    frames = [f for f in raw.split("\n\n") if f.strip()]
+    assert frames[-1] == "data: [DONE]", "a client waits for the sentinel"
+    payload = _json.loads(frames[0].removeprefix("data: "))
+    assert payload["error"]["code"] == "upstream_unavailable"
+    assert "mid-response" in payload["error"]["message"]

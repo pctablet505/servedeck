@@ -213,6 +213,22 @@ def transform_sse_line(line: bytes) -> bytes:
     return b"data:" + lead + _dumps(mirror_reasoning(data)) + ending
 
 
+def sse_error_chunk(message: str) -> bytes:
+    """A terminal SSE error frame, followed by ``[DONE]``.
+
+    Once a stream's status and headers are on the wire there is no status code
+    left to change, so an upstream that dies mid-response can only be reported
+    in-band. A stream that just stops is indistinguishable from a completed
+    answer, and an agent keeps the half-sentence it has as the model's reply.
+    The shape is the OpenAI error object clients already parse.
+    """
+    body = json.dumps(
+        {"error": {"message": message, "type": "upstream_unavailable",
+                   "code": "upstream_unavailable", "param": None}}
+    )
+    return f"data: {body}\n\ndata: [DONE]\n\n".encode()
+
+
 async def sse_stream(source: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
     """Transform an SSE byte stream line by line, without buffering it.
 

@@ -141,6 +141,14 @@ _COLDSTART_ALLOWED = {
     "tests/test_units.py",
     # This file, which names the rule.
     "tests/test_hygiene.py",
+    # The knowledge base records where a behaviour came FROM, and three of
+    # these behaviours came from the predecessor: Codex's 30-minute frozen
+    # turn, GLM's KV-vs-context failure under the old dashboard, and the
+    # gated-repo 401. Naming it in history is not the rename being unfinished
+    # — the test above still guards every generated config, unit and path.
+    "docs/CLIENTS.md",
+    "docs/models/glm53.md",
+    "docs/models/flashnext.md",
 }
 
 _SWEEP_SUFFIXES = {".py", ".md", ".toml", ".js", ".html", ".css", ".service", ".sh"}

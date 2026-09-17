@@ -51,6 +51,9 @@ class Upstream:
         self.chunks: list[bytes] | None = None
         self.headers: dict[str, str] = {}
         self.raise_on_send: Exception | None = None
+        #: Raised while the body is being STREAMED, after status and headers
+        #: are already on the wire: an engine that dies mid-answer.
+        self.raise_mid_stream: Exception | None = None
 
     @property
     def last(self) -> httpx.Request:
@@ -67,9 +70,13 @@ class Upstream:
 
         pieces = list(self.chunks)
 
+        mid = self.raise_mid_stream
+
         async def gen():
             for piece in pieces:
                 yield piece
+            if mid is not None:
+                raise mid
 
         return httpx.Response(self.status, headers=headers, content=gen())
 
@@ -582,6 +589,39 @@ def test_mirroring_a_stream_that_carries_no_reasoning_is_byte_identical():
     up.chunks = [raw]
     r = call(app, "POST", "/v1/chat/completions", json={"model": "lfm2", "stream": True})
     assert r.content == raw
+
+
+def test_an_upstream_that_dies_mid_stream_says_so_in_band():
+    """Status and headers are already on the wire, so there is no status code
+    left to change: a stream that merely stops is indistinguishable from a
+    finished answer, and the agent keeps its half-sentence as the reply."""
+    import json as _json
+
+    table = FakeRouteTable([lfm2_route(mirror_reasoning=True)], main_name="LFM2.5-350M")
+    app, up = rig(table)
+    up.media = "text/event-stream"
+    up.chunks = [b'data: {"choices":[{"delta":{"content":"half a sen"}}]}\n\n']
+    up.raise_mid_stream = httpx.ReadError("engine went away")
+    r = call(app, "POST", "/v1/chat/completions", json={"model": "lfm2", "stream": True})
+    text = r.content.decode()
+    assert "half a sen" in text, "what did arrive is still delivered"
+    frames = [f for f in text.split("\n\n") if f.strip()]
+    assert frames[-1] == "data: [DONE]"
+    err = _json.loads(frames[-2].removeprefix("data: "))
+    assert err["error"]["code"] == "upstream_unavailable"
+    assert "incomplete" in err["error"]["message"]
+
+
+def test_an_upstream_that_dies_while_a_json_body_is_read_is_a_502():
+    """Uncaught, this reached the client as a bare 500 in text/plain — not an
+    OpenAI error object, so clients reported a parse failure of their own."""
+    table = FakeRouteTable([lfm2_route(mirror_reasoning=True)], main_name="LFM2.5-350M")
+    app, up = rig(table)
+    up.chunks = [b'{"choices":[']
+    up.raise_mid_stream = httpx.ReadError("engine went away")
+    r = call(app, "POST", "/v1/chat/completions", json={"model": "lfm2"})
+    assert r.status_code == 502
+    assert r.json()["error"]["code"] == "upstream_unavailable"
 
 
 # ---------------------------------------------------------------------------

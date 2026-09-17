@@ -44,6 +44,7 @@ Two rules this file does not bend
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
@@ -54,6 +55,8 @@ from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from servedeck import glm_policies, policies
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # The route table contract — implemented by the registry (P1/P3), not here
@@ -484,9 +487,23 @@ async def _proxy(
             source = glm.sse(source)
 
         async def sse_body() -> AsyncIterator[bytes]:
+            """The stream, with a terminal error EVENT if the upstream dies.
+
+            Status and headers are already on the wire by the time a stream
+            breaks, so there is no status code left to change: the only honest
+            way to tell a client is in-band. Without this the stream simply
+            stopped, which a client cannot tell from a completed answer — the
+            agent kept whatever half-sentence it had as the model's reply.
+            """
             try:
                 async for chunk in source:
                     yield chunk
+            except Exception as exc:  # noqa: BLE001 — mid-stream upstream death
+                log.warning("%s: upstream stream failed mid-response: %r", route.model_id, exc)
+                yield policies.sse_error_chunk(
+                    f"the upstream for {route.model_id} stopped mid-response "
+                    f"({type(exc).__name__}); the answer is incomplete"
+                )
             finally:
                 await upstream.aclose()
 
@@ -499,8 +516,16 @@ async def _proxy(
     ):
         # The only place a response body is held in full, and only because a
         # complete JSON object cannot be mirrored a chunk at a time.
+        #
+        # The read can fail after the headers arrived: the engine died, or the
+        # GPU fault took it, mid-body. Uncaught, that reached the client as a
+        # bare "500 Internal Server Error" in text/plain — not an OpenAI error
+        # object, so every client reported it as a parse failure or a crash of
+        # its own rather than "the server went away, retry".
         try:
             payload = await upstream.aread()
+        except Exception as exc:  # noqa: BLE001 — a dead upstream is a 502
+            return upstream_unavailable_response(route, exc)
         finally:
             await upstream.aclose()
         body = policies.transform_json_body(payload) if mirror else payload
