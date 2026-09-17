@@ -137,6 +137,10 @@ class Model:
     min_output_tokens: int | None = None
     max_output_tokens: int | None = None
     vision: bool = False
+    #: Retired 2026-09-18 (see models.toml): nothing enforced it, the sysctl
+    #: file makes it false for the one model that set it, and doctor's
+    #: ptrace_scope row is now unconditional. Kept as a parsed field so an
+    #: older models.toml still loads instead of failing on an unknown key.
     needs_tty: bool = False
     #: P9 — the GLM-5.3 client-compatibility switches (servedeck/glm_policies.py).
     #: They live on the MODEL, not in an env var, so they travel with the model
@@ -193,6 +197,12 @@ class Build:
 class GPU:
     total_mib: int
     margin_mib: int
+    #: The power cap this box is supposed to run at, in watts, for `servedeck
+    #: doctor` to compare against the live one. Optional and deliberately
+    #: unset by default: the cap is an owner decision (the card fell off the
+    #: bus twice, at 600 W under load and at 450 W idle), and a number in this
+    #: file that nobody has decided would read as one that somebody had.
+    power_limit_w: int | None = None
 
 
 @dataclass(frozen=True)
@@ -458,7 +468,13 @@ def load(path: str | Path) -> Registry:
     gpu_raw = data.get("gpu")
     if gpu_raw is None or "total_mib" not in gpu_raw or "margin_mib" not in gpu_raw:
         raise RegistryError("[gpu] table with total_mib and margin_mib is required")
-    gpu = GPU(total_mib=int(gpu_raw["total_mib"]), margin_mib=int(gpu_raw["margin_mib"]))
+    gpu = GPU(
+        total_mib=int(gpu_raw["total_mib"]),
+        margin_mib=int(gpu_raw["margin_mib"]),
+        power_limit_w=(
+            int(gpu_raw["power_limit_w"]) if gpu_raw.get("power_limit_w") is not None else None
+        ),
+    )
 
     builds = _load_builds(data.get("builds") or {})
     defaults_env = dict((data.get("defaults") or {}).get("env") or {})

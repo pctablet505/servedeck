@@ -582,36 +582,33 @@ def test_a_training_marker_is_a_failure_not_a_warning(tmp_path):
     assert "do not start a model" in result.detail
 
 
-def test_ptrace_scope_is_only_checked_for_models_that_need_a_tty(tmp_path):
-    """Checked per model, so the answer names which model would fail — and not
-    checked at all for a registry with no `needs_tty` model, rather than
-    emitting a passing row nobody asked for."""
+def test_ptrace_scope_is_one_unconditional_host_row(tmp_path):
+    """Keyed on nothing (2026-09-18): TWO subsystems need scope 0 — Flash-Next's
+    PLE handoff (pidfd_getfd between sibling workers) and the KV-offload
+    reaper, which reads a non-descendant engine's /proc/<pid>/maps to prove a
+    40 GiB buffer is live before deleting it. A registry-keyed row vanished the
+    moment `needs_tty` was removed, taking the only report of a host setting
+    two subsystems depend on with it."""
     reg = models.load(REPO_ROOT / "models.toml")
-    needy = [m.key for m in reg.models.values() if m.needs_tty]
-    assert needy, "models.toml has no needs_tty model; this test has no subject"
+    assert not any(m.needs_tty for m in reg.models.values()), "the flag is retired"
 
     ok = doctor.check_ptrace_scope(reg, 0)
-    assert [r.name for r in ok] == [f"ptrace_scope ({k})" for k in needy]
-    assert all(r.ok for r in ok)
+    assert [r.name for r in ok] == ["ptrace_scope (host)"] and ok[0].ok
 
     bad = doctor.check_ptrace_scope(reg, 1)
-    assert all(not r.ok for r in bad)
-    # The detail must say why the launcher's own sudo sysctl does not save it:
-    # there is no tty under systemd, so the relaxation silently no-ops.
-    assert "no tty" in bad[0].detail
-    assert "sysctl" in bad[0].detail
+    assert len(bad) == 1 and not bad[0].ok
+    assert "PLE handoff" in bad[0].detail and "reaper" in bad[0].detail
+    assert "90-servedeck.conf" in bad[0].detail, "name the file that fixes it"
 
     unreadable = doctor.check_ptrace_scope(reg, None)
-    assert all(not r.ok for r in unreadable)
-    assert "could not read" in unreadable[0].detail
+    assert not unreadable[0].ok and "could not read" in unreadable[0].detail
 
 
-def test_a_registry_with_no_needs_tty_model_gets_no_ptrace_row(tmp_path):
+def test_the_host_ptrace_row_is_there_for_a_minimal_registry_too(tmp_path):
     path = tmp_path / "models.toml"
     path.write_text(MINIMAL_TOML)
     reg = models.load(path)
-    assert not any(m.needs_tty for m in reg.models.values())
-    assert doctor.check_ptrace_scope(reg, 1) == []
+    assert len(doctor.check_ptrace_scope(reg, 1)) == 1
 
 
 def test_none_scope_is_distinguishable_from_not_supplied(tmp_path):
@@ -629,3 +626,91 @@ def test_none_scope_is_distinguishable_from_not_supplied(tmp_path):
     # Not supplied: reads the host, whatever it says — only the shape is fixed.
     from_host = doctor.check_ptrace_scope(reg)
     assert len(from_host) == len(explicit_none)
+
+
+# --------------------------------------------------------------------------- #
+# Host state nothing was reporting before 2026-09-18
+# --------------------------------------------------------------------------- #
+
+
+def test_a_leaked_offload_buffer_is_a_failing_row(tmp_path):
+    """40 GiB of host RAM per buffer, invisible until this row: vLLM unlinks
+    them only inside its own shutdown, which a kill or a lost GPU skips."""
+    shm = tmp_path / "shm"
+    shm.mkdir()
+    live = shm / "vllm_offload_live.mmap"
+    dead = shm / "vllm_offload_dead.mmap"
+    for f in (live, dead):
+        f.write_bytes(b"\0" * 2048)
+
+    clean = doctor.check_offload_buffers(shm, in_use=lambda: frozenset({str(live), str(dead)}))
+    assert clean.ok and "all mapped" in clean.detail
+
+    leaked = doctor.check_offload_buffers(shm, in_use=lambda: frozenset({str(live)}))
+    assert not leaked.ok
+    assert "vllm_offload_dead.mmap" in leaked.detail
+    assert "ptrace_scope" in leaked.detail, "say what to check when a reap does not help"
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert doctor.check_offload_buffers(empty, in_use=lambda: frozenset()).ok
+
+
+def test_a_wanted_model_with_no_unit_is_a_failing_row(tmp_path):
+    """The question nothing asked: a model whose engine died and whose unit
+    systemd then collected leaves desired state naming it, no unit, and no
+    complaint anywhere — every client gets "not running" while the page shows
+    nothing wrong."""
+    from servedeck import desired as _desired
+
+    path = tmp_path / "models.toml"
+    path.write_text(MINIMAL_TOML)
+    reg = models.load(path)
+    key = next(iter(reg.models))
+    state = tmp_path / "desired.json"
+
+    _desired.save(_desired.Desired(main=key), state)
+    gone = doctor.check_desired_is_live(reg, state, run=_no_units_runner())
+    assert len(gone) == 1 and not gone[0].ok
+    assert key in gone[0].detail and "servedeck start" in gone[0].detail
+
+    present = doctor.check_desired_is_live(reg, state, run=_one_unit_runner(f"model-{key}"))
+    assert present[0].ok
+
+    _desired.save(_desired.Desired(), state)
+    assert doctor.check_desired_is_live(reg, state, run=_no_units_runner())[0].ok
+
+
+def test_a_model_whose_weights_are_missing_is_a_failing_row(tmp_path):
+    """Models launch with HF_HUB_OFFLINE=1, so a missing snapshot is not a slow
+    launch, it is a dead one."""
+    path = tmp_path / "models.toml"
+    path.write_text(MINIMAL_TOML)
+    reg = models.load(path)
+    rows = doctor.check_weights_present(reg, hub_dir=str(tmp_path / "empty-hub"))
+    assert rows and not rows[0].ok
+    assert "not in the local hub cache" in rows[0].detail
+
+
+def test_the_power_cap_row_reports_and_only_fails_against_an_expectation():
+    """The cap changes under the operator: a boot unit pins one value and a
+    hand `nvidia-smi -pl` lasts until the next reboot."""
+    silent = doctor.check_power_cap(None, 375.0)
+    assert silent.ok and "375 W" in silent.detail and "no expected value" in silent.detail
+    assert doctor.check_power_cap(485, 485.0).ok
+    bad = doctor.check_power_cap(485, 375.0)
+    assert not bad.ok and "375" in bad.detail and "485" in bad.detail
+    assert "nvidia-power-limit.service" in bad.detail, "name what re-applies it"
+    assert doctor.check_power_cap(485, None).ok, "nvidia-smi silent is not a failure"
+
+
+def _no_units_runner():
+    import subprocess
+
+    return lambda argv: subprocess.CompletedProcess(argv, 0, "", "")
+
+
+def _one_unit_runner(unit: str):
+    import subprocess
+
+    return lambda argv: subprocess.CompletedProcess(argv, 0, f"{unit}.service\n", "")

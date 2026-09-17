@@ -514,7 +514,10 @@ def test_the_gateway_serves_v1_models_from_the_registry(client) -> None:
 def test_the_gateway_lists_every_alias_and_preset_of_a_live_model(client) -> None:
     set_live(client, FakeLive(key="big", unit="sd-test-big"))
     ids = [entry["id"] for entry in client.get("/v1/models").json()["data"]]
-    assert ids == ["Big-Model", "big-alias", "big-high"]
+    # The slot aliases come last, and only for the model holding the main
+    # slot: they are the one name a client config keeps across a switch, so
+    # the list has to advertise them (2026-09-18).
+    assert ids == ["Big-Model", "big-alias", "main", "local", "big-high"]
     assert all(e["root"] == "Big-Model" for e in client.get("/v1/models").json()["data"])
 
 

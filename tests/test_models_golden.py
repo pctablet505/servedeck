@@ -249,10 +249,17 @@ def test_qwen27b_argv_and_env_match_frozen_snapshot(registry):
     # snapshot — not just one. CUDA_HOME and VLLM_USE_FLASHINFER_SAMPLER must
     # match exactly; PATH only by its <venv>/bin:<CUDA_HOME>/bin prefix (the
     # rest is the capturing shell's own PATH — see the env fixture's header).
-    assert set(legacy_env) == set(v2_env), (
+    # HF_HUB_OFFLINE is a DELIBERATE v2 addition (models.toml [defaults.env]
+    # carries the reasoning and the history): the legacy launcher for this
+    # model ran against the network, and v2 launches every model from the
+    # local hub cache. Excluded from the set comparison rather than dropped
+    # from it, so any OTHER divergence still fails this test.
+    deliberate_additions = {"HF_HUB_OFFLINE"}
+    assert set(legacy_env) == set(v2_env) - deliberate_additions, (
         f"env var set differs: snapshot only {set(legacy_env) - set(v2_env)}, "
-        f"v2 only {set(v2_env) - set(legacy_env)}"
+        f"v2 only {set(v2_env) - set(legacy_env) - deliberate_additions}"
     )
+    assert v2_env["HF_HUB_OFFLINE"] == "1"
     assert legacy_env["CUDA_HOME"] == v2_env["CUDA_HOME"]
     assert legacy_env["VLLM_USE_FLASHINFER_SAMPLER"] == v2_env["VLLM_USE_FLASHINFER_SAMPLER"] == "0"
     expected_prefix = f"{vllm_bin.rsplit('/bin/vllm', 1)[0]}/bin:{v2_env['CUDA_HOME']}/bin:"

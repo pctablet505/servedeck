@@ -45,6 +45,30 @@ def safe_toml(tmp_path) -> Path:
     return p
 
 
+
+
+def _fake_hub(tmp_path, *repos: str):
+    """A hub cache holding exactly ``repos``, servable, and nothing else.
+
+    Mirrors what `servedeck.discovery` reads: models--<org>--<name>/snapshots/
+    <rev>/config.json plus one safetensors shard.
+    """
+    import json
+
+    hub = tmp_path / "hub"
+    for repo in repos:
+        org, _, name = repo.partition("/")
+        snap = hub / f"models--{org}--{name}" / "snapshots" / "deadbeef"
+        snap.mkdir(parents=True)
+        (snap / "config.json").write_text(json.dumps({
+            # One of discovery.KNOWN_ARCHS, or the entry is "unknown architecture".
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "max_position_embeddings": 1000,
+        }))
+        (snap / "model-00001-of-00001.safetensors").write_bytes(b"\0" * 4096)
+    return hub
+
+
 # --------------------------------------------------------------------------- #
 # models
 # --------------------------------------------------------------------------- #
@@ -175,8 +199,21 @@ def test_doctor_command_all_ok_with_safe_ports(safe_toml, isolated_doctor_client
     # doctor rightly said this one-model test registry does not know it).
     from servedeck import doctor as _doctor
     real = _doctor.run_doctor
-    monkeypatch.setattr(_doctor, "run_doctor",
-                        lambda path, **kw: real(path, unit_run=_no_units, **kw))
+    # Every host check takes its input rather than reading this box: a missing
+    # checkpoint, a leaked /dev/shm buffer or a real desired.json would
+    # otherwise make this test's result depend on the machine it runs on
+    # (doctor's own docstring rule; the 2026-09-18 rows follow it too).
+    hub = _fake_hub(tmp_path, "org/a")
+    shm = tmp_path / "shm"
+    shm.mkdir()
+    desired = tmp_path / "desired.json"
+    monkeypatch.setattr(
+        _doctor, "run_doctor",
+        lambda path, **kw: real(
+            path, unit_run=_no_units, hub_dir=str(hub), shm_dir=shm,
+            desired_path=desired, power_limit_w=None, **kw
+        ),
+    )
     rc = cli.main(["doctor", "--models-toml", str(safe_toml)])
     out = capsys.readouterr().out
     assert "registry loads" in out

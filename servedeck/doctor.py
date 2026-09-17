@@ -46,8 +46,13 @@ from typing import NamedTuple
 
 import httpx
 
+from . import control as _control
+from . import desired as _desired
+from . import discovery as _discovery
+from . import gpu as _gpu
 from . import limits as _limits
 from . import models as _models
+from . import settings as _settings
 from . import units as _units
 from . import wire as _wire
 
@@ -432,48 +437,188 @@ def _read_ptrace_scope() -> int | None:
 def check_ptrace_scope(
     registry: _models.Registry, scope: int | None | _Unset = _UNSET
 ) -> list[CheckResult]:
-    """``kernel.yama.ptrace_scope`` for every model that declares ``needs_tty``.
+    """``kernel.yama.ptrace_scope`` — one HOST row, always.
 
-    Flash-Next relaxes this sysctl itself, through ``sudo sysctl`` — which
-    silently no-ops without an interactive tty, and a systemd ``ExecStart`` has
-    none. So "it works when I run it by hand" and "it works as a unit" are
-    different facts, and the model only appears to work today because
-    ptrace_scope happens to be 0 on this boot. Checked per model rather than
-    globally so the answer names which model would fail; a registry with no
-    ``needs_tty`` model gets no row at all rather than a passing check nobody
-    asked for.
+    Two things on this box need it at 0, which is why it is no longer keyed on
+    a model flag (``needs_tty``, removed 2026-09-18 — nothing enforced it, and
+    /etc/sysctl.d/90-servedeck.conf made "cannot boot unattended" false):
+
+    * Flash-Next's PLE offload hands a CUDA IPC fd between sibling worker
+      processes (``pidfd_getfd``), which yama blocks at scope 1.
+    * servedeck's own KV-offload reaper reads ``/proc/<pid>/maps`` of engines
+      that are NOT its descendants, to prove a 40 GiB buffer is still mapped
+      before deleting it. At scope 1 it cannot see them, so it fails closed
+      and stops reaping — safe, but the leak then accumulates 40 GiB per
+      crash until reboot.
+
+    Unconditional, because a registry-keyed check disappears the moment the
+    flag is removed, taking the only report of a host setting two subsystems
+    depend on with it.
     """
-    needy = [m for m in registry.models.values() if m.needs_tty]
-    if not needy:
-        return []
     if isinstance(scope, _Unset):
         scope = _read_ptrace_scope()
-    results: list[CheckResult] = []
-    for m in needy:
-        name = f"ptrace_scope ({m.key})"
-        if scope is None:
-            results.append(
-                CheckResult(name, False, f"could not read {PTRACE_PATH}")
+    name = "ptrace_scope (host)"
+    if scope is None:
+        return [CheckResult(name, False, f"could not read {PTRACE_PATH}")]
+    if scope != PTRACE_SCOPE_REQUIRED:
+        return [
+            CheckResult(
+                name,
+                False,
+                f"kernel.yama.ptrace_scope={scope}, needs 0: Flash-Next's PLE handoff "
+                f"(pidfd_getfd between sibling workers) fails, and the KV-offload "
+                f"reaper cannot see a live engine's mappings so it stops reclaiming "
+                f"leaked buffers. Owner action: /etc/sysctl.d/90-servedeck.conf",
             )
-        elif scope != PTRACE_SCOPE_REQUIRED:
-            results.append(
-                CheckResult(
-                    name,
-                    False,
-                    f"kernel.yama.ptrace_scope={scope}; {m.id} needs 0 for its PLE "
-                    f"handoff (pidfd_getfd). Its launcher's own `sudo sysctl` does "
-                    f"NOT fix this under systemd — there is no tty. Owner action: "
-                    f"/etc/sysctl.d/90-vllm.conf",
-                )
-            )
-        else:
-            results.append(CheckResult(name, True, f"0 — {m.id} can do its PLE handoff"))
-    return results
+        ]
+    return [
+        CheckResult(name, True, "0 — the PLE handoff and the offload reaper can both see what they need")
+    ]
 
 
 # --------------------------------------------------------------------------- #
 # Orchestration + presentation
 # --------------------------------------------------------------------------- #
+
+
+
+# --------------------------------------------------------------------------- #
+# Host state the 2026-09-18 audit found nothing was reporting
+# --------------------------------------------------------------------------- #
+
+
+def check_offload_buffers(
+    shm_dir: Path | None = None, in_use: Callable[[], frozenset[str]] | None = None
+) -> CheckResult:
+    """Leaked KV-offload buffers: 40 GiB of host RAM each, invisible.
+
+    vLLM unlinks ``/dev/shm/vllm_offload_*.mmap`` only inside its own
+    shutdown, which a kill, a crash or a lost GPU skips. servedeck reaps them,
+    but the reaper fails closed when it cannot see every engine's mappings
+    (ptrace_scope), so "reaped" is not guaranteed — and until this row nothing
+    told an operator that 40 or 80 GiB of the 182 was simply gone.
+    """
+    directory = Path("/dev/shm") if shm_dir is None else shm_dir
+    try:
+        found = sorted(directory.glob(_control.OFFLOAD_REGION_GLOB))
+    except OSError as exc:
+        return CheckResult("offload buffers", False, f"could not read {directory}: {exc}")
+    if not found:
+        return CheckResult("offload buffers", True, f"none in {directory}")
+    mapped = in_use() if in_use is not None else _control.offload_scan().paths
+    orphans = [f for f in found if str(f) not in mapped]
+    total = sum(f.stat().st_size for f in orphans if f.exists())
+    if not orphans:
+        return CheckResult(
+            "offload buffers",
+            True,
+            f"{len(found)} buffer(s), all mapped by a live engine",
+        )
+    return CheckResult(
+        "offload buffers",
+        False,
+        f"{len(orphans)} of {len(found)} buffer(s) hold {total / 2**30:.0f} GiB of host RAM "
+        f"that no engine maps: {', '.join(f.name for f in orphans)}. A stop or start reaps "
+        f"them; if they survive that, check kernel.yama.ptrace_scope",
+    )
+
+
+def check_desired_is_live(
+    registry: _models.Registry,
+    desired_path: Path,
+    run: _units.Runner | None = None,
+) -> list[CheckResult]:
+    """Does what the box is configured to serve match what is running?
+
+    The one question no check asked. A model whose engine died and whose unit
+    systemd then collected leaves desired state naming it, no unit, and no
+    complaint anywhere: every client gets "not running" while the page shows
+    nothing wrong.
+    """
+    try:
+        want = _desired.load(desired_path)
+    except Exception as exc:  # noqa: BLE001
+        return [CheckResult("desired state", False, f"{desired_path} unreadable: {exc}")]
+    wanted = [k for k in [*want.residents, *([want.main] if want.main else [])]]
+    if not wanted:
+        return [CheckResult("desired state", True, "nothing is configured to run")]
+    try:
+        units_present = {
+            u.removeprefix(_control.UNIT_PREFIX).removesuffix(".service")
+            for u in _units.list_units(f"{_control.UNIT_PREFIX}*", run=run)
+        }
+    except _units.UnitError as exc:
+        return [CheckResult("desired state", False, f"could not list model units: {exc}")]
+    out: list[CheckResult] = []
+    for key in wanted:
+        name = f"desired ({key})"
+        if key not in registry.models:
+            out.append(CheckResult(name, False, f"{key} is wanted but not in the registry"))
+        elif key in units_present:
+            out.append(CheckResult(name, True, "wanted, and its unit exists"))
+        else:
+            out.append(
+                CheckResult(
+                    name,
+                    False,
+                    f"{key} is wanted but no {_control.UNIT_PREFIX}{key} unit exists — its "
+                    f"engine died and systemd collected the unit, or it never started. "
+                    f"`servedeck start {key}` and read the journal",
+                )
+            )
+    return out
+
+
+def check_weights_present(registry: _models.Registry, hub_dir: str | None = None) -> list[CheckResult]:
+    """Is each model's checkpoint actually in the local hub cache?
+
+    Models launch with ``HF_HUB_OFFLINE=1``, so a missing or half-downloaded
+    snapshot is not a slow launch, it is a dead one — and the first v2 launch
+    of Flash-Next died exactly this way (a gated-repo 401, because offline was
+    NOT set and the hub was asked). One row per model, so the answer names
+    which checkpoint to fetch.
+    """
+    try:
+        entries = {e.repo_id: e for e in _discovery.discover_models(hub_dir)}
+    except Exception as exc:  # noqa: BLE001
+        return [CheckResult("weights", False, f"could not read the hub cache: {exc}")]
+    out: list[CheckResult] = []
+    for m in registry.models.values():
+        entry = entries.get(m.repo)
+        name = f"weights ({m.key})"
+        if entry is None:
+            out.append(CheckResult(name, False, f"{m.repo} is not in the local hub cache"))
+        elif not entry.servable:
+            out.append(CheckResult(name, False, f"{m.repo}: {entry.reason or 'not servable'}"))
+        else:
+            out.append(CheckResult(name, True, f"{m.repo} is local"))
+    return out
+
+
+def check_power_cap(expected_w: int | None, actual_w: float | None) -> CheckResult:
+    """The GPU power cap, which a system unit re-applies at every boot.
+
+    Reported always, because it is a number that silently changes under the
+    operator: ``nvidia-power-limit.service`` pins one value, a hand
+    ``nvidia-smi -pl`` lasts until reboot, and the difference is measurable
+    throughput. It only FAILS when models.toml states an expected value.
+    """
+    if actual_w is None:
+        return CheckResult("power cap", True, "nvidia-smi did not report a power limit")
+    if expected_w is None:
+        return CheckResult(
+            "power cap",
+            True,
+            f"{actual_w:.0f} W (no expected value in models.toml [gpu] power_limit_w)",
+        )
+    if abs(actual_w - expected_w) > 1:
+        return CheckResult(
+            "power cap",
+            False,
+            f"{actual_w:.0f} W, but models.toml expects {expected_w} W. A boot unit "
+            f"re-applies its own value: /etc/systemd/system/nvidia-power-limit.service",
+        )
+    return CheckResult("power cap", True, f"{actual_w:.0f} W, as models.toml expects")
 
 
 def run_doctor(
@@ -485,6 +630,10 @@ def run_doctor(
     http_get: HttpGet | None = None,
     marker_paths: Sequence[str] | None = None,
     ptrace_scope: int | None | _Unset = _UNSET,
+    desired_path: Path | None = None,
+    shm_dir: Path | None = None,
+    hub_dir: str | None = None,
+    power_limit_w: float | None | _Unset = _UNSET,
 ) -> list[CheckResult]:
     results: list[CheckResult] = [check_registry(models_path)]
     if not results[0].ok:
@@ -523,6 +672,15 @@ def run_doctor(
     # `run_doctor`'s result depend on the machine the suite happens to run on.
     results.append(check_training_marker(marker_paths))
     results.extend(check_ptrace_scope(registry, ptrace_scope))
+    results.extend(check_desired_is_live(registry, desired_path or _settings.get().desired_path, run=unit_run))
+    results.extend(check_weights_present(registry, hub_dir))
+    results.append(check_offload_buffers(shm_dir))
+    results.append(
+        check_power_cap(
+            registry.gpu.power_limit_w,
+            _gpu.power_limit_w() if power_limit_w is _UNSET else power_limit_w,
+        )
+    )
     return results
 
 

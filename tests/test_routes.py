@@ -408,3 +408,15 @@ def test_main_names_the_slot_holder_even_when_nothing_is_live(routes) -> None:
     route = routes.resolve("main")
     assert route is not None and route.model_id == "Big-Model"
     assert not route.live, "nothing is running, so the route is not live"
+
+
+def test_the_live_main_model_publishes_the_slot_aliases(routes) -> None:
+    """`GET /v1/models` has to advertise the name clients are told to use, or
+    every client's config names something the box denies having — which is
+    exactly what `servedeck doctor` reported the moment the alias shipped."""
+    live(routes, "main1")
+    route = routes.resolve("Big-Model")
+    assert "main" in route.aliases and "local" in route.aliases
+    # Not on a model that is merely registered: the slot is held by one model.
+    other = routes.resolve("Other-Main")
+    assert "main" not in other.aliases

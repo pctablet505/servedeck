@@ -359,7 +359,20 @@ def render_codex(
     text = _upsert_section(
         text,
         "[model_providers.servedeck]",
-        {"name": "servedeck", "base_url": f"{GATEWAY_BASE_URL}/v1", "wire_api": "responses"},
+        {
+            "name": "servedeck",
+            "base_url": f"{GATEWAY_BASE_URL}/v1",
+            "wire_api": "responses",
+            # A cold boot of a big model is 4-10 minutes on this box and a
+            # restart mid-session is ordinary, so Codex's client needs the
+            # patience to ride one out instead of failing the turn. These
+            # three keys were verified present in the installed builds'
+            # ModelProviderInfo (they were hand-added to the pre-cutover
+            # config, and were lost when wiring moved to ~/.codex).
+            "request_max_retries": 2,
+            "stream_max_retries": 2,
+            "stream_idle_timeout_ms": 900_000,
+        },
     )
     text = _remove_sections(text, "[profiles.")
     ctx = _slot_ctx(registry, resolve_ctx)

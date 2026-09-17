@@ -88,6 +88,32 @@ def gpu_alive() -> bool:
     return result.returncode == 0 and "GPU" in result.stdout
 
 
+def power_limit_w() -> float | None:
+    """The GPU's enforced power limit in watts, or None if nvidia-smi cannot
+    say. Its own row in ``servedeck doctor``: a system unit re-applies one
+    value at every boot and a hand ``nvidia-smi -pl`` lasts only until the
+    next one, so this number changes under the operator — and the difference
+    between the two values used on this box is measurable throughput.
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=power.limit", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=_NVIDIA_SMI_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    line = next((ln.strip() for ln in result.stdout.splitlines() if ln.strip()), "")
+    try:
+        return float(line)
+    except ValueError:
+        return None
+
+
 def gpu_summary() -> GpuSummary | None:
     """The single GPU's current headline numbers, or None if nvidia-smi is
     unavailable / its output doesn't parse as expected. Never raises."""

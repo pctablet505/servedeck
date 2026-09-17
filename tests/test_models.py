@@ -173,7 +173,7 @@ ctx = 1000
     assert reg.models["a"].env == {"VLLM_USE_FLASHINFER_SAMPLER": "1", "FOO": "bar"}
     # a model with no [env] table still gets the default.
     assert reg.models["b"].env == {"VLLM_USE_FLASHINFER_SAMPLER": "0"}
-    assert reg.defaults_env == {"VLLM_USE_FLASHINFER_SAMPLER": "0"}
+    assert reg.defaults_env == {"VLLM_USE_FLASHINFER_SAMPLER": "0"}  # this fixture's own [defaults.env]
 
 
 def test_resident_model_requires_vram_mib(tmp_path):
@@ -194,7 +194,14 @@ def test_real_models_toml_loads():
     assert set(reg.models) == {"qwen27b", "flashnext", "glm53", "lfm2"}
     assert reg.gpu.total_mib == 97887
     assert reg.gpu.margin_mib == 1024
-    assert reg.defaults_env == {"VLLM_USE_FLASHINFER_SAMPLER": "0"}
+    assert reg.defaults_env == {
+        "VLLM_USE_FLASHINFER_SAMPLER": "0",
+        # Offline for every model since 2026-09-18: all four snapshots are
+        # complete on disk and doctor has a `weights (<key>)` row, so a launch
+        # never depends on the network or resolves a revision that is not the
+        # one on disk. models.toml carries the full history of this flag.
+        "HF_HUB_OFFLINE": "1",
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -615,13 +622,17 @@ def test_native_ctx_matches_real_hub_cache_for_qwen27b():
 
 
 
-def test_flashnext_launches_offline_as_its_v1_profile_did() -> None:
+def test_every_model_launches_from_the_local_hub_cache() -> None:
     """2026-09-17: the first v2 launch of Flash-Next went online and died on a
-    gated-repo 401; HF_HUB_OFFLINE=1 lived only in its v1 launcher and
-    profile. The 27B and GLM profiles never set it, so they stay online."""
+    gated-repo 401; HF_HUB_OFFLINE=1 lived only in its v1 launcher and profile.
+    It was then set for all four models unverified, narrowed back to flashnext
+    on review, and on 2026-09-18 made the default for all four once the audit
+    had confirmed every snapshot is complete on disk and doctor had grown a
+    `weights (<key>)` row per model. A launch that depends on the network can
+    resolve a revision other than the one on disk, and needs a token for a
+    gated repo; this one cannot."""
     from pathlib import Path
     reg = models.load(Path(__file__).resolve().parent.parent / "models.toml")
     env = lambda k: models.render_env(reg.models[k], reg.builds[reg.models[k].build])  # noqa: E731
-    assert env("flashnext").get("HF_HUB_OFFLINE") == "1"
-    assert "HF_HUB_OFFLINE" not in env("qwen27b")
-    assert "HF_HUB_OFFLINE" not in env("glm53")
+    for key in reg.models:
+        assert env(key).get("HF_HUB_OFFLINE") == "1", key

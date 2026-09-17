@@ -239,11 +239,18 @@ class RegistryRoutes:
         overlay: Mapping[str, Any] | None = None
         if preset is not None:
             overlay = model.presets.get(preset) or None
+        # The slot aliases are published as aliases of whichever model holds
+        # the main slot, so `GET /v1/models` advertises the one name a client
+        # config can keep across a switch — and `servedeck doctor`, which
+        # checks each wired name against that list, can see it.
+        aliases = tuple(model.aliases)
+        if model.slot == "main" and self.is_live(model.key):
+            aliases = aliases + MAIN_ALIASES
         return Route(
             model_id=model.id,
             port=model.port,
             live=self.is_live(model.key),
-            aliases=tuple(model.aliases),
+            aliases=aliases,
             presets=tuple(model.presets),
             policies=RoutePolicies(
                 mirror_reasoning=bool(model.reasoning and model.reasoning.mirror_content),

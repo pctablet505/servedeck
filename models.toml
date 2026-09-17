@@ -27,6 +27,23 @@ margin_mib = 1024          # never handed to any model
 #   ~/.config/systemd/user/lfm2-350m.service (Environment=)
 [defaults.env]
 VLLM_USE_FLASHINFER_SAMPLER = "0"
+# Every model launches from the local hub cache, never the network.
+#
+# History, because this flag has moved twice: serve-abliterated.sh:34 and
+# local_llm/profiles/flashnext.env set it for Flash-Next only; the registry did
+# not carry it, so the first v2 launch asked the hub about a gated repo and
+# died on a 401. It was then set for all four models, which was unverified, and
+# narrowed back to flashnext on review. It is here now because the 2026-09-18
+# audit verified all four snapshots are complete on disk AND `servedeck doctor`
+# grew a `weights (<key>)` row per model, so a missing checkpoint is reported
+# before a launch instead of discovered as a 401 minutes into one.
+#
+# What this buys: a launch cannot depend on the network, cannot resolve a
+# revision other than the one on disk, and needs no HF_TOKEN. What it costs:
+# if a snapshot is genuinely missing a file vLLM wants, the launch fails fast
+# with a local-files-only error instead of fetching it. The 27B and GLM have
+# not yet been launched under v2, so watch the first one.
+HF_HUB_OFFLINE = "1"
 
 # Every legacy launcher also exports CUDA_HOME=<venv>/lib/python3.13/site-packages/
 # nvidia/cu13 and prepends <venv>/bin:$CUDA_HOME/bin to PATH — nvcc/ptxas live
@@ -106,10 +123,12 @@ build   = "qwen38next"
 ctx     = "native"                 # config.json max_position_embeddings = 262144
 vision  = true
 max_output_tokens = 32000
-# serve.sh relaxes kernel.yama.ptrace_scope via sudo for the PLE-offload CUDA IPC
-# handoff (serve.sh:106-131). No sudo in servedeck v2 today, so this model needs a
-# human at a TTY until that is replaced (tracked, not solved, by this packet).
-needs_tty = true
+# needs_tty is GONE (2026-09-18). serve.sh relaxed kernel.yama.ptrace_scope via
+# sudo for the PLE-offload CUDA IPC handoff (serve.sh:106-131) and nothing in
+# servedeck could; /etc/sysctl.d/90-servedeck.conf now pins it to 0 at boot, so
+# this model launches unattended — it did tonight. Nothing ever enforced the
+# flag anyway (it only chose whether doctor printed a row); doctor now checks
+# the sysctl unconditionally, as the host property it is.
 
 # serve.sh:218-236 (MM_LIMIT_JSON images-on, KV_DTYPE=auto, SPEC_TOKENS=3), plus
 # the live v1 launch of 2026-09-17: MAX_NUM_SEQS=16 for parallel agents and the
@@ -151,11 +170,6 @@ parser = "qwen3_coder"
 
 # serve.sh:76,90-91.
 [models.flashnext.env]
-# serve-abliterated.sh:34 and local_llm/profiles/flashnext.env set this; the
-# registry did not carry it, so the first v2 launch (2026-09-17) went online,
-# asked the hub about this gated repo and died on a 401. The 27B and GLM
-# profiles never set it and are left as they launched.
-HF_HUB_OFFLINE = "1"
 VLLM_PLE_CPU_OFFLOAD = "1"
 # This checkpoint's PLE n-gram table is the FP8 build (model-plefp8-*.safetensors
 # in the hub cache, confirmed 2026-09-12) — serve.sh:83-89 selects this env var
