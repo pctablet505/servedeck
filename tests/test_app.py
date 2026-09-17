@@ -589,7 +589,8 @@ async def test_the_stream_opens_with_the_current_state_and_recent_notices(runtim
     assert parsed[0][0] == "state"
     assert parsed[1] == (
         "notice",
-        {"level": "error", "message": "something broke", "replay": True},
+        {"level": "error", "message": "something broke", "replay": True,
+             "body": "something broke", "code": None},
     )
 
 

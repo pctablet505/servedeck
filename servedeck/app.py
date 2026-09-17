@@ -68,6 +68,7 @@ from servedeck import discovery as _discovery
 from servedeck import doctor as _doctor
 from servedeck import gateway as _gateway
 from servedeck import gpu as _gpu
+from servedeck import legacy_page as _legacy
 from servedeck import metrics as _metrics
 from servedeck import models as _models
 from servedeck import parallelism as _parallelism
@@ -252,6 +253,8 @@ class Runtime:
     #: concluded it was listening and reconciled. The nonce makes "is that me"
     #: answerable instead of assumed.
     instance_id: str = field(default_factory=lambda: secrets.token_hex(8))
+    #: Boot progress folded into the phase bar the page draws (legacy_page).
+    boot: _legacy.BootTracker = field(default_factory=_legacy.BootTracker)
 
     def poller_for(self, key: str, port: int) -> _metrics.MetricsPoller:
         base = f"http://127.0.0.1:{port}"
@@ -460,7 +463,7 @@ async def build_state(rt: Runtime) -> dict[str, Any]:
         if view.unknown
     ]
 
-    return {
+    state = {
         "generated_at": time.time(),
         "gateway_url": rt.settings.gateway_url,
         "unit_prefix": rt.settings.unit_prefix,
@@ -477,6 +480,26 @@ async def build_state(rt: Runtime) -> dict[str, Any]:
             free_mib=facts["gpu"]["free_mib"],
         ),
     }
+    # The v1 page's blocks, ADDED to the document (legacy_page): upstream,
+    # vllm, sizing, boot, supervisor, config, gpu_v1, uptimes.
+    try:
+        state.update(
+            await asyncio.to_thread(
+                _legacy.augment_state,
+                registry=rt.registry,
+                state=state,
+                boot=rt.boot,
+                busy=rt.busy,
+                main_key=main_key,
+                main_ctx=main_ctx,
+                main_snapshot=main_snapshot,
+                desired_main=desired.main,
+                uptimes=facts["uptimes"],
+            )
+        )
+    except Exception:  # noqa: BLE001 - the v1 blocks must not take the v2 state down
+        log.exception("legacy state blocks failed")
+    return state
 
 
 def _state_changed(old: dict[str, Any], new: dict[str, Any]) -> bool:
@@ -529,6 +552,8 @@ async def _poll_loop(rt: Runtime) -> None:
         rt.first_state.set()
         if changed:
             rt.hub.publish("state", state)
+        # v1's page paints the live strip from this every poll, changed or not.
+        rt.hub.publish("telemetry", _legacy.telemetry_payload(state))
         await asyncio.sleep(POLL_INTERVAL_S)
 
 
@@ -609,13 +634,15 @@ async def _reconcile_after_bind(
         },
     )
     result = await asyncio.to_thread(
-        lambda: rt.control.reconcile(want, on_progress=_progress_publisher(rt.hub, "reconcile"))
+        lambda: rt.control.reconcile(want, on_progress=_progress_publisher(rt.hub, "reconcile", rt.boot))
     )
     _publish_reconciliation(rt.hub, result)
     return result
 
 
-def _progress_publisher(hub: Hub, key: str) -> Callable[[Any], None]:
+def _progress_publisher(
+    hub: Hub, key: str, boot: _legacy.BootTracker | None = None
+) -> Callable[[Any], None]:
     """A ``control.ProgressCallback`` that turns each event into an SSE frame.
 
     Called from the worker thread ``control.start`` runs in, which is why
@@ -623,6 +650,8 @@ def _progress_publisher(hub: Hub, key: str) -> Callable[[Any], None]:
     """
 
     def on_progress(event: Any) -> None:
+        if boot is not None:
+            boot.record(key, event.kind, event.marker_index, event.elapsed_s)
         hub.publish(
             "progress",
             {
@@ -1157,6 +1186,14 @@ def _register_api(app: FastAPI, rt: Runtime) -> None:
         """
         entries = await asyncio.to_thread(_discovery.discover_models)
         by_repo = {e.repo_id: e for e in entries}
+        live = rt.routes.live()
+        legacy_rows = {
+            r["key"]: r
+            for r in _legacy.model_rows(
+                rt.registry, entries, ctx_for=rt.routes.ctx_for,
+                live_keys={k: bool(v.ready) for k, v in live.items()},
+            )
+        }
         registry_rows = []
         for key, model in rt.registry.models.items():
             entry = by_repo.get(model.repo)
@@ -1170,9 +1207,14 @@ def _register_api(app: FastAPI, rt: Runtime) -> None:
                     "on_disk": entry is not None and entry.servable,
                     "disk_gib": round(entry.disk_bytes / 1024**3, 2) if entry else None,
                     "reason": entry.reason if entry else "not in the local hub cache",
+                    # v1 rail fields (legacy_page.model_rows), same row.
+                    **{k: v for k, v in legacy_rows.get(key, {}).items()
+                       if k not in ("key", "id", "repo", "slot", "build", "on_disk", "disk_gib", "reason")},
                 }
             )
         return {
+            "serving": next((r["name"] for r in legacy_rows.values() if r["serving"]), None),
+            "disk": await asyncio.to_thread(_legacy.disk_payload, list(legacy_rows.values())),
             "models": registry_rows,
             "cache": [
                 {
@@ -1195,7 +1237,7 @@ def _register_api(app: FastAPI, rt: Runtime) -> None:
             _run_mutation(
                 rt,
                 f"start {key}",
-                lambda: rt.control.start(key, on_progress=_progress_publisher(rt.hub, key)),
+                lambda: rt.control.start(key, on_progress=_progress_publisher(rt.hub, key, rt.boot)),
                 action="start",
                 key=key,
             )
@@ -1221,7 +1263,7 @@ def _register_api(app: FastAPI, rt: Runtime) -> None:
             _run_mutation(
                 rt,
                 f"switch {key}",
-                lambda: rt.control.switch(key, on_progress=_progress_publisher(rt.hub, key)),
+                lambda: rt.control.switch(key, on_progress=_progress_publisher(rt.hub, key, rt.boot)),
                 action="switch",
                 key=key,
             )
@@ -1283,6 +1325,7 @@ def _register_api(app: FastAPI, rt: Runtime) -> None:
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    _legacy.register(app, rt)
 
 def _wire_payload(rt: Runtime, apply: bool) -> dict[str, Any]:
     """The dry-run diff for every client config, and optionally the write.
@@ -1352,6 +1395,11 @@ async def _event_stream(rt: Runtime, request: Request) -> AsyncIterator[bytes]:
 
 
 def _frame(event_type: str, data: Any) -> bytes:
+    if event_type == "notice" and isinstance(data, dict):
+        # The v1 page reads `body` and `code`; the v2 shape is `message` and
+        # `reason`. The frame carries both names; the stored notice keeps one.
+        data = {**data, "body": data.get("body", data.get("message")),
+                "code": data.get("code", data.get("reason"))}
     return f"event: {event_type}\ndata: {json.dumps(data, default=str)}\n\n".encode()
 
 

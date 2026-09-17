@@ -359,6 +359,21 @@ def http_probe(port: int, timeout_s: float = _PROBE_TIMEOUT_S) -> list[str] | No
     return [item["id"] for item in data if isinstance(item, dict) and isinstance(item.get("id"), str)]
 
 
+def apply_argv_overrides(argv: list[str], overrides: Mapping[str, str] | None) -> list[str]:
+    """Replace a flag's value in ``argv`` (or append the pair when absent)."""
+    if not overrides:
+        return argv
+    out = list(argv)
+    for flag, value in overrides.items():
+        for i, a in enumerate(out):
+            if a == flag and i + 1 < len(out):
+                out[i + 1] = str(value)
+                break
+        else:
+            out += [flag, str(value)]
+    return out
+
+
 def listener_pid(port: int) -> int | None:
     """The pid listening on ``127.0.0.1:port``/``0.0.0.0:port``, from ``ss``."""
     try:
@@ -710,11 +725,18 @@ class Control:
         on_progress: ProgressCallback | None = None,
         restart: str = "on-failure",
         restart_sec: int = 10,
+        util: float | None = None,
+        argv_overrides: Mapping[str, str] | None = None,
     ) -> StartResult | Refusal:
         """Launch ``key`` as ``model-<key>.service`` and wait for it to answer.
 
         Refuses rather than raises for every operational "no": unknown model,
         already running, main slot taken, not enough VRAM.
+
+        ``util`` and ``argv_overrides`` are the page's allocator (2026-09-17):
+        an explicit utilisation and flag values (``--max-model-len``,
+        ``--max-num-seqs``) for THIS launch only. The registry stays the
+        default; the VRAM refusal still applies when nothing would fit.
         """
         spec = self._spec(key)
         if spec is None:
@@ -744,11 +766,15 @@ class Control:
                     live_key=holder.key,
                 )
 
-        util = self.compute_util(spec)
-        if isinstance(util, Refusal):
-            return util
+        computed = self.compute_util(spec)
+        if isinstance(computed, Refusal):
+            return computed
+        chosen = computed if util is None else float(util)
+        if util is not None and chosen != computed:
+            log.info("%s: launching at util %.2f (operator override; computed %.2f)", key, chosen, computed)
+        util = chosen
 
-        argv = list(spec.render_argv(util, spec.port))
+        argv = apply_argv_overrides(list(spec.render_argv(util, spec.port)), argv_overrides)
         env = dict(spec.render_env())
         env.setdefault("PATH", f"{spec.venv_bin}:/usr/local/bin:/usr/bin:/bin")
 
@@ -1049,6 +1075,8 @@ class Control:
         timeout_s: float = 900.0,
         release_timeout_s: float = RELEASE_TIMEOUT_S,
         on_progress: ProgressCallback | None = None,
+        util: float | None = None,
+        argv_overrides: Mapping[str, str] | None = None,
     ) -> SwitchResult | Refusal:
         """Replace whatever holds the main slot with ``key``.
 
@@ -1139,7 +1167,7 @@ class Control:
                 live_key=key,
             )
 
-        started = self.start(key, timeout_s=timeout_s, on_progress=on_progress)
+        started = self.start(key, timeout_s=timeout_s, on_progress=on_progress, util=util, argv_overrides=argv_overrides)
         return SwitchResult(
             stopped=stopped,
             released=released,
