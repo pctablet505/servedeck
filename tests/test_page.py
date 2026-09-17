@@ -111,10 +111,12 @@ def test_information_sits_with_its_question() -> None:
     the GPU name is in the Machine panel, not the header."""
     alloc = INDEX.split('<div class="alloc">')[1].split('<div class="pref"')[0]
     assert 'class="vram"' in alloc and INDEX.count('class="vram"') == 1
-    status = INDEX.split('<div class="status-row">')[1].split('<div class="thru"')[0]
-    assert 'id="kvPct"' in status and 'id="queued"' in status
-    req = INDEX.split("Request size")[1]
-    assert 'id="mPre"' in req and 'id="oversub"' in req
+    status = INDEX.split('<div class="status">')[1].split('<div class="alloc">')[0]
+    assert 'id="queued"' in status and 'id="livestrip"' in status
+    live = INDEX.split('id="livestrip"')[1].split('<div class="phases"')[0]
+    assert 'id="kvPct"' in live and 'id="mPre"' in live and 'id="mWaitCap"' in live
+    req = INDEX.split('id="reqPanel"')[1].split('id="logPanel"')[0]
+    assert 'id="oversub"' in req and 'id="mPre"' not in req
     cache_cell = INDEX.split('id="tkCacheK"')[1].split("</div>\n          </div>")[0]
     assert 'id="hitRate"' in cache_cell
     header = INDEX.split('<div class="top">')[1].split('<div class="grid">')[0]
@@ -128,10 +130,12 @@ def test_the_big_blocks_are_direct_children_of_the_wrapper() -> None:
     depth = 0
     at = {}
     for line in INDEX.split("\n"):
-        for key in ('class="grid"', 'id="logPanel"', 'class="foot"', 'class="vram"', 'class="alloc"'):
+        for key in ('class="grid"', 'id="logPanel"', 'class="panel notes"', 'class="vram"', 'class="alloc"', 'id="reqPanel"'):
             if key in line:
                 at[key] = depth
         depth += len(re.findall(r"<div\b", line)) - line.count("</div>")
     assert depth == 0
-    assert at['class="grid"'] == 1 and at['id="logPanel"'] == 1 and at['class="foot"'] == 1
+    assert at['class="grid"'] == 1 and at['id="logPanel"'] == 1
+    assert at['class="panel notes"'] == 3, "the reading note is a panel inside the sidebar column"
+    assert at['id="reqPanel"'] == 1, "request size spans the page below both columns"
     assert at['class="vram"'] == at['class="alloc"'] + 1, "the VRAM bar is a child of the allocator"

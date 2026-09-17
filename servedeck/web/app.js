@@ -1244,6 +1244,13 @@ function paintTelemetry(t) {
   if (q) q.className = "queued mono" + (running > 0 || waiting > 0 ? " on" : "");
   set("mWait", reachable ? liveMetrics.waiting : "—");
   set("mPre", reachable ? liveMetrics.preemptions : "—");
+  set("mWaitCap", reachable ? (liveMetrics.waiting_capacity || 0) : "—");
+  set("mRun2", reachable ? (liveMetrics.running || 0) : "—");
+  set("mWait2", reachable ? (liveMetrics.waiting || 0) : "—");
+  set("preNote", reachable
+    ? (liveMetrics.preemptions > 8 ? "high — the agent count is above what the pool holds"
+       : liveMetrics.preemptions ? "a few; watch whether it climbs" : "none")
+    : "—");
 
   const w = $("mWait");
   if (w) w.className = "n mono" + (reachable && liveMetrics.waiting > 0 ? " hot" : "");

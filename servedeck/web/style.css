@@ -452,3 +452,9 @@ input[type=range]:focus-visible{outline:2px solid var(--accent);outline-offset:3
 .status-row .queued{margin-left:0}
 .kvgauge .lk{white-space:nowrap}
 .kvgauge canvas{flex:0 0 180px}
+
+.status .thru.live{margin-top:8px}
+.tcell canvas{display:block;width:100%;height:34px;margin-top:6px}
+
+.panel.notes .foot{margin-top:0;border-top:none;padding-top:0}
+.panel.notes .foot b{display:block;margin-bottom:4px}
