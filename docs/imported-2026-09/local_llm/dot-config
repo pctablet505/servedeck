@@ -1,0 +1,92 @@
+# Updated 2026-09-09 (later same day) for a live validation pass of the
+# Qwen3.8-Flash-Next ("flashnext") T1/T2/T3 patches in
+# ~/Projects/vllm-qwen38next/src. BACKEND=flashnext is the ACTIVE model
+# below -- the Qwen3.8-27B ("inline") forensics pass earlier today finished
+# and released the GPU (confirmed via nvidia-smi --query-compute-apps
+# empty before this switch); its config is commented out just below,
+# unchanged, for fast switch-back. Keep header and values in agreement --
+# this file is the one that bit us before (see the older NOTEs preserved
+# below the commented inline block).
+#
+# Values MUST be double-quoted: llm and shellconfig._KV_LINE_RE only match
+# KEY="value", and an unquoted line is silently skipped -- which is how this
+# file previously parsed to {} and left the UI showing a stale default port.
+
+# COLDSTART_URL is empty; Coldstart is optional and not required for this run.
+COLDSTART_URL=""
+# 0.95 -> 0.96 on 2026-09-09: enabling images costs 1.30 GiB of KV (0.81 GiB
+# vision-tower weights + 0.49 GiB profiling/encoder), which dropped available KV
+# to 6.68 GiB and made vLLM refuse to boot (262144 tokens needs 7.17 GiB). One
+# extra point of util is ~0.96 GiB on this 95.59 GiB card and restores full
+# context. 0.98 is known to boot then OOM under load -- do NOT exceed 0.96.
+# IMAGES ENABLED 2026-09-09: --language-model-only removed (it forced every
+# modality limit to 0). The companion half lives in serve.sh: images also need
+# --limit-mm-per-prompt {"image":2,"video":0}, which CANNOT be expressed here --
+# llm parses this file with ([A-Z_]+)="([^\"]*)" and silently SKIPS any line
+# whose value contains a double quote. serve.sh therefore reads MM_LIMIT_JSON
+# from the environment, defaulting to images-OFF so bin/serve-model.sh parity is
+# preserved. The operator must therefore start this backend as:
+#     MM_LIMIT_JSON='{"image":2,"video":0}' ./llm start
+# A BARE `llm start` WILL SERVE WITH IMAGES DISABLED. Making images the default
+# needs the flashnext profile in local_llm/bin/serve-model.sh to carry the same
+# limit (owned by the launcher work in flight on 2026-09-09).
+
+# --- Qwen3.8-27B ("inline") settings, kept for reference / fast switch-back -
+# BACKEND="inline"
+# MODEL_REPO="RadixArk/Qwen3.8-27B-NVFP4"
+# PORT="8004" (moved from 8000 on 2026-09-09): 8000 is permanently held by
+# the UNRELATED ats-optimizer.service (systemd user unit, autostarts via
+# default.target.wants; pid ~2922, .../ats-optimizer/.venv/bin/python -m
+# src.cli serve -- confirmed with `ss -lntp`/`systemctl --user list-units`).
+# That is the owner's separate work -- not stopped, disabled, or
+# reconfigured. 8004 was free (`ss -lnt`) and avoids 8001 (Flash-Next),
+# 8002/8003 (GLM/proxy), 8010 (coldstart), 8099 (a prior test port). Every
+# other site naming the 27B's port (bin/qwen-server-run.sh default,
+# servedeck.toml [backends.inline], docs/CLIENTS.md) was moved to 8004 in
+# the same pass -- grep for ":8000" if one turns up unmoved.
+# PORT="8004"
+# EXTRA_ARGS=""
+# GPU_MEM_UTIL left UNSET so the script's own hardcoded default (0.47)
+# applies. 0.47 is the value the Aug 2026 crash bisection settled on after
+# Xid 13/31 hit at util=.62 (Aug 23) and util=.92 (Aug 24). The 2026-09-09
+# investigation re-tested util=.47, util=.62, and util=.62+--enforce-eager
+# under a 7-agent growing-context load; none reproduced the fault in the
+# available ~11-15 min windows (the historical incidents took 30 min to
+# 30 h), so this is NOT proof .62 is safe -- it is consistent with the
+# known behavior that .47 has been the actually-safe, Xid-free operating
+# point for 9+ real days. Do not raise it without a multi-hour soak.
+# The upstream bug (vllm-project/vllm#52225, matching RadixArk/Qwen3.8-27B-
+# NVFP4 GDN-hybrid + MTP + fp8 KV cache on SM120 reports from other
+# operators of this exact checkpoint) is still open and unmerged as of
+# vLLM 0.29.0 (2026-09-09).
+
+# --- GLM-5.3-Flash settings, kept for reference / fast switch-back -----------
+# BACKEND="glm53"
+# MODEL_REPO="dealignai/GLM-5.3-Flash-ABLITERATED-NVFP4"
+# SERVED_NAME="glm53-flash"
+# PORT="8002"
+# MAX_MODEL_LEN="327680"
+# MAX_NUM_SEQS="1"
+# GPU_MEM_UTIL="0.95"
+# --- Servedeck wrote this block live at 21:53 on 2026-09-10 after being
+# pointed at a checkout whose state/desired.json still named GLM with
+# auto_restart. It duplicated the switch-back block above it while leaving
+# Flash-Next's EXTRA_ARGS live, which cannot work: those are Qwen4Exp flags.
+# Re-commented 2026-09-10; the live values below match the running server.
+# BACKEND="glm53"
+# MODEL_REPO="dealignai/GLM-5.3-Flash-ABLITERATED-NVFP4"
+# SERVED_NAME="glm53-flash"
+# PORT="8002"
+# MAX_MODEL_LEN="327680"
+# MAX_NUM_SEQS="1"
+# GPU_MEM_UTIL="0.95"
+
+# --- Flash-Next (LIVE, matches the server running on :8001) ------------------
+EXTRA_ARGS="--mamba-ssm-cache-dtype bfloat16 --long-prefill-token-threshold 1024 --watermark 0.10 --kv-offloading-size 40"
+BACKEND="flashnext"
+MODEL_REPO="mazinb/Qwen3.8-Flash-Next-Uncensored-NVFP4"
+SERVED_NAME="Qwen3.8-Flash-Next-Uncensored-NVFP4"
+PORT="8001"
+MAX_MODEL_LEN="262144"
+MAX_NUM_SEQS="16"
+GPU_MEM_UTIL="0.965"

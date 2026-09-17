@@ -1,0 +1,621 @@
+#!/usr/bin/env bash
+# llm -- one entry point for the local model stack.
+#
+#   llm start        bring everything up (server + effort proxy), wait until ready
+#   llm stop         shut everything down cleanly
+#   llm restart      stop, then start
+#   llm status       what is running, how fast, how much memory
+#   llm logs [-f]    tail the server log
+#   llm chat "..."   one-shot prompt, for checking it works
+#   llm codex [...]  launch Codex wired to the local model
+#   llm ui           print the Coldstart URL (and start it if it is down)
+#
+# Everything is configured in ./.config. This script deliberately owns only the
+# ORCHESTRATION; the tuned vLLM flags live in the backend's own serve script so
+# there is exactly one place to change them.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUN_DIR="$HERE/run"; LOG_DIR="$HERE/logs"; CONFIG_FILE="$HERE/.config"
+mkdir -p "$RUN_DIR" "$LOG_DIR"
+
+# --- config -------------------------------------------------------------------
+BACKEND="glm53"; SERVED_NAME="glm53-flash"; PORT="8002"
+PROXY_PORT="8003"; COLDSTART_PORT="8010"
+# LAUNCHER: which launch path `llm start` uses.
+#   legacy  (default) -- the per-backend serve script, exactly as before.
+#   unified           -- bin/serve-model.sh with a profile from profiles/.
+# The unified launcher is proven to resolve the SAME argv and environment as
+# the legacy scripts by tests/test_serve_model_golden.sh, but nothing about
+# the running system changes until this is set to "unified" in .config.
+# LAUNCHER_PROFILE overrides the BACKEND->profile mapping below, so a variant
+# (flashnext-tuned, glm53-legacy) can be selected without changing BACKEND --
+# which codex-qwen.sh and servedeck also read.
+LAUNCHER="legacy"; LAUNCHER_PROFILE=""
+MODEL_REPO="dealignai/GLM-5.3-Flash-ABLITERATED-NVFP4"
+EXTRA_ARGS=""
+MAX_MODEL_LEN="262144"; MAX_NUM_SEQS="1"; GPU_MEM_UTIL="0.95"
+# Only KEY="value" lines are read. WHICH LINES ARE ACCEPTED IS UNCHANGED -- an
+# uppercase key, a double-quoted value, and no double quote inside the value --
+# because servedeck/shellconfig.py and codex-qwen.sh parse the same file with
+# the same shape, and widening it here alone would let this reader see a value
+# they cannot. What changed on 2026-09-10 is that a line which LOOKS like an
+# assignment and is skipped is now NAMED on stderr instead of vanishing.
+#
+# That silence cost real time twice. Once with an unquoted line, which parsed
+# to {} and left the UI on a stale default port (the note at the top of
+# .config). Once with MM_LIMIT_JSON: images need
+# --limit-mm-per-prompt {"image":2,"video":0}, whose value contains double
+# quotes, so MM_LIMIT_JSON="..." here is dropped without a word and the server
+# comes up text-only. The right home for that one is the environment or the
+# launcher's own default (both serve.sh and bin/serve-model.sh default it to
+# images-on as of 2026-09-10); the warning is how you find that out in a second
+# rather than after a five-minute boot.
+#
+# tests/test_llm_config_warn.sh extracts this block via the markers below.
+# --- config_read begin ---
+read_config_file(){
+    local file="$1" line lineno=0
+    [ -f "$file" ] || return 0
+    while IFS= read -r line; do
+        lineno=$((lineno + 1))
+        if [[ "$line" =~ ^[[:space:]]*([A-Z_]+)=\"([^\"]*)\"[[:space:]]*$ ]]; then
+            printf -v "${BASH_REMATCH[1]}" '%s' "${BASH_REMATCH[2]}"
+        elif [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*= ]]; then
+            # Comments and blanks never reach here: both fail this pattern.
+            # `export KEY=...` is matched too -- it is the shape someone
+            # reaches for when a bare KEY="value" did not seem to work, and it
+            # is skipped just as silently.
+            echo "llm: WARNING: $file:$lineno sets ${BASH_REMATCH[2]} but is NOT read --" \
+                 "only KEY=\"value\" is accepted, and the value may not itself" \
+                 "contain a double quote. Pass it in the environment instead." >&2
+            echo "llm:          $line" >&2
+        fi
+    done < "$file"
+}
+# --- config_read end ---
+read_config_file "$CONFIG_FILE"
+
+case "$BACKEND" in
+    glm53)     SERVE_SH="$HOME/Projects/vllm-glm53/serve-opt.sh"; VENV="$HOME/Projects/vllm-glm53/.venv-glm53"; PROFILE="glm53" ;;
+    flashnext) SERVE_SH="$HOME/Projects/vllm-qwen38next/serve-abliterated.sh"; VENV="$HOME/Projects/vllm-qwen38next/.venv-next"; PROFILE="flashnext" ;;
+    *)         echo "llm: unknown BACKEND=\"$BACKEND\" in $CONFIG_FILE" >&2; exit 2 ;;
+esac
+# SERVE_MATCH is the substring that identifies OUR server in a /proc cmdline.
+# It has to be the backend tree, not $(dirname "$SERVE_SH"): under
+# LAUNCHER=unified the launcher lives in local_llm/bin while the vllm it starts
+# still runs out of the backend's venv, so matching on the launcher's directory
+# would stop recognising our own server and `llm stop` would report "already
+# stopped" while the GPU stayed held.
+SERVE_MATCH="$(dirname "$SERVE_SH")"
+[ -n "$LAUNCHER_PROFILE" ] && PROFILE="$LAUNCHER_PROFILE"
+if [ "$LAUNCHER" = "unified" ]; then
+    SERVE_SH="$HERE/bin/serve-model.sh"
+fi
+PROXY_DIR="$HOME/Projects/glm53-effort-proxy"
+SERVER_LOG="$LOG_DIR/server.log"; PROXY_LOG="$LOG_DIR/proxy.log"
+SERVER_PID_FILE="$RUN_DIR/server.pid"
+# One port, one pidfile, one GPU -- so one lock. run/start.lock is the same file
+# codex-qwen.sh already flocks for its own launches, deliberately: two starts of
+# ANY local model on this box must not overlap.
+START_LOCK="$RUN_DIR/start.lock"
+START_LOCK_OWNER="$RUN_DIR/start.lock.owner"
+LOCK_WAIT="${LLM_LOCK_WAIT:-120}"
+PY="$VENV/bin/python"
+
+# Help text is the header comment, printed up to the first non-comment line.
+usage(){ awk 'NR>1 && /^#/{sub(/^# ?/,""); print; next} NR>1{exit}' "$0"; }
+
+write_codex_config(){
+    local base="$1" model="$2"
+    mkdir -p "$HERE/.codex"
+    cat > "$HERE/.codex/config.toml" <<EOF
+model_provider = "local-${BACKEND}"
+model = "$model"
+
+[model_providers.local-${BACKEND}]
+name = "local-${BACKEND}"
+base_url = "$base/v1"
+wire_api = "responses"
+request_max_retries = 2
+stream_max_retries = 2
+stream_idle_timeout_ms = 900000
+
+[agents]
+max_concurrent_threads_per_session = 6
+EOF
+}
+
+c_g=$'\e[32m'; c_r=$'\e[31m'; c_y=$'\e[33m'; c_d=$'\e[2m'; c_0=$'\e[0m'
+[ -t 1 ] || { c_g=""; c_r=""; c_y=""; c_d=""; c_0=""; }
+ok(){ echo "  ${c_g}✓${c_0} $*"; }; bad(){ echo "  ${c_r}✗${c_0} $*"; }; note(){ echo "  ${c_d}$*${c_0}"; }
+
+# --- process helpers ----------------------------------------------------------
+# NEVER pgrep -f / pkill -f: those match this script's own command line.
+port_pid(){ ss -ltnp 2>/dev/null | awk -v p=":$1$" '$4 ~ p {print $NF}' | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2; }
+up(){ curl -sf -m 3 "http://127.0.0.1:$1/v1/models" 2>/dev/null | grep -q '"id"[[:space:]]*:[[:space:]]*"'"$SERVED_NAME"'"'; }
+# up_stable: up() with retries, for the ONE decision where a false negative is
+# expensive -- "is a server already running here?". A single `curl -m 3` against
+# a server that is mid-generation on a 262k-token request times out and reads as
+# "down"; on 2026-09-10 that false negative is what made a second `llm start`
+# believe the port was free and go on to fight the incumbent for it.
+up_stable(){
+    local n
+    for n in 1 2 3; do
+        up "$1" && return 0
+        # Nothing is listening at all: retrying cannot change that, and a cold
+        # `llm start` should not pay 6 s for a certainty.
+        [ -n "$(port_pid "$1")" ] || return 1
+        sleep 3
+    done
+    return 1
+}
+
+cmdline_of(){ tr '\0' ' ' < "/proc/${1:-0}/cmdline" 2>/dev/null || true; }
+describe_pid(){
+    local pid="${1:-}" comm cmd
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null | tr -d ' ')
+    cmd=$(cmdline_of "$pid"); cmd="${cmd:0:90}"
+    printf 'pid %s (%s)%s' "$pid" "${comm:-gone}" "${cmd:+ -- $cmd}"
+}
+
+# is_ours PID [MATCH] -- POSITIVE ownership. True only when PID is alive AND its
+# /proc cmdline identifies it as a process this tooling launched. Every signal
+# this script sends is gated on this: "whatever holds the port" is not an owner.
+# With MATCH given (the effort proxy) that substring is used instead of the
+# server identity.
+is_ours(){
+    local pid="${1:-}" match="${2:-}" cmd
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
+    cmd=$(cmdline_of "$pid")
+    if [ -n "$match" ]; then
+        case "$cmd" in *"$match"*) return 0 ;; esac
+        return 1
+    fi
+    # $SERVE_SH is matched TOO, not just $SERVE_MATCH. Under LAUNCHER=unified
+    # the recorded pid is bin/serve-model.sh, whose cmdline contains neither the
+    # backend tree nor $MODEL_REPO (the model arrives in the environment, and
+    # /proc/PID/cmdline does not show environment). Without this, server_pid()
+    # returned empty for our OWN wrapper: `llm stop` printed "already stopped"
+    # while it was alive, and cmd_start's failure path called stop_group with an
+    # empty pid and left a half-started server holding VRAM. Under the legacy
+    # launcher $SERVE_SH lives inside $SERVE_MATCH, so this adds nothing there.
+    case "$cmd" in
+        *"$SERVE_MATCH"*|*"$MODEL_REPO"*|*"$SERVE_SH"*) return 0 ;;
+    esac
+    return 1
+}
+
+# wrapper_of PID -- climb from the pid that HOLDS the socket (which is the vllm
+# child, not the launcher) to the outermost ancestor that is still ours. The
+# walk stops the moment a parent is not ours: `llm` itself, and the shell that
+# ran it, never match, so this cannot climb out of the server's own tree.
+wrapper_of(){
+    local pid="${1:-}" parent
+    is_ours "$pid" || { echo "$pid"; return 0; }
+    while :; do
+        parent=$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)
+        [ -n "$parent" ] && [ "$parent" != 0 ] && is_ours "$parent" || break
+        pid="$parent"
+    done
+    echo "$pid"
+}
+
+owned_server_pid(){
+    local pid
+    pid=$(port_pid "$PORT")
+    [ -n "$pid" ] || return 0
+    is_ours "$pid" && wrapper_of "$pid"
+}
+
+server_pid(){
+    local pid
+    pid=$(cat "$SERVER_PID_FILE" 2>/dev/null || true)
+    is_ours "$pid" && echo "$pid"
+    return 0
+}
+
+# clear_pidfile_if PID -- remove run/server.pid only when it still names PID, or
+# names a pid that is dead. A pidfile naming some OTHER live server is left
+# exactly as it is: a start or stop that did not create it does not get to
+# destroy it.
+clear_pidfile_if(){
+    local pid="${1:-}" rec
+    rec=$(tr -d ' \n' < "$SERVER_PID_FILE" 2>/dev/null || true)
+    [ -n "$rec" ] || return 0
+    if [ "$rec" = "$pid" ] || ! kill -0 "$rec" 2>/dev/null; then rm -f "$SERVER_PID_FILE"; fi
+}
+
+# take_start_lock SECONDS -- exclusive for the WHOLE start sequence. Returns
+# non-zero (having changed nothing) if the lock is not free in time.
+take_start_lock(){
+    local wait_s="${1:-$LOCK_WAIT}" holder
+    exec 9>"$START_LOCK" 2>/dev/null || { bad "cannot open the start lock $START_LOCK"; return 1; }
+    if flock -n 9; then printf '%s %s\n' "$$" "${0##*/}" > "$START_LOCK_OWNER" 2>/dev/null; return 0; fi
+    holder=$(lock_holder)
+    note "another start holds $START_LOCK${holder:+ ($holder)}; waiting up to ${wait_s}s"
+    if flock -w "$wait_s" 9; then printf '%s %s\n' "$$" "${0##*/}" > "$START_LOCK_OWNER" 2>/dev/null; return 0; fi
+    holder=$(lock_holder)
+    bad "another start is still running${holder:+ ($holder)} after ${wait_s}s -- NOTHING was changed"
+    local inc; inc=$(port_pid "$PORT")
+    if [ -n "$inc" ]; then note "the server on :$PORT is $(describe_pid "$(wrapper_of "$inc")")"
+    else note "nothing is listening on :$PORT yet -- it is probably still loading"; fi
+    note "watch it with: llm logs -f   or check: llm status"
+    return 1
+}
+lock_holder(){
+    local rec pid
+    rec=$(cat "$START_LOCK_OWNER" 2>/dev/null || true)
+    pid="${rec%% *}"
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 0
+    printf 'pid %s, %s' "$pid" "${rec#* }"
+}
+
+# stop_group PID [MATCH] -- terminate a process this tooling started, and only
+# that. Two ownership gates, both of which were missing when a losing start
+# SIGTERM'd a healthy incumbent on 2026-09-10:
+#   1. is_ours: never signal a pid whose cmdline is not one of ours.
+#   2. pgid == pid: group-kill only a group we CREATED. `llm start` setsid's the
+#      wrapper, so the wrapper leads its own group. The old code group-killed
+#      any pgid != 1 and != our own, so being handed a pid that merely BELONGS
+#      to somebody else's group would have taken that whole group down.
+stop_group(){
+    local pid="${1:-}" match="${2:-}" pgid own_pgid
+    [ -n "$pid" ] || return 0
+    is_ours "$pid" "$match" || { note "refusing to signal $(describe_pid "$pid"): not started by this tooling"; return 1; }
+    pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+    own_pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
+    if [ -n "$pgid" ] && [ "$pgid" = "$pid" ] && [ "$pgid" != "$own_pgid" ]; then
+        kill -TERM -- "-$pgid" 2>/dev/null || true
+        for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || return 0; sleep 1; done
+        kill -KILL -- "-$pgid" 2>/dev/null || true
+    else
+        kill -TERM "$pid" 2>/dev/null || true
+        for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || return 0; sleep 1; done
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+}
+
+wait_ready(){ # $1 port, $2 label, $3 max_seconds
+    local n=0 max=$(( ${3:-600} / 5 ))
+    while [ $n -lt $max ]; do
+        up "$1" && return 0
+        if grep -qiE 'EngineCore failed|FATAL|OutOfMemoryError|Worker failed|ValueError' "$SERVER_LOG" 2>/dev/null; then
+            bad "$2 failed to start:"
+            grep -oiE '(FATAL|OutOfMemoryError|ValueError|RuntimeError)[:( ].{0,120}' "$SERVER_LOG" | sort -u | head -3 | sed 's/^/      /'
+            return 1
+        fi
+        printf "\r  ${c_d}waiting for %s ... %ds${c_0}" "$2" $((n*5)); n=$((n+1)); sleep 5
+    done
+    printf "\r"; bad "$2 did not come up in ${3:-600}s (see: llm logs)"; return 1
+}
+
+# rotate_log PATH (2026-09-09): called at the start of `llm start` instead of
+# truncating the server log in place. The old `: > "$SERVER_LOG"` destroyed
+# the previous boot's log -- crash trace included -- at the very next start,
+# which is why nothing had captured a Flash-Next crash since 2026-08-31 (only
+# a stale copy under ~/Projects/vllm-qwen38next/serve.log survived).
+# If PATH exists and is non-empty, it is renamed (same filesystem, atomic) to
+# <dir>/<stem>-<timestamp>.log so wait_ready's grep against $SERVER_LOG below
+# still starts against a clean, empty file, and the old content survives
+# under a new name instead of being lost. An empty or missing PATH is left
+# alone -- nothing to lose, and it avoids a pointless empty rotated file on
+# the very first `llm start`. After rotating, only the newest 20 rotated
+# files for this stem are kept (logs/ is real disk, not tmpfs -- this is
+# tidiness, not a space emergency), mirroring the cap
+# bin/qwen-server-run.sh already applies to its own qwen_server-*.log files.
+# --- rotate_log begin ---
+rotate_log(){
+    local path="$1" dir base stem stamp
+    [ -s "$path" ] || { : > "$path"; return 0; }
+    dir="$(dirname "$path")"; base="$(basename "$path")"; stem="${base%.log}"
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    mv -- "$path" "$dir/${stem}-${stamp}.log"
+    : > "$path"
+    ls -1t "$dir/${stem}-"*.log 2>/dev/null | tail -n +21 | xargs -r rm -f
+}
+# --- rotate_log end ---
+
+# ensure_proxy -- the glm53 effort proxy. Hoisted out of cmd_start so that the
+# idempotent "server is already up" return still starts a proxy that is down;
+# before the early return existed, this block was simply fallen through to.
+ensure_proxy(){
+    if [ "$BACKEND" = "glm53" ] && [ -d "$PROXY_DIR" ]; then
+        if curl -sf -m 3 "http://127.0.0.1:$PROXY_PORT/health" >/dev/null 2>&1; then ok "effort proxy already up on :$PROXY_PORT"
+        else
+            ( cd "$PROXY_DIR" && GLM_TRACE="${GLM_TRACE:-0}" setsid --fork nohup "$PY" -m uvicorn proxy:app \
+                --host 127.0.0.1 --port "$PROXY_PORT" >> "$PROXY_LOG" 2>&1 </dev/null 9>&- & )
+            sleep 4
+            curl -sf -m 3 "http://127.0.0.1:$PROXY_PORT/health" >/dev/null 2>&1 \
+                && ok "effort proxy up on :$PROXY_PORT" || bad "effort proxy failed (see $PROXY_LOG)"
+        fi
+    fi
+}
+
+# repair_pidfile PID -- record a live server of OURS whose pid the file does not
+# already hold. Only ever replaces a MISSING or STALE record (dead pid, or a pid
+# that is not ours after reuse); a file naming a different LIVE server of ours is
+# left untouched. This is the "a stale pidfile must be detected and replaced,
+# not trusted" half of the invariant -- the other half is that nothing else in
+# this script writes the file.
+repair_pidfile(){
+    local pid="${1:-}" rec
+    [ -n "$pid" ] || return 0
+    rec=$(tr -d ' \n' < "$SERVER_PID_FILE" 2>/dev/null || true)
+    [ "$rec" = "$pid" ] && return 0
+    if [ -n "$rec" ] && is_ours "$rec"; then
+        note "run/server.pid names a different live server (pid $rec) -- leaving it alone"
+        return 0
+    fi
+    note "run/server.pid was ${rec:-missing}${rec:+ (stale)} -- recording the live server, pid $pid"
+    printf '%s\n' "$pid" > "$SERVER_PID_FILE"
+}
+
+# --- commands -----------------------------------------------------------------
+# cmd_start -- 2026-09-10. Two healthy servers were SIGTERM'd (01:46:34 and
+# 01:52:19) by a SECOND `llm start` that lost the race for :8001 and then, on
+# its failure path, signalled whatever run/server.pid happened to name -- which
+# by then was the other start's server. Three things were wrong and all three
+# are fixed here:
+#   * no mutual exclusion: the whole sequence now runs under flock(run/start.lock).
+#   * no ownership: the launched pid is captured in a PRIVATE per-start file and
+#     that pid is the only thing the failure path ever signals.
+#   * run/server.pid was `rm -f`d and then overwritten by whoever started last.
+#     It is now written exactly once, by the start that actually spawned the
+#     process it names, after the spawn.
+# The pre-checks in between are the cheap half: a healthy server of this config
+# makes the start a no-op SUCCESS, and a foreign holder of the port aborts
+# without a signal (port 8000 is permanently ats-optimizer.service).
+# The lock is taken HERE and released HERE, so no path out of the start
+# sequence can leak it. That matters more than it looks: fd 9 is the lock, and
+# `llm codex` execs into codex at the end -- a leaked fd 9 would have kept the
+# lock held for the whole life of the agent session. The spawned server closes
+# it explicitly too (9>&- below), because the server outlives `llm`.
+# tests/test_start_concurrency.sh builds an UNFIXED copy of this file by
+# blanking the three marked regions below and reverting two exact lines further
+# down. That is how the fail-before half of that test exercises this same code
+# path rather than an imitation of it -- so if you move or rename a marker,
+# that test fails loudly instead of quietly proving nothing.
+cmd_start(){
+    # --- start_lock begin ---
+    take_start_lock "$LOCK_WAIT" || return 3
+    # --- start_lock end ---
+    local rc=0
+    _cmd_start_locked || rc=$?
+    # --- start_unlock begin ---
+    flock -u 9 2>/dev/null || true; exec 9>&-
+    # --- start_unlock end ---
+    return $rc
+}
+
+_cmd_start_locked(){
+    echo "Starting ${SERVED_NAME} (${BACKEND})"
+    # --- concurrency_guard begin ---
+    local holder=""
+    if up_stable "$PORT"; then
+        holder=$(port_pid "$PORT"); [ -n "$holder" ] && holder=$(wrapper_of "$holder")
+        ok "server already up on :$PORT (${SERVED_NAME}${holder:+, pid $holder}) -- nothing to start"
+        [ -n "$holder" ] && is_ours "$holder" && repair_pidfile "$holder"
+        ensure_proxy
+        echo; cmd_status; return 0
+    fi
+    holder=$(port_pid "$PORT")
+    if [ -n "$holder" ]; then
+        if is_ours "$holder"; then
+            holder=$(wrapper_of "$holder")
+            bad "our own server already holds :$PORT ($(describe_pid "$holder")) but is not answering"
+            note "it is probably still loading -- watch: llm logs -f   (or: llm stop)"
+        else
+            bad "port $PORT is held by a FOREIGN process: $(describe_pid "$holder")"
+            note "this tooling did not start it, so it will not be signalled."
+            note "change PORT in .config, or stop that service yourself."
+        fi
+        note "nothing was started and nothing was changed."
+        return 4
+    fi
+    # A pidfile naming a LIVE process of ours means a server is up somewhere
+    # other than this port -- refuse rather than start a second one. A pidfile
+    # naming a live FOREIGN pid is pid reuse: it is replaced, never signalled.
+    local rec; rec=$(tr -d ' \n' < "$SERVER_PID_FILE" 2>/dev/null || true)
+    if [ -n "$rec" ] && kill -0 "$rec" 2>/dev/null; then
+        if is_ours "$rec"; then
+            bad "run/server.pid names a live server ($(describe_pid "$rec")) that is not on :$PORT"
+            note "stop it first: llm stop   (nothing was started, pid $rec was NOT signalled)"
+            return 4
+        fi
+        note "run/server.pid names live but foreign $(describe_pid "$rec") -- pid reuse; replacing the file, not signalling it"
+    fi
+    # --- concurrency_guard end ---
+    [ -x "$SERVE_SH" ] || { bad "serve script missing or not executable: $SERVE_SH"; return 1; }
+    local avail; avail=$(free -g | awk 'NR==2{print $7}')
+    [ "${avail:-0}" -lt 60 ] && note "only ${avail} GiB RAM free -- a stale server may still be shutting down"
+    rotate_log "$SERVER_LOG"
+    if [ "$BACKEND" = "flashnext" ] && [ -r /proc/sys/kernel/yama/ptrace_scope ] \
+        && [ "$(cat /proc/sys/kernel/yama/ptrace_scope)" != "0" ]; then
+        sudo -v || { bad "sudo authentication is required for Flash-Next PLE startup"; return 1; }
+    fi
+    # THE LAUNCHED SHELL RECORDS ITS OWN PID, and `$!` is not used at all.
+    # `$!` here is the forked shell that execs setsid, and setsid FORKS
+    # again when it is a process-group leader -- so the recorded pid was a
+    # transient intermediate that exits immediately, never the server
+    # wrapper. Measured 2026-09-09 on the live box: run/server.pid held
+    # 699043 while the Flash-Next wrapper was 699047. Consequences:
+    # server_pid() found nothing (or, after pid reuse, something else --
+    # only the cmdline check below kept that from being dangerous), so
+    # `llm stop` worked ONLY through the port fallback, and cmd_start's
+    # failure path -- where the server never binds the port, which is
+    # exactly when this matters -- stopped nothing and left a half-started
+    # vLLM holding the GPU. `bash -c 'echo $$ ...; exec "$@"'` writes the
+    # pid of the process that then BECOMES the wrapper, so the recorded pid
+    # is right regardless of how many times setsid forks.
+    # PROFILE is passed for both launchers: the legacy serve scripts do not
+    # read it, so this is inert until LAUNCHER=unified.
+    # cd to the BACKEND tree, not to $(dirname "$SERVE_SH"): under
+    # LAUNCHER=unified the latter is local_llm/bin, which would silently
+    # change the server's working directory. The legacy path ran with cwd =
+    # the backend tree, and cwd is part of the launch contract the golden
+    # test cannot see (it compares argv and env only).
+    # The spawned wrapper records its pid into a PRIVATE, per-start file,
+    # never straight into run/server.pid. That is what makes ownership
+    # positive: $own_pid below is the pid THIS start created, so the
+    # failure path cannot signal anything else, and a start that never got
+    # this far cannot have touched the shared pidfile at all.
+    local start_pid_file="$RUN_DIR/server.pid.starting.$$"
+    rm -f "$start_pid_file"
+    ( cd "$SERVE_MATCH" && setsid nohup env \
+        MODEL="$MODEL_REPO" SERVED_NAME="$SERVED_NAME" PORT="$PORT" \
+        MAX_LEN="$MAX_MODEL_LEN" MAX_SEQS="$MAX_NUM_SEQS" \
+        GPU_UTIL="$GPU_MEM_UTIL" EXTRA_ARGS="${EXTRA_ARGS:-}" \
+        PROFILE="$PROFILE" \
+        bash -c 'echo $$ > "$1"; shift; exec "$@"' llm-start "$start_pid_file" "$SERVE_SH" \
+        >> "$SERVER_LOG" 2>&1 </dev/null 9>&- & )
+    # The wrapper writes the file microseconds after it starts; wait for it
+    # so a fast failure path cannot read a pidfile that is not there yet.
+    for _ in $(seq 1 50); do [ -s "$start_pid_file" ] && break; sleep 0.1; done
+    local own_pid; own_pid=$(tr -d ' \n' < "$start_pid_file" 2>/dev/null || true)
+    rm -f "$start_pid_file"
+    [ -n "$own_pid" ] || { bad "the launcher never recorded a pid (see: llm logs)"; return 1; }
+    printf '%s\n' "$own_pid" > "$SERVER_PID_FILE"
+    note "loading weights and pinning host memory -- first token is ~5-6 min away"
+    if ! wait_ready "$PORT" "server" 900; then
+        stop_group "$own_pid"
+        clear_pidfile_if "$own_pid"
+        return 1
+    fi
+    printf "\r"; ok "server up on :$PORT"
+    ensure_proxy
+    echo; cmd_status
+}
+
+cmd_stop(){
+    echo "Stopping"
+    local pp; pp=$(port_pid "$PROXY_PORT");
+    if [ "$BACKEND" = "glm53" ] && [ -n "$pp" ]; then
+        local proxy_cmd; proxy_cmd=$(tr '\0' ' ' < "/proc/$pp/cmdline" 2>/dev/null || true)
+        case "$proxy_cmd" in
+            *"$PROXY_DIR"*) stop_group "$pp" "$PROXY_DIR" && ok "effort proxy stopped" ;;
+        esac
+    fi
+    local pid; pid=$(server_pid || true)
+    if [ -z "$pid" ]; then
+        # No usable record. The port is the only other handle -- but adopt the
+        # holder ONLY if it is ours. A foreign holder is reported and left
+        # completely alone; `llm stop` is not a way to free somebody else's port.
+        local holder; holder=$(port_pid "$PORT")
+        if [ -n "$holder" ] && is_ours "$holder"; then
+            pid=$(owned_server_pid)
+            note "run/server.pid did not name it; adopting the :$PORT holder, pid $pid"
+        elif [ -n "$holder" ]; then
+            bad "port $PORT is held by $(describe_pid "$holder")"
+            note "this tooling did not start it, so it will not be signalled. Nothing was changed."
+            return 4
+        fi
+    fi
+    if [ -z "$pid" ]; then ok "server already stopped"; else
+        stop_group "$pid" || { note "nothing was changed."; return 4; }
+        clear_pidfile_if "$pid"
+        # The offloaded experts are pinned host memory and take a moment to come
+        # back, so wait -- but wait on the THING, not on an absolute number.
+        # The old loop slept until free RAM crossed 100 GiB no matter what it
+        # had just stopped, so on a box where anything else legitimately holds
+        # RAM it burned the full 60 s every time (three of them made
+        # tests/test_unified_cutover_safety.sh look like it hung). Poll instead,
+        # and stop as soon as free RAM has stopped rising.
+        local flat=0 prev cur
+        prev=$(free -g | awk 'NR==2{print $7}')
+        for _ in $(seq 1 20); do
+            sleep 1
+            cur=$(free -g | awk 'NR==2{print $7}')
+            if [ "${cur:-0}" -gt "${prev:-0}" ]; then flat=0; else flat=$((flat + 1)); fi
+            prev="$cur"
+            [ "$flat" -ge 3 ] && break
+        done
+        ok "server stopped (${prev} GiB RAM free)"
+    fi
+}
+
+cmd_status(){
+    echo "Status"
+    if up "$PORT"; then ok "server   :$PORT  ${SERVED_NAME}"; else bad "server   :$PORT  down"; fi
+    if [ "$BACKEND" != "glm53" ]; then
+        note "proxy    disabled for $BACKEND"
+    elif curl -sf -m 3 "http://127.0.0.1:$PROXY_PORT/health" >/dev/null 2>&1; then
+        ok "proxy    :$PROXY_PORT  effort aliases (-low / -high / -max)"
+    else bad "proxy    :$PROXY_PORT  down"; fi
+    if curl -sf -m 3 "http://127.0.0.1:$COLDSTART_PORT/" >/dev/null 2>&1; then
+        ok "ui       :$COLDSTART_PORT  http://127.0.0.1:$COLDSTART_PORT/"
+    else note "ui       :$COLDSTART_PORT  down (llm ui)"; fi
+    command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits |
+        awk -F', ' '{printf "  '"${c_d}"'VRAM %s / %s MiB   free %d MiB'"${c_0}"'\n",$1,$2,$2-$1}'
+    free -g | awk '{if(NR==2) printf "  '"${c_d}"'RAM  %s / %s GiB used   free %s GiB'"${c_0}"'\n",$3,$2,$7}'
+    if up "$PORT"; then
+        curl -s -m 5 "http://127.0.0.1:$PORT/metrics" 2>/dev/null | awk '
+            /^vllm:request_prompt_tokens_sum/{ps=$2} /^vllm:request_prompt_tokens_count/{pc=$2}
+            /^vllm:generation_tokens_total/{g=$2} /^vllm:prompt_tokens_total/{p=$2}
+            END{ if(pc>0) printf "  '"${c_d}"'served %d requests   %d prompt tok   %d generated tok'"${c_0}"'\n",pc,p,g }'
+    fi
+}
+
+cmd_chat(){
+    up "$PORT" || { bad "server is down -- run: llm start"; exit 1; }
+    local prompt="${*:-Say hello in one short sentence.}" base="http://127.0.0.1:$PORT" model="$SERVED_NAME"
+    if [ "$BACKEND" = "glm53" ] && curl -sf -m 3 "http://127.0.0.1:$PROXY_PORT/health" >/dev/null 2>&1; then
+        base="http://127.0.0.1:$PROXY_PORT"; model="${SERVED_NAME}-high"
+    fi
+    note "via $base as $model"
+    "$PY" - "$base" "$model" "$prompt" <<'PYEOF'
+import json,sys,time,urllib.request
+base,model,prompt=sys.argv[1],sys.argv[2],sys.argv[3]
+body={"model":model,"messages":[{"role":"user","content":prompt}],"max_tokens":512,"temperature":0}
+r=urllib.request.Request(f"{base}/v1/chat/completions",data=json.dumps(body).encode(),headers={"Content-Type":"application/json"})
+t0=time.time(); d=json.loads(urllib.request.urlopen(r,timeout=900).read()); w=time.time()-t0
+m=d["choices"][0]["message"]; u=d.get("usage",{})
+print((m.get("content") or "").strip() or "[no content -- the model spent its budget reasoning]")
+print(f"\n  {u.get('completion_tokens',0)} tokens in {w:.1f}s = {u.get('completion_tokens',0)/w:.1f} tok/s")
+PYEOF
+}
+
+cmd_codex(){
+    # Bring the whole stack up rather than failing: the point of one entry
+    # point is that `llm codex` just works from cold.
+    up "$PORT" || cmd_start
+    up "$PORT" || { bad "server would not start -- see: llm logs"; exit 1; }
+    # The dashboard is how you watch a long agent run, so start it alongside.
+    curl -sf -m 3 "http://127.0.0.1:$COLDSTART_PORT/" >/dev/null 2>&1 || cmd_ui >/dev/null 2>&1
+    local base="http://127.0.0.1:$PORT" model="$SERVED_NAME"
+    if [ "$BACKEND" = "glm53" ] && curl -sf -m 3 "http://127.0.0.1:$PROXY_PORT/health" >/dev/null 2>&1; then
+        base="http://127.0.0.1:$PROXY_PORT"
+        [ "$BACKEND" = "glm53" ] && model="${SERVED_NAME}-high"
+    else
+        note "effort proxy down; Codex will talk to :$PORT directly"
+    fi
+    write_codex_config "$base" "$model"
+    local bin="$HERE/bin/codex"; [ -x "$bin" ] || bin="$(command -v codex 2>/dev/null)"
+    [ -n "$bin" ] || { bad "no codex binary (looked in bin/codex and \$PATH)"; exit 1; }
+    note "CODEX_HOME=$HERE/.codex"
+    CODEX_HOME="$HERE/.codex" exec "$bin" "$@"
+}
+
+cmd_ui(){
+    if ! curl -sf -m 3 "http://127.0.0.1:$COLDSTART_PORT/" >/dev/null 2>&1; then
+        local cs="$HOME/Projects/coldstart"
+        [ -d "$cs" ] && ( cd "$cs" && setsid --fork nohup .venv-gui/bin/python .venv-gui/bin/uvicorn \
+            coldstart.app:app --host 127.0.0.1 --port "$COLDSTART_PORT" >> "$LOG_DIR/coldstart.log" 2>&1 </dev/null 9>&- & )
+        sleep 5
+    fi
+    curl -sf -m 3 "http://127.0.0.1:$COLDSTART_PORT/" >/dev/null 2>&1 \
+        && ok "http://127.0.0.1:$COLDSTART_PORT/" || bad "Coldstart did not start (see logs/coldstart.log)"
+}
+
+case "${1:-help}" in
+    start)   cmd_start ;;
+    stop)    cmd_stop ;;
+    restart) cmd_stop; echo; cmd_start ;;
+    status)  cmd_status ;;
+    logs)    shift; [ "${1:-}" = "-f" ] && tail -f "$SERVER_LOG" || tail -n "${1:-60}" "$SERVER_LOG" ;;
+    chat)    shift; cmd_chat "$@" ;;
+    codex)   shift; cmd_codex "$@" ;;
+    ui)      cmd_ui ;;
+    help|-h|--help) usage ;;
+    *) echo "llm: unknown command '${1}'"; echo; usage; exit 2 ;;
+esac
