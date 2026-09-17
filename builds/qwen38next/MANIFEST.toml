@@ -54,6 +54,10 @@ files = [
 # and 2 new untracked files (tests/entrypoints/unit_tests/test_reasoning_field_chat_template_roundtrip.py,
 # tests/models/qwen4_exp/test_qsa_update_draft_decode_metadata.py). Both patch
 # files are required; there is nothing else uncommitted in this tree.
+# 2026-09-17: working-tree-tracked.patch re-exported after two more tracked
+# edits (vllm/distributed/kv_transfer/kv_connector/v1/offloading/{config,scheduler}.py:
+# skip non-prefix-cacheable KV groups so --kv-offloading-size boots on Qwen4Exp;
+# the standalone diff is flashnext-kv-offload-skip-qsa-ring.patch beside it).
 excluded_branches = [
     "branches/jit-warmup-and-template-errors/0001-*.patch, 0002-*.patch (2 commits over tree.head; local branch 'jit-warmup-and-template-errors', not merged into release/qwen38next_offload)",
     "branches/mm-encoder-offload/0001-*.patch (1 commit over tree.head; local branch 'mm-encoder-offload', not merged)",

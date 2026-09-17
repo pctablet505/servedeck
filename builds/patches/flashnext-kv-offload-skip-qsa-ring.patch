@@ -1,0 +1,130 @@
+--- a/src/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py	2026-09-17 20:20:29.657838341 +0530
++++ b/src/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py	2026-09-17 20:20:29.675081655 +0530
+@@ -104,6 +104,11 @@
+     # of these groups is volatile and lacks a stable hash, so it must
+     # be excluded from store and load scheduling.
+     is_eagle_group: bool = False
++    # True for groups that are never offloaded: their spec is not
++    # prefix-cacheable (per-request scratch such as a CircularBufferSpec
++    # ring). They keep their index so GPULoadStoreSpec stays group-aligned,
++    # with zero blocks in every transfer.
++    skip: bool = False
+ 
+ 
+ def get_sliding_window_size_in_chunks(
+@@ -122,6 +127,11 @@
+         # Mamba depends on a single state
+         return 1
+ 
++    if not kv_cache_spec.prefix_cacheable:
++        # Per-request scratch state (Qwen4Exp's QSA CircularBufferSpec ring):
++        # excluded from offloading entirely via GroupOffloadConfig.skip.
++        return None
++
+     assert isinstance(kv_cache_spec, FullAttentionSpec)
+     return None
+ 
+@@ -195,7 +205,7 @@
+             sw = get_sliding_window_size_in_chunks(
+                 kv_spec, tokens_per_block * spec.blocks_per_chunk
+             )
+-            if sw is None:
++            if sw is None and kv_spec.prefix_cacheable:
+                 full_attn_tokens_per_chunk.add(tokens_per_block * spec.blocks_per_chunk)
+ 
+         # Only apply the optimization if there's a single consistent
+@@ -264,10 +274,20 @@
+                         isinstance(kv_spec, MambaSpec)
+                         and kv_spec.mamba_cache_mode == "align"
+                     ),
++                    skip=not kv_spec.prefix_cacheable,
+                 )
+             )
+         kv_group_configs = tuple(kv_group_configs_list)
+-        group_block_sizes = {config.tokens_per_block for config in kv_group_configs}
++        skipped = [c.group_idx for c in kv_group_configs if c.skip]
++        if skipped:
++            logger.info(
++                "KV offloading: groups %s are not prefix-cacheable and will "
++                "not be offloaded.",
++                skipped,
++            )
++        group_block_sizes = {
++            config.tokens_per_block for config in kv_group_configs if not config.skip
++        }
+         has_partial_recurrent_group = any(
+             config.requires_cow_source
+             and config.tokens_per_block > spec.tokens_per_hash
+@@ -286,6 +306,7 @@
+                 for config in kv_group_configs
+             )
+             and not any(config.is_eagle_group for config in kv_group_configs)
++            and not any(config.skip for config in kv_group_configs)
+             and vllm_config.parallel_config.decode_context_parallel_size == 1
+         )
+ 
+@@ -357,6 +378,8 @@
+         for group_config, group_state in zip(
+             self.config.kv_group_configs, self.group_states
+         ):
++            if group_config.skip:
++                continue
+             for req_block_hash in islice(
+                 self.req.block_hashes,
+                 group_config.hashes_per_chunk * len(group_state.offload_keys)
+@@ -504,6 +527,8 @@
+         full_attention_groups: list[int] = []
+         sliding_window_groups: list[int] = []
+         for group_config in self.config.kv_group_configs:
++            if group_config.skip:
++                continue
+             if group_config.sliding_window_size_in_chunks is None:
+                 full_attention_groups.append(group_config.group_idx)
+             else:
+@@ -1017,6 +1042,10 @@
+             self._current_batch_allocated_block_ids.update(
+                 block.block_id for block in group_blocks if block.block_id != 0
+             )
++            if group_config.skip:
++                group_sizes.append(0)
++                block_indices.append(0)
++                continue
+ 
+             tokens_per_block = group_config.tokens_per_block
+             tokens_per_chunk = group_config.tokens_per_chunk
+@@ -1278,6 +1307,8 @@
+             for group_config, group_state in zip(
+                 self.config.kv_group_configs, req_status.group_states
+             ):
++                if group_config.skip:
++                    continue
+                 num_chunks = req_status.storable_chunks(
+                     group_config, group_state, num_offloadable_tokens
+                 )
+@@ -1349,6 +1380,10 @@
+             for group_config, group_state in zip(
+                 self.config.kv_group_configs, req_status.group_states
+             ):
++                if group_config.skip:
++                    group_sizes.append(0)
++                    block_indices.append(0)
++                    continue
+                 is_sliding_window = (
+                     group_config.sliding_window_size_in_chunks is not None
+                 )
+--- a/src/vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py	2026-09-17 20:20:29.658407445 +0530
++++ b/src/vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py	2026-09-17 20:20:29.673599143 +0530
+@@ -56,7 +56,12 @@
+     )
+ 
+     _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
+-    for group in groups:
++    for group, kv_group in zip(groups, kv_cache_config.kv_cache_groups):
++        # Non-prefix-cacheable groups (e.g. Qwen4Exp's QSA CircularBufferSpec
++        # ring, one 8-token block per request) are never offloaded, so their
++        # block size need not align with the hash unit.
++        if not kv_group.kv_cache_spec.prefix_cacheable:
++            continue
+         assert group.tokens_per_block % tokens_per_hash == 0, (
+             f"tokens_per_block={group.tokens_per_block} not divisible by "
+             f"tokens_per_hash={tokens_per_hash}. "

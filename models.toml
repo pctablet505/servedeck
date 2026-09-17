@@ -93,17 +93,27 @@ max_output_tokens = 32000
 # human at a TTY until that is replaced (tracked, not solved, by this packet).
 needs_tty = true
 
-# serve.sh:218-236, at the script's own defaults (MAX_SEQS=1, MAX_BATCHED=8192,
-# MM_LIMIT_JSON images-on, KV_DTYPE=auto, SPEC_TOKENS=3).
+# serve.sh:218-236 (MM_LIMIT_JSON images-on, KV_DTYPE=auto, SPEC_TOKENS=3), plus
+# the live v1 launch of 2026-09-17: MAX_NUM_SEQS=16 for parallel agents and the
+# EXTRA_ARGS of local_llm/.config:85. `--kv-offloading-size 40` parks evicted
+# contexts in 40 GiB of pinned host RAM (measured: a 35k-token context comes
+# back in 0.36 s vs 3.78 s of prefill; decode unchanged). It needs the fork
+# patch builds/patches/qwen38next/flashnext-kv-offload-skip-qsa-ring.patch,
+# without which the engine asserts on the QSA ring group. `--prefix-match-unit`
+# was dropped (measured inert, and 208 does not divide the ring's 8-token block).
 flags = [
     "--tensor-parallel-size", "1",
     "--distributed-executor-backend", "mp",
-    "--max-num-seqs", "1",
+    "--max-num-seqs", "16",
     "--max-num-batched-tokens", "8192",
     "--limit-mm-per-prompt", '{"image":2,"video":0}',
     "--kv-cache-dtype", "auto",
     "--enable-prefix-caching",
     "--speculative-config", '{"method":"mtp","num_speculative_tokens":3}',
+    "--mamba-ssm-cache-dtype", "bfloat16",
+    "--long-prefill-token-threshold", "1024",
+    "--watermark", "0.10",
+    "--kv-offloading-size", "40",
 ]
 
 [models.flashnext.reasoning]
