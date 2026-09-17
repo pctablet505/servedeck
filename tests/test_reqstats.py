@@ -154,14 +154,19 @@ def test_a_full_window_is_not_partial_and_rolls() -> None:
     assert st.p50.hi == 50000.0, "the window kept 100 stale requests instead of rolling"
 
 
-def test_first_scrape_is_a_baseline_and_adds_nothing() -> None:
-    """The lifetime histogram must not be poured into the window on the first
-    poll: those requests finished before Servedeck was watching, and counting
-    them would make a freshly-started dashboard claim a 100-request window."""
+def test_first_scrape_seeds_the_window_and_says_so() -> None:
+    """Reversed 2026-09-17. This used to assert the first poll adds nothing,
+    so that a fresh dashboard never claimed requests it had not watched. Ten
+    dashboard restarts in one evening then showed a one-request picture each
+    time. The lifetime histogram is now poured in — bucket-bounded, scaled
+    to the window, and COUNTED SEPARATELY as ``seeded_n`` so the page can say
+    where the picture came from."""
     win = RequestWindow()
     added = win.observe(cumulative({50000.0: 900}), hist_sum=2.7e7, hist_count=900.0)
-    assert added == 0
-    assert win.stats().n == 0
+    st = win.stats()
+    assert added == 100 and st.n == 100
+    assert st.seeded_n == 100 and st.exact_n == 0
+    assert st.p90 is not None and not st.p90.exact
 
 
 # --------------------------------------------------------------------------
@@ -506,3 +511,55 @@ def test_a_transient_scrape_failure_does_not_clear_the_window() -> None:
     w.observe(cumulative({1000.0: 5}), hist_sum=5 * 1000.0, hist_count=5.0)
 
     assert len(w) == 5, "a transient failure emptied a window the engine never reset"
+
+
+
+# --------------------------------------------------------------------------
+# Seeding from the engine's lifetime histogram (2026-09-17)
+# --------------------------------------------------------------------------
+
+import math as _math  # noqa: E402
+
+from servedeck.reqstats import RequestWindow as _RW  # noqa: E402
+
+
+def _cum(c1, c2, c3):
+    return [(1000.0, c1), (10000.0, c1 + c2), (_math.inf, c1 + c2 + c3)]
+
+
+def test_the_first_scrape_seeds_the_window_from_the_lifetime_histogram() -> None:
+    w = _RW(maxlen=100)
+    added = w.observe(_cum(5, 50, 5), hist_sum=1.0e6, hist_count=60, ceiling=262144, ts=100.0)
+    st = w.stats()
+    assert added == 60 and st.n == 60 and st.exact_n == 0 and st.seeded_n == 60
+    assert st.p50 is not None and st.p50.lo == 1001.0 and st.p50.hi == 10000.0
+    assert st.to_dict()["seeded_n"] == 60
+
+
+def test_a_lifetime_bigger_than_the_window_is_scaled_to_it_keeping_its_shape() -> None:
+    w = _RW(maxlen=100)
+    w.observe(_cum(100, 800, 100), hist_sum=1.0e6, hist_count=1000, ts=100.0)
+    st = w.stats()
+    assert st.n == 100 and st.seeded_n == 100
+    by_bucket = {}
+    for o in w._obs:
+        by_bucket[o.bucket] = by_bucket.get(o.bucket, 0) + 1
+    assert by_bucket == {0: 10, 1: 80, 2: 10}
+
+
+def test_a_dropped_baseline_never_reseeds() -> None:
+    w = _RW(maxlen=100)
+    w.observe(_cum(5, 50, 5), hist_sum=1.0e6, hist_count=60, ts=100.0)
+    w.observe(_cum(5, 51, 5), hist_sum=1.0e6 + 4000, hist_count=61, ts=102.0)
+    assert w.stats().n == 61 and w.stats().exact_n == 1
+    w.drop_baseline()
+    assert w.observe(_cum(5, 53, 5), hist_sum=1.0e6 + 9000, hist_count=63, ts=200.0) == 0
+    assert w.stats().n == 61, "requests finished during the outage are lost, not invented"
+
+
+def test_an_engine_restart_reseeds_from_the_new_process() -> None:
+    w = _RW(maxlen=100)
+    w.observe(_cum(5, 50, 5), hist_sum=1.0e6, hist_count=60, ts=100.0)
+    w.observe(_cum(0, 2, 0), hist_sum=8000.0, hist_count=2, ts=200.0)  # counters went backwards
+    st = w.stats()
+    assert st.n == 2 and st.seeded_n == 2, "the old process's requests are gone; the new one's seed the window"

@@ -1281,7 +1281,8 @@ function winSpan(w) {
   if (!w || !w.n) return `0/${(w && w.capacity) || 100} requests observed`;
   const age = w.age_s == null ? "" : ` · ${durTxt(w.age_s)}`;
   const ex = w.exact_n < w.n ? ` · ${w.exact_n} exact` : "";
-  return `${w.n}/${w.capacity} requests${age}${ex}`;
+  const seeded = w.seeded_n ? ` · ${w.seeded_n} from the engine's histogram since its start` : "";
+  return `${w.n}/${w.capacity} requests${age}${ex}${seeded}`;
 }
 
 /* The mixed-load table, as text: {head, title, cols, rows, note}.

@@ -749,12 +749,15 @@ def test_the_live_fixture_carries_the_histogram_the_window_needs() -> None:
     assert values == sorted(values)
 
 
-def test_the_first_scrape_does_not_backfill_the_lifetime_histogram() -> None:
-    """A dashboard restart must show an EMPTY window, not 1,717 requests it
-    never watched. The panel's sample count is what was observed."""
+def test_the_first_scrape_seeds_the_window_from_the_lifetime_histogram() -> None:
+    """Reversed 2026-09-17: a dashboard restart no longer empties the picture.
+    The first scrape fills the window from the engine's own histogram, and
+    the stats say how many came that way (``seeded_n``) so the page can
+    label them rather than pass them off as watched."""
     snaps = _scrape_all([_FIXTURE.read_text()], [100.0])
-    assert snaps[0].prompt_stats["n"] == 0
-    assert snaps[0].prompt_stats["partial"] is True
+    stats = snaps[0].prompt_stats
+    assert stats["n"] > 0 and stats["seeded_n"] == stats["n"]
+    assert stats["exact_n"] == 0
 
 
 def test_requests_finishing_between_two_scrapes_enter_the_window() -> None:
