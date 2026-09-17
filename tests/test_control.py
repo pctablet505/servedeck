@@ -1277,15 +1277,22 @@ def test_a_v1_stopped_file_migrates_to_no_main(tmp_path) -> None:
     assert desired_mod.load(path) == Desired(main=None, residents=[])
 
 
-def test_migration_does_not_rewrite_the_v1_file_on_read(tmp_path) -> None:
-    """Reading must not destroy the rollback. Step 4 of the migration keeps
-    the old units on disk precisely so it can be undone; a read that rewrote
-    desired.json would take v1's port/util/max_model_len with it."""
+def test_migration_rewrites_the_v1_file_once_and_keeps_the_original(tmp_path) -> None:
+    """Reading must not destroy the rollback, and must not re-warn on every
+    poll either (30 warnings a minute on 2026-09-17, because nothing ever
+    wrote v2 unless an operator action changed the set). The first read
+    rewrites desired.json as schema 2 and keeps the verbatim v1 body beside
+    it as desired.json.v1, which is what the cutover's rollback restores."""
     path = tmp_path / "desired.json"
-    body = json.dumps({"version": 1, "desired_state": "RUNNING", "backend": "inline", "util": 0.91})
+    body = json.dumps({
+        "version": 1, "desired_state": "RUNNING", "backend": "inline", "util": 0.91,
+    })
     path.write_text(body)
-    desired_mod.load(path)
-    assert path.read_text() == body
+    assert desired_mod.load(path) == Desired(main="inline", residents=[])
+    assert json.loads(path.read_text())["version"] == 2
+    assert (tmp_path / "desired.json.v1").read_text() == body
+    assert desired_mod.load(path) == Desired(main="inline", residents=[])
+    assert (tmp_path / "desired.json.v1").read_text() == body, "a second read leaves the v1 copy alone"
 
 
 @pytest.mark.parametrize("body", ["", "not json", "[]", '{"version": 99}', '{"version": 2}'])

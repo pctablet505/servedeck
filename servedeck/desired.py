@@ -110,7 +110,20 @@ def load(path: str | os.PathLike[str] | None = None) -> Desired:
 
     version = raw.get("version")
     if version == 1:
-        return _from_v1(raw, str(target))
+        migrated = _from_v1(raw, str(target))
+        # Migrate in place, once. Left as v1 on disk, every poll re-read and
+        # re-warned (30 lines a minute on 2026-09-17) and nothing ever wrote
+        # v2 unless an operator action happened to change the desired set.
+        # v1's file is kept beside it for the rollback the cutover runbook
+        # describes.
+        try:
+            backup = target.with_name(target.name + ".v1")
+            if not backup.exists():
+                backup.write_text(text, encoding="utf-8")
+            save(migrated, target)
+        except OSError as exc:
+            log.warning("%s: could not persist the v2 migration (%s)", target, exc)
+        return migrated
     if version != SCHEMA_VERSION:
         log.warning(
             "%s has unknown schema version %r (expected %d); treating desired "

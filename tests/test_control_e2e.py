@@ -474,7 +474,7 @@ class _OneModelRegistry:
         return self._spec
 
     def keys(self) -> list[str]:
-        return [self.spec.key]
+        return [self._spec.key]
 
 
 @pytest.fixture(autouse=True)
