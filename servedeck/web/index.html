@@ -57,9 +57,8 @@
            live figure that belongs beside the models, and it fills the
            column the rail used to leave empty. -->
       <div class="panel">
-        <div class="panel-h"><span>KV cache in use</span><span class="mono" style="font-size:10px">/metrics · 2s</span></div>
+        <div class="panel-h"><span>KV cache in use <span style="text-transform:none;font-weight:400;letter-spacing:0">(in flight, 0 when idle)</span></span><span class="mono" style="font-size:10px">/metrics · 2s</span></div>
         <div class="lcol">
-        <div class="lk">KV blocks in use <span style="text-transform:none;font-weight:400">(in-flight, 0 when idle)</span></div>
         <div class="lbig mono" id="kvPct">—</div>
         <div class="lsub mono" id="kvTok">—</div>
         <canvas id="spark" width="420" height="42" aria-label="KV cache usage over time"></canvas>
@@ -282,9 +281,8 @@
     </div>
 
       <div class="panel">
-        <div class="panel-h"><span>Request size</span><span class="mono" style="font-size:10px">prompt tokens · last 100</span></div>
+        <div class="panel-h"><span>Request size <span style="text-transform:none;font-weight:400;letter-spacing:0">(prompt tokens, last 100 finished requests)</span></span><span class="mono" style="font-size:10px">/metrics · 2s</span></div>
         <div class="lcol">
-        <div class="lk">Request size <span style="text-transform:none;font-weight:400">(prompt tokens, last 100)</span></div>
         <div class="lbig mono" id="pctP90">—</div>
         <div class="lsub">p90 — the agent count is sized on this</div>
         <canvas id="reqHist" width="440" height="96" aria-label="Prompt-token counts over the last 100 finished requests. Exact requests are drawn in fine bins; requests known only to a vLLM bucket are drawn as a translucent band over that bucket's range. Median, p90 and p99 are marked."></canvas>
