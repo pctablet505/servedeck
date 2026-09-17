@@ -194,7 +194,7 @@ def test_real_models_toml_loads():
     assert set(reg.models) == {"qwen27b", "flashnext", "glm53", "lfm2"}
     assert reg.gpu.total_mib == 97887
     assert reg.gpu.margin_mib == 1024
-    assert reg.defaults_env == {"VLLM_USE_FLASHINFER_SAMPLER": "0"}
+    assert reg.defaults_env == {"VLLM_USE_FLASHINFER_SAMPLER": "0", "HF_HUB_OFFLINE": "1"}
 
 
 # --------------------------------------------------------------------------- #
@@ -612,3 +612,14 @@ def test_native_ctx_matches_real_hub_cache_for_qwen27b():
     if not (hub_dir / dirname).is_dir():
         pytest.skip("RadixArk/Qwen3.8-27B-NVFP4 not in this box's hub cache")
     assert models.native_ctx("RadixArk/Qwen3.8-27B-NVFP4") == 262144
+
+
+
+def test_every_model_launches_offline_from_the_hub_cache() -> None:
+    """2026-09-17: the first v2 launch of Flash-Next went online and died on a
+    gated-repo 401, because HF_HUB_OFFLINE=1 lived only in the v1 launcher."""
+    from pathlib import Path
+    reg = models.load(Path(__file__).resolve().parent.parent / "models.toml")
+    for key, m in reg.models.items():
+        env = models.render_env(m, reg.builds[m.build])
+        assert env.get("HF_HUB_OFFLINE") == "1", key

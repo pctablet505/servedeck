@@ -27,6 +27,12 @@ margin_mib = 1024          # never handed to any model
 #   ~/.config/systemd/user/lfm2-350m.service (Environment=)
 [defaults.env]
 VLLM_USE_FLASHINFER_SAMPLER = "0"
+# Every model is served from the local hub cache. The Flash-Next launcher
+# exported this (serve-abliterated.sh:34) and the registry did not carry it:
+# the first v2 launch (2026-09-17) went online, asked the hub about a gated
+# repo, and died on a 401. Offline also means a boot never depends on the
+# network being up.
+HF_HUB_OFFLINE = "1"
 
 # Every legacy launcher also exports CUDA_HOME=<venv>/lib/python3.13/site-packages/
 # nvidia/cu13 and prepends <venv>/bin:$CUDA_HOME/bin to PATH — nvcc/ptxas live
