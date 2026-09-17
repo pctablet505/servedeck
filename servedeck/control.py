@@ -359,18 +359,23 @@ def http_probe(port: int, timeout_s: float = _PROBE_TIMEOUT_S) -> list[str] | No
     return [item["id"] for item in data if isinstance(item, dict) and isinstance(item.get("id"), str)]
 
 
-def apply_argv_overrides(argv: list[str], overrides: Mapping[str, str] | None) -> list[str]:
-    """Replace a flag's value in ``argv`` (or append the pair when absent)."""
+def apply_argv_overrides(argv: list[str], overrides: Mapping[str, str | None] | None) -> list[str]:
+    """Replace a flag's value in ``argv`` (or append the pair when absent).
+    A value of ``None`` removes the flag and its value."""
     if not overrides:
         return argv
     out = list(argv)
     for flag, value in overrides.items():
         for i, a in enumerate(out):
             if a == flag and i + 1 < len(out):
-                out[i + 1] = str(value)
+                if value is None:
+                    del out[i : i + 2]
+                else:
+                    out[i + 1] = str(value)
                 break
         else:
-            out += [flag, str(value)]
+            if value is not None:
+                out += [flag, str(value)]
     return out
 
 
@@ -726,7 +731,7 @@ class Control:
         restart: str = "on-failure",
         restart_sec: int = 10,
         util: float | None = None,
-        argv_overrides: Mapping[str, str] | None = None,
+        argv_overrides: Mapping[str, str | None] | None = None,
     ) -> StartResult | Refusal:
         """Launch ``key`` as ``model-<key>.service`` and wait for it to answer.
 
@@ -1076,7 +1081,7 @@ class Control:
         release_timeout_s: float = RELEASE_TIMEOUT_S,
         on_progress: ProgressCallback | None = None,
         util: float | None = None,
-        argv_overrides: Mapping[str, str] | None = None,
+        argv_overrides: Mapping[str, str | None] | None = None,
     ) -> SwitchResult | Refusal:
         """Replace whatever holds the main slot with ``key``.
 

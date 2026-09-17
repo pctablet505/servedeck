@@ -435,3 +435,10 @@ input[type=range]:focus-visible{outline:2px solid var(--accent);outline-offset:3
 .pref:empty{display:none}
 .livegrid{grid-template-columns:1fr 1fr}
 @media (max-width: 900px){.agrid{grid-template-columns:1fr}.livegrid{grid-template-columns:1fr}}
+
+/* -- 2026-09-17 later: two columns without a gap; four allocator controls -- */
+.col{display:flex;flex-direction:column;gap:16px;min-width:0}
+.col .panel .lcol{border-right:none}
+.agrid{grid-template-columns:repeat(4,1fr)}
+@media (max-width: 1180px){.agrid{grid-template-columns:1fr 1fr}}
+@media (max-width: 900px){.agrid{grid-template-columns:1fr}}

@@ -87,6 +87,11 @@ def test_the_2026_09_17_ux_pass_holds() -> None:
         assert present in ids, present
     for gone in ("smoke", "mRun", "mWait", "recN", "recMath", "mixTbl", "recCal"):
         assert gone not in ids, gone
-    assert INDEX.count('class="acell"') == 3
+    assert INDEX.count('class="acell"') == 4
+    for present in ("offload", "offloadNote"):
+        assert present in ids, present
+    # Two columns, nothing spanning under the rail: the KV picture sits under
+    # the models, the request histogram under the main panel.
+    assert INDEX.count('class="col"') == 2 and 'class="panel live"' not in INDEX
     render_ctx = APP_JS.split("function renderCtx")[1].split("\nfunction ")[0]
     assert "ctxLabel(" not in render_ctx, "the context bound must print the exact figure"

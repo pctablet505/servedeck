@@ -571,6 +571,7 @@ let ctxSource = "default";   // "default" | "running" | "operator"; see ctxChoic
 let ctxRun = null;           // the serving model's real --max-model-len, when it is selected
 let lastRunSig = null;       // which server ctxRun was read from; see runCtxOf()
 let agents = 1;   // --max-num-seqs: the scheduler's ceiling on concurrent sequences
+let offloadGib = null;   // --kv-offloading-size in GiB; null until read back or estimated
 let lastEstimate = null;
 let controlEnabled = false;
 let liveFacts = {};      // the RUNNING engine's own numbers, from /api/state
@@ -731,7 +732,8 @@ async function doEstimate() {
     const r = await fetch("/api/capacity/estimate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ repo_id: m.repo_id, util, ctx, max_num_seqs: agents }),
+      body: JSON.stringify({ repo_id: m.repo_id, util, ctx, max_num_seqs: agents,
+                             kv_offload_gib: offloadGib }),
     });
     var d = await r.json();
   } catch (e) {
@@ -904,14 +906,19 @@ function paintEstimate(d) {
   const gib = (v) => (typeof v === "number" ? `${v.toFixed(1)} GiB` : "—");
   set("vramTxt",
     `weights ${gib(d.weights_gib)} · KV ${gib(d.kv_gib)} · budget ${gib(d.budget_gib)}`);
-  set("kvOffload", (typeof d.offload_gib === "number" && d.offload_gib > 0)
-    ? `${d.offload_gib} GiB host RAM for parked KV` +
-      (d.offload_tokens ? ` ≈ ${fmt(d.offload_tokens)} tokens` : "")
-    : "");
+  // The offload field: what this many GiB parks, and how much host RAM is
+  // free for it. First estimate seeds the field from the registry's flag.
+  if (offloadGib === null && typeof d.offload_gib === "number") {
+    offloadGib = d.offload_gib;
+    const o = $("offload");
+    if (o) o.value = String(offloadGib);
+  }
+  const free = typeof d.offload_max_gib === "number" ? ` · up to ${fmt(d.offload_max_gib)} GiB free` : "";
+  set("offloadNote", (typeof d.offload_gib === "number" && d.offload_gib > 0)
+    ? `≈ ${fmt(d.offload_tokens)} tokens parked${free}`
+    : `off — contexts evicted from the GPU are prefilled again${free}`);
   const ko = $("kvOffload");
-  if (ko) ko.title = "--kv-offloading-size: evicted contexts are copied to pinned host RAM and " +
-    "reloaded on their next turn instead of being prefilled again. It does not raise the " +
-    "per-request context or how many run at once.";
+  if (ko) ko.textContent = "";
 }
 
 function showFindings(findings) {
@@ -1733,6 +1740,10 @@ function dirtyBits(facts, sizing, want) {
   if (sizing.max_num_seqs && sizing.max_num_seqs !== want.agents) {
     bits.push(`${want.agents} agent${want.agents === 1 ? "" : "s"}`);
   }
+  if (typeof want.offload === "number" && facts.util_effective) {
+    const runOff = typeof facts.kv_offload_gib === "number" ? facts.kv_offload_gib : 0;
+    if (runOff !== want.offload) bits.push(`${want.offload} GiB KV offload`);
+  }
   return bits;
 }
 
@@ -1745,7 +1756,7 @@ function paintDirty(upIsUp, runCtx) {
   // a changed context was never marked unsaved at all.
   const facts = Object.assign({}, liveFacts || {});
   if (runCtx) facts.ctx = runCtx;
-  const diff = dirtyBits(facts, liveSizing || {}, { util: util, ctx: ctx, agents: agents });
+  const diff = dirtyBits(facts, liveSizing || {}, { util: util, ctx: ctx, agents: agents, offload: offloadGib });
   d.classList.toggle("on", diff.length > 0);
   d.textContent = diff.length ? `unsaved: ${diff.join(", ")}` : "unsaved changes";
 }
@@ -1819,6 +1830,17 @@ function paintState(s) {
     const a = $("agents");
     if (a) a.value = String(agents);
     estimate();
+  }
+  // The running server's --kv-offloading-size, read back like util and the
+  // agent count. A server launched without the flag reads back as 0.
+  if (!userPicked && liveFacts.util_effective) {
+    const runOff = typeof liveFacts.kv_offload_gib === "number" ? liveFacts.kv_offload_gib : 0;
+    if (runOff !== offloadGib) {
+      offloadGib = runOff;
+      const o = $("offload");
+      if (o) o.value = String(offloadGib);
+      estimate();
+    }
   }
   const sv = s.supervisor || {};
   const phase = busyPhase(sv);
@@ -1997,6 +2019,7 @@ function wireControls() {
       try {
         await post(path, {
           repo_id: m.repo_id, backend: m.backend, util, ctx, max_num_seqs: agents,
+          kv_offload_gib: offloadGib,
         });
         log(`applying ${m.name} …`, "g");
       } catch (e) { log("apply failed: " + e.message, "e"); apply.disabled = false; }
@@ -2086,6 +2109,18 @@ async function init() {
   // the live panel; this writes it into the field it constrains. It is a
   // suggestion the operator confirms by clicking, never an automatic write:
   // paintState deliberately does not move `agents` on its own.
+  const off = $("offload");
+  if (off) {
+    off.oninput = (e) => {
+      const n = Math.round(+e.target.value);
+      offloadGib = isFinite(n) ? Math.min(160, Math.max(0, n)) : 0;
+      if (e.target.value !== "" && e.target.value !== String(offloadGib)) {
+        e.target.value = String(offloadGib);
+      }
+      userPicked = true;
+      estimate();
+    };
+  }
   const useRec = $("useRec");
   if (useRec) {
     useRec.onclick = () => {

@@ -219,3 +219,20 @@ def test_the_kv_offload_is_read_from_argv_and_sized_like_the_pool() -> None:
     assert lp.offload_tokens_for(40, 297926, 9.3) == int(40 * 297926 / 9.3)
     assert lp.offload_tokens_for(None, 297926, 9.3) is None
     assert lp.offload_tokens_for(40, 0, 9.3) is None
+
+
+def test_the_offload_field_maps_to_the_flag_and_zero_removes_it() -> None:
+    _u, argv = lp.overrides_from({"kv_offload_gib": 40})
+    assert argv == {"--kv-offloading-size": "40"}
+    _u, argv = lp.overrides_from({"kv_offload_gib": 0})
+    assert argv == {"--kv-offloading-size": None}
+    with_flag = ARGV + ["--kv-offloading-size", "40"]
+    assert control.apply_argv_overrides(list(with_flag), {"--kv-offloading-size": None}) == ARGV
+    assert control.apply_argv_overrides(list(ARGV), {"--kv-offloading-size": None}) == ARGV
+    assert control.apply_argv_overrides(list(ARGV), {"--kv-offloading-size": "24"})[-2:] == ["--kv-offloading-size", "24"]
+
+
+def test_host_ram_is_read_in_gib() -> None:
+    ram = lp.host_ram("MemTotal:       190865040 kB\nMemFree: 1 kB\nMemAvailable:   74108072 kB\n")
+    assert ram == {"total_gib": 182.0, "available_gib": 70.7}
+    assert lp.host_ram("") == {}

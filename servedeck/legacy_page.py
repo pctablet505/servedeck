@@ -84,6 +84,22 @@ def float_flag(argv: Sequence[str], flag: str) -> float | None:
         return None
 
 
+def host_ram(meminfo: str | None = None) -> dict[str, Any]:
+    """``MemTotal`` / ``MemAvailable`` in GiB, from /proc/meminfo — the room a
+    KV offload buffer (pinned host RAM) can be given."""
+    try:
+        text = meminfo if meminfo is not None else Path("/proc/meminfo").read_text()
+    except OSError:
+        return {}
+    out: dict[str, Any] = {}
+    for line in text.splitlines():
+        if line.startswith("MemTotal:"):
+            out["total_gib"] = round(int(line.split()[1]) / 1048576, 1)
+        elif line.startswith("MemAvailable:"):
+            out["available_gib"] = round(int(line.split()[1]) / 1048576, 1)
+    return out
+
+
 def process_uptime_s(pid: int) -> int | None:
     """Seconds since ``pid`` started, from ``/proc/<pid>/stat`` — for an adopted
     process no unit start time exists, and "up —" beside a model that has
@@ -568,6 +584,8 @@ def estimate_payload(
     own_pids: Sequence[int],
     ptrace_scope: int | None,
     state: str | None,
+    kv_offload_gib: float | None = None,
+    running_offload_gib: float | None = None,
 ) -> dict[str, Any]:
     entry = next((e for e in entries if e.repo_id == repo_id), None)
     kv_dtype, ssm_dtype = cache_flags(model)
@@ -590,12 +608,24 @@ def estimate_payload(
     fit, fit_reason = _native_ctx_fit(
         repo_id, util, entry, kv_dtype, ssm_dtype, native=mi.model_max_ctx, known=known,
     )
-    offload_gib = float_flag(list(model.flags), "--kv-offloading-size") if model else None
+    offload_gib = (
+        float(kv_offload_gib) if kv_offload_gib is not None
+        else (float_flag(list(model.flags), "--kv-offloading-size") if model else None)
+    ) or 0.0
+    ram = host_ram()
+    # What can be pinned: what is available now plus what the running server
+    # already holds for this purpose (a restart gives it back first).
+    offload_max = None
+    if ram.get("available_gib") is not None:
+        offload_max = int(ram["available_gib"] + (running_offload_gib or 0.0) - 4)  # keep 4 GiB for the box
+        offload_max = max(0, offload_max)
     return {
         "kv_gib": round(r.kv_gib, 2),
         "kv_tokens": r.kv_tokens,
         "offload_gib": offload_gib,
         "offload_tokens": offload_tokens_for(offload_gib, r.kv_tokens, r.kv_gib),
+        "offload_max_gib": offload_max,
+        "host_ram": ram,
         "budget_gib": round(r.budget_gib, 2),
         "concurrency_x": round(r.concurrency_x, 2),
         "agents_at_ctx": r.agents_at_ctx,
@@ -650,16 +680,20 @@ def key_for_repo(registry: _models.Registry, repo_id: str | None, backend: str |
     return None
 
 
-def overrides_from(body: Mapping[str, Any]) -> tuple[float | None, dict[str, str]]:
+def overrides_from(body: Mapping[str, Any]) -> tuple[float | None, dict[str, str | None]]:
     """``util`` / ``ctx`` / ``max_num_seqs`` from the allocator's POST body."""
     util = None
     if body.get("util") is not None:
         util = max(0.05, min(0.99, float(body["util"])))
-    argv: dict[str, str] = {}
+    argv: dict[str, str | None] = {}
     if body.get("ctx") is not None:
         argv["--max-model-len"] = str(int(body["ctx"]))
     if body.get("max_num_seqs") is not None:
         argv["--max-num-seqs"] = str(max(1, int(body["max_num_seqs"])))
+    if body.get("kv_offload_gib") is not None:
+        gib = max(0.0, float(body["kv_offload_gib"]))
+        # 0 means no offload at all: the flag is removed, not passed as 0.
+        argv["--kv-offloading-size"] = f"{gib:g}" if gib > 0 else None
     return util, argv
 
 
@@ -716,6 +750,7 @@ def augment_state(
             "backend": model.build if model else None,
             "max_model_len": full_ctx,
         },
+        "host": host_ram(),
         "uptime_s": int(time.time() - STARTED_AT),
         "server_uptime_s": (
             int(uptimes[main_key]) if main_key and uptimes.get(main_key) is not None
@@ -755,9 +790,13 @@ def register(app: FastAPI, rt: Any) -> None:
         holder = _app._main_holder(rt, rt.routes.live())
         view = rt.routes.live_view(holder) if holder else None
         pids = [view.pid] if view and view.pid else []
+        running_argv = cmdline_of(view.pid) if view and view.pid else []
+        raw_off = body.get("kv_offload_gib")
         try:
             return await _app.asyncio.to_thread(
                 estimate_payload,
+                kv_offload_gib=(float(raw_off) if raw_off is not None else None),
+                running_offload_gib=float_flag(running_argv, "--kv-offloading-size"),
                 repo_id=model.repo if model else str(repo),
                 util=float(body.get("util", 0.96)),
                 ctx=int(body.get("ctx", DEFAULT_MODEL_MAX_CTX)),
