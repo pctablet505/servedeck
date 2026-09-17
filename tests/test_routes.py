@@ -314,6 +314,9 @@ def test_known_names_lists_every_name_resolve_accepts(routes) -> None:
         "Big-Model", "big", "bigmodel", "big-high", "big-low",
         "Small-Model", "small",
         "Other-Main",
+        # "whatever holds the main slot" — the one name a client config can
+        # keep across a switch (2026-09-18).
+        "main", "local",
     ]
     for name in names:
         assert routes.resolve(name) is not None, name
@@ -382,3 +385,26 @@ def test_routes_with_no_control_never_reports_anything_live(registry) -> None:
     assert routes.refresh() == {}
     assert routes.live_routes() == []
     assert isinstance(routes.resolve("big"), Route)
+
+
+# --------------------------------------------------------------------------
+# The slot aliases (2026-09-18): one name a client can keep across a switch
+# --------------------------------------------------------------------------
+
+
+def test_main_resolves_to_whatever_holds_the_main_slot(routes) -> None:  # noqa: D401
+    """Every client config used to name one model, so switching the card left
+    all of them asking for a model that is no longer serving — a 503 the
+    operator had to fix in three files."""
+    live(routes, "main1")
+    got = routes.resolve("main")
+    assert got is not None and got.model_id == "Big-Model" and got.live
+    assert routes.resolve("local") is not None, "the v1-era habit name works too"
+
+
+def test_main_names_the_slot_holder_even_when_nothing_is_live(routes) -> None:
+    """On an idle box, `main` must give that model's 503 (with its boot state),
+    not a 404 that reads as "no such model"."""
+    route = routes.resolve("main")
+    assert route is not None and route.model_id == "Big-Model"
+    assert not route.live, "nothing is running, so the route is not live"

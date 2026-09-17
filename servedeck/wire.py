@@ -93,6 +93,19 @@ def _vscode_entry(served_name: str, m: _models.Model, ctx: int) -> dict[str, Any
         "url": CHAT_COMPLETIONS_URL,
         "toolCalling": True,
         "vision": m.vision,
+        # `thinking` is what makes VS Code REPLAY the previous turn's
+        # reasoning. Without it (the state until 2026-09-18) the extension
+        # drops reasoning_content on replay and sends its own cot_summary /
+        # cot_id, which vLLM ignores — so the model reads a multi-turn thread
+        # as fresh on every turn. That erasure is the measured cause of agent
+        # amnesia on this box, and the gateway's output-side mirror cannot fix
+        # it: the mirror makes the thinking available to a client, it cannot
+        # make a client send it back. The flag is declared per model in the
+        # copilot extension's customendpoint schema.
+        "thinking": m.reasoning is not None,
+        # The schema's own source of truth for the window, beside the derived
+        # split below (which VS Code uses for its own prompt budgeting).
+        "contextWindow": ctx,
         "maxInputTokens": max(ctx - max_out, 0),
         "maxOutputTokens": max_out,
     }
@@ -115,6 +128,16 @@ def render_vscode(
         groups = []
 
     entries: list[dict[str, Any]] = []
+    main_models = [m for m in registry.models.values() if m.slot == "main"]
+    if main_models:
+        # First in the list, so it is the obvious pick: "whatever is serving".
+        # Every other entry names one model and 503s whenever the card holds a
+        # different one.
+        # The narrowest main context (see _slot_ctx): whichever model is
+        # serving, a prompt sized against this fits.
+        ctx = _slot_ctx(registry, resolve_ctx)
+        narrowest = min(main_models, key=resolve_ctx)
+        entries.append(_vscode_entry(_MAIN_ROUTE, narrowest, ctx))
     for m in registry.models.values():
         ctx = resolve_ctx(m)
         entries.append(_vscode_entry(m.id, m, ctx))
@@ -163,7 +186,13 @@ def _find_top_level_section(text: str, header: str) -> tuple[int, int] | None:
         return None
     end = len(lines)
     for j in range(start + 1, len(lines)):
-        if lines[j].startswith("["):
+        # ANY comment below the table ends its span, ours included. A foreign
+        # comment belongs to whatever comes next, so ending the span at the
+        # next "[" swallowed it and every `wire --apply` silently deleted the
+        # operator's notes between two tables; and swallowing OUR OWN marker
+        # un-owned the table below it, which is why retiring the Codex
+        # profiles removed only alternate ones. Both found 2026-09-18.
+        if lines[j].startswith("[") or lines[j].lstrip().startswith("#"):
             end = j
             break
     start_off = sum(len(l) for l in lines[:start])
@@ -212,6 +241,90 @@ def _upsert_section(
     return text + sep + block
 
 
+#: The gateway name meaning "whatever holds the main slot"
+#: (:data:`servedeck.routes.MAIN_ALIASES`). Client configs name this instead of
+#: a model id, so `servedeck switch` does not strand every client.
+_MAIN_ROUTE = "main"
+
+
+def _slot_ctx(registry: _models.Registry, resolve_ctx: CtxResolver) -> int:
+    """The context to advertise for the main SLOT: the smallest any main model
+    serves, not the largest.
+
+    The slot can be holding any of them, and a client that sized a prompt
+    against GLM's 327,680 while Flash-Next (262,144) is serving gets the
+    request rejected by the engine. Under-promising costs context on the
+    widest model; over-promising costs the request.
+    """
+    lengths = [resolve_ctx(m) for m in registry.models.values() if m.slot == "main"]
+    lengths = [n for n in lengths if n > 0]
+    return min(lengths) if lengths else 0
+
+
+def _upsert_top_level(text: str, data: dict[str, Any]) -> str:
+    """Set top-level keys, which must appear BEFORE the first ``[table]``.
+
+    An owned key already present is replaced in place (wherever it sits, as
+    long as it is above the first table); the rest are inserted at the top of
+    the file under the generated-by comment. Nothing else is touched — a
+    hand-written ``approval_policy`` or ``sandbox_mode`` above the tables stays
+    exactly where it is.
+    """
+    lines = text.splitlines(keepends=True)
+    first_table = next((i for i, l in enumerate(lines) if l.startswith("[")), len(lines))
+    remaining = dict(data)
+    for i in range(first_table):
+        key = lines[i].split("=", 1)[0].strip()
+        if key in remaining:
+            rendered = _render_table_values({key: remaining.pop(key)})
+            lines[i] = rendered + "\n"
+    if remaining:
+        block = f"{_OWNED_COMMENT}\n" + _render_table_values(remaining) + "\n\n"
+        lines.insert(0, block)
+    return "".join(lines)
+
+
+def _remove_sections(text: str, prefix: str) -> str:
+    """Delete every table whose header starts with ``prefix`` AND is preceded
+    by our generated-by comment — tables servedeck wrote and no longer owns.
+
+    An upsert-only generator cannot retire anything: the ``[profiles.<key>]``
+    tables written before 2026-09-18 are the exact reason Codex refuses
+    ``--profile``, so leaving them in place would leave the bug in place.
+    Requiring our own comment above the header is what keeps this from
+    deleting a table the operator wrote by hand.
+    """
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        is_ours = (
+            lines[i].startswith(prefix)
+            and out
+            and out[-1].rstrip("\n") == _OWNED_COMMENT
+        )
+        if not is_ours:
+            out.append(lines[i])
+            i += 1
+            continue
+        out.pop()  # drop our comment too
+        i += 1
+        while i < len(lines):
+            # ANY comment ends the span, our own included: the only comment
+            # inside a table's span is the one directly above its header (the
+            # pop above), and consuming the NEXT table's marker made this
+            # remove alternate tables only — qwen27b and glm53 went, flashnext
+            # and lfm2 stayed, because each removal ate the following marker.
+            if lines[i].startswith("[") or lines[i].lstrip().startswith("#"):
+                break
+            i += 1
+        while out and out[-1].strip() == "":
+            out.pop()
+        if out:
+            out.append("\n")
+    return "".join(out)
+
+
 # --------------------------------------------------------------------------- #
 # Codex — ~/.codex/config.toml
 # --------------------------------------------------------------------------- #
@@ -220,16 +333,27 @@ def _upsert_section(
 def render_codex(
     registry: _models.Registry, existing_text: str, *, resolve_ctx: CtxResolver
 ) -> str:
-    """One ``[model_providers.servedeck]`` and one ``[profiles.<key>]`` per
-    model, keyed by the model's registry key (``codex --profile qwen27b``).
-    Everything else in the file (other providers, other profiles, comments) is
-    left exactly as it was.
+    """``[model_providers.servedeck]`` plus TOP-LEVEL ``model`` /
+    ``model_provider`` / ``model_context_window``, so a bare ``codex`` reaches
+    this box. Everything else in the file is left exactly as it was.
 
-    ``model_max_output_tokens`` is this packet's best-effort reading of
-    ``local_llm/docs/CLIENTS.md``'s "xhigh needs a large max_tokens or you get
-    an EMPTY response" warning — the exact config key this Codex build accepts
-    for that is NOT verified against a running binary (none is installed on
-    this box); see the P1 report's open questions.
+    Two things were wrong here until 2026-09-18, both reproduced against the
+    installed binaries (codex-cli 0.150.1 and 0.154.0-alpha.6.2):
+
+    * The ``[profiles.<key>]`` tables this used to write are REFUSED outright:
+      "--profile `flashnext` cannot be used while config.toml contains legacy
+      `profile = ...` or `[profiles.flashnext]` config; move those settings
+      into <home>/flashnext.config.toml". Per-profile files are the supported
+      shape now, and a profile per model buys little here anyway: one model
+      serves at a time, so the name to select is the SLOT, not a model.
+    * There was no top-level ``model``/``model_provider``, so a bare ``codex``
+      silently used its built-in cloud default — it worked, it cost money, and
+      it left the local box idle while ``servedeck doctor`` reported codex OK.
+
+    The model named is :data:`_MAIN_ROUTE`, the gateway's "whatever holds the
+    main slot" alias, so switching the card does not strand this config.
+    ``model_max_output_tokens`` is gone: neither installed binary knows that
+    key (``strings | grep -c`` is 0 in both), so it was noise.
     """
     text = existing_text
     text = _upsert_section(
@@ -237,12 +361,12 @@ def render_codex(
         "[model_providers.servedeck]",
         {"name": "servedeck", "base_url": f"{GATEWAY_BASE_URL}/v1", "wire_api": "responses"},
     )
-    for key, m in registry.models.items():
-        data: dict[str, Any] = {"model_provider": "servedeck", "model": m.id}
-        if m.max_output_tokens is not None:
-            data["model_max_output_tokens"] = m.max_output_tokens
-        text = _upsert_section(text, f"[profiles.{key}]", data)
-    return text
+    text = _remove_sections(text, "[profiles.")
+    ctx = _slot_ctx(registry, resolve_ctx)
+    top: dict[str, Any] = {"model": _MAIN_ROUTE, "model_provider": "servedeck"}
+    if ctx:
+        top["model_context_window"] = ctx
+    return _upsert_top_level(text, top)
 
 
 # --------------------------------------------------------------------------- #
@@ -300,8 +424,50 @@ def render_kimi(
             "display_name": m.id,
         }
         text = _upsert_section(text, f'[models."servedeck/{key}"]', data)
+
+    # "whatever holds the main slot", and Kimi's default points at it: a
+    # per-model default (servedeck/flashnext) is stale the moment the card is
+    # switched, and the owner then has to edit three client configs to get a
+    # working local model back.
+    main_models = [m for m in registry.models.values() if m.slot == "main"]
+    if main_models:
+        ctx = _slot_ctx(registry, resolve_ctx)
+        caps: list[str] = []
+        for m in main_models:  # the union: any main model may be holding the slot
+            for cap in _kimi_capabilities(m):
+                if cap not in caps:
+                    caps.append(cap)
+        text = _upsert_section(
+            text,
+            f'[models."servedeck/{_MAIN_ROUTE}"]',
+            {
+                "provider": "servedeck",
+                "model": _MAIN_ROUTE,
+                "max_context_size": ctx,
+                "capabilities": caps,
+                "display_name": "servedeck: the model in the main slot",
+            },
+        )
+        text = _set_kimi_default(text, f"servedeck/{_MAIN_ROUTE}")
     text = _merge_thinking_section(text)
     return text
+
+
+def _set_kimi_default(text: str, name: str) -> str:
+    """Point ``default_model`` at ``name`` — but only when it already names a
+    servedeck model or is absent. A cloud default the operator chose on
+    purpose (kimi-code/k3) is theirs to keep."""
+    lines = text.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if line.startswith("["):
+            break
+        key, sep, value = line.partition("=")
+        if sep and key.strip() == "default_model":
+            if "servedeck/" not in value:
+                return text
+            lines[i] = f'default_model = "{name}"\n'
+            return "".join(lines)
+    return f'default_model = "{name}"\n' + text
 
 
 # --------------------------------------------------------------------------- #

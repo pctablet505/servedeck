@@ -50,10 +50,12 @@ def test_vscode_empty_existing_creates_group(registry, resolve_ctx):
     assert data[0]["vendor"] == "customendpoint"
     assert data[0]["apiType"] == "chat-completions"
     ids = [e["id"] for e in data[0]["models"]]
-    # one per id and per preset: 4 base ids + 3 glm53 presets = 7.
+    # The slot first (the stable pick), then one per id and per preset:
+    # 1 + 4 base ids + 3 glm53 presets = 8.
+    assert ids[0] == "main", "the entry that survives a switch is the obvious pick"
     assert ids.count("Qwen3.8-27B-NVFP4") == 1
     assert "glm53-flash-low" in ids and "glm53-flash-high" in ids and "glm53-flash-max" in ids
-    assert len(ids) == 7
+    assert len(ids) == 8
 
 
 def test_vscode_entry_fields(registry, resolve_ctx):
@@ -122,14 +124,23 @@ def test_vscode_idempotent(registry, resolve_ctx):
 # --------------------------------------------------------------------------- #
 
 
-def test_codex_empty_existing_adds_provider_and_profiles(registry, resolve_ctx):
+def test_codex_points_a_bare_codex_at_the_main_slot(registry, resolve_ctx):
+    """Reproduced against codex-cli 0.150.1 and 0.154.0-alpha.6.2 on
+    2026-09-18: [profiles.<key>] tables are REFUSED ("move those settings into
+    <home>/<name>.config.toml"), and with no top-level model/model_provider a
+    bare `codex` silently used its cloud default — working, costing money, and
+    leaving the local box idle while doctor reported codex OK."""
     out = wire.render_codex(registry, "", resolve_ctx=resolve_ctx)
     parsed = tomllib.loads(out)
     assert parsed["model_providers"]["servedeck"]["base_url"] == "http://127.0.0.1:8010/v1"
     assert parsed["model_providers"]["servedeck"]["wire_api"] == "responses"
-    assert set(parsed["profiles"]) == {"qwen27b", "flashnext", "glm53", "lfm2"}
-    assert parsed["profiles"]["qwen27b"]["model"] == "Qwen3.8-27B-NVFP4"
-    assert parsed["profiles"]["qwen27b"]["model_provider"] == "servedeck"
+    # The SLOT, not a model id: one model serves at a time, so a per-model
+    # profile would be stale the moment the card is switched.
+    assert parsed["model"] == "main"
+    assert parsed["model_provider"] == "servedeck"
+    assert parsed["model_context_window"] > 0
+    assert "profiles" not in parsed, "the refused shape must not come back"
+    assert "model_max_output_tokens" not in out, "neither installed binary knows that key"
 
 
 def test_codex_preserves_unrelated_provider_and_its_comments(registry, resolve_ctx):
@@ -154,22 +165,38 @@ def test_codex_rerun_replaces_in_place_without_duplicating(registry, resolve_ctx
     out2 = wire.render_codex(registry, out1, resolve_ctx=resolve_ctx)
     assert out1 == out2
     assert out2.count("[model_providers.servedeck]") == 1
-    assert out2.count("[profiles.qwen27b]") == 1
-    assert out2.count(wire._OWNED_COMMENT) == 1 + 4  # one provider + 4 profiles
+    assert out2.count('model = "main"') == 1
+    # Two owned blocks now: the top-level keys and the provider table.
+    assert out2.count(wire._OWNED_COMMENT) == 2  # one provider + 4 profiles
 
 
-def test_codex_updates_existing_servedeck_profile_when_registry_changes(registry, resolve_ctx):
-    out1 = wire.render_codex(registry, "", resolve_ctx=resolve_ctx)
-    # Change requires a fresh Model with a different max_output_tokens.
+def test_codex_keeps_hand_written_top_level_settings(registry, resolve_ctx):
+    existing = (
+        "# my own preferences\n"
+        'approval_policy = "on-request"\n'
+        'sandbox_mode = "workspace-write"\n'
+    )
+    out = wire.render_codex(registry, existing, resolve_ctx=resolve_ctx)
+    parsed = tomllib.loads(out)
+    assert parsed["approval_policy"] == "on-request"
+    assert parsed["sandbox_mode"] == "workspace-write"
+    assert parsed["model"] == "main"
+    assert "# my own preferences" in out
+
+
+def test_codex_context_window_follows_the_registry(registry, resolve_ctx):
+    """The context Codex plans against must be the served one, not a guess:
+    it is what its own auto-compaction is sized from."""
     import dataclasses
 
-    changed = dataclasses.replace(registry.models["qwen27b"], max_output_tokens=1)
-    new_models = dict(registry.models)
-    new_models["qwen27b"] = changed
-    changed_registry = dataclasses.replace(registry, models=new_models)
-    out2 = wire.render_codex(changed_registry, out1, resolve_ctx=resolve_ctx)
-    parsed = tomllib.loads(out2)
-    assert parsed["profiles"]["qwen27b"]["model_max_output_tokens"] == 1
+    out1 = wire.render_codex(registry, "", resolve_ctx=resolve_ctx)
+    smaller = {m.key: dataclasses.replace(m, ctx=1024) for m in registry.models.values()}
+    out2 = wire.render_codex(
+        dataclasses.replace(registry, models=smaller), out1, resolve_ctx=lambda m: 1024
+    )
+    assert tomllib.loads(out1)["model_context_window"] != 1024
+    assert tomllib.loads(out2)["model_context_window"] == 1024
+    assert out2.count("model_context_window") == 1, "replaced in place, not appended"
 
 
 # --------------------------------------------------------------------------- #
@@ -304,3 +331,100 @@ def test_make_default_ctx_resolver_caches_per_model(tmp_path, monkeypatch, regis
     # Delete the config; a cached resolver must not need to re-read it.
     (snap / "config.json").unlink()
     assert resolver(m) == 12345
+
+
+# --------------------------------------------------------------------------- #
+# 2026-09-18 audit: the reasoning round trip, and wire eating comments
+# --------------------------------------------------------------------------- #
+
+
+def test_vscode_declares_thinking_for_a_reasoning_model(registry, resolve_ctx):
+    """Without `thinking`, VS Code drops reasoning_content when it replays the
+    previous turn and sends its own cot_summary/cot_id, which vLLM ignores —
+    the model reads a multi-turn thread as fresh every turn. That erasure is
+    the measured cause of agent amnesia here, and the gateway's output-side
+    mirror cannot fix it."""
+    out = json.loads(wire.render_vscode(registry, "", resolve_ctx=resolve_ctx))
+    entries = {e["id"]: e for g in out if g["name"] == "servedeck" for e in g["models"]}
+    thinker = registry.models["qwen27b"]
+    assert thinker.reasoning is not None
+    assert entries[thinker.id]["thinking"] is True
+    assert entries[thinker.id]["contextWindow"] == resolve_ctx(thinker)
+    plain = registry.models["lfm2"]
+    assert plain.reasoning is None
+    assert entries[plain.id]["thinking"] is False, "LFM2 has no thinking mode to declare"
+
+
+def test_wire_does_not_eat_a_comment_between_two_tables(registry, resolve_ctx):
+    """Every `wire --apply` silently deleted the operator's own notes: an
+    owned table's span ran to the next "[", absorbing any comment below it."""
+    existing = (
+        "[providers.servedeck]\n"
+        'base_url = "http://127.0.0.1:8010/v1"\n'
+        "\n"
+        "# my own note about the model below — do not delete\n"
+        '[models."something/else"]\n'
+        'provider = "elsewhere"\n'
+    )
+    out = wire.render_kimi(registry, existing, resolve_ctx=resolve_ctx)
+    assert "# my own note about the model below — do not delete" in out
+    assert '[models."something/else"]' in out
+    assert 'provider = "elsewhere"' in out
+
+
+def test_kimi_default_follows_the_slot_not_a_model(registry, resolve_ctx):
+    """A per-model default is stale the moment the card is switched, and the
+    owner then edits three client configs to get a local model back."""
+    out = wire.render_kimi(registry, 'default_model = "servedeck/flashnext"\n', resolve_ctx=resolve_ctx)
+    parsed = tomllib.loads(out)
+    assert parsed["default_model"] == "servedeck/main"
+    entry = parsed["models"]["servedeck/main"]
+    assert entry["model"] == "main" and entry["provider"] == "servedeck"
+    assert "thinking" in entry["capabilities"], "a reasoning model may hold the slot"
+
+
+def test_kimi_keeps_a_cloud_default_the_operator_chose(registry, resolve_ctx):
+    out = wire.render_kimi(registry, 'default_model = "kimi-code/k3"\n', resolve_ctx=resolve_ctx)
+    assert tomllib.loads(out)["default_model"] == "kimi-code/k3"
+    assert 'models."servedeck/main"' in out, "the entry is still offered"
+
+
+def test_codex_retires_the_profile_tables_it_used_to_write(registry, resolve_ctx):
+    """Upsert-only could not retire anything, and the [profiles.<key>] tables
+    written before 2026-09-18 are the exact reason Codex refuses --profile."""
+    legacy = (
+        "# servedeck-generated by `servedeck wire` — edits here are overwritten.\n"
+        "[profiles.qwen27b]\n"
+        'model = "Qwen3.8-27B-NVFP4"\n'
+        "\n"
+        "# servedeck-generated by `servedeck wire` — edits here are overwritten.\n"
+        "[profiles.flashnext]\n"
+        'model_provider = "servedeck"\n'
+        'model = "Qwen3.8-Flash-Next-Uncensored-NVFP4"\n'
+        "\n"
+        "# a profile the operator wrote by hand\n"
+        "[profiles.mine]\n"
+        'model = "something-else"\n'
+    )
+    out = wire.render_codex(registry, legacy, resolve_ctx=resolve_ctx)
+    parsed = tomllib.loads(out)
+    assert "flashnext" not in parsed.get("profiles", {}), "ours is retired"
+    assert "qwen27b" not in parsed.get("profiles", {}), "every one of ours, not alternate ones"
+    assert parsed["profiles"]["mine"]["model"] == "something-else", "theirs is not"
+    assert "# a profile the operator wrote by hand" in out
+
+
+def test_the_slot_advertises_the_narrowest_main_context(registry, resolve_ctx):
+    """The slot may be holding any main model. A client that sized a prompt
+    against GLM's 327,680 while Flash-Next (262,144) is serving gets the
+    request rejected by the engine, so the smallest is the safe figure."""
+    mains = [m for m in registry.models.values() if m.slot == "main"]
+    smallest = min(resolve_ctx(m) for m in mains)
+    assert smallest < max(resolve_ctx(m) for m in mains), "fixture needs two widths"
+    codex = tomllib.loads(wire.render_codex(registry, "", resolve_ctx=resolve_ctx))
+    assert codex["model_context_window"] == smallest
+    kimi = tomllib.loads(wire.render_kimi(registry, "", resolve_ctx=resolve_ctx))
+    assert kimi["models"]["servedeck/main"]["max_context_size"] == smallest
+    vscode = json.loads(wire.render_vscode(registry, "", resolve_ctx=resolve_ctx))
+    entry = next(e for g in vscode for e in g["models"] if e["id"] == "main")
+    assert entry["contextWindow"] == smallest

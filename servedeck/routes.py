@@ -121,6 +121,12 @@ def make_ctx_resolver(hub_dir: str | None = None) -> CtxResolver:
     return resolve
 
 
+#: Names that mean "whatever holds the main slot", so a client config does not
+#: have to be rewritten every time the card is switched. ``main`` is the
+#: documented one; ``local`` is the habit name from the v1 era.
+MAIN_ALIASES = ("main", "local")
+
+
 class RegistryRoutes:
     """``gateway.RouteTable`` over P1's registry and P3's ``Control``.
 
@@ -252,12 +258,20 @@ class RegistryRoutes:
         return bool(view and view.ready)
 
     def resolve(self, name: str) -> Route | None:
-        """Route for ``name`` — id, alias, preset or registry key — live or not.
+        """Route for ``name`` — id, alias, preset, registry key, or ``main``.
 
         Delegates the name lookup to ``Registry.resolve`` rather than keeping a
         second index: one place decides what a name means, so the gateway and
         ``servedeck doctor`` can never disagree about whether a model exists.
+
+        ``main`` (and ``local``, the habit name) means "whatever holds the main
+        slot". Without it every client config names one model, and switching
+        the card leaves all of them pointing at a model that is no longer
+        serving: the client asks for Flash-Next, the box is running GLM, and
+        the answer is a 503 the operator has to fix in three config files.
         """
+        if name in MAIN_ALIASES:
+            return self.main() or self._main_holder_route()
         found = self.registry.resolve(name)
         if found is None:
             return None
@@ -290,10 +304,20 @@ class RegistryRoutes:
                 return self.route_for(model)
         return None
 
+    def _main_holder_route(self) -> Route | None:
+        """The main-slot model even when nothing is live, so a request for
+        ``main`` on an idle box gets that model's 503 (with its boot state)
+        rather than a 404 that reads as "no such model"."""
+        for model in self.registry.models.values():
+            if model.slot == "main":
+                return self.route_for(model)
+        return None
+
     def known_names(self) -> list[str]:
         """Every name ``resolve`` accepts, for the 404 body: each model's id,
-        its aliases and its presets, in registry order."""
+        its aliases and its presets, in registry order, plus the slot aliases."""
         out: list[str] = []
         for model in self.registry.models.values():
             out.extend(model.served_names())
+        out.extend(MAIN_ALIASES)
         return out
