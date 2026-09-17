@@ -95,10 +95,6 @@ class Observation:
     hi: float
     ts: float
     bucket: int = -1
-    #: True for an observation seeded from the engine's lifetime histogram at
-    #: the dashboard's first scrape (bucket-bounded, never exact) rather than
-    #: watched finishing. Reported as ``seeded_n`` so the page can say so.
-    seeded: bool = False
 
     @property
     def exact(self) -> bool:
@@ -198,7 +194,6 @@ class WindowStats:
     #: True when the window has not yet filled. The UI must say "n of 100",
     #: never pad to 100 and never imply the window is representative.
     partial: bool
-    seeded_n: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         pct = lambda p: None if p is None else p.to_dict()  # noqa: E731
@@ -214,7 +209,6 @@ class WindowStats:
             "p99": pct(self.p99),
             "max": pct(self.peak),
             "partial": self.partial,
-            "seeded_n": self.seeded_n,
         }
 
 
@@ -330,17 +324,9 @@ class RequestWindow:
         self._prev = (list(cum), hist_sum, hist_count)
         self._last_seen = self._prev
         if prev is None:
-            if last_seen is None and not self._obs:
-                # The dashboard's first look at this engine (or at a new
-                # process after clear()). v1 took a baseline only, so every
-                # dashboard restart emptied the picture; on 2026-09-17 ten
-                # restarts left it showing one request. Seed the window
-                # with the engine's lifetime histogram instead — bucket-
-                # bounded, scaled to the window, marked as seeded — and let
-                # real observations replace it from here on.
-                return self._seed(edges, cum, ceiling, now)
-            # No baseline, but the window has history: a scrape failed and
-            # dropped the baseline. Nothing is seeded twice.
+            # First scrape is a baseline only. Counting the whole lifetime
+            # histogram here would fill the "last 100 requests" window with
+            # requests from before the dashboard was even running.
             #
             # But "no baseline" is also what a restart looks like from here:
             # the scrapes that fail while the engine is down drop the
@@ -350,15 +336,13 @@ class RequestWindow:
             # reporting requests served by a process that no longer exists.
             if last_seen is not None and _went_backwards(cum, hist_sum, last_seen):
                 self._obs.clear()
-                return self._seed(edges, cum, ceiling, now)
             return 0
 
         if _went_backwards(cum, hist_sum, prev):
             # Counters went backwards: new engine process. Everything already
-            # in the window belongs to the old one; the new one's (short)
-            # lifetime seeds the picture until its requests are watched.
+            # in the window belongs to the old one.
             self._obs.clear()
-            return self._seed(edges, cum, ceiling, now)
+            return 0
 
         prev_cum, prev_sum, _prev_count = prev
         total_new = int(round(cum[-1] - prev_cum[-1]))
@@ -491,38 +475,6 @@ class RequestWindow:
             ],
         }
 
-    def _seed(
-        self, edges: list[float], cum: list[float], ceiling: float | None, now: float
-    ) -> int:
-        """Fill the window from a cumulative histogram, keeping its shape."""
-        counts: list[int] = []
-        for i in range(len(cum)):
-            below = cum[i - 1] if i else 0.0
-            counts.append(max(0, int(round(cum[i] - below))))
-        total = sum(counts)
-        if total <= 0:
-            return 0
-        want = min(total, self._maxlen)
-        # Largest-remainder scaling: the seeded picture sums to `want` and
-        # keeps each bucket's share.
-        raw = [c * want / total for c in counts]
-        take = [int(x) for x in raw]
-        short = want - sum(take)
-        for i in sorted(range(len(raw)), key=lambda k: raw[k] - take[k], reverse=True)[:short]:
-            take[i] += 1
-        for i, d in enumerate(take):
-            if d <= 0:
-                continue
-            lo = float(MIN_PROMPT_TOKENS) if i == 0 else edges[i - 1] + 1.0
-            hi = edges[i]
-            if hi == math.inf and ceiling is not None:
-                hi = float(ceiling)
-            if hi < lo:
-                hi = lo
-            for _ in range(d):
-                self._obs.append(Observation(lo=lo, hi=hi, ts=now, bucket=i, seeded=True))
-        return want
-
     def stats(self) -> WindowStats:
         obs = list(self._obs)
         n = len(obs)
@@ -546,7 +498,6 @@ class RequestWindow:
             n=n,
             capacity=self._maxlen,
             exact_n=sum(1 for o in obs if o.exact),
-            seeded_n=sum(1 for o in obs if o.seeded),
             age_s=max(0.0, time.time() - oldest),
             buckets=self._bars(obs),
             fine=self._fine(obs),
