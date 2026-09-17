@@ -23,11 +23,12 @@ editor an hour later." Four kinds of check, each yielding one or more
    ``/run/user/<uid>/systemd/transient`` and are enumerated with
    ``systemctl --user list-units``, never as files in that directory — a
    file-existence check there can never pass after the cutover.
-5. the two host-state checks that survived ``preflight.py``: no training
-   marker claims the GPU, and ``ptrace_scope`` is 0 for any model that
-   declares ``needs_tty``. Both are about the HOST, not about a model's
-   configuration, which is why neither had anywhere else to go when
-   ``preflight.py`` was deleted.
+5. host state, which is about the machine rather than about a model's
+   configuration and so had nowhere else to go when ``preflight.py`` was
+   deleted: no training marker claims the GPU, ``kernel.yama.ptrace_scope``
+   is 0, every wanted model has a unit, every registry checkpoint is in the
+   local hub cache, no orphaned KV-offload buffer is holding host RAM, and
+   the GPU's power cap is what ``models.toml`` expects (when it says).
 
 All network access is a plain ``httpx.get`` with a 2 s timeout, injectable via
 ``http_get`` so tests never need a real server — except the two tests that are

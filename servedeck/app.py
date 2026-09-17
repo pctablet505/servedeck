@@ -474,7 +474,6 @@ async def build_state(rt: Runtime) -> dict[str, Any]:
             "build": model.build,
             "repo": model.repo,
             "vram_mib": model.vram_mib,
-            "needs_tty": model.needs_tty,
             "live": view is not None,
             "ready": bool(view and view.ready),
             "unit": view.unit if view else f"{rt.settings.unit_prefix}{key}",

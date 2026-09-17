@@ -420,3 +420,24 @@ def test_the_live_main_model_publishes_the_slot_aliases(routes) -> None:
     # Not on a model that is merely registered: the slot is held by one model.
     other = routes.resolve("Other-Main")
     assert "main" not in other.aliases
+
+
+def test_the_client_compatibility_switches_reach_the_route(tmp_path) -> None:
+    """models.toml declares them, models.py parses them, glm_policies reads
+    them off RoutePolicies — and route_for, the only place production builds
+    one, did not set them, so all three were inert (found 2026-09-18)."""
+    path = tmp_path / "models.toml"
+    path.write_text(
+        '[gpu]\ntotal_mib = 100000\nmargin_mib = 1024\n'
+        '[builds.stock]\nvenv = "/opt/v"\ncuda_home = "/opt/cuda"\n'
+        '[models.g]\nid = "G"\nrepo = "org/g"\nslot = "main"\nport = 8002\nbuild = "stock"\n'
+        'ctx = 4096\nsanitize_tool_tags = true\nrestore_reasoning = true\ncapture = true\n'
+    )
+    routes_obj = RegistryRoutes(_models.load(path), FakeControl())
+    pol = routes_obj.resolve("G").policies
+    assert pol.sanitize_tool_tags and pol.restore_reasoning and pol.capture
+
+
+def test_a_model_that_declares_none_of_them_gets_none_of_them(routes) -> None:
+    pol = routes.resolve("Big-Model").policies
+    assert not pol.sanitize_tool_tags and not pol.restore_reasoning and not pol.capture

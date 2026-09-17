@@ -257,6 +257,16 @@ class RegistryRoutes:
                 effort_overlay=overlay,
                 min_output_tokens=model.min_output_tokens,
                 ctx=self.ctx_for(model),
+                # The three client-compatibility switches. They were declared
+                # in models.toml, parsed by models.py and read by
+                # glm_policies — and never set here, which is the only place
+                # a production RoutePolicies is built, so all three were inert
+                # (found 2026-09-18 while documenting them). GLM's tool-tag
+                # repair is on by default in the registry precisely because
+                # the leak it fixes breaks a client's tool call outright.
+                sanitize_tool_tags=model.sanitize_tool_tags,
+                restore_reasoning=model.restore_reasoning,
+                capture=model.capture,
             ),
         )
 

@@ -135,7 +135,7 @@ max_output_tokens = 32000
 # EXTRA_ARGS of local_llm/.config:85. `--kv-offloading-size 40` parks evicted
 # contexts in 40 GiB of pinned host RAM (measured: a 35k-token context comes
 # back in 0.36 s vs 3.78 s of prefill; decode unchanged). It needs the fork
-# patch builds/patches/qwen38next/flashnext-kv-offload-skip-qsa-ring.patch,
+# patch builds/patches/flashnext-kv-offload-skip-qsa-ring.patch,
 # without which the engine asserts on the QSA ring group. `--prefix-match-unit`
 # was dropped (measured inert, and 208 does not divide the ring's 8-token block).
 flags = [
