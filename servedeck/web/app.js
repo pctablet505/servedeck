@@ -2177,7 +2177,16 @@ async function init() {
   es.addEventListener("telemetry", (ev) => paintTelemetry(JSON.parse(ev.data)));
   es.addEventListener("notice", (ev) => {
     const n = JSON.parse(ev.data);
-    log(n.body || n.code, n.level === "warn" ? "w" : "e");
+    const bad = n.level === "error" && !n.replay;
+    log(n.body || n.code, n.level === "warn" ? "w" : n.level === "error" ? "e" : "g");
+    // A refused or failed action must never be silent. On 2026-09-17 an
+    // Apply & restart was refused and the only trace went into the folded
+    // log; the owner saw nothing happen. An error unfolds the log.
+    const panel = $("logPanel");
+    if (bad && panel && panel.classList.contains("folded")) {
+      const f = $("logFold");
+      if (f) f.click();
+    }
   });
   // The page used to ALSO poll /api/state every 5 s on top of this stream,
   // which already pushes a state event on that same interval. Two sources for

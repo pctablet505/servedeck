@@ -824,10 +824,11 @@ def register(app: FastAPI, rt: Any) -> None:
         holder = _app._main_holder(rt, rt.routes.live())
         model = rt.registry.models[key]
         if holder is not None and model.slot == "main":
-            label, verb = f"switch {key}", "switch"
+            same = holder == key
+            label, verb = (f"restart {key}", "switch") if same else (f"switch {key}", "switch")
             work = lambda: rt.control.switch(  # noqa: E731
                 key, on_progress=_app._progress_publisher(rt.hub, key, rt.boot),
-                util=util, argv_overrides=argv,
+                util=util, argv_overrides=argv, relaunch=same,
             )
         else:
             label, verb = f"start {key}", "start"

@@ -1082,6 +1082,7 @@ class Control:
         on_progress: ProgressCallback | None = None,
         util: float | None = None,
         argv_overrides: Mapping[str, str | None] | None = None,
+        relaunch: bool = False,
     ) -> SwitchResult | Refusal:
         """Replace whatever holds the main slot with ``key``.
 
@@ -1119,7 +1120,11 @@ class Control:
         waited = 0.0
         free_after = self._free_mib()
 
-        if holder is not None and holder.key != key:
+        # relaunch=True (2026-09-17): the page's "Apply & restart" on the model
+        # that already holds the slot, with new util/context/agents/offload.
+        # Without it this branch refused "already holds the main slot", the
+        # POST was accepted, and nothing restarted.
+        if holder is not None and (holder.key != key or relaunch):
             result = self.stop(holder.key)
             if isinstance(result, Refusal):
                 return result

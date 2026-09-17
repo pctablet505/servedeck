@@ -134,3 +134,11 @@ def test_the_nesting_is_the_intended_tree() -> None:
     assert at['id="trafficPanel"'] == 1 and at['id="logPanel"'] == 1
     assert at['class="col"'] == 2
     assert at['class="vram"'] == at['class="alloc"'] + 1
+
+
+
+def test_an_error_notice_unfolds_the_log() -> None:
+    """A refusal written only into a folded log is a silent failure."""
+    handler = APP_JS.split('addEventListener("notice"')[1].split("});")[0]
+    assert 'n.level === "error"' in handler and "logFold" in handler and ".click()" in handler
+    assert "n.replay" in handler, "replayed history on page load must not pop the log open"

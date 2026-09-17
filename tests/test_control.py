@@ -1477,3 +1477,35 @@ def test_reconcile_leaves_an_adopted_desired_main_alone(tmp_path) -> None:
     c._save_desired(c.load_desired().with_main("flashnext"))
     rec = c.reconcile()
     assert rec.already_live == ["flashnext"] and rec.started == [] and systemd.started == []
+
+
+
+def test_switch_to_the_running_model_refuses_unless_relaunch(tmp_path) -> None:
+    """2026-09-17: the page's Apply & restart on the running model was a
+    switch to itself, refused as already_live — accepted by the API, and
+    nothing restarted. relaunch=True stops, waits for the card, and starts."""
+    systemd = FakeSystemd()
+    systemd.add("model-flashnext", main_pid=1000)
+    free_readings = [1344, 1344, 80000, 80000, 80000, 80000]
+    ctl = make_control(
+        systemd, FakeRegistry(BIG27, FLASH), tmp_path, free=(1344,),
+        used=lambda: {1000: 90000}, cgroup_pids=lambda unit: [1000],
+        probe=lambda port: ["Qwen3.8-Flash-Next"] if port == 8001 else None,
+    )
+    refused = ctl.switch("flashnext")
+    assert isinstance(refused, Refusal) and refused.reason == "already_live"
+    assert systemd.started == [], "without relaunch nothing is touched"
+
+    ctl = make_control(
+        systemd, FakeRegistry(BIG27, FLASH), tmp_path, free=tuple(free_readings),
+        used=lambda: {1000: 90000}, cgroup_pids=lambda unit: [1000],
+        probe=lambda port: ["Qwen3.8-Flash-Next"] if port == 8001 else None,
+    )
+    result = ctl.switch("flashnext", relaunch=True,
+                        argv_overrides={"--max-num-seqs": "4"})
+    assert not isinstance(result, Refusal)
+    assert result.stopped is not None and result.stopped.key == "flashnext"
+    assert result.released
+    assert not isinstance(result.started, Refusal)
+    launched = " ".join(systemd.started[-1])
+    assert "--max-num-seqs 4" in launched, "the new setting reaches the relaunch"
