@@ -527,8 +527,9 @@ def test_a_wide_axis_from_an_interval_widens_the_bars_too() -> None:
     st = win.stats()
     assert st.exact_n == 100
     assert st.fine["step"] >= 2000 and len(st.fine["bins"]) <= 20
-    # one request the engine only bounded to (100k, ceiling]
-    count += 1; total += 150000
+    # two requests in one poll that the engine only bounded to (100k, ceiling]
+    # (two, because a single new request is made exact from delta(_sum))
+    count += 2; total += 300000
     win.observe([(1000.0, 0), (10000.0, 0), (20000.0, 0), (50000.0, 100), (100000.0, 100), (math.inf, count)],
                 hist_sum=total, hist_count=count, ceiling=262144, ts=300.0)
     st = win.stats()
