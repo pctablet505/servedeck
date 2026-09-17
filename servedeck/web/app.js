@@ -1823,6 +1823,16 @@ function paintState(s) {
   // one-directional: util was read back but the agent count never was, so the
   // "Parallel agents" field showed 1 against a server running 8, and the
   // recommendation column below it disagreed with the input above it.
+  // Nothing running: start from the utilisation this model is PROVEN at
+  // (models.toml `util`), not from the page-wide default. Otherwise Apply on
+  // an idle card launches at whatever the page happened to show.
+  const pinned = MODELS[sel] && MODELS[sel].util_pinned;
+  if (!userPicked && !liveFacts.util_effective && pinned && Math.abs(pinned - util) > 0.002) {
+    util = pinned;
+    const up = $("util");
+    if (up) up.value = String(Math.round(util * 100));
+    estimate();
+  }
   if (!userPicked && liveFacts.util_effective && Math.abs(liveFacts.util_effective - util) > 0.002) {
     util = liveFacts.util_effective;
     const u = $("util");

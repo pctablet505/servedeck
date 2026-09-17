@@ -110,6 +110,22 @@ class Model:
     env: dict[str, str] = field(default_factory=dict)
     presets: dict[str, dict[str, Any]] = field(default_factory=dict)
     vram_mib: int | None = None  # resident slot only
+    #: The GPU utilisation this model is PROVEN to serve at on this card, from
+    #: the launcher that ran it (main slot only; a resident derives its own
+    #: from ``vram_mib``). Without it, a plain start hands the model whatever
+    #: the free-VRAM arithmetic yields — 0.98 on an idle card, which boots and
+    #: then dies of CUDA OOM under concurrency (measured 2026-09-03), while
+    #: Flash-Next has only ever been run at 0.96 and the 27B at 0.95. It is a
+    #: ceiling, not a target: ``control.compute_util`` refuses rather than
+    #: quietly launching at a lower utilisation than the proven one.
+    util: float | None = None
+    #: Bytes of KV cache this model needs per context token, when the engine
+    #: has to be told explicitly (``--kv-cache-memory-bytes``). GLM's launcher
+    #: derived it as MAX_LEN * 17200 at launch time (serve-opt.sh:315); the
+    #: registry used to pin the PRODUCT instead, so moving the context control
+    #: left the KV cap sized for the old length and vLLM refused to start
+    #: after a six-minute load. Derived here, the two can never disagree.
+    kv_cache_bytes_per_token: int | None = None
     min_output_tokens: int | None = None
     max_output_tokens: int | None = None
     vision: bool = False
@@ -213,6 +229,20 @@ class Resolved:
 # --------------------------------------------------------------------------- #
 
 
+def _as_util(raw: Mapping[str, Any], key: str) -> float | None:
+    """``util`` as a fraction in (0, 1]. A typo here would be a launch at a
+    utilisation nobody chose, so it is refused at load time."""
+    value = raw.get("util")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RegistryError(f"models.{key}.util must be a number, got {value!r}")
+    out = float(value)
+    if not 0.0 < out <= 1.0:
+        raise RegistryError(f"models.{key}.util must be in (0, 1], got {out}")
+    return out
+
+
 def _as_str_tuple(value: Any, where: str) -> tuple[str, ...]:
     if value is None:
         return ()
@@ -300,6 +330,12 @@ def _load_model(key: str, raw: dict[str, Any], defaults_env: dict[str, str]) -> 
         env=merged_env,
         presets=presets,
         vram_mib=int(vram_mib) if vram_mib is not None else None,
+        util=_as_util(raw, key),
+        kv_cache_bytes_per_token=(
+            int(raw["kv_cache_bytes_per_token"])
+            if raw.get("kv_cache_bytes_per_token") is not None
+            else None
+        ),
         min_output_tokens=raw.get("min_output_tokens"),
         max_output_tokens=raw.get("max_output_tokens"),
         vision=bool(raw.get("vision", False)),
@@ -491,6 +527,10 @@ def render_argv(
         argv += ["--reasoning-parser", model.reasoning.parser]
     argv += ["--max-model-len", str(ctx_tokens)]
     argv += ["--gpu-memory-utilization", f"{util:.2f}"]
+    if model.kv_cache_bytes_per_token:
+        # Derived from the SAME ctx the engine is given, so the cap always
+        # matches the context (see the field's docstring).
+        argv += ["--kv-cache-memory-bytes", str(ctx_tokens * model.kv_cache_bytes_per_token)]
     argv += ["--port", str(port)]
     argv += list(model.flags)
     return argv

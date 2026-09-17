@@ -409,25 +409,31 @@ def test_a_resident_whose_budget_does_not_fit_is_refused(tmp_path) -> None:
     arithmetic notices the budget does not fit. Without this the unit
     launches, vLLM asks for 3.3 GiB of a card with 2 GiB free, and the failure
     arrives minutes later as a CUDA OOM in journald with no mention of the
-    number that was wrong."""
-    ctl = make_control(FakeSystemd(), FakeRegistry(LFM2), tmp_path, free=(4000,), margin=1024)
-    refusal = ctl.compute_util(LFM2)  # budget 3300, available 4000-1024 = 2976
+    number that was wrong.
+
+    What it is charged is its DERIVED allocation plus its own CUDA-context
+    cushion — not its budget plus the global margin, which is the main
+    model's cushion and is already spent (see the test below)."""
+    ctl = make_control(FakeSystemd(), FakeRegistry(LFM2), tmp_path, free=(3000,), margin=1024)
+    refusal = ctl.compute_util(LFM2)  # needs ceil(100000*0.03)=3000 + 512
     assert isinstance(refusal, Refusal) and refusal.reason == "not_enough_vram"
-    assert "3300" in refusal.message and "2976" in refusal.message
+    assert "3000" in refusal.message and "512" in refusal.message
 
 
-def test_a_resident_that_exactly_fits_is_allowed(tmp_path) -> None:
-    """The boundary, so the guard is `>` and not `>=`: a budget equal to what
-    is available is fundable, and refusing it would make the margin count
-    twice."""
+def test_a_resident_starts_beside_a_main_model_that_took_the_margin(tmp_path) -> None:
+    """The resident exists to run co-resident with a big model, which is the
+    one case the old arithmetic refused: 3,300 MiB budget with 3,735 MiB free
+    was "not enough VRAM" while its real allocation is 3,000 MiB and v1 ran it
+    there (its unit header records ~0.6 GiB of slack at util 0.03).
+    Regression found by the 2026-09-18 audit."""
     ctl = make_control(FakeSystemd(), FakeRegistry(LFM2), tmp_path,
-                       free=(3300 + 1024,), margin=1024)
+                       free=(3735,), margin=1024)
     assert ctl.compute_util(LFM2) == 0.03
 
 
 def test_start_refuses_a_resident_that_does_not_fit(tmp_path) -> None:
     systemd = FakeSystemd()
-    ctl = make_control(systemd, FakeRegistry(LFM2), tmp_path, free=(4000,))
+    ctl = make_control(systemd, FakeRegistry(LFM2), tmp_path, free=(2000,))
     assert isinstance(ctl.start("lfm2"), Refusal)
     assert systemd.started == []
 
@@ -1250,11 +1256,12 @@ def test_reconcile_does_not_start_registry_residents_by_default(tmp_path) -> Non
 # --------------------------------------------------------------------------
 
 
-def test_desired_roundtrips_as_version_2(tmp_path) -> None:
+def test_desired_roundtrips_as_the_current_schema(tmp_path) -> None:
     path = tmp_path / "desired.json"
     desired_mod.save(Desired(main="flashnext", residents=["lfm2"]), path)
     assert json.loads(path.read_text()) == {
-        "version": 2,
+        "version": 3,
+        "launch": {},
         "main": "flashnext",
         "residents": ["lfm2"],
     }
@@ -1286,7 +1293,7 @@ def test_migration_rewrites_the_v1_file_once_and_keeps_the_original(tmp_path) ->
     """Reading must not destroy the rollback, and must not re-warn on every
     poll either (30 warnings a minute on 2026-09-17, because nothing ever
     wrote v2 unless an operator action changed the set). The first read
-    rewrites desired.json as schema 2 and keeps the verbatim v1 body beside
+    rewrites desired.json as the current schema and keeps the verbatim v1 body beside
     it as desired.json.v1, which is what the cutover's rollback restores."""
     path = tmp_path / "desired.json"
     body = json.dumps({
@@ -1294,7 +1301,7 @@ def test_migration_rewrites_the_v1_file_once_and_keeps_the_original(tmp_path) ->
     })
     path.write_text(body)
     assert desired_mod.load(path) == Desired(main="inline", residents=[])
-    assert json.loads(path.read_text())["version"] == 2
+    assert json.loads(path.read_text())["version"] == desired_mod.SCHEMA_VERSION
     assert (tmp_path / "desired.json.v1").read_text() == body
     assert desired_mod.load(path) == Desired(main="inline", residents=[])
     assert (tmp_path / "desired.json.v1").read_text() == body, "a second read leaves the v1 copy alone"
@@ -1329,6 +1336,59 @@ def test_save_is_atomic_and_leaves_no_temp_files(tmp_path) -> None:
     desired_mod.save(Desired(main="b"), path)
     assert [p.name for p in tmp_path.iterdir()] == ["desired.json"]
     assert desired_mod.load(path).main == "b"
+
+
+def test_a_v2_file_gains_the_launch_block_in_place(tmp_path) -> None:
+    """v2 -> v3 is additive, and it must be written back: a file left at the
+    old version is re-migrated on every poll (the v1 mistake of 2026-09-17)."""
+    path = tmp_path / "desired.json"
+    path.write_text(json.dumps({"version": 2, "main": "flashnext", "residents": []}))
+    assert desired_mod.load(path) == Desired(main="flashnext", residents=[])
+    written = json.loads(path.read_text())
+    assert written["version"] == 3 and written["launch"] == {}
+
+
+def test_launch_settings_survive_a_roundtrip(tmp_path) -> None:
+    """The allocator's values are what a reboot must repeat."""
+    path = tmp_path / "desired.json"
+    launch = desired_mod.Launch(util=0.96, argv={"--max-num-seqs": "16", "--kv-offloading-size": None})
+    desired_mod.save(Desired(main="flashnext", launch={"flashnext": launch}), path)
+    back = desired_mod.load(path)
+    assert back.launch_for("flashnext") == launch
+    assert back.launch_for("glm53") == desired_mod.Launch(), "an unset model has no stored launch"
+
+
+def test_a_ready_start_records_the_operators_settings_and_a_plain_one_does_not(tmp_path) -> None:
+    """Found 2026-09-18: the page's allocator was write-only. util, context,
+    agent count and KV offload lived in the argv of a running process and
+    nowhere else, so the next restart or reboot relaunched at the registry
+    defaults with util recomputed from free VRAM (0.98 on an idle card)."""
+    systemd = FakeSystemd()
+    ctl = make_control(systemd, FakeRegistry(FLASH), tmp_path, free=(94587,),
+                       probe=lambda port: ["Qwen3.8-Flash-Next"] if port == 8001 else None)
+    result = ctl.start("flashnext", util=0.96, argv_overrides={"--max-num-seqs": "8"})
+    assert not isinstance(result, Refusal) and result.ready
+    stored = desired_mod.load(tmp_path / "desired.json").launch_for("flashnext")
+    assert stored == desired_mod.Launch(util=0.96, argv={"--max-num-seqs": "8"})
+
+    systemd.units.clear()
+    plain = ctl.start("flashnext")
+    assert not isinstance(plain, Refusal)
+    after = desired_mod.load(tmp_path / "desired.json").launch_for("flashnext")
+    assert after == stored, "a plain start keeps the last applied settings, it does not invent any"
+
+
+def test_reconcile_relaunches_with_the_stored_settings(tmp_path) -> None:
+    """Reboot behaviour: what the operator applied is what comes back."""
+    systemd = FakeSystemd()
+    ctl = make_control(systemd, FakeRegistry(FLASH), tmp_path, free=(94587,),
+                       probe=lambda port: ["Qwen3.8-Flash-Next"] if port == 8001 else None)
+    want = Desired(main="flashnext",
+                   launch={"flashnext": desired_mod.Launch(util=0.90, argv={"--max-num-seqs": "4"})})
+    ctl.reconcile(want)
+    command = systemd.started[0][systemd.started[0].index("--") + 1:]
+    assert float(command[command.index("--gpu-memory-utilization") + 1]) == 0.90
+    assert command[command.index("--max-num-seqs") + 1] == "4"
 
 
 def test_residents_are_deduplicated_on_read_and_on_add(tmp_path) -> None:

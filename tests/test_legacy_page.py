@@ -335,3 +335,61 @@ def test_a_second_apply_while_one_is_in_flight_is_refused(tmp_path) -> None:
         release.set()
         _app._main_holder = orig
     assert calls == ["a"], f"the model was restarted {len(calls)}x"
+
+
+# --------------------------------------------------------------------------
+# A pinned context is a ceiling (2026-09-18 audit)
+# --------------------------------------------------------------------------
+
+
+def test_a_launch_above_the_pinned_context_is_refused(tmp_path) -> None:
+    """GLM's registry ctx (327,680) is the validated VRAM ceiling on this
+    card; its checkpoint claims 1,048,576. The page defaulted to the
+    checkpoint's number, so EVERY page launch of GLM asked vLLM for a KV cache
+    3.2x the size that fits — and the refusal arrived minutes into a 181 GiB
+    load naming KV bytes, not the control that was moved."""
+    from fastapi.testclient import TestClient
+    from servedeck import app as _app
+    from servedeck.settings import Settings
+
+    class Ctl:
+        def live(self):
+            return []
+        def adopt(self, **_kw):
+            return None
+        def reconcile(self, *_a, **_kw):
+            return None
+
+    reg = _registry(tmp_path)  # model "a" pins ctx = 4096
+    settings = Settings(listen_host="127.0.0.1", listen_port=8099, models_path=tmp_path / "models.toml",
+                        state_dir=tmp_path / "state", unit_prefix="sd-test-")
+    app = _app.create_app(settings, registry=reg, control=Ctl(), reconcile=False, poll=False)
+    with TestClient(app) as c:
+        r = c.post("/api/server/start", json={"repo_id": "org/A", "ctx": 8192})
+        assert r.status_code == 409
+        assert "4,096" in r.json()["error"] and "8,192" in r.json()["error"]
+        # At or below the ceiling it is accepted (this stub control returns None).
+        assert c.post("/api/server/start", json={"repo_id": "org/A", "ctx": 4096}).status_code == 202
+
+
+def test_the_estimate_never_offers_more_context_than_the_registry_pins(tmp_path) -> None:
+    reg = _registry(tmp_path)
+    out = lp.estimate_payload(
+        repo_id="org/A", util=0.9, ctx=4096, seqs=1, model=reg.models["a"], entries=[],
+        own_pids=[], ptrace_scope=0, state="READY",
+    )
+    assert out["ctx_max_model"] <= 4096, "a pinned ctx is a ceiling, not a suggestion"
+
+
+def test_the_offload_field_cannot_offer_more_than_dev_shm_holds(tmp_path, monkeypatch) -> None:
+    """/dev/shm is where vLLM puts the buffer, and it is a fixed-size tmpfs.
+    A value MemAvailable allows but the tmpfs cannot hold fails minutes into a
+    boot with a short write instead of at Apply time."""
+    reg = _registry(tmp_path)
+    monkeypatch.setattr(lp, "host_ram", lambda: {"available_gib": 200.0, "total_gib": 256.0})
+    monkeypatch.setattr(lp, "shm_free_gib", lambda path="/dev/shm": 12.0)
+    out = lp.estimate_payload(
+        repo_id="org/A", util=0.9, ctx=4096, seqs=1, model=reg.models["a"], entries=[],
+        own_pids=[], ptrace_scope=0, state="READY",
+    )
+    assert out["offload_max_gib"] == 11, "12 GiB of tmpfs, less 1 GiB of slack"

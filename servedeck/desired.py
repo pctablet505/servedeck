@@ -1,7 +1,11 @@
 """Desired state — the one thing servedeck remembers across restarts
 (REDESIGN-2026-09-12.md §2.2).
 
-    {"version": 2, "main": "flashnext" | null, "residents": ["lfm2"]}
+    {"version": 3, "main": "flashnext" | null, "residents": ["lfm2"],
+     "launch": {"flashnext": {"util": 0.96,
+                              "argv": {"--max-model-len": "262144",
+                                       "--max-num-seqs": "16",
+                                       "--kv-offloading-size": "40"}}}}
 
 That is the whole schema. Not a mirror of what is running — *what an operator
 last explicitly asked for*. It is written only by ``control.start`` /
@@ -9,6 +13,16 @@ last explicitly asked for*. It is written only by ``control.start`` /
 from a probe, because a model that crashed must stay "desired" so reconcile
 brings it back, and a model an operator stopped must stay stopped even though
 adopting a stray unit would otherwise silently re-desire it.
+
+``launch`` (v3, 2026-09-18) is the second thing an operator asks for: the
+values they applied on the page. Without it the allocator was write-only —
+the tuned utilisation, context, agent count and KV-offload size lived in the
+argv of a running process and nowhere else, so the next servedeck restart or
+reboot relaunched the model at the registry defaults with the utilisation
+recomputed from free VRAM (0.98 on an idle card, the value with the known
+OOM-under-concurrency history) and nothing said so. Written only after a
+launch that actually became ready, so a configuration that fails to boot is
+never the one a reboot repeats.
 
 v1 (``{"version": 1, "desired_state": "RUNNING", "backend": "inline", "port":
 8004, "util": 0.91, ...}``) described a single server with its launch flags
@@ -28,11 +42,36 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__all__ = ["Desired", "SCHEMA_VERSION", "load", "save", "default_path"]
+__all__ = ["Desired", "Launch", "SCHEMA_VERSION", "load", "save", "default_path"]
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+
+@dataclass(frozen=True)
+class Launch:
+    """The settings one model was last launched READY with.
+
+    ``argv`` holds whole flags (``{"--max-num-seqs": "16"}``) rather than named
+    fields, so a control the page grows tomorrow persists without a schema
+    change; ``None`` as a value means "remove this flag", exactly as
+    ``control.apply_argv_overrides`` reads it.
+    """
+
+    util: float | None = None
+    argv: dict[str, str | None] = field(default_factory=dict)
+
+    def to_json(self) -> dict[str, object]:
+        out: dict[str, object] = {}
+        if self.util is not None:
+            out["util"] = self.util
+        if self.argv:
+            out["argv"] = dict(self.argv)
+        return out
+
+    def __bool__(self) -> bool:
+        return self.util is not None or bool(self.argv)
 
 
 @dataclass
@@ -41,24 +80,44 @@ class Desired:
 
     main: str | None = None
     residents: list[str] = field(default_factory=list)
+    #: Per-model launch settings from the last ready boot; see :class:`Launch`.
+    launch: dict[str, Launch] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, object]:
         return {
             "version": SCHEMA_VERSION,
             "main": self.main,
             "residents": list(self.residents),
+            "launch": {k: v.to_json() for k, v in sorted(self.launch.items()) if v},
         }
 
+    def _copy(self, **changes: object) -> "Desired":
+        out = Desired(main=self.main, residents=list(self.residents), launch=dict(self.launch))
+        for name, value in changes.items():
+            setattr(out, name, value)
+        return out
+
     def with_main(self, key: str | None) -> "Desired":
-        return Desired(main=key, residents=list(self.residents))
+        return self._copy(main=key)
 
     def with_resident(self, key: str) -> "Desired":
         if key in self.residents:
-            return Desired(main=self.main, residents=list(self.residents))
-        return Desired(main=self.main, residents=[*self.residents, key])
+            return self._copy()
+        return self._copy(residents=[*self.residents, key])
 
     def without_resident(self, key: str) -> "Desired":
-        return Desired(main=self.main, residents=[k for k in self.residents if k != key])
+        return self._copy(residents=[k for k in self.residents if k != key])
+
+    def with_launch(self, key: str, launch: Launch) -> "Desired":
+        merged = dict(self.launch)
+        if launch:
+            merged[key] = launch
+        else:
+            merged.pop(key, None)
+        return self._copy(launch=merged)
+
+    def launch_for(self, key: str) -> Launch:
+        return self.launch.get(key, Launch())
 
 
 def default_path() -> Path:
@@ -109,6 +168,16 @@ def load(path: str | os.PathLike[str] | None = None) -> Desired:
         return Desired()
 
     version = raw.get("version")
+    if version == 2:
+        # v2 -> v3 is purely additive (no `launch` block means "no settings
+        # recorded yet"), so it migrates silently and in place: a file left at
+        # the old version would be re-read and re-migrated on every poll.
+        migrated = _parse(raw)
+        try:
+            save(migrated, target)
+        except OSError as exc:
+            log.warning("%s: could not persist the v3 migration (%s)", target, exc)
+        return migrated
     if version == 1:
         migrated = _from_v1(raw, str(target))
         # Migrate in place, once. Left as v1 on disk, every poll re-read and
@@ -134,6 +203,12 @@ def load(path: str | os.PathLike[str] | None = None) -> Desired:
         )
         return Desired()
 
+    return _parse(raw)
+
+
+def _parse(raw: dict[str, object]) -> Desired:
+    """The v2/v3 body. Every field degrades to its empty value rather than
+    raising: this file must never be the reason servedeck will not start."""
     main = raw.get("main")
     if not isinstance(main, str) or not main:
         main = None
@@ -143,7 +218,26 @@ def load(path: str | os.PathLike[str] | None = None) -> Desired:
         for item in residents_raw:
             if isinstance(item, str) and item and item not in residents:
                 residents.append(item)
-    return Desired(main=main, residents=residents)
+    launch: dict[str, Launch] = {}
+    launch_raw = raw.get("launch")
+    if isinstance(launch_raw, dict):
+        for key, entry in launch_raw.items():
+            if not isinstance(key, str) or not isinstance(entry, dict):
+                continue
+            util = entry.get("util")
+            argv_raw = entry.get("argv")
+            argv: dict[str, str | None] = {}
+            if isinstance(argv_raw, dict):
+                for flag, value in argv_raw.items():
+                    if isinstance(flag, str) and flag.startswith("-"):
+                        argv[flag] = value if isinstance(value, str) else None
+            parsed = Launch(
+                util=float(util) if isinstance(util, (int, float)) and not isinstance(util, bool) else None,
+                argv=argv,
+            )
+            if parsed:
+                launch[key] = parsed
+    return Desired(main=main, residents=residents, launch=launch)
 
 
 def save(desired: Desired, path: str | os.PathLike[str] | None = None) -> Path:

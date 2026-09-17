@@ -441,6 +441,10 @@ def model_rows(
                 "trust": "measured" if key in live_keys else "estimated",
                 "weights_gib": (round(float(g("safetensors_gib")), 2) if g("safetensors_gib") is not None else None),
                 "serving": bool(live_keys.get(key)),
+                # The utilisation this model is proven at (models.toml `util`),
+                # so the allocator starts from it instead of a page-wide 0.95
+                # when nothing is running. None means "derive it".
+                "util_pinned": getattr(model, "util", None),
             }
         )
     return rows
@@ -619,6 +623,13 @@ def estimate_payload(
     if ram.get("available_gib") is not None:
         offload_max = int(ram["available_gib"] + (running_offload_gib or 0.0) - 4)  # keep 4 GiB for the box
         offload_max = max(0, offload_max)
+    # ...and no more than /dev/shm can hold. vLLM's buffer is a named file in
+    # that tmpfs, so a value MemAvailable would allow but the tmpfs would not
+    # fails minutes into a boot with a short write, not at Apply time.
+    shm_gib = shm_free_gib()
+    if shm_gib is not None:
+        ceiling = max(0, int(shm_gib + (running_offload_gib or 0.0) - 1))
+        offload_max = ceiling if offload_max is None else min(offload_max, ceiling)
     return {
         "kv_gib": round(r.kv_gib, 2),
         "kv_tokens": r.kv_tokens,
@@ -631,7 +642,17 @@ def estimate_payload(
         "agents_at_ctx": r.agents_at_ctx,
         "effective_parallel": r.effective_parallel,
         "max_single_ctx": r.max_single_ctx,
-        "ctx_max_model": r.ctx_max_model,
+        # A model whose registry ctx is a pinned number (GLM: 327,680, the
+        # validated ceiling on this card) must not be offered the
+        # checkpoint's own 1,048,576: the page would default to it, the launch
+        # would ask vLLM for a KV cache 3.2x the size that fits, and the
+        # refusal arrives minutes into a 181 GiB load naming KV bytes rather
+        # than the control that was moved.
+        "ctx_max_model": (
+            min(r.ctx_max_model, int(model.ctx))
+            if model is not None and isinstance(model.ctx, int)
+            else r.ctx_max_model
+        ),
         "ctx_max_fit": fit,
         "ctx_fit_reason": fit_reason,
         "full_at_once": (
@@ -678,6 +699,15 @@ def key_for_repo(registry: _models.Registry, repo_id: str | None, backend: str |
     if backend and backend in registry.models:
         return backend
     return None
+
+
+def shm_free_gib(path: str = "/dev/shm") -> float | None:
+    """Free space in the tmpfs that holds vLLM's KV-offload buffer, in GiB."""
+    try:
+        st = os.statvfs(path)
+    except OSError:
+        return None
+    return st.f_bavail * st.f_frsize / 2**30
 
 
 def overrides_from(body: Mapping[str, Any]) -> tuple[float | None, dict[str, str | None]]:
@@ -821,8 +851,21 @@ def register(app: FastAPI, rt: Any) -> None:
                 {"error": f"servedeck is busy: {rt.busy.get('label')}"}, status_code=409
             )
         util, argv = overrides_from(body)
-        holder = _app._main_holder(rt, rt.routes.live())
         model = rt.registry.models[key]
+        # A model whose registry ctx is a pinned number has that number as its
+        # validated ceiling on this card (GLM: 327,680; the checkpoint claims
+        # 1,048,576 and does not fit). Refuse rather than clamp: a launch that
+        # silently serves a third of the asked-for context is the kind of
+        # disagreement between control and reality this rewrite exists to end.
+        want_ctx = argv.get("--max-model-len")
+        if want_ctx is not None and isinstance(model.ctx, int) and int(want_ctx) > model.ctx:
+            return JSONResponse(
+                {"error": f"{key} is validated to {model.ctx:,} tokens on this card, not "
+                          f"{int(want_ctx):,}. models.toml pins it; raise it there with the "
+                          "measurement that justifies it."},
+                status_code=409,
+            )
+        holder = _app._main_holder(rt, rt.routes.live())
         if holder is not None and model.slot == "main":
             same = holder == key
             if same and action != "restart":

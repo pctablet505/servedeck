@@ -91,6 +91,13 @@ READY_MARKERS: tuple[str, ...] = (
 #: VRAM never handed to any model (models.toml ``[gpu] margin_mib``).
 DEFAULT_MARGIN_MIB = 1024
 
+#: A co-resident model's own CUDA-context headroom, on top of the fraction of
+#: the card its budget derives. The global margin is the MAIN model's cushion
+#: and is already spent by the time a resident starts, so charging the
+#: resident for it as well refused every co-resident launch — which is the
+#: only kind a resident has.
+RESIDENT_CUSHION_MIB = 512
+
 #: Environment variable names that must never reach a model process.
 #:
 #: A transient unit inherits the user manager's environment, which on a
@@ -861,6 +868,27 @@ class Control:
             )
         if spec.slot == "main":
             util = floor2((free - self.margin_mib) / total)
+            pinned = getattr(spec, "util", None)
+            if pinned is not None:
+                # A registry `util` is the value this model is PROVEN to serve
+                # at (models.toml says which launcher proved it). Handing it
+                # more because the card happens to be empty is how a launch
+                # ends up at 0.98 and dies of CUDA OOM once agents arrive; and
+                # silently handing it LESS would change the KV budget, the
+                # context that fits and the agent count with no mention of it,
+                # so that is a refusal naming what is holding the card.
+                if util < pinned:
+                    return Refusal(
+                        reason="not_enough_vram",
+                        message=(
+                            f"{spec.key} is proven at utilisation {pinned:.2f} but only "
+                            f"{util:.2f} fits right now ({free} MiB free of {total} MiB, "
+                            f"less the {self.margin_mib} MiB margin). Free the card, or "
+                            f"launch it explicitly at a lower utilisation"
+                        ),
+                        key=spec.key,
+                    )
+                util = pinned
         else:
             if spec.vram_mib is None or spec.vram_mib <= 0:
                 return Refusal(
@@ -873,13 +901,24 @@ class Control:
             # this check the unit launches, vLLM asks for 3.3 GiB of a card
             # with 2 GiB free, and the failure arrives minutes later as a CUDA
             # OOM in journald with no mention of the number that was wrong.
-            if spec.vram_mib > free - self.margin_mib:
+            # What the resident will actually take is its DERIVED fraction of
+            # the card, and the margin is the main model's cushion — it has
+            # already been spent by the main model that is running. Charging
+            # the resident for it too is what made the opt-in resident
+            # unstartable in exactly the situation it exists for: 3,300 MiB
+            # budget, 3,735 MiB free, refused as "not enough VRAM" while its
+            # own allocation is 2,937 MiB and the v1 unit demonstrably ran it
+            # co-resident with a 0.96 main model (its header records ~0.6 GiB
+            # of slack in both boot orders at util 0.03).
+            need = math.ceil(total * floor2(spec.vram_mib / total))
+            if need + RESIDENT_CUSHION_MIB > free:
                 return Refusal(
                     reason="not_enough_vram",
                     message=(
-                        f"resident {spec.key} budgets {spec.vram_mib} MiB but only "
-                        f"{free - self.margin_mib} MiB is available ({free} MiB free "
-                        f"less the {self.margin_mib} MiB margin)"
+                        f"resident {spec.key} needs {need} MiB at utilisation "
+                        f"{floor2(spec.vram_mib / total):.2f} plus a "
+                        f"{RESIDENT_CUSHION_MIB} MiB CUDA-context cushion, and only "
+                        f"{free} MiB is free"
                     ),
                     key=spec.key,
                 )
@@ -950,6 +989,7 @@ class Control:
                     live_key=holder.key,
                 )
 
+        requested_util = None if util is None else float(util)
         computed = self.compute_util(spec)
         if isinstance(computed, Refusal):
             return computed
@@ -1017,6 +1057,19 @@ class Control:
         result = replace(result, util=util, argv=argv)
         if result.ready:
             current_desired = self.load_desired()
+            # Record what actually worked, so a servedeck restart or a reboot
+            # repeats THIS launch rather than the registry defaults with the
+            # utilisation recomputed from an idle card (0.98 — the value with
+            # the OOM-under-concurrency history). Only a ready boot is stored:
+            # a configuration that failed is not one to repeat unattended.
+            if requested_util is not None or argv_overrides:
+                current_desired = current_desired.with_launch(
+                    key,
+                    desired_mod.Launch(
+                        util=requested_util,
+                        argv={k: v for k, v in (argv_overrides or {}).items()},
+                    ),
+                )
             if spec.slot == "main":
                 self._save_desired(current_desired.with_main(key))
             else:
@@ -1528,8 +1581,20 @@ class Control:
             if model is not None:
                 (already if model.ready else booting).append(key)
                 continue
-            result = self.start(key, timeout_s=timeout_s, on_progress=on_progress)
+            # The settings the operator last applied, not the registry
+            # defaults: without this a reboot silently re-tuned the box.
+            stored = want.launch_for(key)
+            result = self.start(
+                key,
+                timeout_s=timeout_s,
+                on_progress=on_progress,
+                util=stored.util,
+                argv_overrides=stored.argv or None,
+            )
             if isinstance(result, Refusal):
+                log.warning(
+                    "reconcile: %s not started (%s): %s", key, result.reason, result.message
+                )
                 refused.append(result)
             else:
                 started.append(result)

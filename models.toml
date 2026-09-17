@@ -50,6 +50,11 @@ cuda_home = "~/Projects/vllm-glm53/.venv-glm53/lib/python3.13/site-packages/nvid
 # --------------------------------------------------------------------------------
 [models.qwen27b]
 id      = "Qwen3.8-27B-NVFP4"
+# Proven utilisation, NOT a computed one. local_llm/.config's own commented
+# entries for this model read GPU_MEM_UTIL="0.95", which is also
+# qwen-server-run.sh's live value and the one memory note
+# qwen27b-xid-root-cause.md records the owner choosing deliberately.
+util    = 0.95
 aliases = ["RadixArk/Qwen3.8-27B-NVFP4", "qwen27b", "inline"]
 repo    = "RadixArk/Qwen3.8-27B-NVFP4"
 slot    = "main"
@@ -80,6 +85,13 @@ parser = "qwen3_xml"
 # --------------------------------------------------------------------------------
 [models.flashnext]
 id      = "Qwen3.8-Flash-Next-Uncensored-NVFP4"
+# serve.sh:197 sizes this model's whole KV budget at 0.96 ("262,144 tokens at
+# GPU_MEM_UTIL 0.96, which still holds a full 262,144-token request"), and
+# local_llm/.config:92 ran it at 0.965. 0.96 is what the live engine runs and
+# the highest value this model has served at without a CUDA OOM under
+# concurrency; 0.98 (what free-VRAM arithmetic yields on an idle card) boots
+# and then dies with agents in flight — measured 2026-09-03.
+util    = 0.96
 aliases = ["qwen38-flash-next", "flashnext"]
 repo    = "mazinb/Qwen3.8-Flash-Next-Uncensored-NVFP4"
 slot    = "main"
@@ -151,6 +163,13 @@ TORCH_CUDA_ARCH_LIST = "12.0f"
 # --------------------------------------------------------------------------------
 [models.glm53]
 id      = "glm53-flash"
+# serve-opt.sh:328 — GPU_UTIL defaults to 0.95 and every measured GLM run on
+# this card used it. GLM's KV is capped separately by --kv-cache-memory-bytes,
+# so raising this only takes VRAM the hot-expert slots need.
+util    = 0.95
+# serve-opt.sh:315-316 derives the KV cap as MAX_LEN * 17200 at launch time;
+# servedeck emits --kv-cache-memory-bytes from this and the launch ctx.
+kv_cache_bytes_per_token = 17200
 aliases = ["glm53", "GLM-5.3-Flash"]
 repo    = "dealignai/GLM-5.3-Flash-ABLITERATED-NVFP4"
 slot    = "main"
@@ -205,10 +224,11 @@ capture = false
 # MOE_BACKEND=marlin, LOAD_FORMAT=auto, KV_DTYPE=auto, SPEC=1/SPEC_TOKENS=2, images
 # off, AUTOTUNE=1 i.e. no flag, ENFORCE_EAGER=0 i.e. no flag, BLOCK_SIZE unset i.e.
 # no flag, ATTN_BACKEND unset i.e. no flag).
-# --kv-cache-memory-bytes = ctx * 17200 (serve-opt.sh:315-316), computed here for
-# ctx = 327680 because ctx is pinned above; it must change with ctx.
+# --kv-cache-memory-bytes is NOT a flag here: it is derived from ctx at render
+# time via kv_cache_bytes_per_token below, because a pinned product and a
+# movable ctx are two sources of truth for one number — and the page's context
+# control moved only one of them.
 flags = [
-    "--kv-cache-memory-bytes", "5636096000",
     "--tensor-parallel-size", "1",
     "--distributed-executor-backend", "mp",
     "--offload-backend", "uva",

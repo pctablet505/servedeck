@@ -350,5 +350,15 @@ def test_glm53_argv_matches_serve_opt_sh_literal_text(registry):
     # and carries the product literally, so the two must agree by arithmetic.
     assert "KV_BYTES_PER_TOKEN:-17200" in text or "17200" in text
     assert m.ctx == 327680, "GLM ctx is pinned to the validated VRAM ceiling, not native"
-    assert "--kv-cache-memory-bytes 5636096000" in flags_text
+    # Derived, not pinned (2026-09-18): the flag is emitted by render_argv from
+    # the ctx the engine is actually given, because a pinned product plus a
+    # movable context control is two sources of truth for one number — the page
+    # moved ctx and left the cap sized for the old length, which vLLM refuses
+    # only after a six-minute 181 GiB load.
+    assert "--kv-cache-memory-bytes" not in flags_text
+    assert m.kv_cache_bytes_per_token == 17200
+    rendered = models.render_argv(m, "/v/bin/vllm", 0.95, 327680, m.port)
+    assert rendered[rendered.index("--kv-cache-memory-bytes") + 1] == "5636096000", (
+        "the derived cap at the validated ctx must equal what serve-opt.sh computed"
+    )
     assert 327680 * 17200 == 5636096000
