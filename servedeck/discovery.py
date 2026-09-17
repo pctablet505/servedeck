@@ -1,0 +1,842 @@
+"""servedeck.registry — model discovery, servability, and the observation store.
+
+Implements SPEC.md §4 (REGISTRY):
+  * Discovery over ``~/.cache/huggingface/hub/models--*/``.
+  * Servability rules and ``KNOWN_ARCHS`` (which also selects backend/launcher).
+  * The append-only ``state/measurements.json`` observation store.
+  * ``resolve_inputs(repo_id, util, ctx)`` and its three-tier lookup.
+
+This module is pure discovery + bookkeeping: it does not launch anything, does not
+compute VRAM budgets (that is servedeck/capacity.py's job — see SPEC §3), and never
+fabricates a number that was not either read from disk or explicitly given in
+SPEC §0's ground-truth table.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import os
+import statistics
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Literal
+
+from . import settings as _settings
+from . import disksize
+from . import kvcalc
+
+# --------------------------------------------------------------------------- #
+# Constants (SPEC §4)
+# --------------------------------------------------------------------------- #
+
+#: architectures[0] -> backend. This map is also how backend/launcher/venv is
+#: selected for a servable model (SPEC §4, §1 "Delegation, not reimplementation").
+KNOWN_ARCHS: dict[str, str] = {
+    "Qwen3_5ForConditionalGeneration": "inline",
+    "Qwen4ExpForConditionalGeneration": "flashnext",
+}
+
+def arch_backends() -> dict[str, str]:
+    """architectures[0] -> build name.
+
+    v1 layered ``[backends.<name>].architectures`` from servedeck.toml over the
+    built-in map, so a new model family could be taught without a code change.
+    v2 has no ``[backends]``: a model declares its own ``build`` in models.toml
+    and is launched from it, so an architecture no longer has to be mapped to
+    anything before the model can run. This map now answers one question --
+    could servedeck serve this checkpoint sitting in the hub cache at all --
+    and KNOWN_ARCHS is the whole of it.
+    """
+    return dict(KNOWN_ARCHS)
+
+
+def _reverse_arch_backends() -> dict[str, str]:
+    """Reverse of :func:`arch_backends`. Valid only where the map is 1:1 (each
+    backend has exactly one known architecture). Used by the tier-3 KV-rate
+    family estimate to classify *historical* observations by architecture even
+    if their repo has since been deleted from the hub cache (backend survives
+    in the observation; the architecture does not). A backend declaring several
+    architectures simply has no single reverse answer — last one wins, and the
+    estimate degrades to "no measured observation", never to a wrong family.
+    """
+    return {backend: arch for arch, backend in arch_backends().items()}
+
+GIB = 1024**3
+
+#: Default kv_cache_dtype used by the launchers when nothing overrides it
+#: (SPEC §1: "flashnext: ... KV_DTYPE=auto ... serve.sh ALREADY reads ... KV_DTYPE from env").
+DEFAULT_KV_CACHE_DTYPE = "auto"
+
+WeightsSource = Literal["measured", "estimated", "unknown"]
+KvSource = Literal["measured", "measured_other_ctx", "estimated", "unknown"]
+Trust = Literal["measured", "measured_other_ctx", "estimated", "unknown"]
+
+_CONFIG_FIELD_NAMES = (
+    "architectures0",
+    "model_type",
+    "max_position_embeddings",
+    "num_hidden_layers",
+    "num_key_value_heads",
+    "head_dim",
+    "full_attention_interval",
+    "quant_algo",
+)
+
+
+# --------------------------------------------------------------------------- #
+# Hub cache location
+# --------------------------------------------------------------------------- #
+
+
+def default_hub_dir() -> Path:
+    """~/.cache/huggingface/hub, overridable via SERVEDECK_HF_HUB_DIR (tests only)."""
+    override = os.environ.get("SERVEDECK_HF_HUB_DIR")
+    if override:
+        return Path(override)
+    return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+# --------------------------------------------------------------------------- #
+# Discovery
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class ModelEntry:
+    """One ``models--*`` hub directory, resolved and (if possible) parsed."""
+
+    repo_id: str
+    hub_dirname: str
+    snapshot_path: str | None
+    skipped: bool
+    servable: bool
+    backend: str | None
+    safetensors_gib: float
+    safetensors_count: int
+    #: Allocated bytes (st_blocks) for the whole snapshot, each blob counted
+    #: once. This is the "how much room would deleting this free" number and
+    #: the one the UI shows; ``safetensors_gib`` is an apparent-size weights
+    #: proxy and is NOT interchangeable with it.
+    disk_bytes: int
+    #: The part of ``disk_bytes`` on the same filesystem as the hub cache.
+    #: Less than ``disk_bytes`` when a snapshot's blobs symlink to another
+    #: mount, where deleting them frees nothing on the cache's own filesystem.
+    disk_local_bytes: int
+    config_exists: bool
+    architectures0: str | None
+    model_type: str | None
+    max_position_embeddings: int | None
+    num_hidden_layers: int | None
+    num_key_value_heads: int | None
+    head_dim: int | None
+    full_attention_interval: int | None
+    quant_algo: str | None
+    reason: str | None
+
+
+def _repo_id_from_dirname(dirname: str) -> str:
+    """``models--Org--Name`` -> ``Org/Name``.
+
+    Only the separator between namespace and repo name is a hub convention
+    ("--"); repo names themselves use single hyphens (e.g. "Qwen3.8-27B-NVFP4"),
+    so only the *first* "--" is replaced.
+    """
+    if not dirname.startswith("models--"):
+        raise ValueError(f"not a models-- directory: {dirname!r}")
+    rest = dirname[len("models--") :]
+    return rest.replace("--", "/", 1)
+
+
+def _resolve_snapshot(hub_repo_dir: Path) -> Path | None:
+    """snapshot = refs/main content else newest snapshots/ dir; None if no snapshots/."""
+    refs_main = hub_repo_dir / "refs" / "main"
+    if refs_main.is_file():
+        try:
+            rev = refs_main.read_text().strip()
+        except OSError:
+            rev = ""
+        if rev:
+            candidate = hub_repo_dir / "snapshots" / rev
+            if candidate.is_dir():
+                return candidate
+
+    snapshots_dir = hub_repo_dir / "snapshots"
+    if not snapshots_dir.is_dir():
+        return None
+    try:
+        candidates = [p for p in snapshots_dir.iterdir() if p.is_dir()]
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+@dataclass(frozen=True)
+class SnapshotScan:
+    """What one snapshot directory costs, and what it contains.
+
+    Two different sizes, because two different questions are asked of them:
+
+    * ``safetensors_bytes`` is the *apparent* size of the ``.safetensors``
+      shards. It feeds the tier-3 weights estimate, which asks "how many bytes
+      become tensors in VRAM" — a sparse hole still loads as zeros, so the
+      apparent figure is the right input there.
+    * ``disk_bytes`` is the *allocated* size (``st_blocks``) of every file in
+      the snapshot. It answers "how much room would deleting this give back",
+      which is what a panel headed "Models on disk" is claiming.
+
+    Both deduplicate on ``(st_dev, st_ino)``. A hub snapshot is a directory of
+    symlinks into ``../../blobs/<sha>``; two entries can name the same blob,
+    and the FP8 PLE table on this box is additionally hardlinked in from a
+    staging directory. Counting per-name instead of per-inode reported those
+    bytes once per link.
+
+    ``disk_local_bytes`` is the part of ``disk_bytes`` that lives on the same
+    filesystem as the hub cache. On this box half the snapshots symlink out to
+    an external exfat stick: real bytes, but freeing them does nothing to the
+    ``df`` figure sitting next to them on screen.
+    """
+
+    safetensors_bytes: int
+    safetensors_count: int
+    gguf_count: int
+    dangling_count: int
+    #: Distinct resolvable files inside the SNAPSHOT (not the repo dir: refs/
+    #: and blobs/ are cache bookkeeping, not downloaded content). Zero means
+    #: a download that never started; non-zero with no weights and no config
+    #: means one that stopped partway.
+    snapshot_files: int
+    disk_bytes: int
+    disk_local_bytes: int
+    #: Names visited vs distinct inodes behind them. ``links > blobs`` is the
+    #: proof that a per-name sum would have over-reported this snapshot.
+    disk_links: int
+    disk_blobs: int
+
+
+def _scan_snapshot_files(snapshot: Path, repo_dir: Path | None = None) -> SnapshotScan:
+    """Measure one snapshot directory, counting each stored blob exactly once.
+
+    Sizes resolve symlinks (hub snapshot files are symlinks into blobs/), per
+    SPEC §4 — but resolving is only half the job: the resolved *inode* is the
+    identity of the bytes, and without deduplicating on it a blob reachable
+    under two names is added twice.
+
+    ``dangling_count`` is the entries that ARE symlinks and do not resolve.
+    A hub snapshot whose blobs were moved to an external drive that is not
+    mounted looks byte-for-byte like an empty download -- same zero
+    safetensors, same unreadable config.json -- and reporting it as "0
+    safetensors, no config.json" sends the operator to re-download 180 GiB
+    that is already on a disk they only have to plug in.
+    """
+    # Two walks over the same directory, sharing nothing: the safetensors walk
+    # must not let a non-safetensors blob claim an inode first, and the whole-
+    # tree walk must not stop at the top level. Both are cheap (the entire hub
+    # cache stats in ~25 ms warm).
+    st_scan = disksize.scan_tree(snapshot, recursive=False, match=".safetensors")
+    snap_scan = disksize.scan_tree(snapshot, recursive=True)
+    # The whole ``models--*`` directory, not just the resolved snapshot: what
+    # deleting this model frees is blobs/ plus every snapshot that references
+    # them, and blobs/ is where the bytes actually are. Walking it per-name
+    # counts each blob twice -- once as blobs/<sha>, once as the snapshot
+    # symlink that points at it -- which on this box turns a 126.02 GiB model
+    # into 204.26 GiB. scan_tree deduplicates on the resolved inode.
+    all_scan = disksize.scan_tree(repo_dir if repo_dir is not None else snapshot, recursive=True)
+
+    gguf_count = 0
+    try:
+        children = list(snapshot.iterdir())
+    except OSError:
+        return SnapshotScan(0, 0, 0, 0, 0, 0, 0, 0, 0)
+    for p in children:
+        if p.name.endswith(".gguf") and not (p.is_symlink() and not p.exists()):
+            gguf_count += 1
+
+    return SnapshotScan(
+        safetensors_bytes=st_scan.apparent_bytes,
+        safetensors_count=st_scan.blobs,
+        gguf_count=gguf_count,
+        # Dangling links are a property of the top level, where the snapshot's
+        # own entries live; the recursive walk would also count anything broken
+        # inside a subdirectory, which is not what the "blobs are on an
+        # unmounted drive" message is about.
+        dangling_count=st_scan.dangling,
+        snapshot_files=snap_scan.blobs,
+        disk_bytes=all_scan.allocated_bytes,
+        disk_local_bytes=all_scan.local_bytes,
+        disk_links=all_scan.links,
+        disk_blobs=all_scan.blobs,
+    )
+
+
+def _parse_config(snapshot: Path) -> dict[str, Any] | None:
+    cfg_path = snapshot / "config.json"
+    if not cfg_path.is_file():
+        return None
+    try:
+        return json.loads(cfg_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def load_model_config(repo_id: str, hub_dir: Path | str | None = None) -> dict[str, Any] | None:
+    """The raw config.json of one hub repo, or None.
+
+    Read from the LOCAL snapshot only — never fetched. A capacity panel that
+    reaches the network to answer "how big is this model's KV cache" is a
+    panel that blocks on a DNS timeout when the machine is offline, and this
+    machine serves models offline by design (HF_HUB_OFFLINE is exported into
+    every launch).
+    """
+    root = Path(hub_dir) if hub_dir is not None else default_hub_dir()
+    dirname = "models--" + repo_id.replace("/", "--")
+    snapshot = _resolve_snapshot(root / dirname)
+    if snapshot is None:
+        return None
+    return _parse_config(snapshot)
+
+
+def _extract_config_fields(cfg: dict[str, Any]) -> dict[str, Any]:
+    """architectures[0], model_type from root; the rest from text_config, falling
+    back to root when text_config is absent (SPEC §4)."""
+    text_config = cfg.get("text_config") or cfg
+    quant = cfg.get("quantization_config") or {}
+    architectures = cfg.get("architectures") or []
+    return {
+        "architectures0": architectures[0] if architectures else None,
+        "model_type": cfg.get("model_type"),
+        "max_position_embeddings": text_config.get("max_position_embeddings"),
+        "num_hidden_layers": text_config.get("num_hidden_layers"),
+        "num_key_value_heads": text_config.get("num_key_value_heads"),
+        "head_dim": text_config.get("head_dim"),
+        "full_attention_interval": text_config.get("full_attention_interval"),
+        "quant_algo": quant.get("quant_algo") or quant.get("quant_method"),
+    }
+
+
+def _build_entry(repo_id: str, hub_dirname: str, snapshot: Path | None) -> ModelEntry:
+    if snapshot is None:
+        return ModelEntry(
+            repo_id=repo_id,
+            hub_dirname=hub_dirname,
+            snapshot_path=None,
+            skipped=True,
+            servable=False,
+            backend=None,
+            safetensors_gib=0.0,
+            safetensors_count=0,
+            disk_bytes=0,
+            disk_local_bytes=0,
+            config_exists=False,
+            **{k: None for k in _CONFIG_FIELD_NAMES},
+            reason="skipped: no snapshots/ (stub dir)",
+        )
+
+    # snapshot is <hub>/models--Org--Name/snapshots/<rev>; the repo dir two
+    # levels up is the unit an operator deletes.
+    scan = _scan_snapshot_files(snapshot, repo_dir=snapshot.parent.parent)
+    safetensors_gib = scan.safetensors_bytes / GIB
+    st_count = scan.safetensors_count
+    gguf_count = scan.gguf_count
+    dangling = scan.dangling_count
+    cfg = _parse_config(snapshot)
+    config_exists = cfg is not None
+    fields = _extract_config_fields(cfg) if cfg is not None else {k: None for k in _CONFIG_FIELD_NAMES}
+    known_archs = arch_backends()
+    backend = known_archs.get(fields["architectures0"]) if fields["architectures0"] else None
+
+    reasons: list[str] = []
+    if safetensors_gib <= 0:
+        reasons.append("0 safetensors")
+    if not config_exists:
+        reasons.append("no config.json")
+    elif fields["architectures0"] not in known_archs:
+        reasons.append(f"unknown architecture {fields['architectures0']!r}")
+
+    servable = not reasons
+    reason: str | None = None
+    if reasons:
+        if gguf_count > 0 and safetensors_gib <= 0:
+            prefix = "GGUF-only: "
+        elif dangling and safetensors_gib <= 0:
+            prefix = (
+                f"{dangling} unresolved symlink(s) — the blobs this snapshot points at "
+                "are on a filesystem that is not mounted: "
+            )
+        elif not config_exists and safetensors_gib <= 0 and scan.snapshot_files > 0:
+            # Files ARE here and they all resolve; none of them is a weight or
+            # a config. That is a download that stopped partway (`hf download`
+            # interrupted, or a --include filter that fetched only a
+            # tokenizer), and it is fixed by resuming the download -- not by
+            # remounting a drive and not by finding a GGUF loader. Saying only
+            # "0 safetensors, no config.json" leaves the operator to guess
+            # which of the three it is.
+            prefix = (
+                f"partial download — {scan.snapshot_files} file(s) present, none of them weights: "
+            )
+        else:
+            prefix = ""
+        reason = prefix + ", ".join(reasons)
+
+    return ModelEntry(
+        repo_id=repo_id,
+        hub_dirname=hub_dirname,
+        snapshot_path=str(snapshot),
+        skipped=False,
+        servable=servable,
+        backend=backend,
+        # Not rounded: this is a raw measurement (SPEC §0 "measured, do not
+        # substitute"). round(x, 4) has a resolution of ~105 KiB at GiB scale
+        # (1024**3 * 0.0001), which is invisible for real multi-GB safetensors
+        # shards but silently truncates small values to 0.0 — display-layer
+        # rounding belongs in the CLI formatter (_fmt_gib), not in the
+        # measurement itself.
+        safetensors_gib=safetensors_gib,
+        safetensors_count=st_count,
+        disk_bytes=scan.disk_bytes,
+        disk_local_bytes=scan.disk_local_bytes,
+        config_exists=config_exists,
+        reason=reason,
+        **fields,
+    )
+
+
+def discover_models(hub_dir: Path | str | None = None) -> list[ModelEntry]:
+    """Scan ``models--*`` directories under ``hub_dir`` (default: the real hub cache).
+
+    Returns one ModelEntry per hub directory, including skipped stubs — callers
+    that only want launchable models should filter on ``.servable``.
+    """
+    root = Path(hub_dir) if hub_dir is not None else default_hub_dir()
+    if not root.is_dir():
+        return []
+    entries: list[ModelEntry] = []
+    for child in sorted(root.iterdir()):
+        if not child.is_dir() or not child.name.startswith("models--"):
+            continue
+        try:
+            repo_id = _repo_id_from_dirname(child.name)
+        except ValueError:
+            continue
+        snapshot = _resolve_snapshot(child)
+        entries.append(_build_entry(repo_id, child.name, snapshot))
+    return entries
+
+
+# --------------------------------------------------------------------------- #
+# Observation store — state/measurements.json (append-only)
+# --------------------------------------------------------------------------- #
+
+
+MEASUREMENTS_FILENAME = "measurements.json"
+
+
+def default_measurements_path() -> Path:
+    """The observation store, inside the CONFIGURED state directory.
+
+    It used to be `<package>/../state/measurements.json` unconditionally,
+    which agrees with `state_dir` only for its default value. Set `state_dir`
+    to anything else — an absolute path, which is what a systemd unit with a
+    StateDirectory= wants — and the supervisor writes boot measurements to one
+    directory while the registry reads capacity out of another. Nothing fails;
+    every model simply reverts to "never booted" forever, because the boots
+    are being recorded where nobody looks.
+    """
+    return _settings.get().state_dir / MEASUREMENTS_FILENAME
+
+
+def load_observations(path: Path | str | None = None) -> list[dict[str, Any]]:
+    """Read the observation list. Missing/empty/corrupt file -> []; never raises."""
+    if path is not None:
+        # An explicit path means "read exactly this file". Merging the legacy
+        # store into it would make every caller that names a file -- tests
+        # included -- read something off this machine that it never asked for.
+        return _load_observation_file(Path(path))
+    # v1 also merged in the pre-rename `coldstart` tree's store, so that
+    # renaming the project did not make every measured model report
+    # "estimated" again. That rename was two weeks ago, the merge has run, and
+    # legacy.py is gone: there is one store now, at $SERVEDECK_STATE_DIR.
+    return _load_observation_file(default_measurements_path())
+
+
+def _load_observation_file(p: Path) -> list[dict[str, Any]]:
+    """One observations file. Missing/empty/corrupt -> []; never raises."""
+    if not p.is_file():
+        return []
+    try:
+        raw = p.read_text()
+    except OSError:
+        return []
+    if not raw.strip():
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return parsed
+
+
+def _atomic_write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".measurements-", suffix=".json.tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, sort_keys=False)
+            fh.write("\n")
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+
+
+def append_observation(observation: dict[str, Any], path: Path | str | None = None) -> None:
+    """Append one observation. Never overwrites prior entries (append-only log,
+    SPEC §4). Written after every boot reaching READY, and after a boot that
+    fails at KV cache sizing (which still yields a weights measurement)."""
+    p = Path(path) if path is not None else default_measurements_path()
+    observations = load_observations(p)
+    observations.append(observation)
+    _atomic_write_json(p, observations)
+
+
+def _kv_rate_of(obs: dict[str, Any]) -> float | None:
+    """kv_kib_per_token for one observation: derived from kv_gib/kv_tokens when
+    both are present (SPEC §4 "Derived, not stored twice"); otherwise falls back
+    to a directly-stored rate (used by observations where only the rate itself
+    is known, e.g. a secondary calibration boot at a different ctx)."""
+    measured = obs.get("measured") or {}
+    kv_gib = measured.get("kv_gib")
+    kv_tokens = measured.get("kv_tokens")
+    if kv_gib is not None and kv_tokens:
+        try:
+            return float(kv_gib) * 1048576.0 / float(kv_tokens)
+        except (TypeError, ZeroDivisionError, ValueError):
+            pass
+    rate = measured.get("kv_kib_per_token")
+    return float(rate) if rate is not None else None
+
+
+# --------------------------------------------------------------------------- #
+# resolve_inputs() — three-tier lookup (SPEC §4)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class ResolvedInputs:
+    """What resolve_inputs() found, and how much to trust it.
+
+    Consumed by servedeck/capacity.py (not owned by this module) to build its
+    own ModelInputs and raise UNKNOWN_CAPACITY when weights_source=="unknown".
+    """
+
+    repo_id: str
+    backend: str | None
+    requested_util: float
+    requested_ctx: int
+    weights_gib: float | None
+    weights_source: WeightsSource
+    kv_kib_per_token: float | None
+    kv_source: KvSource
+    trust: Trust
+    overhead_gib: float | None
+    model_max_ctx: int | None
+    model_type: str | None
+    architectures0: str | None
+    matched_ctx: int | None
+    other_ctx_kv_rates: dict[int, float] = field(default_factory=dict)
+    reason: str | None = None
+
+
+def _estimate_weights_gib(
+    safetensors_gib: float | None, model_type: str | None
+) -> tuple[float | None, WeightsSource, str | None]:
+    """Tier-3 weight estimate: safetensors_gib*1.01 — refused for qwen4_exp.
+
+    Refusal reason (SPEC §3/§4): the Flash-Next n-gram (MTP) table is
+    host-offloaded, so its on-disk safetensors size overstates the actual VRAM
+    footprint by ~37% (125.91 GiB disk vs 78.47 GiB VRAM, measured). Applying
+    the *1.01 correction to that number would still be wildly wrong, so this
+    tier refuses outright rather than emit a bad estimate.
+    """
+    if safetensors_gib is None or safetensors_gib <= 0:
+        return None, "unknown", "no safetensors size available for this repo_id"
+    if model_type == "qwen4_exp":
+        return (
+            None,
+            "unknown",
+            "safetensors*1.01 estimator refused for model_type='qwen4_exp': the "
+            "n-gram (MTP) table is host-offloaded, so on-disk size overstates VRAM "
+            "weights by ~37% (measured: 125.91 GiB disk vs 78.47 GiB VRAM on "
+            "RadixArk/Qwen3.8-Flash-Next-NVFP4)",
+        )
+    if model_type == "glm5_next":
+        return (
+            None,
+            "unknown",
+            "safetensors*1.01 estimator refused for model_type='glm5_next': the "
+            "routed experts are host-offloaded via --cpu-offload-gb, so VRAM "
+            "weights are on-disk size MINUS whatever that knob is set to, and "
+            "the knob is a tuning choice rather than a model property (measured: "
+            "181.3 GiB disk, ~79 GiB VRAM at CPU_OFFLOAD_GB=104). Estimating "
+            "from disk size produced 183.11 GiB and a nonsensical negative KV "
+            "budget of -97 GiB",
+        )
+    return round(safetensors_gib * 1.01, 4), "estimated", None
+
+
+def _estimate_kv_rate(
+    architectures0: str | None,
+    all_observations: list[dict[str, Any]],
+    *,
+    cfg: dict[str, Any] | None = None,
+    ctx: int | None = None,
+    kv_cache_dtype: str | None = None,
+    mamba_ssm_dtype: str | None = None,
+) -> tuple[float | None, KvSource, str | None]:
+    """Tier-3 KV rate estimate.
+
+    FIRST from the checkpoint's own config.json, through the per-architecture
+    calculator in ``kvcalc`` — the KV rate is a property of the layer stack
+    (how many attention layers, how many KV heads, what latent rank, what
+    cache dtype), not of the family name.
+
+    The old rule was the MEDIAN measured rate of other models sharing
+    ``architectures[0]``, which is wrong in both directions. It answers with a
+    different model's number when it has one (Qwen3.8-27B has 16 attention
+    layers of 4 KV heads, Flash-Next 12 of 2 — 1.6x apart before any
+    measurement), and answers with nothing at all when it does not. The second
+    case is the one that shipped: GLM-5.3-Flash, measured on this box at
+    375,543 tokens, rendered "0 tokens / capacity unknown" because no other
+    Glm5Next checkpoint had ever been booted here.
+
+    The family median survives as the fallback for a repo whose config.json
+    cannot be read.
+    """
+    if cfg is not None and ctx:
+        try:
+            geo = kvcalc.geometry(
+                cfg, kv_cache_dtype=kv_cache_dtype, mamba_ssm_dtype=mamba_ssm_dtype
+            )
+        except Exception:  # noqa: BLE001 - a malformed config falls through
+            geo = None
+        if geo is not None and geo.family != "unknown" and geo.attn_bytes_per_token > 0:
+            return round(geo.kib_per_token(ctx), 4), "estimated", None
+    if not architectures0:
+        return None, "unknown", "unknown architecture; cannot estimate KV rate by family"
+    rates: list[float] = []
+    reverse_archs = _reverse_arch_backends()
+    for obs in all_observations:
+        if obs.get("trust") != "measured":
+            continue
+        arch = reverse_archs.get(obs.get("backend"))
+        if arch != architectures0:
+            continue
+        rate = _kv_rate_of(obs)
+        if rate is not None:
+            rates.append(rate)
+    if not rates:
+        return None, "unknown", f"no measured KV-cache observation exists for architecture {architectures0!r}"
+    return round(statistics.median(rates), 4), "estimated", None
+
+
+def resolve_inputs(
+    repo_id: str,
+    util: float,
+    ctx: int,
+    *,
+    observations: list[dict[str, Any]] | None = None,
+    hub_dir: Path | str | None = None,
+    kv_cache_dtype: str | None = None,
+    mamba_ssm_dtype: str | None = None,
+) -> ResolvedInputs:
+    """Three-tier lookup (SPEC §4):
+
+      1. exact (repo_id, backend, max_model_len==ctx)   -> trust="measured"
+      2. same repo_id, any ctx                           -> trust="measured_other_ctx"
+      3. estimate: weights = safetensors_gib*1.01 (refused for qwen4_exp);
+         kv rate = median of measured observations sharing architectures[0]
+
+    ``observations`` and ``hub_dir`` are injectable for tests; production
+    callers pass neither and get the real measurements store / hub cache.
+    """
+    all_observations = load_observations() if observations is None else observations
+    registry_entries = discover_models(hub_dir)
+    registry_entry = next((e for e in registry_entries if e.repo_id == repo_id), None)
+
+    backend = registry_entry.backend if registry_entry else None
+    model_max_ctx = registry_entry.max_position_embeddings if registry_entry else None
+    model_type = registry_entry.model_type if registry_entry else None
+    architectures0 = registry_entry.architectures0 if registry_entry else None
+
+    repo_obs = [o for o in all_observations if o.get("repo_id") == repo_id]
+    if backend is None and repo_obs:
+        # repo_id no longer present in the hub cache (e.g. deleted) — fall back
+        # to whatever backend its own observation history recorded.
+        backend = repo_obs[0].get("backend")
+    if backend is not None:
+        by_backend = [o for o in repo_obs if o.get("backend") == backend]
+        repo_obs = by_backend or repo_obs
+
+    other_ctx_kv_rates: dict[int, float] = {}
+    for obs in repo_obs:
+        obs_ctx = (obs.get("inputs") or {}).get("max_model_len")
+        rate = _kv_rate_of(obs)
+        if obs_ctx is not None and rate is not None:
+            other_ctx_kv_rates[int(obs_ctx)] = rate
+
+    # Tier 1: exact ctx match.
+    exact = [o for o in repo_obs if (o.get("inputs") or {}).get("max_model_len") == ctx]
+    if exact:
+        obs = exact[-1]  # most recently appended wins
+        measured = obs.get("measured") or {}
+        weights_gib = measured.get("weights_gib")
+        kv_rate = _kv_rate_of(obs)
+        return ResolvedInputs(
+            repo_id=repo_id,
+            backend=backend,
+            requested_util=util,
+            requested_ctx=ctx,
+            weights_gib=weights_gib,
+            weights_source="measured" if weights_gib is not None else "unknown",
+            kv_kib_per_token=kv_rate,
+            kv_source="measured" if kv_rate is not None else "unknown",
+            trust="measured",
+            overhead_gib=measured.get("overhead_gib"),
+            model_max_ctx=model_max_ctx,
+            model_type=model_type,
+            architectures0=architectures0,
+            matched_ctx=ctx,
+            other_ctx_kv_rates=other_ctx_kv_rates,
+        )
+
+    # Tier 2: same repo_id, any ctx.
+    if repo_obs:
+        obs = repo_obs[-1]
+        measured = obs.get("measured") or {}
+        weights_gib = measured.get("weights_gib")
+        kv_rate = _kv_rate_of(obs)
+        matched_ctx = (obs.get("inputs") or {}).get("max_model_len")
+        return ResolvedInputs(
+            repo_id=repo_id,
+            backend=backend,
+            requested_util=util,
+            requested_ctx=ctx,
+            weights_gib=weights_gib,
+            weights_source="measured" if weights_gib is not None else "unknown",
+            kv_kib_per_token=kv_rate,
+            kv_source="measured_other_ctx" if kv_rate is not None else "unknown",
+            trust="measured_other_ctx",
+            overhead_gib=measured.get("overhead_gib"),
+            model_max_ctx=model_max_ctx,
+            model_type=model_type,
+            architectures0=architectures0,
+            matched_ctx=int(matched_ctx) if matched_ctx is not None else None,
+            other_ctx_kv_rates=other_ctx_kv_rates,
+        )
+
+    # Tier 3: estimate.
+    safetensors_gib = registry_entry.safetensors_gib if registry_entry else None
+    weights_gib, weights_source, w_reason = _estimate_weights_gib(safetensors_gib, model_type)
+    raw_cfg = load_model_config(repo_id, hub_dir)
+    kv_rate, kv_source, kv_reason = _estimate_kv_rate(
+        architectures0,
+        all_observations,
+        cfg=raw_cfg,
+        ctx=ctx,
+        kv_cache_dtype=kv_cache_dtype,
+        mamba_ssm_dtype=mamba_ssm_dtype,
+    )
+
+    if weights_source == "unknown":
+        trust: Trust = "unknown"
+    elif weights_source == "estimated" or kv_source == "estimated":
+        trust = "estimated"
+    else:
+        trust = "unknown"
+
+    return ResolvedInputs(
+        repo_id=repo_id,
+        backend=backend,
+        requested_util=util,
+        requested_ctx=ctx,
+        weights_gib=weights_gib,
+        weights_source=weights_source,
+        kv_kib_per_token=kv_rate,
+        kv_source=kv_source,
+        trust=trust,
+        overhead_gib=None,
+        model_max_ctx=model_max_ctx,
+        model_type=model_type,
+        architectures0=architectures0,
+        matched_ctx=None,
+        other_ctx_kv_rates=other_ctx_kv_rates,
+        reason=w_reason or kv_reason,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# CLI — `python -m servedeck.registry --list`
+# --------------------------------------------------------------------------- #
+
+
+def _fmt_gib(x: float | None) -> str:
+    return f"{x:.2f}" if x is not None else "—"
+
+
+def _format_listing(entries: list[ModelEntry]) -> str:
+    skipped = [e for e in entries if e.skipped]
+    unservable = [e for e in entries if not e.skipped and not e.servable]
+    servable = [e for e in entries if e.servable]
+
+    lines = [
+        f"Scanned {len(entries)} hub dir(s): "
+        f"{len(servable)} servable, {len(unservable)} unservable, {len(skipped)} skipped",
+        "",
+    ]
+    for e in entries:
+        status = "SKIPPED" if e.skipped else ("SERVABLE" if e.servable else "UNSERVABLE")
+        backend = e.backend or "-"
+        arch = e.architectures0 or "-"
+        lines.append(f"[{status:10}] {e.repo_id}")
+        lines.append(
+            f"             backend={backend:9} "
+            f"safetensors={_fmt_gib(e.safetensors_gib)} GiB (n={e.safetensors_count}) "
+            f"disk={disksize.format_bytes(e.disk_bytes)}"
+            # Only worth printing when they differ, which is exactly when the
+            # naive reading ("delete this, get that back") would be wrong.
+            + (
+                f" ({disksize.format_bytes(e.disk_local_bytes)} on this filesystem)"
+                if e.disk_bytes != e.disk_local_bytes
+                else ""
+            )
+            + f" arch={arch}"
+        )
+        if e.reason:
+            lines.append(f"             reason: {e.reason}")
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="python -m servedeck.registry")
+    parser.add_argument("--list", action="store_true", help="list discovered hub models")
+    args = parser.parse_args(argv)
+
+    if not args.list:
+        parser.print_help()
+        return 0
+
+    entries = discover_models()
+    print(_format_listing(entries))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

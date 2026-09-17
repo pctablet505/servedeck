@@ -1,0 +1,47 @@
+# Frozen snapshot of `qwen-server-run.sh` DRY_RUN=1 ARGV output for the 27B.
+#
+# Captured 2026-09-12 from a tmp copy of the then-live ~/Projects/local_llm/.config,
+# which held (mutable, will be retired — see REDESIGN-2026-09-12.md §3 step 5):
+#   BACKEND=inline
+#   MODEL_REPO=RadixArk/Qwen3.8-27B-NVFP4
+#   SERVED_NAME=Qwen3.8-27B-NVFP4
+#   PORT=8004
+#   MAX_MODEL_LEN=262144
+#   MAX_NUM_SEQS=16
+#   GPU_MEM_UTIL=0.91
+#   EXTRA_ARGS=(empty)
+#
+# Command: DRY_RUN=1 CONFIG_FILE=<tmp copy> DRY_ENV_VARS="CUDA_HOME PATH
+# VLLM_USE_FLASHINFER_SAMPLER" bash ~/Projects/local_llm/bin/qwen-server-run.sh
+#
+# tests/test_models_golden.py's always-run test reads this file (no subprocess,
+# no dependency on the live, mutable .config); test_qwen27b_snapshot_is_current
+# re-runs the live launcher and asserts it still produces this file's content —
+# that second test is the one to re-run (and this file to regenerate) if
+# ~/Projects/local_llm/.config or qwen-server-run.sh's own defaults change.
+#
+# Lines below are exactly the launcher's own "ARGV <token>" dump lines, one
+# argv token per line, in order. Comment lines (this header) are ignored.
+ARGV /home/pctablet505/Projects/local_llm/.venv-llm-029/bin/vllm
+ARGV serve
+ARGV RadixArk/Qwen3.8-27B-NVFP4
+ARGV --port
+ARGV 8004
+ARGV --served-model-name
+ARGV Qwen3.8-27B-NVFP4
+ARGV --max-model-len
+ARGV 262144
+ARGV --enable-auto-tool-choice
+ARGV --tool-call-parser
+ARGV qwen3_xml
+ARGV --reasoning-parser
+ARGV qwen3
+ARGV --speculative-config
+ARGV {"method": "mtp", "num_speculative_tokens": 4}
+ARGV --max-num-seqs
+ARGV 16
+ARGV --gpu-memory-utilization
+ARGV 0.91
+ARGV --enable-prefix-caching
+ARGV --mamba-cache-mode
+ARGV all

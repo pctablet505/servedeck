@@ -1,25 +1,19 @@
-"""Tests for servedeck.gateway — SPEC.md §7, corrected by the 2026-08-27
-addendum (C2 per-path policy, C7 disconnect propagation, C8 finite hold).
+"""Tests for ``servedeck.gateway`` — the one normalising gateway.
 
-Every test here drives the module against a stubbed supervisor (a plain
-object satisfying gateway.SupervisorView) and a stubbed upstream
-(httpx.MockTransport) — SPEC's own verification instruction: "unit-test
-the state matrix with a stubbed upstream (do not proxy to the live :8001
-server for destructive cases)". No network is used anywhere in this file.
+The upstream is an ``httpx.MockTransport`` that records exactly what the
+gateway sent it and replies with whatever the test asks for (including a
+byte-stream cut at boundaries the test chooses).  The gateway itself is driven
+over ``httpx.ASGITransport``, so every assertion goes through the real ASGI
+request/response path — path parameters, header raw lists, streaming response
+bodies — rather than calling handler functions directly.
 
-Handlers are exercised directly (``gateway._handle_hold_eligible`` /
-``gateway._handle_pass_through``) against hand-built Starlette Requests
-rather than through TestClient. That's a deliberate choice, not a
-shortcut: TestClient runs the ASGI app on a separate portal thread, and
-several of these tests (park-then-wake, park-detects-FAILED-mid-hold,
-shed-while-another-request-is-parked) need to flip supervisor state from
-the *same* asyncio loop that's awaiting inside the handler — asyncio.Event
-isn't thread-safe to .set() across loops without call_soon_threadsafe
-gymnastics that would test the harness, not the gateway. Calling the
-handler coroutines directly keeps everything on one loop and is exactly
-as much "the real code" as going through the router, since the router's
-own dispatch (`v1_dispatch`) is a two-line method/path check covered
-separately in test_router_dispatches_hold_eligible_paths_only.
+What is deliberately NOT asserted here: time-to-first-chunk.  httpx's
+``ASGITransport`` collects a streaming response into a list of body parts
+before handing it back, so an in-process test cannot see incremental delivery
+however the gateway behaves.  That property is proved in
+``tests/test_gateway_e2e.py`` against a real server over a real socket.  What
+*is* asserted here is the property that makes incremental delivery correct:
+the output must not depend on where the upstream's chunk boundaries fell.
 """
 
 from __future__ import annotations
@@ -29,620 +23,734 @@ import json
 
 import httpx
 import pytest
+from fastapi import FastAPI
 from starlette.requests import Request
 
 from servedeck import gateway
+from servedeck.gateway import Route, RoutePolicies
+from tests.fake_routes import FakeRouteTable, load, lfm2_route, reassemble, sse_events
 
-# ---------------------------------------------------------------------------
-# Request builder — no ASGI server involved, just a scope + receive callable.
-# ---------------------------------------------------------------------------
-
-
-def make_request(method: str = "GET", path: str = "/v1/models", body: bytes = b"", headers: dict | None = None) -> Request:
-    raw_headers = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
-    scope = {
-        "type": "http",
-        "method": method,
-        "path": path,
-        "raw_path": path.encode(),
-        "query_string": b"",
-        "headers": raw_headers,
-        "http_version": "1.1",
-        "scheme": "http",
-        "server": ("127.0.0.1", 8010),
-        "client": ("127.0.0.1", 12345),
-    }
-    state = {"sent": False}
-
-    async def receive():
-        if state["sent"]:
-            return {"type": "http.disconnect"}
-        state["sent"] = True
-        return {"type": "http.request", "body": body, "more_body": False}
-
-    return Request(scope, receive)
+STREAM = "chat_stream_reasoning.sse"
+NONSTREAM = "chat_nonstream_reasoning.json"
+NOREASON = "chat_nonstream_noreasoning.json"
 
 
 # ---------------------------------------------------------------------------
-# Stub supervisor — satisfies gateway.SupervisorView structurally.
+# Harness
 # ---------------------------------------------------------------------------
 
 
-class StubSupervisor:
-    def __init__(self, *, desired: str = gateway.DESIRED_RUNNING, actual: str = gateway.ACTUAL_READY):
-        self._desired = desired
-        self._actual = actual
-        self.ready_event = asyncio.Event()
-        if actual == gateway.ACTUAL_READY:
-            self.ready_event.set()
-        self._failure_code: str | None = None
-        self._failure_detail: str | None = None
-        self._hold = gateway.HoldStatus(
-            phase_code="loading_weights", phase_label="Loading weights", eta_s=190, attempt=1
-        )
+class Upstream:
+    """A recorded fake vLLM behind ``httpx.MockTransport``."""
 
-    def desired_state(self) -> str:
-        return self._desired
+    def __init__(self) -> None:
+        self.requests: list[httpx.Request] = []
+        self.status = 200
+        self.media = "application/json"
+        self.body: bytes = b"{}"
+        self.chunks: list[bytes] | None = None
+        self.headers: dict[str, str] = {}
+        self.raise_on_send: Exception | None = None
 
-    def actual_state(self) -> str:
-        return self._actual
+    @property
+    def last(self) -> httpx.Request:
+        assert self.requests, "upstream was never called"
+        return self.requests[-1]
 
-    def upstream_base_url(self) -> str:
-        return "http://upstream.invalid"
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        if self.raise_on_send is not None:
+            raise self.raise_on_send
+        headers = {"content-type": self.media, **self.headers}
+        if self.chunks is None:
+            return httpx.Response(self.status, headers=headers, content=self.body)
 
-    def hold_status(self) -> gateway.HoldStatus:
-        return self._hold
+        pieces = list(self.chunks)
 
-    def failure_code(self) -> str | None:
-        return self._failure_code
+        async def gen():
+            for piece in pieces:
+                yield piece
 
-    def failure_detail(self) -> str | None:
-        return self._failure_detail
-
-    # test helpers, not part of the protocol
-    def set_actual(self, actual: str) -> None:
-        self._actual = actual
-        if actual == gateway.ACTUAL_READY:
-            self.ready_event.set()
-        else:
-            self.ready_event.clear()
-
-    def set_desired(self, desired: str) -> None:
-        self._desired = desired
-
-    def set_failure(self, code: str, detail: str) -> None:
-        self._failure_code = code
-        self._failure_detail = detail
+        return httpx.Response(self.status, headers=headers, content=gen())
 
 
-assert isinstance(StubSupervisor(), gateway.SupervisorView)
+def rig(table: FakeRouteTable) -> tuple[FastAPI, Upstream]:
+    upstream = Upstream()
+    client = httpx.AsyncClient(transport=httpx.MockTransport(upstream.handler))
+    app = FastAPI()
+    app.include_router(gateway.build_router(table, client=client))
+    return app, upstream
 
 
-# ---------------------------------------------------------------------------
-# Mock transports
-# ---------------------------------------------------------------------------
+def call(app: FastAPI, method: str, path: str, **kwargs) -> httpx.Response:
+    async def go():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://gw") as c:
+            return await c.request(method, path, **kwargs)
+
+    return asyncio.run(go())
 
 
-class CountingOkTransport(httpx.AsyncBaseTransport):
-    """Every request gets a fixed 200 JSON body. Records call count and the
-    last request seen (for header-forwarding assertions)."""
-
-    def __init__(self, body: bytes = b'{"ok": true}'):
-        self.calls = 0
-        self.last_request: httpx.Request | None = None
-        self._body = body
-
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        self.calls += 1
-        self.last_request = request
-
-        async def _one_chunk():
-            yield self._body
-
-        return httpx.Response(
-            200,
-            headers={"content-type": "application/json", "connection": "keep-alive"},
-            content=_one_chunk(),
-        )
-
-
-class RefusingTransport(httpx.AsyncBaseTransport):
-    """Simulates "nothing is listening" — every request raises a connect error."""
-
-    def __init__(self):
-        self.calls = 0
-
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        self.calls += 1
-        raise httpx.ConnectError("Connection refused", request=request)
-
-
-def client_for(transport: httpx.AsyncBaseTransport) -> httpx.AsyncClient:
-    return httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(connect=5.0, read=None, write=None, pool=None))
+def two_model_table(*, flash_live: bool = True, lfm_live: bool = True) -> FakeRouteTable:
+    """The shape the box actually runs: one exclusive main model with an alias
+    and two effort presets, plus an always-on resident."""
+    flash = Route(
+        model_id="glm53-flash",
+        port=8002,
+        live=flash_live,
+        aliases=("glm53",),
+        presets=("glm53-flash-high", "glm53-flash-low"),
+        policies=RoutePolicies(mirror_reasoning=True, ctx=327680),
+    )
+    return FakeRouteTable([flash, lfm2_route(live=lfm_live)], main_name="glm53-flash")
 
 
 # ---------------------------------------------------------------------------
-# READY / UNMANAGED — transparent stream proxy
+# The Protocol itself
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.anyio
-async def test_ready_streams_through():
-    supervisor = StubSupervisor(actual=gateway.ACTUAL_READY)
-    transport = CountingOkTransport()
-    client = client_for(transport)
-    runtime = gateway.GatewayRuntime(max_parked=64)
-    try:
-        request = make_request(method="POST", path="/v1/chat/completions", body=b'{"model":"m"}')
-        resp = await gateway._handle_hold_eligible(request, supervisor, client, runtime, hold_max_s=5.0, park_poll_s=0.05)
-        assert resp.status_code == 200
-        body = b"".join([chunk async for chunk in resp.body_iterator])
-        assert json.loads(body) == {"ok": True}
-        assert transport.calls == 1
-        assert runtime.parked_count == 0  # never parked
-    finally:
-        await client.aclose()
-
-
-@pytest.mark.anyio
-async def test_unmanaged_streams_through_without_parking():
-    supervisor = StubSupervisor(desired=gateway.DESIRED_RUNNING, actual=gateway.ACTUAL_UNMANAGED)
-    transport = CountingOkTransport()
-    client = client_for(transport)
-    runtime = gateway.GatewayRuntime(max_parked=64)
-    try:
-        request = make_request(method="POST", path="/v1/responses", body=b"{}")
-        resp = await gateway._handle_hold_eligible(request, supervisor, client, runtime, hold_max_s=5.0, park_poll_s=0.05)
-        assert resp.status_code == 200
-        assert transport.calls == 1
-        assert runtime.parked_count == 0
-    finally:
-        await client.aclose()
+def test_fake_route_table_satisfies_the_protocol():
+    """P1/P3 implement ``RouteTable``; this pins that the four methods the
+    gateway calls are the four methods the Protocol declares."""
+    assert isinstance(two_model_table(), gateway.RouteTable)
 
 
 # ---------------------------------------------------------------------------
-# desired == STOPPED -> immediate 503, never park, never touch transport
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.anyio
-async def test_desired_stopped_is_immediate_503_never_parks():
-    # actual is deliberately still READY, to prove the desired==STOPPED
-    # check wins the race described in _handle_hold_eligible's docstring
-    # (stop() sets desired_state before signalling).
-    supervisor = StubSupervisor(desired=gateway.DESIRED_STOPPED, actual=gateway.ACTUAL_READY)
-    transport = CountingOkTransport()
-    client = client_for(transport)
-    runtime = gateway.GatewayRuntime(max_parked=64)
-    try:
-        request = make_request(method="POST", path="/v1/chat/completions", body=b"{}")
-        resp = await gateway._handle_hold_eligible(request, supervisor, client, runtime, hold_max_s=5.0, park_poll_s=0.05)
-        assert resp.status_code == 503
-        assert resp.headers["retry-after"] == "5"
-        body = json.loads(bytes(resp.body))
-        assert body["error"]["code"] == "stopped"
-        assert body["error"]["type"] == "servedeck_upstream_unavailable"
-        assert transport.calls == 0
-        assert runtime.parked_count == 0
-    finally:
-        await client.aclose()
-
-
-# ---------------------------------------------------------------------------
-# actual == FAILED -> immediate 503 with classified code, never park
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.anyio
-async def test_failed_is_immediate_503_with_classified_code():
-    supervisor = StubSupervisor(desired=gateway.DESIRED_RUNNING, actual=gateway.ACTUAL_FAILED)
-    supervisor.set_failure("KV_TOO_SMALL", "estimated maximum model length is 131072")
-    transport = CountingOkTransport()
-    client = client_for(transport)
-    runtime = gateway.GatewayRuntime(max_parked=64)
-    try:
-        request = make_request(method="POST", path="/v1/chat/completions", body=b"{}")
-        resp = await gateway._handle_hold_eligible(request, supervisor, client, runtime, hold_max_s=5.0, park_poll_s=0.05)
-        assert resp.status_code == 503
-        body = json.loads(bytes(resp.body))
-        assert body["error"]["code"] == "kv_too_small"
-        assert "estimated maximum model length is 131072" in body["error"]["message"]
-        assert transport.calls == 0
-    finally:
-        await client.aclose()
-
-
-@pytest.mark.anyio
-async def test_failed_with_broken_failure_accessors_still_returns_503():
-    """A supervisor whose failure_code()/failure_detail() raise must not
-    take the whole response path down with it (_safe() wrapping)."""
-
-    class BrokenFailureSupervisor(StubSupervisor):
-        def failure_code(self):
-            raise RuntimeError("not wired yet")
-
-        def failure_detail(self):
-            raise RuntimeError("not wired yet")
-
-    supervisor = BrokenFailureSupervisor(desired=gateway.DESIRED_RUNNING, actual=gateway.ACTUAL_FAILED)
-    transport = CountingOkTransport()
-    client = client_for(transport)
-    runtime = gateway.GatewayRuntime(max_parked=64)
-    try:
-        request = make_request(method="POST", path="/v1/responses", body=b"{}")
-        resp = await gateway._handle_hold_eligible(request, supervisor, client, runtime, hold_max_s=5.0, park_poll_s=0.05)
-        assert resp.status_code == 503
-        body = json.loads(bytes(resp.body))
-        assert body["error"]["code"] == "failed"
-    finally:
-        await client.aclose()
-
-
-# ---------------------------------------------------------------------------
-# STARTING/PREFLIGHT/DRAINING/STOPPING + desired==RUNNING -> PARK
+# Routing
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    "actual_during_hold",
-    [gateway.ACTUAL_STARTING, gateway.ACTUAL_PREFLIGHT, gateway.ACTUAL_DRAINING, gateway.ACTUAL_STOPPING],
+    "name,port,upstream_model",
+    [
+        ("glm53-flash", 8002, "glm53-flash"),
+        ("glm53", 8002, "glm53-flash"),
+        ("glm53-flash-high", 8002, "glm53-flash"),
+        ("LFM2.5-350M", 8007, "LFM2.5-350M"),
+        ("lfm2", 8007, "LFM2.5-350M"),
+    ],
 )
-@pytest.mark.anyio
-async def test_park_then_ready_streams_through(actual_during_hold):
-    supervisor = StubSupervisor(desired=gateway.DESIRED_RUNNING, actual=actual_during_hold)
-    transport = CountingOkTransport()
-    client = client_for(transport)
-    runtime = gateway.GatewayRuntime(max_parked=64)
-    try:
-        request = make_request(method="POST", path="/v1/chat/completions", body=b"{}")
-        task = asyncio.create_task(
-            gateway._handle_hold_eligible(request, supervisor, client, runtime, hold_max_s=5.0, park_poll_s=0.02)
-        )
-        await asyncio.sleep(0.05)
-        assert runtime.parked_count == 1  # confirms it actually parked, not raced ahead
-        assert transport.calls == 0
-        supervisor.set_actual(gateway.ACTUAL_READY)  # also sets ready_event
-        resp = await asyncio.wait_for(task, timeout=2.0)
-        assert resp.status_code == 200
-        assert transport.calls == 1
-        assert runtime.parked_count == 0  # slot released
-    finally:
-        await client.aclose()
+def test_routes_by_id_alias_and_preset(name, port, upstream_model):
+    app, up = rig(two_model_table())
+    call(app, "POST", "/v1/chat/completions", json={"model": name, "messages": []})
+    assert up.last.url.port == port
+    assert up.last.url.path == "/v1/chat/completions"
+    # vLLM was started with the id, not with the alias or the preset name, so
+    # the name the client used must be rewritten or upstream answers 404.
+    assert json.loads(up.last.content)["model"] == upstream_model
 
 
-@pytest.mark.anyio
-async def test_park_timeout_returns_503_restarting_with_eta():
-    supervisor = StubSupervisor(desired=gateway.DESIRED_RUNNING, actual=gateway.ACTUAL_STARTING)
-    transport = CountingOkTransport()
-    client = client_for(transport)
-    runtime = gateway.GatewayRuntime(max_parked=64)
-    try:
-        request = make_request(method="POST", path="/v1/chat/completions", body=b"{}")
-        loop = asyncio.get_event_loop()
-        start = loop.time()
-        resp = await gateway._handle_hold_eligible(request, supervisor, client, runtime, hold_max_s=0.2, park_poll_s=0.05)
-        elapsed = loop.time() - start
-        assert resp.status_code == 503
-        assert elapsed < 1.0  # bounded near hold_max_s, not left hanging
-        body = json.loads(bytes(resp.body))
-        assert body["error"]["code"] == "restarting"
-        assert body["error"]["servedeck"]["phase"] == "loading_weights"
-        assert body["error"]["servedeck"]["eta_s"] == 190
-        assert "3m10s" in body["error"]["message"]
-        assert transport.calls == 0
-        assert runtime.parked_count == 0  # slot released even on timeout
-    finally:
-        await client.aclose()
+def test_get_without_a_model_goes_to_the_main_slot():
+    app, up = rig(two_model_table())
+    call(app, "GET", "/v1/anything?a=1&b=two")
+    assert up.last.url.port == 8002
+    assert up.last.url.query == b"a=1&b=two"
 
 
-@pytest.mark.anyio
-async def test_park_notices_failed_transition_before_full_ceiling():
-    """SPEC corrections C8: 'Never hold when reached_ready was false.' A
-    boot that fails mid-hold must not keep this request parked for the
-    remainder of hold_max_s."""
-    supervisor = StubSupervisor(desired=gateway.DESIRED_RUNNING, actual=gateway.ACTUAL_STARTING)
-    transport = CountingOkTransport()
-    client = client_for(transport)
-    runtime = gateway.GatewayRuntime(max_parked=64)
-    try:
-        request = make_request(method="POST", path="/v1/chat/completions", body=b"{}")
-        task = asyncio.create_task(
-            gateway._handle_hold_eligible(request, supervisor, client, runtime, hold_max_s=30.0, park_poll_s=0.02)
-        )
-        await asyncio.sleep(0.05)
-        supervisor.set_actual(gateway.ACTUAL_FAILED)
-        supervisor.set_failure("RUNTIME_OOM", "CUDA out of memory")
-        resp = await asyncio.wait_for(task, timeout=1.0)  # must NOT take anywhere near 30s
-        assert resp.status_code == 503
-        body = json.loads(bytes(resp.body))
-        assert body["error"]["code"] == "runtime_oom"
-        assert transport.calls == 0
-    finally:
-        await client.aclose()
+def test_post_without_a_model_goes_to_the_main_slot_untouched():
+    app, up = rig(two_model_table())
+    sent = b'{"messages":[{"role":"user","content":"hi"}]}'
+    call(app, "POST", "/v1/chat/completions", content=sent,
+         headers={"content-type": "application/json"})
+    assert up.last.url.port == 8002
+    # No model was named, so none is invented: the body crosses as it stands.
+    assert up.last.content == sent
 
 
-@pytest.mark.anyio
-async def test_park_notices_stopped_transition_before_full_ceiling():
-    supervisor = StubSupervisor(desired=gateway.DESIRED_RUNNING, actual=gateway.ACTUAL_STARTING)
-    transport = CountingOkTransport()
-    client = client_for(transport)
-    runtime = gateway.GatewayRuntime(max_parked=64)
-    try:
-        request = make_request(method="POST", path="/v1/responses", body=b"{}")
-        task = asyncio.create_task(
-            gateway._handle_hold_eligible(request, supervisor, client, runtime, hold_max_s=30.0, park_poll_s=0.02)
-        )
-        await asyncio.sleep(0.05)
-        supervisor.set_desired(gateway.DESIRED_STOPPED)  # user clicked Stop while we were parked
-        resp = await asyncio.wait_for(task, timeout=1.0)
-        assert resp.status_code == 503
-        body = json.loads(bytes(resp.body))
-        assert body["error"]["code"] == "stopped"
-        assert transport.calls == 0
-    finally:
-        await client.aclose()
+@pytest.mark.parametrize("path", ["/health", "/ping", "/metrics", "/tokenize", "/detokenize"])
+def test_non_v1_paths_pass_through_to_the_routed_model(path):
+    app, up = rig(two_model_table())
+    call(app, "GET", path)
+    assert up.last.url.port == 8002
+    assert up.last.url.path == path
 
 
-# ---------------------------------------------------------------------------
-# max_parked shedding
-# ---------------------------------------------------------------------------
+def test_tokenize_routes_by_the_model_in_its_body():
+    app, up = rig(two_model_table())
+    call(app, "POST", "/tokenize", json={"model": "lfm2", "prompt": "hi"})
+    assert up.last.url.port == 8007
+    assert json.loads(up.last.content)["model"] == "LFM2.5-350M"
 
 
-@pytest.mark.anyio
-async def test_max_parked_sheds_with_503_and_releases_after():
-    supervisor = StubSupervisor(desired=gateway.DESIRED_RUNNING, actual=gateway.ACTUAL_STARTING)
-    transport = CountingOkTransport()
-    client = client_for(transport)
-    runtime = gateway.GatewayRuntime(max_parked=1)
-    try:
-        first_req = make_request(method="POST", path="/v1/chat/completions", body=b"{}")
-        first_task = asyncio.create_task(
-            gateway._handle_hold_eligible(first_req, supervisor, client, runtime, hold_max_s=5.0, park_poll_s=0.02)
-        )
-        await asyncio.sleep(0.05)
-        assert runtime.parked_count == 1
-
-        second_req = make_request(method="POST", path="/v1/chat/completions", body=b"{}")
-        shed_resp = await gateway._handle_hold_eligible(
-            second_req, supervisor, client, runtime, hold_max_s=5.0, park_poll_s=0.02
-        )
-        assert shed_resp.status_code == 503
-        shed_body = json.loads(bytes(shed_resp.body))
-        assert shed_body["error"]["code"] == "queue_full"
-        assert shed_body["error"]["servedeck"]["parked"] == 1
-        assert runtime.parked_count == 1  # the shed request never occupied a slot
-
-        supervisor.set_actual(gateway.ACTUAL_READY)
-        first_resp = await asyncio.wait_for(first_task, timeout=2.0)
-        assert first_resp.status_code == 200
-        assert runtime.parked_count == 0
-    finally:
-        await client.aclose()
-
-
-# ---------------------------------------------------------------------------
-# Pass-through paths — SPEC corrections C2: never consult state, never hold
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("actual", [gateway.ACTUAL_FAILED, gateway.ACTUAL_STOPPED, gateway.ACTUAL_STARTING])
-@pytest.mark.anyio
-async def test_get_models_passes_through_ignoring_state(actual):
-    """C2: GET /v1/models must NEVER be held and NEVER synthesized —
-    it's a plain pass-through regardless of what actual_state says."""
-    supervisor = StubSupervisor(desired=gateway.DESIRED_STOPPED, actual=actual)
-    transport = CountingOkTransport(body=b'{"object":"list","data":[{"id":"m"}]}')
-    client = client_for(transport)
-    request = make_request(method="GET", path="/v1/models")
-    resp = await gateway._handle_pass_through(request, supervisor, client)
-    assert resp.status_code == 200
-    assert transport.calls == 1
-
-
-@pytest.mark.anyio
-async def test_passthrough_503_when_upstream_down_and_never_retries():
-    supervisor = StubSupervisor(desired=gateway.DESIRED_RUNNING, actual=gateway.ACTUAL_READY)
-    transport = RefusingTransport()
-    client = client_for(transport)
-    request = make_request(method="GET", path="/health")
-    resp = await gateway._handle_pass_through(request, supervisor, client)
-    assert resp.status_code == 503
-    body = json.loads(bytes(resp.body))
-    assert body["error"]["code"] == "upstream_unreachable"
-    assert transport.calls == 1  # exactly one attempt — no internal retry
-
-
-def test_filter_headers_strips_hop_by_hop_and_configured_extras():
-    items = [
-        ("Host", "should-be-dropped"),
-        ("Connection", "keep-alive"),
-        ("Transfer-Encoding", "chunked"),
-        ("Authorization", "Bearer x"),
-        ("Content-Type", "application/json"),
-    ]
-    out = gateway._filter_headers(items, gateway._REQUEST_STRIP_HEADERS)
-    assert out == {"Authorization": "Bearer x", "Content-Type": "application/json"}
-
-    out_response_side = gateway._filter_headers(items, gateway._HOP_BY_HOP_HEADERS)
-    # response-side stripping does NOT strip "host" — that's a request-only concern.
-    assert out_response_side == {
-        "Host": "should-be-dropped",
-        "Authorization": "Bearer x",
-        "Content-Type": "application/json",
+def test_model_named_late_in_a_large_body_still_routes_correctly():
+    """A client is free to put ``model`` after a megabyte of base64 image. The
+    scan must keep reading rather than give up and route to the main slot."""
+    blob = "A" * 1_200_000
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64," + blob}}],
+            }
+        ],
+        "model": "lfm2",
     }
+    sent = json.dumps(body).encode()
+    app, up = rig(two_model_table())
+    call(app, "POST", "/v1/chat/completions", content=sent,
+         headers={"content-type": "application/json"})
+    assert up.last.url.port == 8007
+    assert len(up.last.content) > 1_000_000
+    assert json.loads(up.last.content)["model"] == "LFM2.5-350M"
 
 
-@pytest.mark.anyio
-async def test_passthrough_does_not_leak_the_incoming_host_header():
-    # httpx respects an explicitly-set Host header verbatim (verified
-    # separately) — so if the gateway forwarded the client's Host as-is,
-    # upstream would see "should-be-dropped" instead of its own address.
-    # This is therefore a real end-to-end check of _REQUEST_STRIP_HEADERS,
-    # not just of _filter_headers in isolation.
-    supervisor = StubSupervisor()
-    transport = CountingOkTransport()
-    client = client_for(transport)
-    request = make_request(
-        method="GET",
-        path="/v1/models",
-        headers={"host": "should-be-dropped", "authorization": "Bearer x"},
+# ---------------------------------------------------------------------------
+# The routing scan is bounded — the request body is never read to EOF
+# ---------------------------------------------------------------------------
+
+
+def _fake_request(method: str, path: str, chunks: list[bytes]) -> Request:
+    """A Starlette Request whose body arrives as exactly these chunks."""
+    pending = list(chunks)
+
+    async def receive():
+        if pending:
+            return {"type": "http.request", "body": pending.pop(0), "more_body": True}
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    return Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": method,
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": b"",
+            "root_path": "",
+            "headers": [(b"content-type", b"application/json")],
+            "server": ("127.0.0.1", 8010),
+            "client": ("127.0.0.1", 40000),
+        },
+        receive,
     )
-    resp = await gateway._handle_pass_through(request, supervisor, client)
-    assert resp.status_code == 200
-    sent = transport.last_request
-    assert sent is not None
-    assert sent.headers["host"] == "upstream.invalid"
-    assert sent.headers["authorization"] == "Bearer x"
+
+
+def test_a_body_with_no_model_is_never_read_to_eof():
+    """The regression this pins: with the ceiling checked *after* the
+    ``"model"`` pre-filter, a body that never mentions a model fell through
+    ``continue`` on every chunk and accumulated to EOF — precisely the
+    unbounded buffering of ``app.py``'s ``catch_all`` that this replaces.
+
+    Three MiB in, at most ``_MODEL_SCAN_LIMIT`` (plus the chunk that crossed
+    it) ever held, and the unread remainder still available to forward.
+    """
+    chunk = b"x" * 65536
+    total = 3 * 1024 * 1024
+    body = b'{"messages":[{"role":"user","content":"' + b"x" * total + b'"}]}'
+    chunks = [body[i : i + len(chunk)] for i in range(0, len(body), len(chunk))]
+    assert len(body) > gateway._MODEL_SCAN_LIMIT, "raise the body size or lower the ceiling"
+
+    # One event loop for both halves: `asyncio.run` closes pending async
+    # generators on exit, so peeking and draining in two runs would leave the
+    # client's stream closed. In production both happen in one request task.
+    model, prefix, rest_bytes, had_rest = asyncio.run(
+        _peek_and_drain(_fake_request("POST", "/v1/chat/completions", chunks))
+    )
+
+    assert model is None
+    assert len(prefix) <= gateway._MODEL_SCAN_LIMIT + len(chunk)
+    assert had_rest, "the ceiling must stop the scan, not the body"
+    # And nothing is lost: prefix + remainder is the body the client sent.
+    assert prefix + rest_bytes == body
+
+
+async def _peek_and_drain(request) -> tuple[str | None, bytes, bytes, bool]:
+    model, prefix, rest = await gateway._peek_model(request)
+    remainder = b"".join([c async for c in rest]) if rest is not None else b""
+    return model, prefix, remainder, rest is not None
+
+
+def test_a_bounded_scan_still_forwards_the_whole_body():
+    """The same body, through the router: capped scanning must not truncate
+    what reaches the model."""
+    body = b'{"messages":[{"role":"user","content":"' + b"x" * (3 * 1024 * 1024) + b'"}]}'
+    app, up = rig(two_model_table())
+    call(app, "POST", "/v1/chat/completions", content=body,
+         headers={"content-type": "application/json"})
+    assert up.last.content == body
+    assert up.last.url.port == 8002  # no model named → the main slot
+
+
+def test_a_model_named_after_the_last_scheduled_rescan_is_still_found():
+    """The structural scan runs on a doubling schedule so its cost stays linear
+    in the body; a body can therefore end *between* two scheduled scans.  The
+    final scan after the loop is what catches that, and without it this body —
+    a tool schema that mentions ``model`` early, the real ``model`` last —
+    routes to the main slot instead of to the model the client asked for.
+    """
+    body = (
+        b'{"tools":[{"function":{"name":"f","parameters":{"type":"object","properties":'
+        b'{"city":{"type":"string"},"model":{"type":"string"}}}}}],'
+        b'"messages":[{"role":"user","content":"' + b"z" * 1300 + b'"}],'
+        b'"model":"lfm2"}'
+    )
+    # The first chunk carries the nested mark and triggers an incomplete scan,
+    # which schedules the next one at 2000 bytes — past the end of the body.
+    chunks = [body[:1000], body[1000:]]
+    assert 1000 < body.rindex(b'"model"') < 2000
+    model, prefix, remainder, _ = asyncio.run(
+        _peek_and_drain(_fake_request("POST", "/v1/chat/completions", chunks))
+    )
+    assert model == "lfm2"
+    assert prefix + remainder == body
+
+
+def test_a_model_key_straddling_a_chunk_boundary_is_still_found():
+    """The pre-filter searches only the newly arrived bytes plus an overlap of
+    ``len('"model"') - 1``.  Drop that overlap and a body whose ``"model"``
+    lands across a chunk boundary routes to the main slot instead."""
+    body = json.dumps({"messages": [], "model": "lfm2"}).encode()
+    split = body.index(b'"model"') + 3
+    model, prefix, remainder, _ = asyncio.run(
+        _peek_and_drain(_fake_request("POST", "/v1/chat/completions", [body[:split], body[split:]]))
+    )
+    assert model == "lfm2"
+    assert prefix + remainder == body
 
 
 # ---------------------------------------------------------------------------
-# Router wiring — the two-line method/path check that picks hold-eligible
-# vs pass-through is exercised for real here (build_gateway_router itself),
-# everything above tests the handlers it dispatches to.
+# Error bodies
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.anyio
-async def test_router_dispatches_hold_eligible_paths_only():
-    supervisor = StubSupervisor(desired=gateway.DESIRED_STOPPED, actual=gateway.ACTUAL_STOPPED)
-    transport = CountingOkTransport()
-    router, client, runtime = gateway.build_gateway_router(supervisor, transport=transport, hold_max_s=1.0)
-    try:
-        route_map = {(r.methods and tuple(sorted(r.methods)), r.path): r for r in router.routes}
-        v1_route = next(r for r in router.routes if r.path == "/v1/{full_path:path}")
-
-        # POST /v1/chat/completions is hold-eligible: desired==STOPPED -> 503, transport untouched.
-        req = make_request(method="POST", path="/v1/chat/completions", body=b"{}")
-        resp = await v1_route.endpoint(full_path="chat/completions", request=req)
-        assert resp.status_code == 503
-        assert transport.calls == 0
-
-        # GET /v1/models is NOT hold-eligible: passes straight through even though STOPPED.
-        req2 = make_request(method="GET", path="/v1/models")
-        resp2 = await v1_route.endpoint(full_path="models", request=req2)
-        assert resp2.status_code == 200
-        assert transport.calls == 1
-
-        # POST /v1/embeddings is not one of the two hold-eligible sub-paths either.
-        req3 = make_request(method="POST", path="/v1/embeddings", body=b"{}")
-        resp3 = await v1_route.endpoint(full_path="embeddings", request=req3)
-        assert resp3.status_code == 200
-        assert transport.calls == 2
-    finally:
-        await client.aclose()
+def test_unknown_model_is_404_listing_the_known_names():
+    app, up = rig(two_model_table())
+    r = call(app, "POST", "/v1/chat/completions", json={"model": "qwen38-flash-next", "messages": []})
+    assert r.status_code == 404
+    err = r.json()["error"]
+    assert err["code"] == "model_not_found"
+    assert err["type"] == "invalid_request_error"
+    assert "qwen38-flash-next" in err["message"]
+    for name in ("glm53-flash", "glm53", "glm53-flash-high", "LFM2.5-350M", "lfm2"):
+        assert name in err["message"]
+    assert not up.requests, "an unknown model must never reach a port"
 
 
-@pytest.mark.anyio
-async def test_fixed_passthrough_paths_registered():
-    supervisor = StubSupervisor()
-    transport = CountingOkTransport()
-    router, client, runtime = gateway.build_gateway_router(supervisor, transport=transport)
-    try:
-        registered = {r.path for r in router.routes}
-        for p in gateway._FIXED_PASSTHROUGH_PATHS:
-            assert p in registered
-    finally:
-        await client.aclose()
+def test_known_but_not_live_is_503_naming_what_holds_the_main_slot():
+    app, up = rig(two_model_table(flash_live=False))
+    r = call(app, "POST", "/v1/chat/completions", json={"model": "lfm2", "messages": []})
+    assert r.status_code == 200  # the resident is live and unaffected
+    r = call(app, "POST", "/v1/chat/completions", json={"model": "glm53", "messages": []})
+    assert r.status_code == 503
+    assert r.headers["Retry-After"] == "15"
+    err = r.json()["error"]
+    assert err["type"] == "model_not_running"
+    assert err["code"] == "not_running"
+    assert err["message"] == "glm53-flash is not running (main slot: glm53-flash, still starting)"
 
 
-# ---------------------------------------------------------------------------
-# C7 — client-disconnect propagation: abandoning the response's body
-# generator early must close the upstream response, not leave it dangling
-# for a --max-num-seqs=1 backend to stay stuck on.
-# ---------------------------------------------------------------------------
+def test_503_names_the_other_model_that_holds_the_slot():
+    flash = Route(model_id="glm53-flash", port=8002, live=True, policies=RoutePolicies(ctx=327680))
+    booting = Route(model_id="Qwen3.8-27B-NVFP4", port=8004, live=False, policies=RoutePolicies(ctx=262144))
+    table = FakeRouteTable([flash, booting], main_name="glm53-flash")
+    app, _ = rig(table)
+    r = call(app, "POST", "/v1/chat/completions", json={"model": "Qwen3.8-27B-NVFP4"})
+    assert r.status_code == 503
+    assert r.json()["error"]["message"] == (
+        "Qwen3.8-27B-NVFP4 is not running (main slot: glm53-flash)"
+    )
 
 
-@pytest.mark.anyio
-async def test_abandoning_stream_closes_upstream_connection():
-    close_calls = {"n": 0}
-
-    class TrackedResponse(httpx.Response):
-        async def aclose(self) -> None:
-            close_calls["n"] += 1
-            await super().aclose()
-
-    async def body_gen():
-        for i in range(5):
-            yield f"chunk{i}".encode()
-            await asyncio.sleep(0.01)
-
-    class TrackingTransport(httpx.AsyncBaseTransport):
-        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-            return TrackedResponse(200, content=body_gen())
-
-    supervisor = StubSupervisor()
-    client = client_for(TrackingTransport())
-    try:
-        request = make_request(method="GET", path="/v1/models")
-        resp = await gateway._stream_proxy(client, supervisor.upstream_base_url(), request)
-        gen = resp.body_iterator
-        first = await gen.__anext__()
-        assert first == b"chunk0"
-        assert close_calls["n"] == 0  # not closed yet — still mid-stream
-        await gen.aclose()  # simulates Starlette tearing the task down on client disconnect
-        assert close_calls["n"] == 1  # our try/finally ran upstream.aclose() exactly once
-    finally:
-        await client.aclose()
+def test_a_resident_only_box_answers_model_less_probes_rather_than_503():
+    """No main slot, one resident up. ``/health`` must not report a serving
+    machine as down: `doctor` and every is-server-up probe read it."""
+    table = FakeRouteTable([lfm2_route()], main_name=None)
+    app, up = rig(table)
+    r = call(app, "GET", "/health")
+    assert r.status_code == 200
+    assert up.last.url.port == 8007
 
 
-@pytest.mark.anyio
-async def test_full_stream_consumption_still_closes_upstream_once():
-    close_calls = {"n": 0}
+def test_a_booting_main_slot_falls_back_to_a_live_resident_for_probes():
+    app, up = rig(two_model_table(flash_live=False))
+    call(app, "GET", "/health")
+    assert up.last.url.port == 8007
 
-    class TrackedResponse(httpx.Response):
-        async def aclose(self) -> None:
-            close_calls["n"] += 1
-            await super().aclose()
 
-    async def body_gen():
-        yield b"only-chunk"
+def test_no_model_named_and_nothing_live_is_503():
+    table = FakeRouteTable([lfm2_route(live=False)], main_name=None)
+    app, up = rig(table)
+    r = call(app, "GET", "/health")
+    assert r.status_code == 503
+    assert r.headers["Retry-After"] == "15"
+    assert r.json()["error"]["message"] == "no model is running (main slot: empty)"
+    assert not up.requests
 
-    class TrackingTransport(httpx.AsyncBaseTransport):
-        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-            return TrackedResponse(200, content=body_gen())
 
-    supervisor = StubSupervisor()
-    client = client_for(TrackingTransport())
-    try:
-        request = make_request(method="GET", path="/v1/models")
-        resp = await gateway._stream_proxy(client, supervisor.upstream_base_url(), request)
-        chunks = [c async for c in resp.body_iterator]
-        assert chunks == [b"only-chunk"]
-        # httpx itself auto-closes a response once its stream is fully
-        # read, on top of our own try/finally's aclose() call — two calls
-        # is the expected, harmless outcome (httpx.Response.aclose() is
-        # idempotent, guarded by `if not self.is_closed`), not a bug.
-        assert close_calls["n"] >= 1
-    finally:
-        await client.aclose()
+def test_upstream_connect_failure_is_502_not_503():
+    """The registry says live and the socket disagrees. That is servedeck being
+    wrong about the world, not a model that is merely starting — a 503 here
+    would tell every client to retry forever against a port with nothing on
+    it."""
+    app, up = rig(two_model_table())
+    up.raise_on_send = httpx.ConnectError("Connection refused")
+    r = call(app, "POST", "/v1/chat/completions", json={"model": "lfm2", "messages": []})
+    assert r.status_code == 502
+    err = r.json()["error"]
+    assert err["type"] == "upstream_unavailable"
+    assert err["code"] == "upstream_unavailable"
+    assert "127.0.0.1:8007" in err["message"]
+
+
+def test_upstream_error_status_and_body_are_relayed_unchanged():
+    app, up = rig(two_model_table())
+    up.status = 400
+    up.body = b'{"error":{"message":"bad","type":"BadRequestError","code":400}}'
+    r = call(app, "POST", "/v1/chat/completions", json={"model": "lfm2", "messages": []})
+    assert r.status_code == 400
+    assert r.content == up.body
 
 
 # ---------------------------------------------------------------------------
-# mount_gateway wiring
+# /v1/models
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.anyio
-async def test_mount_gateway_exposes_runtime_on_app_state():
-    from fastapi import FastAPI
+def test_models_lists_every_served_name_of_every_live_route():
+    app, up = rig(two_model_table())
+    r = call(app, "GET", "/v1/models")
+    assert r.status_code == 200
+    data = r.json()["data"]
+    assert [e["id"] for e in data] == [
+        "glm53-flash",
+        "glm53",
+        "glm53-flash-high",
+        "glm53-flash-low",
+        "LFM2.5-350M",
+        "lfm2",
+    ]
+    by_id = {e["id"]: e for e in data}
+    # root is the model id, which is how a client learns that four of these
+    # entries are the same weights.
+    assert by_id["glm53-flash-high"]["root"] == "glm53-flash"
+    assert by_id["lfm2"]["root"] == "LFM2.5-350M"
+    # max_model_len is published so a client sizes context from the same place
+    # it learned the name.
+    assert by_id["glm53"]["max_model_len"] == 327680
+    assert by_id["lfm2"]["max_model_len"] == 32768
+    assert not up.requests, "/v1/models must be answered from the registry, not proxied"
 
-    supervisor = StubSupervisor()
-    transport = CountingOkTransport()
-    app = FastAPI()
-    runtime = gateway.mount_gateway(app, supervisor, transport=transport)
-    assert app.state.gateway is runtime
-    assert app.state.gateway_client is not None
-    assert isinstance(runtime, gateway.GatewayRuntime)
-    # shutdown handler must close the client without raising
-    for handler in app.router.on_shutdown:
-        await handler()
+
+def test_models_omits_a_route_that_is_not_live():
+    app, _ = rig(two_model_table(flash_live=False))
+    ids = [e["id"] for e in call(app, "GET", "/v1/models").json()["data"]]
+    assert ids == ["LFM2.5-350M", "lfm2"]
+
+
+def test_models_is_empty_when_nothing_is_live():
+    app, _ = rig(two_model_table(flash_live=False, lfm_live=False))
+    assert call(app, "GET", "/v1/models").json() == {"object": "list", "data": []}
 
 
 # ---------------------------------------------------------------------------
-# anyio backend selection — asyncio only, no trio dependency in this repo
+# Header hygiene
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
+def test_request_header_hygiene():
+    app, up = rig(two_model_table())
+    call(
+        app,
+        "POST",
+        "/v1/chat/completions",
+        json={"model": "lfm2"},
+        headers={
+            "authorization": "Bearer sk-a-real-openai-key",
+            "api-key": "azure-secret",
+            "x-api-key": "anthropic-secret",
+            "openai-organization": "org-123",
+            "cookie": "session=deadbeef",
+            "x-request-id": "abc",
+            "accept-encoding": "gzip, br",
+            "connection": "keep-alive",
+            "te": "trailers",
+            "proxy-connection": "keep-alive",
+        },
+    )
+    sent = up.last.headers
+    # STRIPPED: the models run without --api-key, so a client's own credentials
+    # have no use downstream, and forwarding them copies a user's secrets into
+    # a model process's memory and — on a bad request — into its logs.  A route
+    # that ever needs to authenticate upstream gets the gateway's own
+    # credential injected here, not the client's passed through.
+    for secret in ("authorization", "api-key", "x-api-key", "openai-organization", "cookie"):
+        assert secret not in sent, f"{secret} reached the model"
+    assert b"sk-a-real-openai-key" not in bytes(str(sent.raw), "utf-8")
+    # Forwarded untouched: anything the model or its logs might want.
+    assert sent["x-request-id"] == "abc"
+    # Forced, so what upstream writes is what we can relay byte-for-byte.
+    assert sent["accept-encoding"] == "identity"
+    # The client's Host would have named the gateway's own listener.
+    assert sent["host"] == "127.0.0.1:8007"
+    assert "proxy-connection" not in sent
+    assert "te" not in sent
+
+
+def test_response_header_hygiene():
+    """A gzipped upstream reply (which forcing identity should prevent, but
+    which must still be handled) is delivered decoded, so relaying its
+    ``content-encoding`` would tell the client to decompress plain bytes."""
+    import gzip
+
+    app, up = rig(two_model_table())
+    up.body = gzip.compress(b'{"ok":true}')
+    up.headers = {
+        "x-request-id": "abc",
+        "content-encoding": "gzip",
+        "connection": "keep-alive",
+        "transfer-encoding": "chunked",
+    }
+    r = call(app, "POST", "/v1/chat/completions", json={"model": "lfm2"})
+    assert r.content == b'{"ok":true}'
+    assert r.headers["x-request-id"] == "abc"
+    # Dropped: the body we hand back is decoded, and may be a different length
+    # than upstream's once a policy has mirrored a field into it.
+    assert "content-encoding" not in r.headers
+    assert "connection" not in r.headers
+    assert "transfer-encoding" not in r.headers
+
+
+def test_request_body_is_streamed_not_buffered_when_no_policy_applies():
+    """With no policy to apply and no rewrite needed, the body crosses as a
+    stream — which httpx frames as chunked, and which is visible here as the
+    absence of a content-length the gateway would only have if it had read the
+    whole body first."""
+    app, up = rig(two_model_table())
+    sent = json.dumps({"model": "LFM2.5-350M", "messages": [{"role": "user", "content": "x" * 5000}]}).encode()
+    call(app, "POST", "/v1/chat/completions", content=sent,
+         headers={"content-type": "application/json"})
+    assert up.last.headers.get("transfer-encoding") == "chunked"
+    assert "content-length" not in up.last.headers
+    assert up.last.content == sent  # byte-for-byte, not merely equivalent
+
+
+def test_a_body_on_a_non_post_method_is_forwarded_not_dropped():
+    """DELETE with a body is unusual but legal; swallowing it would surface as
+    a confusing 400 from the model rather than as a gateway bug."""
+    app, up = rig(two_model_table())
+    sent = b'{"reason":"cancelled"}'
+    call(app, "DELETE", "/v1/responses/resp_123", content=sent,
+         headers={"content-type": "application/json"})
+    assert up.last.method == "DELETE"
+    assert up.last.content == sent
+
+
+def test_a_get_carries_no_body_upstream():
+    app, up = rig(two_model_table())
+    call(app, "GET", "/v1/models/LFM2.5-350M")
+    assert up.last.content == b""
+    assert "transfer-encoding" not in up.last.headers
+
+
+def test_query_string_and_unknown_paths_reach_upstream():
+    app, up = rig(two_model_table())
+    call(app, "GET", "/v1/anything/else?a=1&b=two")
+    assert up.last.url.path == "/v1/anything/else"
+    assert up.last.url.query == b"a=1&b=two"
+
+
+# ---------------------------------------------------------------------------
+# Byte-identical passthrough
+# ---------------------------------------------------------------------------
+
+
+def test_no_policy_means_the_response_is_byte_identical():
+    table = FakeRouteTable([lfm2_route()], main_name="LFM2.5-350M")
+    app, up = rig(table)
+    up.body = load(NONSTREAM)
+    r = call(app, "POST", "/v1/chat/completions", json={"model": "LFM2.5-350M"})
+    assert r.content == load(NONSTREAM)
+    assert "reasoning_content" not in r.text
+
+
+def test_no_policy_means_the_request_is_byte_identical():
+    table = FakeRouteTable([lfm2_route()], main_name="LFM2.5-350M")
+    app, up = rig(table)
+    sent = b'{"model": "LFM2.5-350M", "messages": [], "trailing garbage'
+    call(app, "POST", "/v1/chat/completions", content=sent,
+         headers={"content-type": "application/json"})
+    assert up.last.content == sent
+
+
+def test_mirroring_a_stream_that_carries_no_reasoning_is_byte_identical():
+    table = FakeRouteTable([lfm2_route(mirror_reasoning=True)], main_name="LFM2.5-350M")
+    app, up = rig(table)
+    raw = load("chat_stream_noreasoning.sse")
+    up.media = "text/event-stream"
+    up.chunks = [raw]
+    r = call(app, "POST", "/v1/chat/completions", json={"model": "lfm2", "stream": True})
+    assert r.content == raw
+
+
+# ---------------------------------------------------------------------------
+# Mirroring, and where it does and does not apply
+# ---------------------------------------------------------------------------
+
+
+def test_mirror_applies_to_a_json_response():
+    table = FakeRouteTable([lfm2_route(mirror_reasoning=True)], main_name="LFM2.5-350M")
+    app, up = rig(table)
+    up.body = load(NONSTREAM)
+    r = call(app, "POST", "/v1/chat/completions", json={"model": "LFM2.5-350M"})
+    msg = r.json()["choices"][0]["message"]
+    assert msg["reasoning_content"] == msg["reasoning"]
+
+
+def test_mirror_applies_to_an_sse_response():
+    table = FakeRouteTable([lfm2_route(mirror_reasoning=True)], main_name="LFM2.5-350M")
+    app, up = rig(table)
+    up.media = "text/event-stream"
+    up.chunks = [load(STREAM)]
+    r = call(app, "POST", "/v1/chat/completions", json={"model": "LFM2.5-350M", "stream": True})
+    events = sse_events(r.content)
+    assert reassemble(events, "reasoning_content") == reassemble(sse_events(load(STREAM)), "reasoning")
+
+
+@pytest.mark.parametrize("media", ["text/plain; charset=utf-8", "application/octet-stream"])
+def test_mirror_is_decided_by_the_upstream_content_type(media):
+    """Whether a response is transformed is decided by what upstream said it
+    is, never by whether the request asked to stream.  A metrics scrape whose
+    text happens to contain the field name must cross untouched."""
+    table = FakeRouteTable([lfm2_route(mirror_reasoning=True)], main_name="LFM2.5-350M")
+    app, up = rig(table)
+    up.media = media
+    up.body = b'vllm:reasoning{"reasoning":"not json at all"} 1.0\n'
+    r = call(app, "POST", "/v1/chat/completions", json={"model": "LFM2.5-350M"})
+    assert r.content == up.body
+    assert b"reasoning_content" not in r.content
+
+
+@pytest.mark.parametrize(
+    "path,method",
+    [
+        ("/v1/responses", "POST"),
+        ("/v1/responses/resp_abc123", "GET"),
+        ("/v1/responses/resp_abc123/cancel", "POST"),
+    ],
+)
+def test_responses_endpoint_is_never_mirrored(path, method):
+    """Codex speaks /v1/responses, where reasoning is already a first-class
+    output item: mirroring there would add a field to a shape that never
+    lacked it.  The sub-paths return the same envelope as the POST, so the
+    match is a prefix, not an equality."""
+    table = FakeRouteTable([lfm2_route(mirror_reasoning=True)], main_name="LFM2.5-350M")
+    app, up = rig(table)
+    up.body = load(NONSTREAM)
+    r = call(app, method, path, json={"model": "LFM2.5-350M"})
+    assert r.content == load(NONSTREAM)
+    assert "reasoning_content" not in r.text
+
+
+def test_a_path_merely_starting_with_responses_is_still_mirrored():
+    """``startswith("/v1/responses")`` alone would also silence mirroring on
+    ``/v1/responses_preview``; the match is on a whole path segment."""
+    table = FakeRouteTable([lfm2_route(mirror_reasoning=True)], main_name="LFM2.5-350M")
+    app, up = rig(table)
+    up.body = load(NONSTREAM)
+    r = call(app, "POST", "/v1/responses_preview", json={"model": "LFM2.5-350M"})
+    assert "reasoning_content" in r.text
+
+
+# ---------------------------------------------------------------------------
+# Streaming chunk boundaries
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("size", [1, 3, 17, 250])
+def test_stream_output_does_not_depend_on_chunk_boundaries(size):
+    table = FakeRouteTable([lfm2_route(mirror_reasoning=True)], main_name="LFM2.5-350M")
+    raw = load(STREAM)
+
+    def run(chunks):
+        app, up = rig(table)
+        up.media = "text/event-stream"
+        up.chunks = chunks
+        return call(app, "POST", "/v1/chat/completions",
+                    json={"model": "lfm2", "stream": True}).content
+
+    shredded = [raw[i : i + size] for i in range(0, len(raw), size)]
+    assert run(shredded) == run([raw])
+
+
+def test_stream_survives_a_split_mid_utf8_character():
+    """A chunk boundary inside a multi-byte character must not corrupt it: a
+    naive per-chunk ``.decode()`` would raise, and a lossy one would replace
+    the character."""
+    table = FakeRouteTable([lfm2_route(mirror_reasoning=True)], main_name="LFM2.5-350M")
+    frame = json.dumps(
+        {"choices": [{"index": 0, "delta": {"reasoning": "héllo — wörld ✅"}, "finish_reason": None}]},
+        ensure_ascii=False,
+    ).encode()
+    raw = b"data: " + frame + b"\n\ndata: [DONE]\n\n"
+    app, up = rig(table)
+    up.media = "text/event-stream"
+    up.chunks = [raw[i : i + 1] for i in range(len(raw))]
+    out = call(app, "POST", "/v1/chat/completions", json={"model": "lfm2", "stream": True}).content
+    delta = sse_events(out)[0]["choices"][0]["delta"]
+    assert delta["reasoning"] == delta["reasoning_content"] == "héllo — wörld ✅"
+
+
+def test_stream_with_a_partial_trailing_line_is_still_delivered():
+    """An upstream that ends without a final newline must not have its last
+    event swallowed by the hold-back."""
+    table = FakeRouteTable([lfm2_route(mirror_reasoning=True)], main_name="LFM2.5-350M")
+    app, up = rig(table)
+    up.media = "text/event-stream"
+    up.chunks = [b'data: {"choices":[{"delta":{"reasoning":"tail"}}]}']
+    out = call(app, "POST", "/v1/chat/completions", json={"model": "lfm2", "stream": True}).content
+    assert b'"reasoning_content":"tail"' in out
+
+
+# ---------------------------------------------------------------------------
+# Per-route request policies
+# ---------------------------------------------------------------------------
+
+
+def test_effort_preset_injects_its_overlay_and_rewrites_the_model():
+    high = Route(
+        model_id="glm53-flash",
+        port=8002,
+        live=True,
+        presets=("glm53-flash-high",),
+        policies=RoutePolicies(effort_overlay={"reasoning_effort": "high"}, ctx=327680),
+    )
+    app, up = rig(FakeRouteTable([high], main_name="glm53-flash"))
+    call(app, "POST", "/v1/chat/completions", json={"model": "glm53-flash-high", "messages": []})
+    sent = json.loads(up.last.content)
+    assert sent["model"] == "glm53-flash"
+    assert sent["chat_template_kwargs"] == {"reasoning_effort": "high"}
+
+
+def test_output_floor_is_applied_per_route():
+    table = FakeRouteTable(
+        [lfm2_route(min_output_tokens=4096)], main_name="LFM2.5-350M"
+    )
+    app, up = rig(table)
+    call(app, "POST", "/v1/chat/completions",
+         json={"model": "LFM2.5-350M", "max_tokens": 64, "messages": []})
+    assert json.loads(up.last.content)["max_tokens"] == 4096
+
+
+def test_output_floor_applies_on_the_responses_endpoint_too():
+    """/v1/responses is routed and floored and nothing else — the empty-turn
+    failure the floor prevents is not specific to chat/completions."""
+    table = FakeRouteTable([lfm2_route(min_output_tokens=4096)], main_name="LFM2.5-350M")
+    app, up = rig(table)
+    call(app, "POST", "/v1/responses",
+         json={"model": "lfm2", "max_output_tokens": 32, "input": "hi"})
+    sent = json.loads(up.last.content)
+    assert sent["max_output_tokens"] == 4096
+    assert sent["model"] == "LFM2.5-350M"
+
+
+def test_a_route_with_no_policies_never_parses_the_request():
+    """Proved by handing it a body that json.loads cannot read: if any policy
+    had run, the request would have been dropped or mangled."""
+    table = FakeRouteTable([lfm2_route()], main_name="LFM2.5-350M")
+    app, up = rig(table)
+    sent = b'{"model":"LFM2.5-350M","messages":[}}}not json'
+    call(app, "POST", "/v1/chat/completions", content=sent,
+         headers={"content-type": "application/json"})
+    assert up.last.content == sent

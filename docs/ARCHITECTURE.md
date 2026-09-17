@@ -1,106 +1,120 @@
-# Architecture
+# Architecture (v2)
 
-One process: a FastAPI app serving a static page, a JSON API, an SSE stream,
-and a pass-through proxy. It shells out to your launcher; it never builds a
-model-server command line.
+One repository, one Python package, one long-running unit, one transient unit
+per model, one endpoint for every client. The *why* for all of it is
+[REDESIGN-2026-09-12.md](REDESIGN-2026-09-12.md); this file is the map.
 
 ```
-browser ──► servedeck (127.0.0.1:8010)
-              ├── web/            static dashboard
-              ├── /api/*          state, models, capacity, events
-              └── /v1/*           proxied to your model server
-                        │
-                        └──► your launcher ──► model server
+clients ──► servedeck (127.0.0.1:8010)
+              ├── /v1/*    gateway: alias/preset routing, reasoning mirror
+              ├── /api/*   control: state, start/stop/switch, wire, doctor, SSE
+              └── /        the page (servedeck/web/)
+                      │
+                      │ systemd-run --user --unit=model-<key> --collect
+                      ▼
+              model-<key>.service ──► vllm serve   (its own cgroup)
+                      ▲
+                      └── models.toml: the single source of truth
 ```
 
-## Modules
+## Layering
 
-| Module | Responsibility |
-|---|---|
-| `config` | every machine-specific value; nothing else may hardcode one |
-| `capacity` | the VRAM arithmetic. Pure — no I/O, no subprocess |
-| `registry` | model discovery, and the measurement store |
-| `kvcalc` | per-architecture KV cache arithmetic from a checkpoint's `config.json` |
-| `metrics` | scrapes Prometheus `/metrics` |
-| `phases` | boot-phase detection and failure classification from logs |
-| `logtail` | follows a log across rotation and truncation |
-| `procctl` | process control by PID and process group |
-| `updetect` | which port the upstream is on, and why — see below |
-| `supervisor` | intent state machine and auto-restart |
-| `gateway` | holds requests while the backend restarts |
-| `app` | HTTP surface |
+```
+settings  limits                 no servedeck imports; env + hardware only
+     │
+     ▼
+models.py (registry)             models.toml -> Model, render_argv/render_env
+     │
+     ▼
+routes.py (the join)             registry names  ×  control liveness
+     │                 │
+     ▼                 ▼
+gateway.py         control.py    the /v1 proxy   |   the supervisor
+ policies.py         units.py                    |   systemd wrappers
+                     desired.py                  |   what an operator asked for
+     └──────┬────────────┘
+            ▼
+          app.py                 the HTTP surface: /api/*, SSE, the page
+            │
+      ┌─────┴─────┐
+      ▼           ▼
+  web/app.js   cli.py            the page  |  the terminal
+```
 
-## Which port the dashboard watches
+## Module map
 
-Four sources, in this order, and `/api/state` says which one answered:
+| Module | Packet | Why it exists |
+|---|---|---|
+| `settings.py` | P4 | Where to listen, where `models.toml` is, which unit namespace we own. Nothing else. |
+| `limits.py` | P4 | The four *hardware* numbers (VRAM total, overhead, frag margin, training markers). |
+| `models.py` | P1 | Loads and validates `models.toml`; renders one model's `vllm serve` argv and env. |
+| `wire.py` | P1 | Rewrites VS Code / Codex / Kimi configs from the registry, in place, with a diff. |
+| `doctor.py` | P1 | Proves the registry against reality: configs, ports, units, host state. |
+| `cli.py` | P1 | The `servedeck` console script; falls back to in-process `Control` when the server is down. |
+| `gateway.py` | P2 | The `/v1` proxy: resolve `model` → port, stream both ways, 404/503/502 envelopes. |
+| `policies.py` | P2 | Pure byte transforms: reasoning mirror, effort overlay, output floor, model rewrite, `scan_model`. |
+| `units.py` | P3 | Thin `systemd-run` / `systemctl` / `journalctl` wrappers. No policy. |
+| `control.py` | P3 | The supervisor: start, wait-ready, stop, switch, adopt, reconcile. |
+| `desired.py` | P3 | `state/desired.json` — what an operator last explicitly asked for. |
+| `gpu.py` | kept, extended by P3 | `nvidia-smi` total / free / per-pid usage. |
+| `routes.py` | P4 | The one join between registry, gateway and control. |
+| `app.py` | P4 | ASGI app: `/api/*`, the SSE hub, the poller, the page. |
+| `__main__.py` | P4 | `python -m servedeck` — starts uvicorn. |
+| `discovery.py` | kept, renamed by P4 | The local hub cache: what is downloaded, servable, and how big. Was `registry.py`, a name the model registry now owns. |
+| `capacity.py` `kvcalc.py` `parallelism.py` | kept | VRAM / KV / concurrency arithmetic, as a library. |
+| `metrics.py` `tokens.py` `reqstats.py` | kept | Scrape and difference vLLM's Prometheus counters. |
+| `disksize.py` | kept | Deduplicated on-disk size of a hub snapshot. |
 
-1. **A live process.** Every vLLM api-server process on the machine, found by
-   walking `/proc` and reading the socket table — never a file. A process that
-   is running is a fact; everything below it is somebody's intention.
-2. **The shell config's `PORT`** (`local_llm/.config`), what the CLI last set up.
-3. **`state/desired.json`**, what Servedeck last wanted.
-4. **A configured backend's port**, as a last resort.
+Gone in v2, and not coming back: `config.py`, `paths.py`, `supervisor.py`,
+`procctl.py`, `phases.py`, `updetect.py`, `shellconfig.py`, `legacy.py`,
+`history.py`, `logtail.py`, `preflight.py`, `smoke.py`, `events.py`.
 
-And one rule across all four: if the port a file names has nothing listening
-while another known backend's port does, the dashboard follows the live one
-and says so. The failure this replaces was silent — `.config` ended with
-`BACKEND="glm53"` / `PORT="8002"`, GLM had been dead for a week, Flash-Next
-was serving on :8001, and the dashboard reported the box as dead with every
-figure blank and no indication of which port it had been looking at.
+## The dependency rules, and what each one buys
 
-`upstream.resolution` in `/api/state` carries the chosen port, the source, a
-sentence explaining it, and every candidate that was checked (with
-`listening: null` meaning "not probed", never "nothing there").
+**`settings.py` imports nothing from `servedeck`.** It is imported by
+everything, so any import of its own would be a cycle to route around. It also
+never reads a TOML file on import — asking it for a model's port, flags or
+context is the bug the redesign removes.
 
-## Where a KV figure comes from
+**`models.render_argv` is pure.** It takes `util`, `ctx_tokens` and `port` as
+already-resolved values and does no I/O, so `tests/test_models_golden.py` can
+compare its output byte-for-byte against a legacy launcher's dry run.
+Resolving `ctx = "native"` needs the hub cache and is therefore a separate
+call (`native_ctx`), made by the caller.
 
-Three sources, and the panel says which one it used:
+**Nothing in a request handler blocks on a subprocess.** `systemctl`,
+`journalctl` and `nvidia-smi` all run under `asyncio.to_thread`; the request
+path only ever reads the snapshot the poller left behind
+(`RegistryRoutes.refresh` pushes it every `POLL_INTERVAL_S` = 2 s). A
+coroutine waiting on `systemctl` stops the whole server — including the
+gateway that is streaming a model's tokens.
 
-1. **The running engine.** `vllm:cache_config_info` on `/metrics` carries
-   `kv_cache_size_tokens` — the same figure the boot log prints once as
-   "GPU KV cache size: N tokens". Labelled **measured**. Preferred whenever
-   the model on screen is the one running, at the context it is running at.
-2. **A recorded boot.** `state/measurements.json`, keyed on repo and context.
-   Labelled **measured**, or **measured at another context** when the only
-   record is from a different length.
-3. **`kvcalc`.** Per-architecture arithmetic over the checkpoint's own
-   `config.json`: attention K/V per layer, MLA latent, QSA compressed keys,
-   and the Mamba/GDN recurrent state charged per sequence rather than per
-   token. Labelled **estimated**.
+**Mutations answer immediately.** `POST /api/models/<key>/start` returns 202
+and reports over SSE; anything decidable from the snapshot (unknown key, busy,
+slot held) is refused synchronously with 404/409 so a client never has to
+watch a stream to learn it was rejected. One `asyncio.Lock` serialises
+mutations, which is what makes "the main slot is exclusive" true of the API
+and not only of the GPU.
 
-`kvcalc` does not reimplement vLLM's block allocator. Each architecture family
-carries one empirical correction for the padding it does not model, calibrated
-against boots measured on the machine it runs on and shipped with the residual
-it leaves — see the constants in `servedeck/kvcalc.py`, which name every boot
-they were fitted to. A family with no such boot has a correction of 1.0 and
-reports `calibrated: false`; the caller must present that as a floor.
+**The gateway router is mounted LAST.** Its `/v1/{path:path}` is a catch-all
+and Starlette matches in registration order, so any route registered after it
+is dead. Order in `create_app`: `_register_api` → `include_router(gateway)` →
+`_register_page` (whose `/{asset:path}` is the second catch-all and must be
+last of all).
 
-## Two rules the design turns on
+**Resolution is total; liveness is a snapshot.** A name spelled in
+`models.toml` always resolves, even with nothing running — that is what
+separates a 404 ("reconfigure yourself") from a 503 ("wait"). An
+un-refreshed table reports nothing live, which fails towards 503.
 
-**Capacity has exactly one implementation.** The browser never computes it —
-it calls the API. The estimate you see and the validation that blocks a start
-are the same code path, so they cannot disagree.
+## Two invariants worth stating outright
 
-**Intent is stored; state is computed.** `desired_state` is written to disk and
-changed only by an explicit human action. `actual_state` is derived from
-probes, never stored. This is what stops a supervisor from resurrecting a
-server you deliberately stopped: it cannot tell "stopped" from "crashed" by
-looking, so it doesn't try — it consults intent.
+**Intent is stored; state is computed.** `state/desired.json` is written only
+by an explicit `start`/`stop`/`switch`/`adopt`. `reconcile` never writes it and
+never stops anything, so servedeck restarting is not a reason for a model to
+restart.
 
-## Auto-restart
-
-Restart only happens when **both**:
-
-1. `desired_state == RUNNING`, and
-2. the server had reached a serving state before it died.
-
-The second condition is the important one. A boot that fails will fail the same
-way forever, so restarting it hides the cause. A process that crashed while
-serving is a different case, and worth retrying with backoff.
-
-## Process control
-
-`pgrep -f` and `pkill -f` match the calling process's own command line. A test
-fails the build if either appears. `procctl` uses PIDs and process groups, and
-refuses to signal a non-positive pgid — `killpg(0, …)` signals the caller's own
-group, and `killpg(-1, …)` signals everything.
+**Capacity has one implementation.** The page does no arithmetic of its own;
+it renders `/api/state`, whose headroom block is `parallelism.recommend()`
+over the engine's own reported KV pool. When that pool is unknown the answer
+is "unknown" with a reason, never an estimate presented beside a measurement.

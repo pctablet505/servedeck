@@ -1,188 +1,116 @@
 # Servedeck
 
-A local web dashboard for a self-hosted LLM server. It answers the questions
-you actually have while running one:
+One control plane for the local LLMs on one box: a registry, a supervisor, a
+normalising gateway and a page.
 
-- How much context can this model hold on my GPU?
-- How many agents can I run in parallel before it starts thrashing?
-- Is my prefix cache working?
-- Did it crash, or did it never start?
+- **One file describes every model** — `models.toml`. Names, aliases, port,
+  context, parsers, flags, environment.
+- **One URL for every client** — `http://127.0.0.1:8010/v1`. VS Code, Codex,
+  Kimi, Claude Code and scripts all point at it, whichever model is loaded.
+- **One command to run one** — `servedeck switch glm53`. The model runs as its
+  own transient systemd unit, so restarting servedeck never touches it.
 
-It reads your GPU and your server's metrics. It does not replace your launch
-script — it runs the one you already have.
-
-
-
----
-
-## Why
-
-Sizing a KV cache by hand is easy to get wrong, and wrong in an expensive
-direction: you either waste half the card or discover at minute nine of a boot
-that the context you asked for never fit.
-
-Servedeck computes the same arithmetic vLLM does, before you start, and refuses
-configurations that cannot work — with the reason and a suggested fix.
-
-On the machine it was built for, its predictions match the engine's own
-reported numbers to within **0.02%**.
+Binds loopback only, makes no external network requests, and never runs `sudo`.
 
 ---
 
 ## Requirements
 
-- Linux, Python 3.11+
+- Linux with a user systemd instance (`systemctl --user`), Python 3.11+
 - An NVIDIA GPU with `nvidia-smi` on `PATH`
-- A model server exposing an OpenAI-compatible API and Prometheus `/metrics`
-  (vLLM, SGLang, or anything that speaks both)
-- A script you already use to start it
-
----
+- A vLLM venv per build, named in `[builds]` in `models.toml`
 
 ## Install
 
 ```bash
 git clone https://github.com/pctablet505/servedeck && cd servedeck
-./setup.sh                    # creates .venv, installs deps
-cp servedeck.toml.example servedeck.toml
-$EDITOR servedeck.toml        # point it at your launcher
-./run.sh                      # → http://127.0.0.1:8010
-./stop.sh                     # stop it (or Ctrl-C in the terminal)
+uv venv .venv
+uv pip install -e '.[dev]'
 ```
 
-Nothing is installed system-wide. Servedeck binds `127.0.0.1` only, makes no
-external network requests, and never runs `sudo`.
+Then describe your models in `models.toml` — see
+**[docs/CONFIGURATION.md](docs/CONFIGURATION.md)** — and check it:
 
----
-
-## Configure
-
-The minimum is one backend — the launcher you already use:
-
-```toml
-[backends.vllm]
-launcher = "~/serve.sh"
-port = 8000
-architectures = ["Qwen3ForCausalLM", "LlamaForCausalLM"]
+```bash
+.venv/bin/servedeck models
+.venv/bin/servedeck doctor
 ```
 
-Servedeck passes settings to your launcher through environment variables, so
-your script keeps owning the flags:
+## Run the server
 
-```toml
-[backends.vllm.env_map]
-repo_id       = "MODEL"
-port          = "PORT"
-max_model_len = "MAX_LEN"
-util          = "GPU_UTIL"
-max_num_seqs  = "MAX_SEQS"
+```bash
+python -m servedeck                  # http://127.0.0.1:8010
+python -m servedeck --no-reconcile   # serve, but start nothing from desired.json
 ```
 
-Machine-specific tuning your launcher reads — offload sizing, a KV cap — goes
-in `[backends.vllm.env]` and is passed through verbatim.
+Or as a unit, which is how it should run on a box you care about:
 
-GPU size and model cache are auto-detected. Full reference:
-**[docs/CONFIGURATION.md](docs/CONFIGURATION.md)**.
-
----
-
-## What it shows
-
-**Models** — everything in your Hugging Face cache, with the ones no backend
-can load marked unservable and the reason why.
-
-**Capacity** — for the model and settings you pick: KV cache size in tokens,
-how many agents fit, and the largest context that will actually start. Numbers
-measured from a real boot are labelled **measured**; the rest say **estimated**.
-
-**Live utilization** — KV occupancy, running and queued requests, preemptions,
-average context per request, and prefix cache hit rate.
-
-**Throughput, both halves** — generation *and* prefill tokens per second, from
-the engine's own counters. One number cannot tell a 17-second time-to-first-
-token apart from a slow decode, and on a PCIe-bound decode the two differ by
-~70x. Prefill excludes prefix-cache hits, because a cached token costs no
-prefill compute and counting it makes a cache hit look like a throughput
-record. An idle server reports "—", never "0 tok/s".
-
-**Agent sizing** — two numbers, never one:
-
-| | meaning |
-|---|---|
-| Safe floor | every agent at full context — a guarantee |
-| At observed average | `KV tokens ÷ measured average prompt` — a bet |
-
-The second is usually several times larger, and it's a bet because one burst of
-full-context requests will preempt. Watch `preemptions`: if it climbs, your
-agent count is too high. That signal beats any estimate.
-
----
-
-## Status
-
-**Working:** the dashboard, capacity estimation, live metrics, model discovery,
-start / stop / restart, and a pass-through proxy.
-
-A server already running when Servedeck starts is deliberately left alone —
-Servedeck does not assume a process it did not start is wanted. Click **Manage
-running server** to adopt it; that is what enables Stop and crash detection
-for it.
-
-**Not wired yet:** the smoke-test button, and the request-holding gateway
-(`gateway.py` exists and is tested, but is not in the request path).
-
----
-
-## How capacity is computed
-
-```
-budget      = util × total_vram
-kv          = budget − weights − overhead
-kv_tokens   = kv ÷ bytes_per_token
-max context = max_position_embeddings, unless one request of it needs more than kv_tokens
+```bash
+cp systemd/servedeck.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now servedeck
+journalctl --user -u servedeck -f
 ```
 
-**The context is per request, not per agent.** `--max-model-len` caps one
-request; the KV pool is shared, and vLLM admits what fits and queues the rest.
-So a launch defaults to the model's own `max_position_embeddings` (read from
-its local `config.json`) and is lowered only when the pool cannot hold even one
-request of that length — the page says so when it does. How long and short
-requests share the pool ("3 at 262,144 at once, plus N at the recent p90
-beside them") is shown as advice, on the calibrated per-request cost in
-`parallelism.py`, never as a cap on the context.
+The unit template assumes the checkout is at `~/Projects/servedeck`; edit
+`WorkingDirectory` and `ExecStart` if it is not.
 
-Two things that trip people up, both handled:
+## The CLI
 
-**KV cost is not context-invariant.** The same model measured 30.4 KiB/token at
-262k context and 33.9 at 131k — block sizing depends on the configured length.
-Servedeck tracks the rate per context and says when it's reusing one measured
-elsewhere.
+```
+servedeck models              # the registry: key, id, slot, port, build, ctx
+servedeck status              # what is live, KV usage, tok/s, uptime, headroom
+servedeck start  <key>        # start a model and stream its boot
+servedeck stop   <key>
+servedeck switch <key>        # replace whatever holds the exclusive main slot
+servedeck adopt               # record already-running units as desired
+servedeck log    <key> -n 200 # tail its journal
+servedeck smoke  <key>        # one chat + one tool call, through the gateway
+servedeck wire [--apply]      # regenerate VS Code / Codex / Kimi configs
+servedeck doctor              # prove the registry against reality
+```
 
-**On-disk size is not loaded size.** A checkpoint with host-offloaded layers can
-be 126 GB on disk and 78 GB in VRAM. Servedeck refuses to estimate weights for
-architectures where that's known to be untrue, rather than being confidently
-wrong by 37%.
+`start`, `stop`, `switch`, `log` and `adopt` drive the dashboard over HTTP when
+it is up, and fall back to driving the same supervisor in-process when it is
+not — saying which on the first line. A CLI whose only mode is "ask the thing
+that is not running" fails exactly when it is needed.
 
----
+`smoke` goes **through the gateway, on the model's public name**, never at the
+model's own port. That is the point: what it proves is that the name a client
+is configured with reaches the weights.
+
+## What the page shows
+
+Driven entirely by `/api/state`, with an SSE stream for boot progress.
+
+- **Live models** — id and aliases, slot, port, context, KV usage, requests in
+  flight, tok/s, uptime, restarts.
+- **Headroom** — free VRAM, and how many full-context and 4k requests still fit
+  in the engine's *own reported* KV pool. When that number is unknown the panel
+  says so instead of estimating.
+- **Controls** — start, stop, switch, wire, doctor. Each is one POST plus a
+  stream of the unit's journal until READY or failure.
 
 ## Docs
 
-- **[CONFIGURATION.md](docs/CONFIGURATION.md)** — every setting
-- **[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** — when something breaks
-- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** — how it's put together
-
----
+- **[CONFIGURATION.md](docs/CONFIGURATION.md)** — `models.toml` and the five
+  environment variables
+- **[SPEC.md](docs/SPEC.md)** — every route, every response shape
+- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** — the module map and the
+  dependency rules
+- **[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** — the failures that
+  actually happened, and what v2 does about them
+- **[REDESIGN-2026-09-12.md](docs/REDESIGN-2026-09-12.md)** — why v2 looks like
+  this
 
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest
+.venv/bin/python -m pytest -q
 ```
 
-Capacity tests assert predictions match real engine output to within 0.2%,
-replayed from boot logs committed under `tests/fixtures/`.
-
----
+The end-to-end tests drive the real `systemd-run` path under the `sd-test-`
+unit namespace, so they can never create, adopt or stop a real model unit.
 
 ## License
 

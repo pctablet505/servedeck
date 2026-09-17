@@ -1,1881 +1,1379 @@
-"""Servedeck — FastAPI application.
+"""The HTTP surface: one gateway, one control API, one page
+(REDESIGN-2026-09-12.md §2.3, §2.5; P4).
 
-Module is named `app` because run.sh and systemd/servedeck.service both import
-`servedeck.app:app`. SPEC.md called it api.py; those two files won the tie
-because they are already installed.
+This is a rewrite, not an edit. The file it replaces was 1,865 lines that
+re-derived everything on every request: four ``/proc`` argv scans per
+``/api/state``, a hand-rolled boot-phase machine, a 240-second request park, a
+``catch_all`` that buffered every request body including megabyte images, and
+a lifespan that started a model *before uvicorn had bound the port*. That last
+one is not a stylistic complaint: on 2026-09-11 it launched the 27B seventy
+times in nine minutes (REDESIGN §4 R4), because uvicorn runs the ASGI lifespan
+before ``bind()``, the bind then failed against a hand-started copy, systemd
+restarted the unit, and the whole thing went round again — each lap leaving a
+real vLLM boot behind it.
 
-Scope of THIS file today: read-only observability + capacity estimation + a
-pass-through proxy. Server control (start/stop/restart) belongs to
-supervisor.py and is NOT wired here yet — the buttons that would call it are
-rendered disabled rather than lying about what they do.
+So the shape of this file is dictated by four rules:
 
-Binds 127.0.0.1 only. Never runs sudo. Never starts a model server.
+1. **Reconcile only after our own port answers.**  ``_reconcile_after_bind``
+   polls ``/api/health`` on our own listen socket and only then calls
+   ``control.reconcile``. If the bind never succeeds, nothing is ever started.
+   ``tests/test_app.py::test_reconcile_waits_for_the_listen_port`` is the
+   proof, and it is written against a fake control that records ordering.
+
+2. **Nothing in a request handler shells out or blocks.**  ``systemctl``,
+   ``journalctl`` and ``nvidia-smi`` are subprocesses; a coroutine that waits
+   on one stops the whole server, including the gateway that is streaming a
+   model's tokens. Every one of them runs in a worker thread
+   (``asyncio.to_thread``), and the request path reads a snapshot.
+
+3. **Mutations answer immediately and report over SSE.**  A start is minutes
+   long. The POST returns 202 with the action it accepted; progress arrives on
+   ``/api/events`` as it happens. A refusal that can be decided from the
+   snapshot (unknown key, slot busy, already live) is answered synchronously
+   with 404/409 and a typed reason, so a client never has to watch a stream to
+   learn that its request was rejected.
+
+4. **Shutdown closes every subscriber.**  The old app hung on
+   ``TimeoutStopSec`` at every stop, because its SSE generators waited forever
+   on a queue nothing would ever fill again. Here the hub hands each one a
+   sentinel and the generators return.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
-import re
+import logging
+import secrets
 import time
+from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    PlainTextResponse,
+    StreamingResponse,
+)
 
-from . import capacity
-from . import disksize
-from . import kvcalc, config, events, gpu, registry, shellconfig, supervisor as _sup
-from . import updetect
-from . import metrics as _metrics_mod
-from . import parallelism, reqstats
-from .metrics import MetricsPoller
+from servedeck import control as _control
+from servedeck import desired as _desired
+from servedeck import discovery as _discovery
+from servedeck import doctor as _doctor
+from servedeck import gateway as _gateway
+from servedeck import gpu as _gpu
+from servedeck import metrics as _metrics
+from servedeck import models as _models
+from servedeck import parallelism as _parallelism
+from servedeck import routes as _routes
+from servedeck import settings as _settings
+from servedeck import units as _units
+from servedeck import wire as _wire
+
+log = logging.getLogger(__name__)
 
 HERE = Path(__file__).resolve().parent
-WEB = HERE / "web"   # inside the package, so it ships in the wheel
-def _candidate_logs() -> list[Path]:
-    """Backend log files, the one serving our port first.
+#: The page lives INSIDE the package so it ships in the wheel.
+WEB = HERE / "web"
 
-    Ordering matters: these logs are append-only across restarts, so we read
-    the LAST match in whichever file belongs to the running backend.
-    """
-    cfg = config.get()
-    ours = [b for b in cfg.backends if b.port == rt.port]
-    others = [b for b in cfg.backends if b.port != rt.port]
-    # log_path is optional: a launcher with no log management of its own has
-    # no fixed file to name, and None is not a path to try opening.
-    return [b.log_path for b in (*ours, *others) if b.log_path is not None]
+#: How often the poller rebuilds ``/api/state``. Two seconds is the metrics
+#: window the throughput figures are differenced over; polling faster would
+#: divide counter deltas by a dt small enough for scheduling jitter to show up
+#: as throughput noise.
+POLL_INTERVAL_S = 2.0
 
-UPSTREAM_HOST = "http://localhost"
-#: Context length assumed when a model's config.json declares no
-#: max_position_embeddings. A fallback, never a claim: it exists so the UI has
-#: something to draw, and every real number overrides it.
-DEFAULT_MODEL_MAX_CTX = 262144
-STARTED_AT = time.time()
+#: SSE keepalive. Any comment frame will do; 15 s is short enough that a proxy
+#: with a 30 s idle timeout never closes a connection that is merely quiet.
+KEEPALIVE_S = 15.0
 
-app = FastAPI(title="Servedeck", docs_url=None, redoc_url=None)
+#: Per-subscriber queue depth. Drop-oldest on overflow: a slow page loses
+#: history rather than stalling the poller that is trying to publish.
+QUEUE_MAXSIZE = 256
+
+#: The small-request size the headroom panel plans against.
+SMALL_REQUEST_TOKENS = 4096
+
+#: How long ``_reconcile_after_bind`` waits for our own port before giving up.
+#: Generous: a cold page cache can make uvicorn's first bind slow. If it
+#: expires, reconcile does not run — refusing to start models is the correct
+#: failure for a dashboard that could not start itself.
+BIND_WAIT_TIMEOUT_S = 60.0
+BIND_POLL_INTERVAL_S = 0.25
 
 
-# ----------------------------------------------------------------- state --
-class Runtime:
-    """Process-wide mutable state. One instance, created at startup."""
+# ==========================================================================
+# SSE hub
+# ==========================================================================
+
+
+class _Subscriber:
+    """One open ``GET /api/events`` connection."""
+
+    __slots__ = ("queue", "dropped")
 
     def __init__(self) -> None:
-        #: How this port was chosen, in words. Never None: a dashboard that
-        #: cannot find a server must still be able to say what it looked at.
-        #: Files only at construction -- this runs at import, and a /proc walk
-        #: plus a socket-table read there would be paid by every consumer of
-        #: the module, tests included. The first poll resolves it properly.
-        self.resolution = _resolve_upstream(discover=False)
-        self.port = self.resolution.port
-        self.upstream = f"{UPSTREAM_HOST}:{self.port}"
-        self.poller = MetricsPoller(self.upstream)
-        self.metrics: dict[str, Any] = _metrics_mod.unreachable_snapshot()
-        self.gpu: dict[str, Any] = {}
-        self.serving_model: str | None = None
-        #: Every id /v1/models advertises on the live port. A vLLM server can
-        #: advertise several aliases for one loaded model, and taking data[0]
-        #: alone made an alias that happened to sort first the whole answer.
-        self.serving_models: list[str] = []
-        self.upstream_up = False
-        self.client: httpx.AsyncClient | None = None
-        self._models_cache: list[dict[str, Any]] | None = None
-        #: When the model scan was taken. The cache used to have no expiry at
-        #: all: scanned once on the first /api/models and then served for the
-        #: life of the process. On the day a 95.37 GiB BF16 PLE table was
-        #: deleted and a 47.68 GiB FP8 one installed, the panel went on
-        #: reporting the pre-deletion sizes for hours -- the whole reason the
-        #: displayed disk figure "looked wrong". A whole-hub scan is ~25 ms
-        #: warm, so there is nothing to protect with a permanent cache.
-        self._models_cache_at: float = 0.0
+        self.queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(QUEUE_MAXSIZE)
+        self.dropped = 0
 
-    def config(self) -> dict[str, str]:
-        return _safe_config()
+    def offer(self, event: dict[str, Any] | None) -> None:
+        """Never blocks and never raises. A full queue loses its OLDEST event,
+        which is what SSE ordering expects: the page is behind, and the newest
+        state is the one worth having."""
+        while True:
+            try:
+                self.queue.put_nowait(event)
+                return
+            except asyncio.QueueFull:
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    self.queue.get_nowait()
+                    self.dropped += 1
 
-    def retarget(self, *, discover: bool | None = None) -> bool:
-        """Re-resolve the upstream and follow it if it moved. True if it moved.
 
-        The port used to be read from the shell config exactly once, at
-        construction, and then only ever re-read from that same file. Both
-        halves were wrong. The first left the metrics poller, the uptime
-        lookup, the running-model probe, the own-VRAM discount and the /v1
-        proxy watching a dead port for the life of the process. The second
-        made ONE hand-edited file the whole truth: on 2026-09-10 that file's
-        last uncommented lines said ``BACKEND="glm53"`` / ``PORT="8002"``,
-        GLM had been dead for a week, Flash-Next was serving on :8001, and the
-        dashboard reported the box as dead with every figure blank.
+class Hub:
+    """In-process pub/sub for ``/api/events``.
 
-        ``discover`` decides whether this tick re-resolves at all. Left as
-        None it does so exactly when the answer can change: when what we are
-        watching is not answering. While the upstream IS answering, the port
-        stays put -- a server we are talking to outranks every file, and the
-        cheap files-only re-resolution would happily move us onto whatever the
-        shell config names (on this box, the dead backend), whereupon the next
-        poll would find that port dead and move us back. A flap every 2 s,
-        rebuilding the poller each way, so no throughput figure would ever
-        live long enough to be computed.
+    Publishable from a worker thread — ``control.start`` runs in one and its
+    progress callback fires there — by hopping to the hub's loop with
+    ``call_soon_threadsafe``. ``asyncio.Queue`` is not thread-safe, and the
+    failure that mistake produces is a lost event rather than an exception, so
+    the hop is not optional.
+    """
 
-        The poller is rebuilt rather than re-pointed: it carries a two-sample
-        throughput baseline belonging to the OLD server, and carrying that
-        across would produce one fabricated rate spanning two processes.
+    def __init__(self) -> None:
+        self._subs: set[_Subscriber] = set()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self.closed = False
+        #: Every notice published this session, newest last, capped. The page's
+        #: Events panel renders the last 50 of these on load, so a page opened
+        #: after a failure still shows the failure.
+        self.notices: list[dict[str, Any]] = []
+
+    def bind(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+
+    def subscribe(self) -> _Subscriber:
+        sub = _Subscriber()
+        self._subs.add(sub)
+        return sub
+
+    def unsubscribe(self, sub: _Subscriber) -> None:
+        self._subs.discard(sub)
+
+    @property
+    def subscriber_count(self) -> int:
+        return len(self._subs)
+
+    def publish(self, event_type: str, data: Any) -> None:
+        """Fan ``data`` out to every subscriber. Safe from any thread."""
+        event = {"type": event_type, "data": data, "ts": time.time()}
+        if event_type == "notice":
+            self.notices.append(event)
+            del self.notices[:-200]
+        loop = self._loop
+        if loop is None:
+            self._fanout(event)
+            return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            self._fanout(event)
+        else:
+            with contextlib.suppress(RuntimeError):  # loop already closed
+                loop.call_soon_threadsafe(self._fanout, event)
+
+    def _fanout(self, event: dict[str, Any] | None) -> None:
+        for sub in list(self._subs):
+            sub.offer(event)
+
+    def close(self) -> None:
+        """Hand every subscriber the sentinel so its generator returns.
+
+        This is the whole of the ``TimeoutStopSec`` fix. Without it each open
+        page holds a coroutine parked on ``queue.get()`` that nothing will ever
+        complete, uvicorn waits for them on shutdown, and systemd SIGKILLs the
+        unit 15 seconds later — every single stop.
         """
-        if discover is None:
-            discover = not self.upstream_up
-        if not discover:
-            return False
-        return self.follow(_resolve_upstream(discover=True, current_port=self.port))
-
-    def follow(self, resolution: updetect.Upstream) -> bool:
-        """Adopt `resolution` as the answer, moving the port if it changed."""
-        self.resolution = resolution
-        if resolution.port == self.port:
-            return False
-        self.port = resolution.port
-        self.upstream = f"{UPSTREAM_HOST}:{self.port}"
-        self.poller = MetricsPoller(self.upstream)
-        self.metrics = _metrics_mod.unreachable_snapshot()
-        self.serving_model = None
-        self.serving_models = []
-        # The cached socket-table answer belongs to the OLD port.
-        _invalidate_listener()
-        return True
+        self.closed = True
+        self._fanout(None)
 
 
-def _configured_ports() -> list[tuple[str, int]]:
-    """(backend name, port) for every backend servedeck.toml declares, in
-    declaration order. Empty when there is no readable config at all."""
-    try:
-        return [(b.name, b.port) for b in config.get().backends if b.port]
-    except Exception:  # noqa: BLE001 - an unreadable config must not blind the UI
-        return []
+# ==========================================================================
+# Runtime
+# ==========================================================================
 
 
-def _desired_target() -> tuple[object, str | None]:
-    """(port, backend) out of state/desired.json — what Servedeck last WANTED.
+@dataclass
+class Runtime:
+    """Everything a request handler needs, assembled once by the lifespan."""
 
-    Read through the supervisor when one already exists, and straight off the
-    file otherwise: constructing a Supervisor touches the state directory and
-    starts reconciliation, which is far too much to do just to read a port.
+    settings: _settings.Settings
+    registry: _models.Registry
+    control: Any
+    routes: _routes.RegistryRoutes
+    hub: Hub
+    client: httpx.AsyncClient
+    #: key -> ModelSpecAdapter, built once at load. Empty when a test injects
+    #: its own control and never needed the adapters.
+    specs: dict[str, Any] = field(default_factory=dict)
+    #: key -> MetricsPoller. One per model, kept across polls because the
+    #: throughput figures are counter deltas and a fresh poller has no baseline.
+    pollers: dict[str, _metrics.MetricsPoller] = field(default_factory=dict)
+    state: dict[str, Any] = field(default_factory=dict)
+    #: (unit, pid) -> unit start time (epoch seconds). systemd's
+    #: ExecMainStartTimestamp is one more `systemctl show` per unit per poll
+    #: and it cannot change while the pid does not, so it is asked for once.
+    _uptime_cache: dict[tuple[str, int], float] = field(default_factory=dict)
+    #: Serialises mutations. Two concurrent switches would each stop what the
+    #: other started; one lock makes "the main slot is exclusive" true of the
+    #: API and not only of the GPU.
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    #: The mutation in flight, as ``{"action", "key", "label"}``, or None.
+    #: A dict rather than the label string alone: the page needs to know WHICH
+    #: model is booting so it can put the progress line on the right row, and
+    #: parsing that back out of "start flashnext" would be a client reading
+    #: English.
+    busy: dict[str, str] | None = None
+    first_state: asyncio.Event = field(default_factory=asyncio.Event)
+    #: A nonce this process invents at startup and echoes from /api/health.
+    #: ``_reconcile_after_bind`` requires it back before it will start a model.
+    #:
+    #: A 200 alone does not prove we won the port: on 2026-09-11 a
+    #: hand-started copy of servedeck held :8010, and it answers /api/health
+    #: with 200 too. Believing that answer is precisely what turned one lost
+    #: bind into 70 real vLLM launches (REDESIGN §4 R4) — the losing process
+    #: concluded it was listening and reconciled. The nonce makes "is that me"
+    #: answerable instead of assumed.
+    instance_id: str = field(default_factory=lambda: secrets.token_hex(8))
+
+    def poller_for(self, key: str, port: int) -> _metrics.MetricsPoller:
+        base = f"http://127.0.0.1:{port}"
+        existing = self.pollers.get(key)
+        if existing is None or existing.base_url != base:
+            existing = _metrics.MetricsPoller(base)
+            self.pollers[key] = existing
+        return existing
+
+
+# --------------------------------------------------------------------------
+# Blocking helpers — every one of these runs in a worker thread
+# --------------------------------------------------------------------------
+
+
+def _unit_started_at(rt: Runtime, unit: str, pid: int) -> float | None:
+    """Epoch seconds the unit's main process started, or None.
+
+    ``ExecMainStartTimestamp`` is a localised human string
+    (``Fri 2026-09-12 13:49:02 IST``); the numeric companion is asked for
+    instead, because parsing a timezone abbreviation is a locale bug waiting
+    to happen and systemd already publishes the microseconds.
     """
-    if _supervisor is not None:
-        return _supervisor.desired.port, _supervisor.desired.backend
+    if pid <= 0:
+        return None
+    hit = rt._uptime_cache.get((unit, pid))
+    if hit is not None:
+        return hit
     try:
-        d = _sup.load_desired()
-    except Exception:  # noqa: BLE001
-        return None, None
-    return d.port, d.backend
+        props = _units.properties(unit, ("ExecMainStartTimestampMonotonic",))
+    except _units.UnitError:
+        return None
+    raw = props.get("ExecMainStartTimestampMonotonic", "")
+    try:
+        monotonic_us = int(raw)
+    except ValueError:
+        return None
+    if monotonic_us <= 0:
+        return None
+    # systemd's monotonic clock is CLOCK_MONOTONIC, the same one
+    # time.monotonic() reads, so the conversion needs no boot time.
+    started = time.time() - (time.monotonic() - monotonic_us / 1_000_000)
+    rt._uptime_cache[(unit, pid)] = started
+    return started
 
 
-def _live_servers() -> list[updetect.LiveServer]:
-    """Every live vLLM api-server process holding a listening socket.
+def _collect_facts(rt: Runtime) -> dict[str, Any]:
+    """The blocking half of a state build: systemd, nvidia-smi, desired state."""
+    live = rt.routes.refresh()
+    uptimes: dict[str, float | None] = {}
+    for key, view in live.items():
+        started = _unit_started_at(rt, view.unit, view.pid)
+        uptimes[key] = None if started is None else max(0.0, time.time() - started)
+    return {
+        "live": live,
+        "uptimes": uptimes,
+        "gpu": {"total_mib": _gpu.total_mib(), "free_mib": _gpu.free_mib()},
+        "desired": _desired.load(rt.settings.desired_path),
+    }
 
-    From ``/proc`` and the socket table — the system itself — never from a
-    file. This is the fact that outranks every configuration: a process that
-    is running is not somebody's intention.
+
+def _headroom(
+    *,
+    main_key: str | None,
+    main_id: str | None,
+    snapshot: dict[str, Any] | None,
+    full_ctx: int,
+    free_mib: int | None,
+) -> dict[str, Any]:
+    """How much more work the running engine can take on.
+
+    The pool is ``vllm:cache_config_info``'s ``kv_cache_size_tokens`` — the
+    engine's own resolved KV capacity, the same number its boot log prints as
+    "GPU KV cache size". That is a measurement, and the panel says so. When it
+    is absent the answer is "unknown" with a reason, never an estimate: an
+    estimated capacity presented beside a measured one is indistinguishable
+    from it on screen, and acting on the wrong one over-subscribes the engine.
+
+    All the arithmetic is ``parallelism``'s, called here — the page does no
+    capacity maths of its own (REDESIGN §2.5).
     """
-    from . import procctl
-
-    try:
-        procs = procctl.scan_vllm_processes()
-    except Exception:  # noqa: BLE001 - a scan failure means "found nothing"
-        return []
-    return [
-        updetect.LiveServer(
-            pid=p.pid, port=p.port, backend=p.venv, cmdline=tuple(p.cmdline)
+    base: dict[str, Any] = {
+        "free_mib": free_mib,
+        "model": main_id,
+        "key": main_key,
+        "full_ctx": full_ctx or None,
+        "pool_tokens": None,
+        "full_context_requests": None,
+        "small_request_tokens": SMALL_REQUEST_TOKENS,
+        "small_requests": None,
+        "fixed_cost_tokens": _parallelism.FIXED_COST_TOKENS,
+        "headroom_fraction": _parallelism.HEADROOM,
+        "source": None,
+        "unavailable": None,
+        "note": None,
+        # Present on EVERY branch, null when unknown. A key that only appears
+        # in the available case makes the document's shape depend on its
+        # content: a client (or a contract test) reading the unavailable branch
+        # concludes these are never sent, and a renderer written against the
+        # available branch throws on the other one.
+        "full_cost_tokens": None,
+        "small_cost_tokens": None,
+    }
+    if main_key is None:
+        base["unavailable"] = "no model holds the main slot"
+        return base
+    pool = (snapshot or {}).get("kv_cache_size_tokens")
+    if not pool:
+        base["unavailable"] = (
+            "the engine has not reported vllm:cache_config_info yet, so its KV "
+            "pool size is unknown"
         )
-        for p in procs
-        if p.role == procctl.ROLE_SERVER and p.port
+        return base
+    if not full_ctx:
+        base["unavailable"] = (
+            "the model's context length is unknown (ctx = \"native\" and the "
+            "checkpoint is not in the local hub cache)"
+        )
+        return base
+    full = _parallelism.recommend(
+        pool_tokens=int(pool), prompt_tokens=full_ctx, basis="full context"
+    )
+    small = _parallelism.recommend(
+        pool_tokens=int(pool),
+        prompt_tokens=SMALL_REQUEST_TOKENS,
+        basis=f"{SMALL_REQUEST_TOKENS}-token request",
+    )
+    base.update(
+        pool_tokens=int(pool),
+        full_context_requests=full.n_before_clamp,
+        full_cost_tokens=full.cost_tokens,
+        small_requests=small.n_before_clamp,
+        small_cost_tokens=small.cost_tokens,
+        source="measured from the running engine",
+        note=_parallelism.calibration_note(main_id),
+    )
+    return base
+
+
+async def build_state(rt: Runtime) -> dict[str, Any]:
+    """The one JSON document the page renders from.
+
+    Every field is either a registry fact, a systemd fact, or a number the
+    running engine published about itself. Nothing here is estimated, and
+    nothing is computed twice: ``/api/state`` is the only shape, and the page
+    has no second source to disagree with it.
+    """
+    facts = await asyncio.to_thread(_collect_facts, rt)
+    live: dict[str, _routes.LiveView] = facts["live"]
+    desired: _desired.Desired = facts["desired"]
+
+    model_rows: list[dict[str, Any]] = []
+    main_key: str | None = None
+    main_id: str | None = None
+    main_ctx = 0
+    main_snapshot: dict[str, Any] | None = None
+
+    for key, model in rt.registry.models.items():
+        view = live.get(key)
+        ctx = rt.routes.ctx_for(model)
+        row: dict[str, Any] = {
+            "key": key,
+            "id": model.id,
+            "aliases": list(model.aliases),
+            "presets": list(model.presets),
+            "slot": model.slot,
+            "port": model.port,
+            "ctx": ctx or None,
+            "ctx_error": rt.routes.ctx_error(key),
+            "build": model.build,
+            "repo": model.repo,
+            "vram_mib": model.vram_mib,
+            "needs_tty": model.needs_tty,
+            "live": view is not None,
+            "ready": bool(view and view.ready),
+            "unit": view.unit if view else f"{rt.settings.unit_prefix}{key}",
+            "unit_state": view.unit_state if view else "not started",
+            "restarts": view.restarts if view else 0,
+            "pid": view.pid if view else 0,
+            "uptime_s": facts["uptimes"].get(key),
+            "metrics": None,
+        }
+        if view is not None and view.ready:
+            snapshot = await rt.poller_for(key, model.port).scrape(rt.client)
+            payload = snapshot.to_dict()
+            row["metrics"] = {
+                "reachable": payload["reachable"],
+                "running": payload["running"],
+                "waiting": payload["waiting"],
+                "kv_usage_perc": payload["kv_usage_perc"],
+                "gen_tok_s": payload["gen_tok_s"],
+                "gen_tok_s_avg": payload["gen_tok_s_avg"],
+                "gen_state": payload["gen_state"],
+                "kv_cache_size_tokens": payload["kv_cache_size_tokens"],
+                "error": payload["error"],
+            }
+            if model.slot == "main":
+                main_snapshot = payload
+        if model.slot == "main" and view is not None:
+            main_key, main_id, main_ctx = key, model.id, ctx
+        model_rows.append(row)
+
+    unknown_units = [
+        {"key": view.key, "unit": view.unit, "unit_state": view.unit_state}
+        for view in live.values()
+        if view.unknown
     ]
 
+    return {
+        "generated_at": time.time(),
+        "gateway_url": rt.settings.gateway_url,
+        "unit_prefix": rt.settings.unit_prefix,
+        "gpu": facts["gpu"],
+        "desired": {"main": desired.main, "residents": list(desired.residents)},
+        "busy": rt.busy,
+        "models": model_rows,
+        "unknown_units": unknown_units,
+        "headroom": _headroom(
+            main_key=main_key,
+            main_id=main_id,
+            snapshot=main_snapshot,
+            full_ctx=main_ctx,
+            free_mib=facts["gpu"]["free_mib"],
+        ),
+    }
 
-def _port_probe():
-    """A ``port -> pid`` probe backed by ONE socket-table read.
 
-    The resolver asks about several ports; ``procctl.listener_pid`` forks an
-    ``ss`` per question, and asking four times a poll for one table is how the
-    dashboard's own cost grows faster than the box it watches.
+def _state_changed(old: dict[str, Any], new: dict[str, Any]) -> bool:
+    """Is this state worth an SSE frame?
+
+    ``generated_at`` and the throughput figures change on every poll; pushing
+    on those would make "on change" mean "every two seconds" and the page would
+    re-render continuously. Compare the document with the perpetually-moving
+    parts removed.
     """
-    from . import procctl
-
-    try:
-        table = procctl.listening_pids()
-    except Exception:  # noqa: BLE001
-        table = {}
-    return lambda port: table.get(port)
+    return _comparable(old) != _comparable(new)
 
 
-def _foreign_pid(pid: int) -> bool:
-    """True when ``pid`` holds a port but is not a vLLM server.
-
-    2026-09-17: an unrelated project's web app took :8002 (the glm53 port)
-    and the page said "serving" with no model up. The socket table says who
-    holds a port; only the process's own cmdline says whether it is vLLM.
-    """
-    from . import procctl
-
-    raw = procctl._read_cmdline_raw(pid)
-    if raw is None:
-        return True  # gone between the socket read and now: not ours either way
-    return "vllm" not in raw.lower()
+_VOLATILE_METRIC_KEYS = ("gen_tok_s", "gen_tok_s_avg", "kv_usage_perc", "gen_state")
 
 
-def _resolve_upstream(
-    *, discover: bool = True, current_port: int | None = None
-) -> updetect.Upstream:
-    """Which port to watch and why — see updetect.py for the precedence.
-
-    ``discover=False`` resolves from files alone (no process scan, no socket
-    probing), which is what construction wants.
-    """
-    cfg = _safe_config()
-    desired_port, desired_backend = _desired_target()
-    return updetect.resolve(
-        scan=_live_servers if discover else (lambda: []),
-        # None, not a probe that always says no: an unprobed port must be
-        # reported as unprobed, never as "nothing is listening there".
-        probe=_port_probe() if discover else None,
-        shell_port=cfg.get("PORT"),
-        shell_backend=(cfg.get("BACKEND") or "").strip() or None,
-        desired_port=desired_port,
-        desired_backend=desired_backend,
-        backends=_configured_ports(),
-        current_port=current_port,
-        fallback_port=_default_port(),
-        foreign=_foreign_pid if discover else None,
-    )
+def _comparable(doc: dict[str, Any]) -> str:
+    stripped = dict(doc)
+    stripped.pop("generated_at", None)
+    rows = []
+    for row in stripped.get("models") or []:
+        row = dict(row)
+        row.pop("uptime_s", None)
+        met = row.get("metrics")
+        if isinstance(met, dict):
+            row["metrics"] = {k: v for k, v in met.items() if k not in _VOLATILE_METRIC_KEYS}
+        rows.append(row)
+    stripped["models"] = rows
+    return json.dumps(stripped, sort_keys=True, default=str)
 
 
-def _training_marker_hits() -> list[str]:
-    """Marker files that exist right now. Empty when none do — and empty when
-    none are configured, which is the same thing to the caller."""
-    hits = []
-    for marker in capacity.TRAINING_MARKER_PATHS:
-        try:
-            if Path(marker).expanduser().exists():
-                hits.append(marker)
-        except OSError:
-            continue
-    return hits
+# ==========================================================================
+# Background tasks
+# ==========================================================================
 
 
-def _server_uptime_s() -> int | None:
-    """Uptime of the process actually serving on rt.port, or None.
-
-    procctl is imported here, not at module scope: app.py deliberately keeps
-    that import local (see api_adopt), and referencing it globally silently
-    raised NameError into the except below — which read as "no uptime".
-    """
-    from . import procctl
-
-    try:
-        pid = _listener_pid_now()
-        if not pid:
-            return None
-        # Whose uptime is this? The pid holding the port is not necessarily a
-        # model server: with the shell config (or, before the ordering fix in
-        # supervisor.start(), a refused start) naming someone else's port, this
-        # reported 105,114 s of an unrelated always-on service as the model
-        # server's uptime while no model was running at all. procctl's own rule
-        # 4 -- a port that answers with no attributable pid is UNMANAGED, not
-        # guessed at -- applies to every figure taken off that pid.
-        if not procctl.is_attributable(pid):
-            return None
-        return procctl.process_uptime_s(pid)
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def _default_port() -> int:
-    """Port of the first configured backend, or 8000 if none are declared."""
-    backends = config.get().backends
-    return backends[0].port if backends else 8000
-
-
-def _safe_config() -> dict[str, str]:
-    try:
-        return shellconfig.read_config()
-    except Exception:  # noqa: BLE001 - a missing .config must not break the UI
-        return {}
-
-
-# One supervisor for the process. Created lazily: constructing it touches the
-# state directory, and an import-time failure would take the whole UI down
-# rather than just disabling the controls. Declared BEFORE the runtime because
-# resolving the upstream port reads desired state through it when one exists.
-_supervisor: _sup.Supervisor | None = None
-_supervisor_error: str | None = None
-
-rt = Runtime()
-
-
-def sup() -> _sup.Supervisor | None:
-    global _supervisor, _supervisor_error
-    if _supervisor is None and _supervisor_error is None:
-        try:
-            _supervisor = _sup.Supervisor()
-        except Exception as exc:  # noqa: BLE001
-            _supervisor_error = f"{type(exc).__name__}: {exc}"
-    return _supervisor
-
-
-def _snap() -> dict[str, Any]:
-    """The supervisor's snapshot, or {} when there is no supervisor at all.
-
-    The guard belongs here rather than at each of the two call sites that build
-    a payload: `sup().snapshot() if sup() is not None else {}` calls sup() twice,
-    and a third copy written as `sup() and sup().snapshot()` would return None
-    rather than {} and put a null where the page expects an object.
-    """
-    s = sup()
-    return s.snapshot() if s is not None else {}
-
-
-# ------------------------------------------------------------- SSE hub ----
-# events.EventHub, not a local one: it supports Last-Event-ID replay, so a
-# browser that reconnects does not silently lose the events it missed.
-hub = events.EventHub()
-
-
-# ----------------------------------------------------------- background ---
-async def _poll_loop() -> None:
-    assert rt.client is not None
+async def _poll_loop(rt: Runtime) -> None:
+    """Rebuild ``/api/state`` on a timer and publish it when it changes."""
     while True:
         try:
-            if rt.retarget():
-                hub.publish(
-                    "notice",
-                    {"level": "info", "code": "retargeted",
-                     "body": f"now watching {rt.upstream} — {rt.resolution.reason}"},
-                )
-            # A request cannot exceed the engine's own --max-model-len, so
-            # that is the ceiling for the histogram's open-ended +Inf bucket.
-            # Set every poll rather than once: a restart at a different
-            # context length must not keep the old ceiling.
-            rt.poller.ceiling_tokens = _running_max_model_len()
-            snap = await rt.poller.scrape(rt.client)
-            rt.metrics = snap.to_dict()
-            rt.upstream_up = snap.reachable
-
-            g = gpu.gpu_summary()
-            rt.gpu = (
-                {
-                    "used_mib": g.used_mib,
-                    "total_mib": g.total_mib,
-                    "free_mib": g.free_mib,
-                    "util_percent": g.util_percent,
-                    "name": g.name,
-                }
-                if g
-                else {}
-            )
-
-            if rt.upstream_up and not rt.serving_models:
-                _SERVED_NAME_REPO.clear()   # a new server may be a new model
-                rt.serving_models = await _fetch_served_models()
-                rt.serving_model = rt.serving_models[0] if rt.serving_models else None
-            if not rt.upstream_up:
-                rt.serving_model = None
-                rt.serving_models = []
-
-            # A server that comes back on its own — started from a terminal
-            # after a blocker was cleared — must be noticed. Without this the
-            # dashboard sits on a stale FAILED while the model serves happily,
-            # and a later crash is misfiled because nothing is tracking it.
-            await _recover_if_server_returned()
-
-            hub.publish(
-                "telemetry",
-                {
-                    "gpu": rt.gpu,
-                    "vllm": rt.metrics,
-                    "sizing": _sizing_payload(),
-                    "uptime_s": int(time.time() - STARTED_AT),
-                },
-            )
-            _publish_state_if_changed()
+            state = await build_state(rt)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001 - the poller must never die
-            hub.publish("notice", {"level": "warn", "code": "poll_error", "body": str(exc)[:200]})
-        await asyncio.sleep(2.0)
+        except Exception:  # noqa: BLE001 - a bad poll must not end the poller
+            log.exception("state poll failed")
+            await asyncio.sleep(POLL_INTERVAL_S)
+            continue
+        changed = _state_changed(rt.state, state)
+        rt.state = state
+        rt.first_state.set()
+        if changed:
+            rt.hub.publish("state", state)
+        await asyncio.sleep(POLL_INTERVAL_S)
 
 
-#: Signature of the last `state` event published by the poll loop, so an
-#: idle box does not re-broadcast an unchanged payload every 2 s.
-_LAST_STATE_SIG: tuple[Any, ...] | None = None
+async def _own_port_answers(client: httpx.AsyncClient, url: str, instance_id: str) -> bool:
+    """Is the thing answering ``url`` THIS process?
 
-#: The supervisor states in which a boot is actually running. app.js keeps its
-#: own copy (BOOTING_STATES) because the page applies the same gate.
-_BOOTING_STATES = ("PREFLIGHT", "STARTING")
+    Three distinct answers collapse into False, and all three mean "do not
+    start a model yet":
 
+    * nothing is listening (the normal case, for the first few hundred ms);
+    * something is listening but is not a servedeck (a 404, a 503);
+    * something is listening and IS a servedeck — just not us.
 
-def _boot_in_progress(snap: dict[str, Any]) -> bool:
-    """Is a boot running right now, as opposed to a phase left over from a run
-    that has ended?
-
-    Phase and reached_ready alone could not tell those apart. After a stop, the
-    finished run still reads phase "ready". Before the latch in
-    phases.PhaseTracker, its reached_ready also went back to False. A boot
-    that failed keeps the phase it died in. In every such case the boot panel
-    stayed on with its elapsed clock counting beside "Not reachable" (seen on
-    2026-09-11 at 07:44, "elapsed 4m 38s"), and this loop republished the state
-    every 2 s indefinitely.
+    The third is the one that mattered: a hand-started copy held :8010 on
+    2026-09-11 and answers ``/api/health`` with a perfectly good 200. A check
+    on the status code alone cannot see the difference, so the process that
+    LOST the bind reconciled anyway and launched the 27B on every restart.
     """
-    return (
-        snap.get("actual_state") in _BOOTING_STATES
-        and snap.get("phase") is not None
-        and not snap.get("reached_ready")
-    )
-
-
-def _publish_state_if_changed() -> None:
-    """Publish a `state` event when the state a human can see has moved.
-
-    The page paints the phase strip, the elapsed clock and the boot ETA only
-    from `state` (app.js: paintState -> paintBoot), and the 5 s /api/state poll
-    was deliberately removed in favour of this stream. The poll loop published
-    only `telemetry`, so across two real boots the browser received three
-    `state` events -- all three published by a control POST returning, at the
-    instant phase was still null. The boot panel therefore never rendered at
-    all: bootActive() needs a phase, and by the time one existed nothing was
-    publishing.
-
-    While a boot is in progress every poll publishes, because the elapsed
-    counter is part of the payload and a counter that only moves on a state
-    CHANGE does not count.
-    """
-    global _LAST_STATE_SIG
-    snap = _snap()
-    booting = _boot_in_progress(snap)
-    sig = (
-        snap.get("actual_state"),
-        snap.get("desired_state"),
-        snap.get("phase"),
-        bool(snap.get("reached_ready")),
-        snap.get("last_error"),
-        snap.get("unmanaged_pid"),
-        rt.upstream_up,
-        rt.upstream,
-        rt.serving_model,
-    )
-    if booting or sig != _LAST_STATE_SIG:
-        _LAST_STATE_SIG = sig
-        hub.publish("state", _state())
-
-
-_KV_RE = re.compile(r"GPU KV cache size:\s*([\d,]+)\s*tokens")
-_KVGIB_RE = re.compile(r"Available KV cache memory:\s*([\d.]+)\s*GiB")
-_CONC_RE = re.compile(r"Maximum concurrency for\s*([\d,]+)\s*tokens per request:\s*([\d.]+)x")
-_WEIGHTS_RE = re.compile(r"Model loading took\s*([\d.]+)\s*GiB")
-_MODEL_RE = re.compile(r"'model_tag':\s*'([^']+)'")
-
-
-def _argv_flag(argv: list[str], flag: str) -> str | None:
-    """The value following `flag` in a command line, or None.
-
-    Space-separated form only — that is how vLLM's own launchers spell their
-    flags. A flag in trailing position has no value and must not read off the
-    end.
-    """
-    for i, a in enumerate(argv):
-        if a == flag and i + 1 < len(argv):
-            return argv[i + 1]
-    return None
-
-
-def _max_model_len_from(argv: list[str]) -> int | None:
-    """--max-model-len as an int, or None if absent or not a length."""
-    raw = _argv_flag(argv, "--max-model-len")
     try:
-        value = int(raw) if raw is not None else 0
+        response = await client.get(url, timeout=2.0)
+    except Exception:  # noqa: BLE001 - not listening yet is the expected case
+        return False
+    if response.status_code != 200:
+        return False
+    try:
+        payload = response.json()
     except ValueError:
-        return None
-    return value if value > 0 else None
+        return False
+    return isinstance(payload, dict) and payload.get("instance") == instance_id
 
 
-#: (port, monotonic deadline, pid) of the last socket-table lookup.
-_LISTENER_CACHE: tuple[int, float, int | None] | None = None
+async def _reconcile_after_bind(
+    rt: Runtime,
+    *,
+    timeout_s: float = BIND_WAIT_TIMEOUT_S,
+    interval_s: float = BIND_POLL_INTERVAL_S,
+) -> Any:
+    """Wait for **our own** listen port to answer, then reconcile.
 
-#: How long one socket-table answer is reused. Deliberately far shorter than
-#: the dashboard's own poll interval, so no two polls ever share an answer:
-#: the point is only that the several questions asked WITHIN one poll — the
-#: running model id, the running max_model_len, the serving identity, the
-#: server's uptime — share the one `ss` between them instead of spawning one
-#: each. A longer window would start hiding a server that just came up.
-_LISTENER_TTL_S = 0.25
+    The rule this enforces, stated as a sequence: no model is started until
+    servedeck has demonstrably won the race for :8010. uvicorn runs the ASGI
+    lifespan *before* it binds, so a reconcile called from the lifespan runs
+    even in the process that is about to exit with "address already in use" —
+    and under ``Restart=on-failure`` that turns one lost race into an
+    unbounded boot loop with a real vLLM launch on every lap (REDESIGN §4 R4,
+    measured: 70 launches in 9 minutes on 2026-09-11).
 
-
-def _invalidate_listener() -> None:
-    """Forget the cached socket-table answer.
-
-    Called wherever Servedeck itself changes what is listening (a start, a
-    stop, a port move), so the next question re-reads rather than waiting out
-    the TTL.
+    Returns the Reconciliation, or None if the port never answered.
     """
-    global _LISTENER_CACHE
-    _LISTENER_CACHE = None
-
-
-def _listener_pid_now() -> int | None:
-    """PID listening on rt.port, from a lookup shared across one poll.
-
-    ``procctl.listener_pid`` shells out to ``ss``: one fork+exec per call, and
-    /api/state asked it five separate times for one listening socket, several
-    times a second, for a fact that cannot change between the questions.
-
-    Keyed on the port, so a repoint (``Runtime.repoint``) can never be
-    answered from the previous port's lookup — that would be the stale-port
-    class of bug this file already carries two fixes for.
-    """
-    global _LISTENER_CACHE
-    from . import procctl
-
-    now = time.monotonic()
-    cached = _LISTENER_CACHE
-    if cached is not None and cached[0] == rt.port and now < cached[1]:
-        return cached[2]
-    pid = procctl.listener_pid(rt.port)
-    _LISTENER_CACHE = (rt.port, now + _LISTENER_TTL_S, pid)
-    return pid
-
-
-def _listener_argv() -> list[str]:
-    """The command line of whatever is listening on rt.port."""
-    from . import procctl
-
-    pid = _listener_pid_now()
-    return procctl.cmdline_of(pid) if pid is not None else []
-
-
-def _running_max_model_len() -> int | None:
-    """The context length the LIVE server is actually serving.
-
-    The serving line's "N ctx" has now been wrong twice from two different
-    stale sources: first the UI's own slider, then supervisor.max_model_len.
-    The second is desired config — what Servedeck WANTS — and for a server it
-    adopted rather than launched, the two need not agree at all. The process's
-    own command line is the only authoritative source, exactly as
-    _running_model_id() already argues for the model name.
-    """
-    return _max_model_len_from(_listener_argv())
-
-
-def _running_max_num_seqs() -> int | None:
-    """``--max-num-seqs`` of the LIVE server, from its own command line.
-
-    The hard ceiling on parallelism: however much KV is free, the scheduler
-    will not run more sequences than this concurrently, so a recommendation
-    above it is a recommendation to build a queue. Read from the process for
-    the same reason as --max-model-len -- servedeck.toml says what Servedeck
-    would launch, which for an adopted server need not be what is running.
-    vLLM's /metrics does not publish it (cache_config_info carries the cache
-    settings only), so the command line is the only live source.
-    """
-    raw = _argv_flag(_listener_argv(), "--max-num-seqs")
-    try:
-        value = int(raw) if raw is not None else 0
-    except ValueError:
-        return None
-    return value if value > 0 else None
-
-
-def _running_model_id() -> str | None:
-    """The model the LIVE process is serving, from its own command line.
-
-    Authoritative, unlike a log file (which can be stale, or belong to a
-    different run) and unlike --served-model-name (which an operator may reuse
-    across different models, leaving two models indistinguishable over the
-    API).
-    """
-    return _model_id_from(_listener_argv())
-
-
-def _model_id_from(argv: list[str]) -> str | None:
-    """The repo a command line loads: ``--model X`` or ``vllm serve X``.
-
-    Split out of _running_model_id() so adoption can ask the same question
-    about a process on a port we are NOT currently watching -- which is the
-    whole of discovering a server somewhere else.
-    """
-    if not argv:
-        return None
-    for i, a in enumerate(argv):
-        if a == "--model" and i + 1 < len(argv):
-            return argv[i + 1]
-    # positional form: `vllm serve <model>`
-    for i, a in enumerate(argv):
-        if a.endswith("vllm") and i + 2 < len(argv) and argv[i + 1] == "serve":
-            return argv[i + 2]
-    return None
-
-
-def _boot_log_candidates(
-    backend: str | None = None, *, boot_log_dir: Path | None = None
-) -> tuple[Path, ...]:
-    """Logs that could hold the running server's boot numbers, best first.
-
-    Chosen by BACKEND, not by port. The old rule ordered by which backend owns
-    rt.port, which cannot name the log of a backend that declares none — so
-    such a deployment opened some other backend's log first, and that file can
-    be a stale symlink to a months-old boot of a different model carrying a
-    real "GPU KV cache size: N tokens" line. Only _live_boot_facts()'
-    model_tag guard kept that number off the dashboard, and that guard is a
-    backstop, not a selection rule.
-
-    The other backends' logs stay on the list as fallbacks — a server can be
-    adopted after a hand launch into any of them — but behind the one that
-    belongs to the backend we believe is running.
-    """
-    if backend is None:
-        s = sup()
-        backend = (s.desired.backend if s is not None else None) or _safe_config().get("BACKEND")
-    if boot_log_dir is None:
-        s = sup()
-        if s is not None:
-            boot_log_dir = s.state_dir / _sup.BOOT_LOG_DIRNAME
-    primary = tuple(Path(p) for p in _sup._default_log_paths(backend, boot_log_dir=boot_log_dir))
-    rest = tuple(p for p in _candidate_logs() if p not in primary)
-    return primary + rest
-
-
-def _boot_payload() -> dict[str, Any]:
-    """Boot progress for the phase bar: the ordered phase list, the per-phase
-    times the supervisor recorded, the elapsed clock, and the ETA.
-
-    The page has drawn none of this since the prototype — #phases/#elapsed
-    shipped markup with no painter, so a multi-minute boot sat on "Elapsed —"
-    with an empty track. The supervisor already tracks the phase and its
-    per-phase times; the only thing computed here is the ETA, which needs the
-    boot history and must stay attributed when it falls back to SPEC.md's
-    calibration figures (history.eta_for handles that; this only forwards it).
-
-    The history read happens ONLY while a boot is in progress. In the steady
-    state — server up, nothing booting — the bar is not drawn, so the 5 s
-    state poll must not open history.jsonl twice for a bar nobody sees.
-    """
-    from . import history, phases
-
-    snap = _snap()
-    out: dict[str, Any] = {
-        "phases": [p.value for p in phases.PHASE_ORDER],
-        "phase": snap.get("phase"),
-        "phase_times": snap.get("phase_times") or {},
-        "elapsed_s": snap.get("run_elapsed_s"),
-        "reached_ready": bool(snap.get("reached_ready")),
-        # The page gates the panel on this as well (app.js bootActive), so a
-        # stale phase from a finished run can never be painted as a boot.
-        "actual_state": snap.get("actual_state"),
-        "eta_s": None,
-        "eta_p90_s": None,
-        "eta_source": None,
-        "eta_note": None,
-        "cold": None,
-    }
-    repo_id = snap.get("repo_id") or rt.serving_model
-    booting = _boot_in_progress(snap)
-    if not booting or not repo_id:
-        return out
-    backend = snap.get("backend") or rt.config().get("BACKEND") or ""
-    try:
-        cold = not history.has_prior_success(repo_id, backend)
-        eta = history.eta_for(repo_id, backend, cold=cold)
-    except Exception:  # noqa: BLE001 - an unreadable history must not blank the bar
-        return out
-    out["cold"] = cold
-    out["eta_s"] = eta.median_total_s
-    out["eta_p90_s"] = eta.p90_total_s
-    out["eta_source"] = eta.source
-    out["eta_note"] = eta.note
-    return out
-
-
-def _sizing_payload() -> dict[str, Any]:
-    """The parallelism panel's whole payload: window stats + the recommendation.
-
-    Computed in Python, not in the page, for one reason: the formula has to be
-    testable. ``tests/test_parallelism.py`` reproduces the measured
-    concurrency table against :func:`parallelism.recommend`; a copy of the same
-    arithmetic living in app.js would be a second, untested implementation that
-    silently disagrees.
-
-    Everything here degrades to a stated REASON rather than to a number. "We do
-    not know yet" and "8 agents" must never look alike on a panel whose whole
-    job is to tell you how hard to push the GPU.
-    """
-    m = rt.metrics or {}
-    window = m.get("prompt_stats") or dict(reqstats.EMPTY_STATS)
-    out: dict[str, Any] = {
-        "window": window,
-        "gen_window": m.get("gen_stats") or dict(reqstats.EMPTY_STATS),
-        "calibration_note": parallelism.calibration_note(rt.serving_model),
-        "running": m.get("running") if m.get("reachable") else None,
-        "preemptions": m.get("preemptions") if m.get("reachable") else None,
-        "max_num_seqs": _running_max_num_seqs(),
-        "recommended": None,
-        "at_p99": None,
-        "over_subscribed": False,
-        "reason": None,
-        # Long and short requests sharing the live pool; see
-        # parallelism.mixed_capacity(). None with a reason when it cannot be
-        # computed, like the recommendation.
-        "mixed": None,
-        "mixed_reason": None,
-    }
-    if not m.get("reachable"):
-        out["reason"] = "backend not reachable"
-        out["mixed_reason"] = out["reason"]
-        return out
-    pool = m.get("kv_cache_size_tokens")
-    if not pool:
-        # The pool must be the RUNNING engine's own kv_cache_size_tokens.
-        # Falling back to the 280,813 the cost curve was calibrated on would
-        # produce a confident recommendation for a server launched at a
-        # different --gpu-memory-utilization, which is how you over-subscribe.
-        out["reason"] = "engine has not published its KV pool size yet"
-        out["mixed_reason"] = out["reason"]
-        return out
-
-    # How the pool splits between full-length requests and the smaller ones
-    # beside them. "Full length" is the running engine's own --max-model-len:
-    # that is the longest request this server will accept. Computed before
-    # the window check because the full-length count needs no request history;
-    # the smaller sizes are added when the window has them.
-    full_ctx = _running_max_model_len()
-    if full_ctx:
-        sizes: dict[str, tuple[float, bool]] = {}
-        for label in ("p50", "p90"):
-            # The UPPER edge of the percentile's interval, as the
-            # recommendation uses: the conservative end of a bucket.
-            pct = window.get(label) or {}
-            if pct.get("hi"):
-                exact = bool(pct.get("exact") or pct.get("lo") == pct.get("hi"))
-                sizes[label] = (float(pct["hi"]), exact)
-        out["mixed"] = parallelism.mixed_capacity(
-            pool_tokens=int(pool), full_ctx=int(full_ctx), sizes=sizes,
-            max_num_seqs=out["max_num_seqs"],
-        ).to_dict()
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if await _own_port_answers(rt.client, rt.settings.health_url, rt.instance_id):
+            break
+        await asyncio.sleep(interval_s)
     else:
-        out["mixed_reason"] = "the running server's --max-model-len is not on its command line"
-
-    p90 = (window.get("p90") or {}).get("hi")
-    if not p90:
-        out["reason"] = (
-            f"no requests observed yet — {window.get('n', 0)} of "
-            f"{window.get('capacity', reqstats.WINDOW_SIZE)} in the window"
-        )
-        return out
-
-    seqs = out["max_num_seqs"]
-    n = window.get("n", 0)
-    rec = parallelism.recommend(
-        pool_tokens=int(pool),
-        prompt_tokens=float(p90),
-        max_num_seqs=seqs,
-        basis=f"p90 of the last {n} request{'' if n == 1 else 's'}",
-    )
-    out["recommended"] = rec.to_dict()
-
-    p99 = (window.get("p99") or {}).get("hi")
-    if p99:
-        out["at_p99"] = parallelism.recommend(
-            pool_tokens=int(pool),
-            prompt_tokens=float(p99),
-            max_num_seqs=seqs,
-            basis=f"p99 of the last {n} request{'' if n == 1 else 's'}",
-        ).to_dict()
-
-    # The warning. Live concurrency above the recommendation is the condition;
-    # num_preemptions_total is the confirmation, because preemption is what
-    # over-subscription actually DOES -- vLLM evicts a sequence's KV and
-    # recomputes it, so work already paid for is thrown away.
-    running = m.get("running") or 0
-    out["over_subscribed"] = bool(running > rec.n)
-    return out
-
-
-def _live_boot_facts() -> dict[str, Any]:
-    """Read the RUNNING server's real KV size from its boot log.
-
-    The live 'KV in use' readout must be a fraction of what the running engine
-    actually allocated - NOT of some other model's estimate.
-
-    FIRST from /metrics. This build publishes the engine's whole resolved cache
-    configuration on vllm:cache_config_info, whose LABELS carry
-    kv_cache_size_tokens - the same figure the boot log prints once as
-    "GPU KV cache size: N tokens". Reading it there needs no log at all, which
-    matters because a server launched by hand in a terminal writes to no log
-    Servedeck knows about, and the boot log of a PREVIOUS run of another model
-    is the wrong file to fall back to.
-
-    The boot log is still read, for the two things /metrics does not carry:
-    the KV pool in GiB and the weights measurement.
-    """
-    facts: dict[str, Any] = {}
-    m = rt.metrics or {}
-    if m.get("reachable") and m.get("kv_cache_size_tokens"):
-        facts["kv_tokens"] = int(m["kv_cache_size_tokens"])
-        facts["kv_source"] = "engine"
-        facts["kv_trust"] = "measured"
-        if m.get("kv_cache_max_concurrency"):
-            facts["concurrency_x"] = round(float(m["kv_cache_max_concurrency"]), 3)
-        if m.get("kv_cache_gpu_util"):
-            facts["util_effective"] = float(m["kv_cache_gpu_util"])
-    # Pick the log belonging to the backend actually running on our port, and
-    # read the LAST match: launcher logs are append-only across restarts, so
-    # the first match is the oldest boot's numbers.
-    want = _running_model_id()
-    for log in _boot_log_candidates():
-        try:
-            if not log.exists():
-                continue
-            text = log.read_text(errors="replace")
-        except OSError:
-            continue
-        # Reject a log written by a different model: these files are reused
-        # across runs, and a foreground launch may not write to one at all.
-        if want:
-            tags = _MODEL_RE.findall(text)
-            if tags and tags[-1] != want:
-                continue
-        kv_all = _KV_RE.findall(text)
-        if not kv_all:
-            continue
-        # /metrics already answered, and it is the running engine rather than
-        # a file that outlives it. Do not overwrite it with a log line.
-        facts.setdefault("kv_tokens", int(kv_all[-1].replace(",", "")))
-        facts.setdefault("kv_source", "boot log")
-        facts.setdefault("kv_trust", "measured")
-        gib_all = _KVGIB_RE.findall(text)
-        if gib_all:
-            facts["kv_gib"] = float(gib_all[-1])
-        conc_all = _CONC_RE.findall(text)
-        if conc_all:
-            facts["ctx"] = int(conc_all[-1][0].replace(",", ""))
-            facts.setdefault("concurrency_x", float(conc_all[-1][1]))
-        w_all = _WEIGHTS_RE.findall(text)
-        if w_all:
-            facts["weights_gib"] = float(w_all[-1])
-        # Derive the utilization actually in force. vLLM never prints it, but
-        # budget = weights + kv + overhead, and util = budget / total. Without
-        # this the UI's slider shows a value the server is not running at.
-        if "weights_gib" in facts and "kv_gib" in facts:
-            budget = facts["weights_gib"] + facts["kv_gib"] + capacity.OVERHEAD_GIB_DEFAULT
-            facts.setdefault("util_effective", round(budget / capacity.GPU_TOTAL_GIB, 3))
-        facts["source"] = str(log)
-        break
-    return facts
-
-
-async def _recover_if_server_returned() -> None:
-    """Adopt a server that reappeared while we were in a terminal state."""
-    s = sup()
-    if s is None or not rt.upstream_up:
-        return
-    if s.actual_state not in ("FAILED", "STOPPED"):
-        return
-    if s.desired.desired_state != "RUNNING":
-        return  # intent says stopped: leave it alone, offer adoption in the UI
-    from . import procctl
-
-    pid = _listener_pid_now()
-    if pid is None or not procctl.is_attributable(pid):
-        return
-    try:
-        s._run_repo_id = s.desired.repo_id or rt.serving_model
-        s._run_backend = s.desired.backend
-        s._adopt_ready(pid)
-        s.last_error = None
-        hub.publish(
+        rt.hub.publish(
             "notice",
-            {"level": "info", "code": "recovered",
-             "body": f"server returned on :{rt.port} (pid {pid}) — now tracking it"},
-        )
-        hub.publish("state", _state())
-    except Exception as exc:  # noqa: BLE001
-        hub.publish("notice", {"level": "warn", "code": "recover_failed", "body": str(exc)[:200]})
-
-
-async def _fetch_served_models() -> list[str]:
-    """Every model id the live server advertises on ``/v1/models``.
-
-    This is the ONLY authority for what the server calls itself. It is not the
-    authority for what the server actually loaded -- see _serving_identity().
-    """
-    return await _probe_models(rt.port)
-
-
-async def _probe_models(port: int) -> list[str]:
-    """``/v1/models`` on any local port: the ids it advertises, or [].
-
-    Takes a port rather than reading rt.upstream because discovery asks this
-    of ports the dashboard is NOT watching -- that is how it finds a server
-    the configuration has lost track of. Loopback GET only, the read-only kind
-    of request SPEC.md's rule 1b allows against a running server.
-
-    Borrows the poller's client when there is one; a request that arrives
-    before startup (a test, a CLI call) opens its own rather than failing.
-    """
-    url = f"{UPSTREAM_HOST}:{port}/v1/models"
-    try:
-        if rt.client is not None:
-            r = await rt.client.get(url, timeout=3.0)
-        else:
-            async with httpx.AsyncClient() as client:
-                r = await client.get(url, timeout=3.0)
-        if r.status_code == 200:
-            data = r.json().get("data") or []
-            return [str(d.get("id")) for d in data if d.get("id")]
-    except Exception:  # noqa: BLE001
-        pass
-    return []
-
-
-async def _discover_servers() -> list[dict[str, Any]]:
-    """Every known port that answers as a model server, best first.
-
-    "Known" is the resolver's own candidate list -- the live processes, the
-    shell config's port, desired state's port, every configured backend's port
-    -- so adoption and the dashboard can never be looking at two different
-    boxes. A port qualifies only if BOTH halves agree: something holds the
-    socket, and ``/v1/models`` answers on it. The process's command line is
-    read for the same reason adoption reads it at all: it says what was
-    actually loaded, while ``/v1/models`` says only what the server calls
-    itself.
-    """
-    from . import procctl
-
-    resolution = _resolve_upstream(discover=True, current_port=rt.port)
-    probe = _port_probe()
-    found: list[dict[str, Any]] = []
-    for candidate in resolution.candidates:
-        if any(f["port"] == candidate.port for f in found):
-            continue
-        pid = candidate.pid if candidate.listening else probe(candidate.port)
-        if pid is None:
-            continue
-        models = await _probe_models(candidate.port)
-        if not models:
-            continue
-        argv = procctl.cmdline_of(pid)
-        found.append(
             {
-                "port": candidate.port,
-                "pid": pid,
-                "models": models,
-                "repo_id": _model_id_from(argv),
-                "backend": procctl.backend_of_pid(pid),
-                "attributable": procctl.is_attributable(pid),
-                "cmdline": argv,
-            }
-        )
-    # An attributable server first: it is the only kind Servedeck can then
-    # stop or watch for a crash. The rest are still reported -- "a server is
-    # there and I cannot control it" is an answer, and it is the one the UI
-    # needs to explain itself.
-    found.sort(key=lambda f: (not f["attributable"], f["port"] != rt.port))
-    return found
-
-
-#: Memo for _repo_for_served_name, keyed on the name. discover_models() walks
-#: the whole model cache -- a directory listing and a config.json parse per
-#: repo -- and _state() runs on every dashboard poll and every SSE state
-#: publish. A served name changes only when a server restarts, so resolving it
-#: once per name is the difference between a lookup and a filesystem scan
-#: several times a second.
-_SERVED_NAME_REPO: dict[str, str | None] = {}
-
-
-def _repo_for_served_name(name: str | None) -> str | None:
-    """The cached repo a served-model-name refers to, if exactly one does.
-
-    Exact match on the repo id or on its final path segment, and only when the
-    match is unique -- a name that fits two cached repos identifies neither.
-    """
-    if not name:
-        return None
-    if name not in _SERVED_NAME_REPO:
-        hits = [
-            e.repo_id
-            for e in registry.discover_models()
-            if e.repo_id == name or e.repo_id.rsplit("/", 1)[-1] == name
-        ]
-        _SERVED_NAME_REPO[name] = hits[0] if len(hits) == 1 else None
-    return _SERVED_NAME_REPO[name]
-
-
-def _serving_identity() -> dict[str, Any]:
-    """Which model is REALLY serving on rt.port, and how we know.
-
-    Sources, in decreasing order of trust:
-
-    1. the live process's own ``--model`` argument -- what vLLM was actually
-       told to load, read from ``/proc/<pid>/cmdline``;
-    2. ``/v1/models`` on the live port, resolved against the model cache --
-       what the server calls itself;
-    3. nothing, and then we say nothing.
-
-    The shell config header is deliberately NOT a source. ``BACKEND`` /
-    ``MODEL_REPO`` record what somebody last INTENDED; on this box that header
-    said GLM while Qwen was serving, and every reader that trusted it was
-    wrong together. ``mismatch`` is true when 1 and 2 disagree -- the
-    ``--served-model-name`` was reused from another model, which is exactly
-    when a name-matching UI shows the wrong row (or no row at all).
-    """
-    from_process = _running_model_id()
-    served_names = list(rt.serving_models)
-    from_name = next(
-        (r for r in (_repo_for_served_name(n) for n in served_names) if r), None
-    )
-    repo_id = from_process or from_name
-    source = "process" if from_process else ("served_name" if from_name else "unknown")
-    pid = None
-    backend = None
-    if rt.upstream_up:
-        from . import procctl
-
-        try:
-            pid = _listener_pid_now()
-            backend = procctl.backend_of_pid(pid) if pid else None
-        except Exception:  # noqa: BLE001
-            backend = None
-    return {
-        "repo_id": repo_id,
-        "source": source,
-        "backend": backend,
-        "served_names": served_names,
-        "mismatch": bool(from_process and from_name and from_process != from_name),
-    }
-
-
-@app.on_event("startup")
-async def _startup() -> None:
-    rt.client = httpx.AsyncClient()
-    # Resolve the upstream BEFORE anything can ask for it. Construction is
-    # files-only (a /proc walk on import would be paid by every importer), so
-    # without this the first page load -- and reconcile_startup below it --
-    # would be answered from a port nothing had yet probed.
-    rt.retarget(discover=True)
-    app.state.poller_task = asyncio.create_task(_poll_loop())
-    # Adopt a server that is already running, so the UI shows READY rather
-    # than STOPPED and a later crash is classified as crash-while-serving.
-    s = sup()
-    if s is not None:
-        try:
-            outcome = await s.reconcile_startup()
-            hub.publish("notice", {"level": "info", "code": "reconciled", "body": outcome})
-        except Exception as exc:  # noqa: BLE001
-            hub.publish("notice", {"level": "warn", "code": "reconcile_failed", "body": str(exc)[:200]})
-
-
-@app.on_event("shutdown")
-async def _shutdown() -> None:
-    task = getattr(app.state, "poller_task", None)
-    if task:
-        task.cancel()
-    if rt.client:
-        await rt.client.aclose()
-
-
-# ------------------------------------------------------------- helpers ----
-#: Seconds a model scan stays fresh. Short enough that a deletion shows up
-#: while the operator is still looking at the screen, long enough that the
-#: 2 s telemetry tick does not re-walk the hub cache on every poll.
-MODELS_CACHE_TTL_S = 5.0
-
-
-def _model_rows(*, now: float | None = None) -> list[dict[str, Any]]:
-    t = time.monotonic() if now is None else now
-    if rt._models_cache is not None and (t - rt._models_cache_at) < MODELS_CACHE_TTL_S:
-        return rt._models_cache
-    rows: list[dict[str, Any]] = []
-    for e in registry.discover_models():
-        if getattr(e, "skipped", False):
-            continue
-        # trust/weights_gib are what the model card's provenance badge and the
-        # serving-model match are built from. The card read both long before
-        # this payload carried either: every model therefore rendered
-        # "estimated" (SPEC.md §3 attaches "~25% optimistic historically" to
-        # that label, so it is a claim, not decoration) and the weights-based
-        # arm of the serving match was dead code.
-        #
-        # Resolved at the model's OWN max context, which is the only ctx that
-        # is a property of the model rather than of the slider — the badge is
-        # a coarse "has this ever been booted and measured", and the exact
-        # per-configuration answer comes from /api/capacity/estimate.
-        ctx_for_trust = e.max_position_embeddings or DEFAULT_MODEL_MAX_CTX
-        try:
-            ri = registry.resolve_inputs(e.repo_id, capacity.UTIL_THIN_MARGIN, ctx_for_trust)
-            trust, weights_gib = ri.trust, ri.weights_gib
-        except Exception:  # noqa: BLE001 - a broken measurements store must not blank the rail
-            trust, weights_gib = "unknown", None
-        # Direct attribute access, NOT getattr-with-default: a field rename must
-        # raise here, not silently render "262144 ctx / no quant" for every row.
-        rows.append(
-            {
-                "repo_id": e.repo_id,
-                "name": e.repo_id.split("/")[-1],
-                "backend": e.backend,
-                "servable": e.servable,
-                "unservable_reason": e.reason,
-                # Bytes, not a pre-rounded GiB float: the unit belongs to the
-                # formatter. Shipping "disk_gib" and rendering it beside the
-                # letters "GB" is how a 125.99 GiB model came to be displayed
-                # as 125.91 GB -- a 7.4% error that reads as a rounding slip.
-                "disk_bytes": e.disk_bytes,
-                "disk_local_bytes": e.disk_local_bytes,
-                "quant": e.quant_algo or "—",
-                "model_max_ctx": ctx_for_trust,
-                "trust": trust,
-                "weights_gib": weights_gib,
-            }
-        )
-    rows.sort(key=lambda r: (not r["servable"], r["name"]))
-    rt._models_cache = rows
-    rt._models_cache_at = t
-    return rows
-
-
-def _disk_payload() -> dict[str, Any]:
-    """Filesystem free/used from statvfs, plus what the hub cache costs.
-
-    The filesystem half never comes from a directory walk. A walk sees only
-    what it can read, so it under-reports "used" by every tree the server
-    cannot enter, and it cannot see free space at all. ``statvfs`` is the
-    kernel's own answer and is what ``df`` prints.
-
-    ``hub_bytes`` versus ``hub_local_bytes``: blobs reached through symlinks
-    to another mount are real bytes but sit on another filesystem, so they
-    must not be subtracted from the ``df`` figure shown beside them.
-    """
-    hub = registry.default_hub_dir()
-    fs = disksize.filesystem_usage(hub if hub.exists() else Path("/"))
-    rows = _model_rows()
-    hub_bytes = sum(r["disk_bytes"] for r in rows)
-    hub_local = sum(r["disk_local_bytes"] for r in rows)
-    return {
-        "path": fs.path,
-        "total_bytes": fs.total_bytes,
-        "used_bytes": fs.used_bytes,
-        "avail_bytes": fs.avail_bytes,
-        "used_pct": round(fs.used_pct, 1),
-        "hub_bytes": hub_bytes,
-        "hub_local_bytes": hub_local,
-        "hub_foreign_bytes": hub_bytes - hub_local,
-        # Named so no consumer has to guess. Everything above is bytes; the
-        # UI divides by 1024 and says GiB.
-        "unit": "bytes",
-    }
-
-
-def _own_gpu_mib() -> int:
-    """VRAM held by OUR vLLM server, to discount when checking free memory.
-
-    Matching any process whose name contains "python" is wrong: a training job
-    holding 60 GiB would be counted as ours, making NOT_ENOUGH_FREE_VRAM
-    unreachable and green-lighting a config that then OOMs. Attribute only
-    processes that are actually part of the server on our upstream port.
-    """
-    try:
-        listener = _listener_pid_now()
-    except Exception:  # noqa: BLE001
-        listener = None
-    if listener is None:
-        return 0
-
-    family = {listener}
-    try:
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdigit():
-                continue
-            try:
-                status = (entry / "status").read_text(errors="replace")
-            except OSError:
-                continue
-            for line in status.splitlines():
-                if line.startswith("PPid:"):
-                    if int(line.split()[1]) in family:
-                        family.add(int(entry.name))
-                    break
-    except OSError:
-        pass
-
-    own = 0
-    try:
-        for a in gpu.compute_apps():
-            if a.pid in family or (a.process_name or "").startswith("VLLM::"):
-                own += a.used_mib
-    except Exception:  # noqa: BLE001
-        return 0
-    return own
-
-
-def _cache_flags(backend: str | None) -> tuple[str | None, str | None]:
-    """(kv_cache_dtype, mamba_ssm_cache_dtype) this backend would launch with.
-
-    They belong in the estimate because they change the cache LAYOUT, not just
-    its speed: --mamba-ssm-cache-dtype bfloat16 halves the GDN recurrent state
-    and is worth 6.9% of the token count on this box's delivered Flash-Next
-    configuration. Estimating without them describes a server nobody starts.
-
-    Sources, in the order a launch resolves them: the backend's own fixed
-    `env` in servedeck.toml, then EXTRA_ARGS out of the shell config -- which
-    supervisor.shell_extra_args() already guards on BACKEND, so another
-    backend's flags can never be read as this one's.
-    """
-    kv = ssm = None
-    b = config.get().backend(backend) if backend else None
-    if b is not None:
-        kv = b.env.get("KV_DTYPE") or None
-    argv = _sup.shell_extra_args(backend).split()
-    kv = _argv_flag(argv, "--kv-cache-dtype") or kv
-    ssm = _argv_flag(argv, "--mamba-ssm-cache-dtype") or ssm
-    return kv, ssm
-
-
-def _kv_geometry(repo_id: str, ctx: int, backend: str | None = None) -> dict[str, Any] | None:
-    """The per-architecture KV breakdown, for the panel's tooltip.
-
-    None when the checkpoint's config.json cannot be read locally — never a
-    network fetch, and never a fabricated breakdown.
-    """
-    try:
-        cfg = registry.load_model_config(repo_id)
-        if cfg is None:
-            return None
-        kv, ssm = _cache_flags(backend)
-        geo = kvcalc.geometry(cfg, kv_cache_dtype=kv, mamba_ssm_dtype=ssm)
-        out = kvcalc.summarise(geo, ctx)
-        out["launch_flags"] = {"kv_cache_dtype": kv, "mamba_ssm_cache_dtype": ssm}
-        return out
-    except Exception:  # noqa: BLE001 - a bad config must not blank the panel
-        return None
-
-
-def _model_inputs(
-    repo_id: str, util: float, ctx: int, entry: Any, kv_dtype: str | None, ssm_dtype: str | None
-) -> tuple[registry.ResolvedInputs, capacity.ModelInputs]:
-    """What capacity.compute() needs for one model at one context length.
-
-    The context matters: the KV rate is resolved per length (a measurement at
-    exactly this length, or the per-architecture calculator at it), because a
-    hybrid model's per-sequence state is spread over the context.
-    """
-    ri = registry.resolve_inputs(
-        repo_id, util, ctx, kv_cache_dtype=kv_dtype, mamba_ssm_dtype=ssm_dtype
-    )
-    mi = capacity.ModelInputs(
-        repo_id=repo_id,
-        backend=ri.backend or "inline",
-        model_max_ctx=ri.model_max_ctx or DEFAULT_MODEL_MAX_CTX,
-        weights_gib=ri.weights_gib,
-        weights_source=ri.weights_source,
-        kv_kib_per_token=ri.kv_kib_per_token,
-        overhead_gib=ri.overhead_gib or capacity.OVERHEAD_GIB_DEFAULT,
-        trust=ri.trust,
-        servable=entry.servable if entry else True,
-        unservable_reason=(entry.reason if entry else None),
-        model_type=ri.model_type or "",
-        used_ctx_for_rate=ri.matched_ctx or ctx,
-        known_kv_rates=ri.other_ctx_kv_rates or {},
-    )
-    return ri, mi
-
-
-def _native_ctx_fit(
-    repo_id: str, util: float, entry: Any, kv_dtype: str | None, ssm_dtype: str | None,
-    *, native: int, known: dict[int, tuple[registry.ResolvedInputs, capacity.CapacityResult]],
-) -> tuple[int, str | None]:
-    """(the longest context one request can use, why it is below the model's).
-
-    This is what a launch defaults to: the model's own max_position_embeddings,
-    read from its local config.json, lowered ONLY when the KV budget cannot
-    hold even one request of that length. It is resolved AT the model's
-    ceiling, never at whatever the slider happens to say: a hybrid model's
-    pool is smaller at a shorter context, so asking "does the full length
-    fit?" with the rate of a lowered one answers no for Flash-Next at util
-    0.95, which does fit.
-
-    It is never divided by the agent count. See capacity.CapacityResult's
-    ctx_max_fit for what that division did.
-
-    (0, None) when the budget is not known (weights that cannot be predicted,
-    no KV rate) or holds nothing: the page then keeps the model's ceiling and
-    the blocking finding says why.
-    """
-
-    def at(length: int) -> tuple[registry.ResolvedInputs, capacity.CapacityResult]:
-        if length not in known:
-            ri, mi = _model_inputs(repo_id, util, length, entry, kv_dtype, ssm_dtype)
-            known[length] = (ri, capacity.compute(mi, util=util, ctx=length, max_num_seqs=1))
-        return known[length]
-
-    ri_max, r_max = at(native)
-    if ri_max.weights_source == "unknown" or not ri_max.kv_kib_per_token or r_max.kv_tokens <= 0:
-        return 0, None
-    fit = capacity.single_request_fit(native, lambda length: at(length)[1].kv_tokens)
-    reason = capacity.ctx_fit_reason(
-        model_max_ctx=native, pool_at_max=r_max.kv_tokens, fit=fit, util=util,
-        kv_source=ri_max.kv_source,
-    )
-    return fit, reason
-
-
-def _estimate(repo_id: str, util: float, ctx: int, seqs: int) -> dict[str, Any]:
-    # servable/reason live on ModelEntry, not ResolvedInputs - look them up
-    # rather than defaulting servable=True, which made MODEL_UNSERVABLE dead.
-    # The entry also names the backend, which is what decides WHICH launch
-    # flags apply -- so it has to be read before the estimate, not after.
-    entry = next((e for e in registry.discover_models() if e.repo_id == repo_id), None)
-    kv_dtype, ssm_dtype = _cache_flags(entry.backend if entry else None)
-    ri, mi = _model_inputs(repo_id, util, ctx, entry, kv_dtype, ssm_dtype)
-    g = gpu.gpu_summary()
-    # own_mib matters: the VRAM held by the server we are ALREADY running is not
-    # a competitor for the config being estimated - restarting reclaims it first.
-    # Without this, every estimate blocks with "not enough free VRAM" simply
-    # because the model is currently up.
-    own = _own_gpu_mib()
-    live = capacity.LiveFacts(
-        gpu_responsive=gpu.gpu_alive(),
-        total_mib=g.total_mib if g else None,
-        used_mib=g.used_mib if g else None,
-        own_mib=own,
-        # capacity.py is pure and never stat()s: somebody allowed I/O has to
-        # do it, and nobody was. The TRAINING_MARKER block was therefore
-        # unreachable — a guard against starting a server on a GPU a training
-        # run is using, that could never fire.
-        training_markers=_training_marker_hits(),
-    )
-    r = capacity.compute(mi, util=util, ctx=ctx, max_num_seqs=seqs, live=live)
-    # The context a launch defaults to, and the slider's ceiling: the model's
-    # own length unless one request of it cannot fit. Resolved at the model's
-    # ceiling with no agent count in it; the result at the slider's own
-    # length is reused when the two coincide, which is the default case.
-    known: dict[int, tuple[registry.ResolvedInputs, capacity.CapacityResult]] = {}
-    if mi.model_max_ctx == ctx:
-        known[ctx] = (ri, r)
-    fit, fit_reason = _native_ctx_fit(
-        repo_id, util, entry, kv_dtype, ssm_dtype, native=mi.model_max_ctx, known=known,
-    )
-    return {
-        "kv_gib": round(r.kv_gib, 2),
-        "kv_tokens": r.kv_tokens,
-        "budget_gib": round(r.budget_gib, 2),
-        "concurrency_x": round(r.concurrency_x, 2),
-        "agents_at_ctx": r.agents_at_ctx,
-        "effective_parallel": r.effective_parallel,
-        "max_single_ctx": r.max_single_ctx,
-        # Bounds for the context control, and the default it rests on. The UI
-        # must not offer a length the model or a single request's KV cannot
-        # serve -- and must not cap it any lower than that.
-        "ctx_max_model": r.ctx_max_model,
-        "ctx_max_fit": fit,
-        "ctx_fit_reason": fit_reason,
-        # How many requests of the configured length the pool holds at once,
-        # on the calibrated per-request cost (fixed per-sequence page
-        # included) -- the figure shown beside the agents field. Advice about
-        # sharing the pool, never a cap on the context.
-        "full_at_once": (
-            parallelism.recommend(
-                pool_tokens=r.kv_tokens, prompt_tokens=ctx,
-                basis=f"one {ctx:,}-token request",
-            ).to_dict()
-            if r.kv_tokens > 0 else None
-        ),
-        "agents": seqs,
-        "confidence": r.confidence,
-        "can_apply": r.can_apply,
-        "weights_gib": mi.weights_gib,
-        "kv_kib_per_token": mi.kv_kib_per_token,
-        # measured (this repo booted at this context) vs estimated (the
-        # per-architecture calculator). The panel labels them differently and
-        # must never present the second as the first.
-        "kv_source": ri.kv_source,
-        "kv_geometry": _kv_geometry(repo_id, ctx, entry.backend if entry else ri.backend),
-        "bar": {
-            "weights_pct": round(r.bar.weights_pct, 2),
-            "kv_pct": round(r.bar.kv_pct, 2),
-            "overhead_pct": round(r.bar.overhead_pct, 2),
-            "free_pct": round(r.bar.free_pct, 2),
-        },
-        "findings": [
-            {
-                "code": f.code,
-                "level": f.level,
-                "title": f.title,
-                "detail": f.detail,
-                "fix": f.fix,
-                "fix_action": f.fix_action,
-            }
-            for f in r.findings
-        ],
-    }
-
-
-def _state() -> dict[str, Any]:
-    cfg = rt.config()
-    return {
-        "upstream": {
-            "url": rt.upstream,
-            "up": rt.upstream_up,
-            "model": rt.serving_model,          # --served-model-name
-            "model_id": _running_model_id(),     # what is REALLY loaded
-            # Which model is serving, and how we know -- never the config
-            # header. The UI matches its model list on this.
-            "identity": _serving_identity(),
-            # The running engine's OWN --max-model-len, not desired config.
-            "max_model_len": _running_max_model_len(),
-            "port": rt.port,
-            # Which port this is, and WHY it is this one. A dashboard that
-            # cannot find a server used to render blanks and nothing else:
-            # no port, no reason, nothing to act on. The reason is written for
-            # a human and the candidate list is what was checked.
-            "resolution": rt.resolution.to_dict(),
-            # the RUNNING engine's own numbers, not an estimate for some other model
-            "live": _live_boot_facts() if rt.upstream_up else {},
-        },
-        "config": {
-            "backend": cfg.get("BACKEND", "unknown"),
-            "gpu_mem_util": cfg.get("GPU_MEM_UTIL"),
-            "max_subagents": cfg.get("CODEX_MAX_SUBAGENTS"),
-        },
-        "gpu": rt.gpu,
-        "vllm": rt.metrics,
-        "sizing": _sizing_payload(),
-        "boot": _boot_payload(),
-        "control_enabled": sup() is not None,
-        "control_note": _supervisor_error or "",
-        "supervisor": _snap(),
-        # Servedeck's own uptime. The UI's "Serving ... up Nm" must NOT use
-        # this: restarting the UI would make a long-running server look fresh.
-        "uptime_s": int(time.time() - STARTED_AT),
-        "server_uptime_s": _server_uptime_s(),
-    }
-
-
-# -------------------------------------------------------------- routes ----
-@app.get("/api/health")
-async def api_health() -> dict[str, Any]:
-    return {"ok": True, "upstream_up": rt.upstream_up}
-
-
-@app.get("/api/state")
-async def api_state() -> dict[str, Any]:
-    return _state()
-
-
-@app.get("/api/models")
-async def api_models() -> dict[str, Any]:
-    return {"models": _model_rows(), "serving": rt.serving_model, "disk": _disk_payload()}
-
-
-@app.get("/api/disk")
-async def api_disk() -> dict[str, Any]:
-    return _disk_payload()
-
-
-@app.post("/api/capacity/estimate")
-async def api_estimate(body: dict[str, Any]) -> Any:
-    repo = body.get("repo_id")
-    if not repo:
-        return JSONResponse({"error": "repo_id is required"}, status_code=400)
-    try:
-        return _estimate(
-            repo,
-            float(body.get("util", 0.96)),
-            int(body.get("ctx", DEFAULT_MODEL_MAX_CTX)),
-            int(body.get("max_num_seqs", 1)),
-        )
-    except Exception as exc:  # noqa: BLE001
-        return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=400)
-
-
-def _need_sup() -> Any:
-    s = sup()
-    if s is None:
-        return JSONResponse(
-            {"error": _supervisor_error or "supervisor unavailable"}, status_code=503
-        )
-    return s
-
-
-@app.post("/api/server/adopt")
-async def api_adopt(body: dict[str, Any] | None = None) -> Any:
-    """Bring an already-running server under management.
-
-    On startup, a server that is running while desired_state is STOPPED is
-    deliberately left alone -- Servedeck does not assume a process it did not
-    start is wanted. Adopting is the explicit human act that says it is, and
-    it is what makes Stop and crash-detection work for that process.
-    """
-    s = _need_sup()
-    if isinstance(s, JSONResponse):
-        return s
-    from . import procctl
-
-    explicit = (body or {}).get("port")
-    if explicit:
-        # A named port is a named port: probe exactly it, and say precisely
-        # why it cannot be adopted rather than quietly adopting something else.
-        port = int(explicit)
-        pid = procctl.listener_pid(port)
-        if pid is None:
-            return JSONResponse({"error": f"nothing is listening on port {port}"}, status_code=409)
-        if not procctl.is_attributable(pid):
-            return JSONResponse(
-                {
-                    "error": (
-                        f"a server is serving on :{port} but its process (pid {pid}) cannot be "
-                        "attributed, so Servedeck cannot control it. Stop it from the terminal "
-                        "that launched it."
-                    )
-                },
-                status_code=409,
-            )
-    else:
-        # No port named: DISCOVER one. This used to fall back to
-        # `s.desired.port or rt.port` -- both files -- so pressing Adopt while
-        # the configuration named a dead backend re-probed the dead port and
-        # reported nothing listening, with a healthy server one port away.
-        rt.retarget(discover=True)
-        found = await _discover_servers()
-        adoptable = next((f for f in found if f["attributable"]), None)
-        if adoptable is None:
-            if found:
-                other = found[0]
-                return JSONResponse(
-                    {
-                        "error": (
-                            f"a server is serving on :{other['port']} "
-                            f"({', '.join(other['models'])}) but its process "
-                            f"(pid {other['pid']}) cannot be attributed, so Servedeck "
-                            "cannot control it. Stop it from the terminal that launched it."
-                        ),
-                        "resolution": rt.resolution.to_dict(),
-                    },
-                    status_code=409,
-                )
-            checked = ", ".join(f":{c.port}" for c in rt.resolution.candidates) or "no ports"
-            return JSONResponse(
-                {
-                    "error": (
-                        f"no server answered /v1/models on any known port (checked {checked})"
-                    ),
-                    "reason": rt.resolution.reason,
-                    "resolution": rt.resolution.to_dict(),
-                },
-                status_code=409,
-            )
-        port, pid = adoptable["port"], adoptable["pid"]
-    # Watch what we just adopted. Adoption used to leave rt.port alone, so
-    # adopting a server on another port produced a managed server the
-    # dashboard still could not see -- and _serving_identity() below would
-    # have read the command line of whatever was on the OLD port.
-    rt.follow(
-        updetect.Upstream(
-            port=port,
-            source=updetect.LIVE_PROCESS,
-            reason=f"adopted by hand: pid {pid} is serving on :{port}",
-            pid=pid,
-            live=True,
-            candidates=(updetect.Candidate(port, updetect.LIVE_PROCESS, None, True, pid),),
-        )
-    )
-    d = s.desired
-    d.desired_state = "RUNNING"
-    d.port = port
-    # Adopt what is RUNNING, not what a header says was intended. `d.repo_id`
-    # was filled from the served-model-name (an alias an operator reuses) and
-    # `d.backend` from the shell config's BACKEND -- the exact header that
-    # said GLM while Qwen was serving. Both now come from the live process,
-    # and only fall back when the process cannot be read at all.
-    #
-    # Read the process DIRECTLY here rather than only through
-    # _serving_identity(): that helper answers about the port the dashboard is
-    # watching and only once the upstream has been observed up, which at the
-    # instant of an adoption it has not been -- so on this path its answer was
-    # empty and the shell config's header was silently taking over again.
-    ident = _serving_identity()
-    d.repo_id = (
-        _model_id_from(procctl.cmdline_of(pid))
-        or ident["repo_id"]
-        or d.repo_id
-        or rt.serving_model
-    )
-    d.backend = (
-        procctl.backend_of_pid(pid)
-        or ident["backend"]
-        or d.backend
-        or (_safe_config().get("BACKEND") or None)
-    )
-    _sup.save_desired(d, s.state_dir)
-    s._run_repo_id, s._run_backend = d.repo_id, d.backend
-    s._adopt_ready(pid)
-    hub.publish("state", _state())
-    return JSONResponse({"adopted": True, "pid": pid, "port": port}, status_code=200)
-
-
-@app.post("/api/server/stop")
-async def api_stop() -> Any:
-    s = _need_sup()
-    if isinstance(s, JSONResponse):
-        return s
-    # Returns immediately; progress arrives on /api/events. Stop sets
-    # desired_state=STOPPED BEFORE signalling, so the resulting exit is
-    # recorded as intent and never auto-restarted.
-    asyncio.create_task(_run_and_report(s.stop(), "stop"))
-    return JSONResponse({"accepted": True, "action": "stop"}, status_code=202)
-
-
-@app.post("/api/server/start")
-async def api_start(body: dict[str, Any] | None = None) -> Any:
-    s = _need_sup()
-    if isinstance(s, JSONResponse):
-        return s
-    b = body or {}
-    d = s.desired
-    # supervisor.start() is idempotent: it returns at its first statement when
-    # the server is READY or mid-transition. Reporting that as 202 accepted is
-    # how the dashboard's "Apply & restart" came to change nothing at all while
-    # the page logged a success. Say so instead, and name the endpoint that
-    # does work.
-    busy = getattr(s, "actual_state", "STOPPED")
-    if busy in ("READY", "STARTING", "PREFLIGHT", "STOPPING", "DRAINING"):
-        return JSONResponse(
-            {
-                "error": (
-                    f"the server is {busy}; a start would be ignored. "
-                    "POST /api/server/restart to apply new settings, or stop it first."
+                "level": "error",
+                "reason": "bind_timeout",
+                "message": (
+                    f"{rt.settings.base_url} did not answer as THIS process within "
+                    f"{timeout_s:.0f}s; not reconciling. Either the bind failed, or "
+                    "another servedeck is holding the port."
                 ),
-                "actual_state": busy,
             },
-            status_code=409,
         )
-    repo_id = b.get("repo_id") or d.repo_id
-    backend = b.get("backend") or d.backend
-    # Port and served name come from the backend/model being started, not from
-    # whatever the PREVIOUS run left in desired.json -- see the two resolvers'
-    # docstrings. Falling through to d.port/d.served_name is what launched one
-    # backend on another's port under the other's model name.
-    port = _sup.resolve_port(backend, d, explicit=b.get("port"), fallback=rt.port)
-    served_name = _sup.resolve_served_name(
-        backend, repo_id, d, explicit=b.get("served_name")
+        return None
+
+    want = await asyncio.to_thread(_desired.load, rt.settings.desired_path)
+    rt.hub.publish(
+        "notice",
+        {
+            "level": "info",
+            "reason": "reconciling",
+            "message": f"listening on {rt.settings.base_url}; reconciling desired state",
+            "desired": {"main": want.main, "residents": list(want.residents)},
+        },
     )
-    asyncio.create_task(
-        _run_and_report(
-            s.start(
-                repo_id=repo_id,
-                backend=backend,
-                served_name=served_name,
-                port=int(port or rt.port),
-                util=float(b["util"]) if b.get("util") is not None else d.util,
-                max_model_len=int(b["ctx"]) if b.get("ctx") is not None else d.max_model_len,
-                max_num_seqs=int(b["max_num_seqs"]) if b.get("max_num_seqs") is not None else d.max_num_seqs,
-            ),
-            "start",
-        )
+    result = await asyncio.to_thread(
+        lambda: rt.control.reconcile(want, on_progress=_progress_publisher(rt.hub, "reconcile"))
     )
-    return JSONResponse({"accepted": True, "action": "start"}, status_code=202)
+    _publish_reconciliation(rt.hub, result)
+    return result
 
 
-@app.post("/api/server/restart")
-async def api_restart(body: dict[str, Any] | None = None) -> Any:
-    s = _need_sup()
-    if isinstance(s, JSONResponse):
-        return s
-    b = body or {}
-    mode = b.get("mode", "immediate")
-    # The same body the Apply button sends to /api/server/start, honoured here
-    # too: this is the only endpoint that actually relaunches, so it is the
-    # only one that can change ctx / max_num_seqs / util on a running server.
-    # Port and served name are re-derived from the backend being started, for
-    # the same reason api_start does it -- never inherited from the previous run.
-    d = s.desired
-    backend = b.get("backend") or d.backend
-    repo_id = b.get("repo_id") or d.repo_id
-    settings: dict[str, Any] = {"repo_id": repo_id, "backend": backend}
-    if b.get("backend") or b.get("port") is not None:
-        settings["port"] = int(_sup.resolve_port(backend, d, explicit=b.get("port"), fallback=rt.port) or rt.port)
-        settings["served_name"] = _sup.resolve_served_name(
-            backend, repo_id, d, explicit=b.get("served_name")
-        )
-    if b.get("util") is not None:
-        settings["util"] = float(b["util"])
-    if b.get("ctx") is not None:
-        settings["max_model_len"] = int(b["ctx"])
-    if b.get("max_num_seqs") is not None:
-        settings["max_num_seqs"] = int(b["max_num_seqs"])
-    asyncio.create_task(_run_and_report(s.restart(mode=mode, **settings), f"restart:{mode}"))
-    return JSONResponse({"accepted": True, "action": "restart", "mode": mode}, status_code=202)
+def _progress_publisher(hub: Hub, key: str) -> Callable[[Any], None]:
+    """A ``control.ProgressCallback`` that turns each event into an SSE frame.
 
-
-async def _run_and_report(coro: Any, label: str) -> None:
-    """Await a supervisor action, reporting the outcome on the event stream.
-
-    Without this, a failure inside a fire-and-forget task is swallowed and the
-    UI simply never changes state.
+    Called from the worker thread ``control.start`` runs in, which is why
+    ``Hub.publish`` hops to the loop rather than touching a queue directly.
     """
-    try:
-        await coro
-    except Exception as exc:  # noqa: BLE001
+
+    def on_progress(event: Any) -> None:
+        hub.publish(
+            "progress",
+            {
+                "key": key,
+                "kind": event.kind,
+                "text": event.text,
+                "marker_index": event.marker_index,
+                "elapsed_s": round(event.elapsed_s, 1),
+            },
+        )
+
+    return on_progress
+
+
+def _publish_reconciliation(hub: Hub, result: Any) -> None:
+    if result is None:
+        return
+    hub.publish(
+        "notice",
+        {
+            "level": "info",
+            "reason": "reconciled",
+            "message": (
+                f"reconcile: {len(result.already_live)} already live, "
+                f"{len(result.booting)} booting, {len(result.started)} started, "
+                f"{len(result.refused)} refused"
+            ),
+            "already_live": list(result.already_live),
+            "booting": list(result.booting),
+            "started": [r.key for r in result.started],
+            "refused": [{"key": r.key, "reason": r.reason, "message": r.message} for r in result.refused],
+        },
+    )
+
+
+# ==========================================================================
+# Refusals
+# ==========================================================================
+
+
+def _refusal(status: int, reason: str, message: str, **extra: Any) -> JSONResponse:
+    """The one refusal shape. ``reason`` is the machine-readable half and is
+    the same vocabulary ``control.Refusal`` uses, so a refusal decided here
+    from the snapshot and one decided there against reality are
+    indistinguishable to a client."""
+    return JSONResponse({"error": {"reason": reason, "message": message, **extra}}, status_code=status)
+
+
+def _accepted(action: str, key: str, **extra: Any) -> JSONResponse:
+    """202. Names the action and the model, so a caller that fires and forgets
+    still has something to correlate the SSE frames against."""
+    return JSONResponse({"accepted": True, "action": action, "model": key, **extra}, status_code=202)
+
+
+def _precheck(rt: Runtime, key: str, action: str) -> JSONResponse | None:
+    """Answer from the snapshot whatever can be answered without a subprocess.
+
+    Everything here is also re-checked inside ``Control`` against reality; this
+    exists so the common refusals come back on the POST rather than as a notice
+    the caller has to be watching a stream to see.
+    """
+    model = rt.registry.models.get(key)
+    if model is None:
+        return _refusal(
+            404,
+            "unknown_model",
+            f"no model {key!r} in the registry",
+            known=list(rt.registry.models),
+        )
+    live = rt.routes.live()
+    if rt.busy is not None:
+        return _refusal(
+            409,
+            "busy",
+            f"servedeck is already running {rt.busy['label']}",
+            busy=rt.busy,
+        )
+    if action in ("start", "switch") and key in live:
+        return _refusal(
+            409,
+            "already_live",
+            f"{live[key].unit} already exists ({live[key].unit_state}); stop it first",
+            live_key=key,
+        )
+    if action == "start" and model.slot == "main":
+        holder = _main_holder(rt, live)
+        if holder is not None:
+            return _refusal(
+                409,
+                "main_slot_busy",
+                f"the main slot is held by {holder} — use POST /api/switch/{key}",
+                live_key=holder,
+            )
+    if action == "switch" and model.slot != "main":
+        return _refusal(
+            409,
+            "not_main_slot",
+            f"{key} is a {model.slot} model; switch only replaces the main slot",
+        )
+    if action == "stop" and key not in live:
+        return _refusal(409, "not_live", f"no unit exists for {key}", live_key=None)
+    if action in ("start", "switch"):
+        spec = rt.specs.get(key)
+        if spec is not None and not spec.ctx_tokens:
+            # `ctx = "native"` that could not be read. Caught here so the
+            # operator gets a sentence naming the checkpoint, instead of a
+            # RegistryError raised inside a background thread and surfacing as
+            # a notice they have to be watching a stream to see.
+            return _refusal(
+                409,
+                "ctx_unresolved",
+                spec.ctx_error or f"{key} has no known context length",
+            )
+    return None
+
+
+def _main_holder(rt: Runtime, live: dict[str, _routes.LiveView]) -> str | None:
+    for key, model in rt.registry.models.items():
+        if model.slot == "main" and key in live:
+            return key
+    return None
+
+
+async def _run_mutation(
+    rt: Runtime, label: str, work: Callable[[], Any], *, action: str = "", key: str = ""
+) -> None:
+    """Run one blocking Control call in a thread, reporting whatever it says.
+
+    Holds ``rt.lock`` for the whole operation and advertises it as ``busy`` in
+    ``/api/state``, so a second start cannot interleave with a switch that is
+    between its stop and its start — the window in which the card is empty and
+    every precheck would say "go ahead".
+
+    ``busy`` is cleared only AFTER the outcome has been published. Clearing it
+    first (in a ``finally`` before the publish) left a tick in which
+    ``/api/state`` said nothing was running while the notice stream was still
+    about to announce the result — two views of the same instant disagreeing,
+    which is the shape of every bug this rewrite exists to remove.
+    """
+    async with rt.lock:
+        rt.busy = {"action": action or label, "key": key, "label": label}
+        rt.hub.publish(
+            "notice",
+            {"level": "info", "reason": "started", "message": f"{label}: running", "key": key or None},
+        )
+        try:
+            result = await asyncio.to_thread(work)
+        except Exception as exc:  # noqa: BLE001 - a failed mutation is a notice
+            log.exception("%s failed", label)
+            rt.hub.publish(
+                "notice",
+                {
+                    "level": "error",
+                    "reason": "exception",
+                    "message": f"{label}: {type(exc).__name__}: {exc}",
+                    "key": key or None,
+                },
+            )
+            return
+        else:
+            _publish_result(rt.hub, label, result)
+        finally:
+            # `else` runs before `finally`, and the except branch publishes
+            # before returning, so every exit path has announced its outcome by
+            # the time `busy` clears. That ordering is the whole fix.
+            rt.busy = None
+    with contextlib.suppress(Exception):
+        state = await build_state(rt)
+        rt.state = state
+        rt.hub.publish("state", state)
+
+
+def _publish_result(hub: Hub, label: str, result: Any) -> None:
+    if isinstance(result, _control.Refusal):
         hub.publish(
             "notice",
-            {"level": "error", "code": f"{label}_failed", "body": f"{type(exc).__name__}: {exc}"},
+            {
+                "level": "error",
+                "reason": result.reason,
+                "message": f"{label}: {result.message}",
+                "key": result.key,
+                "live_key": result.live_key,
+            },
         )
-    else:
-        # The outcome is the supervisor's state afterwards, not the mere fact
-        # that the coroutine returned. Every control action used to report
-        # '<action> completed' at level info -- including a start PORT_IN_USE
-        # had just refused, a start that did nothing because the server was
-        # already up, and the loser of two concurrent starts. An action that
-        # failed must not read like one that worked.
-        hub.publish("notice", _outcome_notice(label))
-    finally:
-        hub.publish("state", _state())
+        return
+    if isinstance(result, _control.StartResult):
+        hub.publish(
+            "notice",
+            {
+                "level": "info" if result.ready else "error",
+                "reason": "ready" if result.ready else "boot_failed",
+                "message": (
+                    f"{label}: {result.key} ready in {result.elapsed_s:.0f}s"
+                    if result.ready
+                    else f"{label}: {result.failure}"
+                ),
+                "key": result.key,
+                "markers": list(result.markers),
+                "journal": list(result.journal),
+            },
+        )
+        return
+    if isinstance(result, _control.StopResult):
+        hub.publish(
+            "notice",
+            {
+                "level": "info",
+                "reason": "stopped",
+                "message": (
+                    f"{label}: {result.unit} stopped"
+                    + (f" (released ~{result.held_mib} MiB)" if result.held_mib else "")
+                ),
+                "key": result.key,
+            },
+        )
+        return
+    if isinstance(result, _control.SwitchResult):
+        _publish_result(hub, label, result.started)
+        return
+    if isinstance(result, _control.Adoption):
+        hub.publish(
+            "notice",
+            {
+                "level": "info",
+                "reason": "adopted",
+                "message": (
+                    f"{label}: adopted {result.adopted or 'nothing'}"
+                    + (f"; unknown units {result.unknown_units}" if result.unknown_units else "")
+                ),
+                "adopted": list(result.adopted),
+                "unknown_units": list(result.unknown_units),
+            },
+        )
+        return
+    if isinstance(result, _control.Reconciliation):
+        _publish_reconciliation(hub, result)
 
 
-#: Supervisor states in which an action is still in flight -- "start
-#: completed" then means "the boot is under way", not "the server is up".
-_IN_FLIGHT_STATES = ("PREFLIGHT", "STARTING", "STOPPING", "DRAINING")
+# ==========================================================================
+# App
+# ==========================================================================
 
 
-def _outcome_notice(label: str) -> dict[str, Any]:
-    """The notice for an action that returned, derived from what it achieved."""
-    s = sup()
-    state = getattr(s, "actual_state", None)
-    error = getattr(s, "last_error", None)
-    if state == "FAILED":
-        return {"level": "error", "code": f"{label}_failed",
-                "body": f"{label} failed: {error or 'no reason recorded'}"}
-    if state == "UNMANAGED":
-        return {"level": "warn", "code": f"{label}_unmanaged",
-                "body": error or f"{label}: a server is running that Servedeck does not manage"}
-    if state in _IN_FLIGHT_STATES:
-        return {"level": "info", "code": label, "body": f"{label} accepted — {state.lower()}"}
-    return {"level": "info", "code": label, "body": f"{label} completed"}
+def build_control(
+    settings: _settings.Settings,
+    registry: _models.Registry,
+    adapter: _RegistryAdapter | None = None,
+) -> _control.Control:
+    """A ``Control`` wired to this registry and this box's settings.
 
-
-@app.get("/api/events")
-async def api_events(request: Request) -> StreamingResponse:
-    # Resume from where a reconnecting browser left off, if it tells us.
-    try:
-        last_id: int | None = int(request.headers.get("last-event-id", ""))
-    except ValueError:
-        last_id = None
-    sub, backlog = hub.subscribe(last_event_id=last_id)
-
-    def frame(ev: events.Event) -> str:
-        return f"id: {ev.id}\nevent: {ev.type}\ndata: {json.dumps(ev.data)}\n\n"
-
-    async def gen():
-        try:
-            yield f"event: state\ndata: {json.dumps(_state())}\n\n"
-            for ev in backlog:
-                yield frame(ev)
-            while True:
-                if await request.is_disconnected():
-                    break
-                try:
-                    ev = await asyncio.wait_for(sub.queue.get(), timeout=15.0)
-                    yield frame(ev)
-                except asyncio.TimeoutError:
-                    yield ": keepalive\n\n"   # keep proxies from closing an idle stream
-        finally:
-            hub.unsubscribe(sub)
-
-    return StreamingResponse(
-        gen(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    Public because ``servedeck.cli`` needs exactly this when the dashboard is
+    not running: the CLI's fallback drives the same supervisor in-process
+    rather than a second, subtly different one.
+    """
+    return _control.Control(
+        adapter or _RegistryAdapter(registry),
+        margin_mib=registry.gpu.margin_mib,
+        total_mib=registry.gpu.total_mib,
+        unit_prefix=settings.unit_prefix,
+        desired_path=settings.desired_path,
     )
 
 
-# --------------------------------------------------------------- proxy ----
-# Pass-through only. NOTE (SPEC C2): /v1/models must never be held or
-# synthesised — codex-qwen.sh's is_server_up() probes it with no timeout, so a
-# held response hangs the CLI forever and a fake 200 makes it believe a dead
-# server is alive. Request holding belongs in gateway.py when that exists.
-_PROXY_PREFIXES = ("/v1", "/health", "/ping", "/metrics", "/tokenize", "/detokenize")
+def build_runtime(
+    settings: _settings.Settings | None = None,
+    *,
+    registry: _models.Registry | None = None,
+    control: Any | None = None,
+    client: httpx.AsyncClient | None = None,
+) -> Runtime:
+    """Assemble a Runtime. Every dependency is injectable, which is how the API
+    tests drive every route with a fake Control and no systemd."""
+    settings = settings or _settings.get()
+    registry = registry if registry is not None else _models.load(settings.models_path)
+    adapter = _RegistryAdapter(registry)
+    if control is None:
+        control = build_control(settings, registry, adapter)
+    # ONE context resolution for the whole process. The adapter already read
+    # every `ctx = "native"` off disk at load; handing the same answers to the
+    # route table means the gateway's `max_model_len`, the page's ctx column
+    # and the `--max-model-len` a model is actually launched with cannot
+    # disagree — which they could when each resolved its own.
+    routes = _routes.RegistryRoutes(
+        registry, control, ctx_resolver=lambda m: adapter.specs[m.key].ctx_tokens
+    )
+    return Runtime(
+        settings=settings,
+        registry=registry,
+        specs=adapter.specs,
+        control=control,
+        routes=routes,
+        hub=Hub(),
+        client=client or httpx.AsyncClient(timeout=10.0),
+    )
 
 
-@app.api_route("/{path:path}", methods=["GET", "POST", "DELETE", "PUT", "PATCH"])
-async def catch_all(path: str, request: Request) -> Any:
-    full = "/" + path
+def _build_venv_bin(build: _models.Build | None) -> str:
+    """``<venv>/bin`` for one ``[builds.<name>]`` table.
 
-    if any(full == p or full.startswith(p + "/") for p in _PROXY_PREFIXES):
-        if rt.client is None:
-            return JSONResponse({"error": "not ready"}, status_code=503)
-        url = f"{rt.upstream}{full}"
-        try:
-            req = rt.client.build_request(
-                request.method,
-                url,
-                content=await request.body(),
-                headers={k: v for k, v in request.headers.items() if k.lower() != "host"},
-                params=dict(request.query_params),
-                timeout=None,
-            )
-            resp = await rt.client.send(req, stream=True)
-        except Exception as exc:  # noqa: BLE001
-            return JSONResponse(
-                {
-                    "error": {
-                        "message": f"Servedeck: upstream {rt.upstream} unreachable ({type(exc).__name__})",
-                        "type": "servedeck_upstream_unavailable",
-                        "code": "unreachable",
-                    }
-                },
-                status_code=503,
-            )
+    ``~`` is expanded here rather than passed through: this string becomes
+    argv[0]'s directory, and ``execve`` does not expand ``~`` — a literal one
+    produces "No such file or directory" naming a path that plainly exists,
+    which is among the least legible failures available. ``render_env`` expands
+    the same two paths for ``PATH``/``CUDA_HOME``, for the same reason.
+    """
+    if build is None:
+        return ""
+    root = Path(build.venv).expanduser()
+    return str(root if root.name == "bin" else root / "bin")
 
-        async def body_iter():
+
+@dataclass(frozen=True)
+class ModelSpecAdapter:
+    """One ``models.Model`` as a ``control.ModelSpec``.
+
+    Built ONCE, at load, for every model — not per call. ``ctx_tokens`` is the
+    reason: resolving ``ctx = "native"`` reads the checkpoint's config.json off
+    disk, and a property would do that on every ``control.live()`` probe.
+    Resolving it here also means the value is settled before anything can try
+    to launch with it.
+
+    ``ctx_tokens`` is 0, and only 0, when ``native`` could not be read.
+    :meth:`render_argv` then refuses rather than launching a model with a
+    context length nobody measured — and ``app._precheck`` catches that case
+    before a POST is ever accepted, so the refusal reaches the operator as a
+    409 instead of as a traceback in a background task.
+    """
+
+    model: _models.Model
+    #: The resolved ``[builds.<name>]`` table this model launches from. Carried
+    #: rather than looked up per call because ``render_env`` needs it on every
+    #: launch and a registry lookup inside the Protocol's methods would put the
+    #: registry back into the supervisor's dependency set.
+    build: _models.Build | None
+    key: str
+    id: str
+    slot: str
+    port: int
+    vram_mib: int | None
+    ctx_tokens: int
+    venv_bin: str
+    ctx_error: str | None = None
+
+    @classmethod
+    def from_model(cls, model: _models.Model, registry: _models.Registry) -> ModelSpecAdapter:
+        """Resolve one registry model into a launchable spec.
+
+        NOT named ``build``: that is the name of the field above, and a
+        classmethod sharing a field's name becomes that field's default as far
+        as ``dataclasses`` is concerned — every field after it then raises
+        "non-default argument follows default argument" at import time.
+        """
+        ctx, error = 0, None
+        if isinstance(model.ctx, int):
+            ctx = model.ctx
+        else:
             try:
-                async for chunk in resp.aiter_raw():
-                    yield chunk
-            finally:
-                await resp.aclose()
-
-        hop = {"content-length", "transfer-encoding", "connection"}
-        return StreamingResponse(
-            body_iter(),
-            status_code=resp.status_code,
-            headers={k: v for k, v in resp.headers.items() if k.lower() not in hop},
+                ctx = _models.native_ctx(model.repo)
+            except _models.RegistryError as exc:
+                error = str(exc)
+        build = registry.builds.get(model.build)
+        return cls(
+            model=model,
+            build=build,
+            key=model.key,
+            id=model.id,
+            slot=model.slot,
+            port=model.port,
+            vram_mib=model.vram_mib,
+            ctx_tokens=ctx,
+            venv_bin=_build_venv_bin(build),
+            ctx_error=error,
         )
 
-    # ---- static site --------------------------------------------------
-    # NOTE: this catch-all is registered before any StaticFiles mount, so it
-    # must serve assets itself - a mount added later never gets reached.
-    # index.html references /assets/<file>; the files live flat in web/, so
-    # strip the prefix rather than requiring a web/assets/ directory.
-    if not WEB.exists():
-        return JSONResponse({"error": "web/ is not built yet"}, status_code=503)
+    def served_names(self) -> list[str]:
+        """A method, matching ``models.Model.served_names`` — one shape for
+        "every name this model answers to", in the registry and in the
+        supervisor's Protocol both."""
+        return self.model.served_names()
 
-    rel = path[len("assets/"):] if path.startswith("assets/") else path
+    def render_argv(self, util: float, port: int) -> list[str]:
+        if not self.ctx_tokens:
+            raise _models.RegistryError(
+                f"{self.key}: {self.ctx_error or 'no context length is known'}"
+            )
+        if self.build is None or not self.venv_bin:
+            raise _models.RegistryError(
+                f"{self.key}: build {self.model.build!r} is not in [builds], so "
+                "there is no venv to launch from"
+            )
+        return _models.render_argv(
+            self.model, str(Path(self.venv_bin) / "vllm"), util, self.ctx_tokens, port
+        )
 
-    if rel:
-        candidate = (WEB / rel).resolve()
-        root = WEB.resolve()
-        if candidate.is_file() and str(candidate).startswith(str(root)):
-            # no-store on the dashboard's own assets. These change whenever the
-            # app is updated, and a browser holding a stale app.js reports bugs
-            # that were already fixed -- with the old error text, which sends
-            # everyone looking in the wrong place. This is a localhost tool;
-            # there is nothing to gain from caching them.
-            return FileResponse(
-                candidate,
-                headers={"Cache-Control": "no-store, must-revalidate"},
-            )   # FileResponse infers the media type
-        # A request with a file extension wants a FILE. Returning index.html
-        # with content-type text/html for a missing .css/.js is worse than a
-        # 404: the browser drops it silently and the page renders unstyled with
-        # a 200 in the network tab. Fail loudly instead.
-        if "." in Path(rel).name:
-            return JSONResponse({"error": f"not found: {rel}"}, status_code=404)
+    def render_env(self) -> dict[str, str]:
+        """The COMPLETE launch environment, including ``CUDA_HOME`` and a full
+        ``PATH`` built from this model's build.
 
-    return FileResponse(
-        WEB / "index.html", headers={"Cache-Control": "no-store, must-revalidate"}
-    )
+        A transient unit inherits the USER MANAGER's environment, never the
+        caller's shell, so anything missing here is missing at boot — and
+        FlashInfer's JIT needs nvcc/ptxas on ``PATH`` at *request* time, not
+        only at process start.
+        """
+        if self.build is None:
+            raise _models.RegistryError(
+                f"{self.key}: build {self.model.build!r} is not in [builds], so "
+                "CUDA_HOME and PATH cannot be derived"
+            )
+        return _models.render_env(self.model, self.build)
 
-# (no StaticFiles mount: the catch-all above is registered first and would
-# shadow it. Assets are served there, including the /assets/ prefix strip.)
+
+class _RegistryAdapter:
+    """P1's ``Registry`` as P3's ``control.Registry`` Protocol.
+
+    ``get`` for every keyed action, ``keys`` for port adoption only (see
+    ``control.Registry``). There is still no ``models()``: nothing decides
+    order here.
+    """
+
+    def __init__(self, registry: _models.Registry) -> None:
+        self.registry = registry
+        self.specs: dict[str, ModelSpecAdapter] = {
+            key: ModelSpecAdapter.from_model(model, registry)
+            for key, model in registry.models.items()
+        }
+
+    def get(self, key: str) -> ModelSpecAdapter:
+        spec = self.specs.get(key)
+        if spec is None:
+            raise KeyError(key)
+        return spec
+
+    def keys(self) -> list[str]:
+        return list(self.specs)
+
+
+def create_app(
+    settings: _settings.Settings | None = None,
+    *,
+    registry: _models.Registry | None = None,
+    control: Any | None = None,
+    client: httpx.AsyncClient | None = None,
+    gateway_transport: httpx.AsyncBaseTransport | None = None,
+    reconcile: bool = True,
+    poll: bool = True,
+) -> FastAPI:
+    """Build the ASGI app.
+
+    ``reconcile``/``poll`` default on and are turned off by tests that want the
+    routes without the background machinery. They are parameters rather than
+    environment variables because a test that has to set an env var to stop the
+    app launching a model is one forgotten fixture away from launching one.
+    """
+    rt = build_runtime(settings, registry=registry, control=control, client=client)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        rt.hub.bind(asyncio.get_running_loop())
+        tasks: list[asyncio.Task[Any]] = []
+        # One synchronous refresh before anything serves, so the first request
+        # sees the truth rather than an empty table that 503s every model.
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(rt.routes.refresh)
+        if poll:
+            tasks.append(asyncio.create_task(_poll_loop(rt), name="servedeck-poll"))
+        if reconcile:
+            tasks.append(asyncio.create_task(_reconcile_after_bind(rt), name="servedeck-reconcile"))
+        try:
+            yield
+        finally:
+            # Subscribers first: a generator parked on queue.get() is what made
+            # every shutdown take TimeoutStopSec.
+            rt.hub.close()
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+            await rt.client.aclose()
+            gw_client = getattr(_app.state, "gateway_client", None)
+            if gw_client is not None and getattr(_app.state, "gateway_owns_client", False):
+                await gw_client.aclose()
+
+    app = FastAPI(title="servedeck", docs_url=None, redoc_url=None, lifespan=lifespan)
+    app.state.rt = rt
+
+    gw = _gateway.build_router(rt.routes, transport=gateway_transport)
+    app.state.gateway_client = gw.gateway_client
+    app.state.gateway_owns_client = gw.gateway_owns_client
+    _register_api(app, rt)
+    # The gateway LAST: its `/v1/{path:path}` is a catch-all, and Starlette
+    # matches in registration order, so a route registered after it is dead.
+    app.include_router(gw)
+    _register_page(app)
+    return app
+
+
+# --------------------------------------------------------------------------
+# Routes
+# --------------------------------------------------------------------------
+
+
+def _register_api(app: FastAPI, rt: Runtime) -> None:
+    @app.get("/api/health")
+    async def health() -> dict[str, Any]:
+        """Deliberately the cheapest possible answer: no systemd, no GPU, no
+        registry walk. ``_reconcile_after_bind`` polls this to learn whether we
+        won the port, and a health check that could itself fail would make the
+        reconcile decision depend on something other than the bind."""
+        return {
+            "ok": True,
+            "service": "servedeck",
+            "port": rt.settings.listen_port,
+            "instance": rt.instance_id,
+        }
+
+    @app.get("/api/state")
+    async def state() -> dict[str, Any]:
+        if not rt.state:
+            rt.state = await build_state(rt)
+            rt.first_state.set()
+        return rt.state
+
+    @app.get("/api/models")
+    async def api_models() -> dict[str, Any]:
+        """The registry, joined with what is actually on disk.
+
+        Two different questions share this route on purpose: "what can I run"
+        is the registry, and "is it downloaded" is the hub cache. Separating
+        them put the main-slot dropdown one round trip away from knowing
+        whether the model it lists would have to download 90 GiB first.
+        """
+        entries = await asyncio.to_thread(_discovery.discover_models)
+        by_repo = {e.repo_id: e for e in entries}
+        registry_rows = []
+        for key, model in rt.registry.models.items():
+            entry = by_repo.get(model.repo)
+            registry_rows.append(
+                {
+                    "key": key,
+                    "id": model.id,
+                    "repo": model.repo,
+                    "slot": model.slot,
+                    "build": model.build,
+                    "on_disk": entry is not None and entry.servable,
+                    "disk_gib": round(entry.disk_bytes / 1024**3, 2) if entry else None,
+                    "reason": entry.reason if entry else "not in the local hub cache",
+                }
+            )
+        return {
+            "models": registry_rows,
+            "cache": [
+                {
+                    "repo_id": e.repo_id,
+                    "servable": e.servable,
+                    "disk_gib": round(e.disk_bytes / 1024**3, 2),
+                    "arch": e.architectures0,
+                    "in_registry": e.repo_id in {m.repo for m in rt.registry.models.values()},
+                }
+                for e in entries
+            ],
+        }
+
+    @app.post("/api/models/{key}/start")
+    async def start(key: str) -> JSONResponse:
+        refusal = _precheck(rt, key, "start")
+        if refusal is not None:
+            return refusal
+        asyncio.create_task(
+            _run_mutation(
+                rt,
+                f"start {key}",
+                lambda: rt.control.start(key, on_progress=_progress_publisher(rt.hub, key)),
+                action="start",
+                key=key,
+            )
+        )
+        return _accepted("start", key)
+
+    @app.post("/api/models/{key}/stop")
+    async def stop(key: str) -> JSONResponse:
+        refusal = _precheck(rt, key, "stop")
+        if refusal is not None:
+            return refusal
+        asyncio.create_task(
+            _run_mutation(rt, f"stop {key}", lambda: rt.control.stop(key), action="stop", key=key)
+        )
+        return _accepted("stop", key)
+
+    @app.post("/api/switch/{key}")
+    async def switch(key: str) -> JSONResponse:
+        refusal = _precheck(rt, key, "switch")
+        if refusal is not None:
+            return refusal
+        asyncio.create_task(
+            _run_mutation(
+                rt,
+                f"switch {key}",
+                lambda: rt.control.switch(key, on_progress=_progress_publisher(rt.hub, key)),
+                action="switch",
+                key=key,
+            )
+        )
+        return _accepted("switch", key)
+
+    @app.post("/api/adopt")
+    async def adopt() -> JSONResponse:
+        asyncio.create_task(
+            _run_mutation(rt, "adopt", lambda: rt.control.adopt(), action="adopt")
+        )
+        return _accepted("adopt", "")
+
+    @app.get("/api/log/{key}")
+    async def log_tail(key: str, lines: int = 80) -> JSONResponse:
+        """``journalctl --user -u <unit> -n <lines>``.
+
+        The journal outlives the unit (``--collect`` deletes the unit object,
+        not its log), which is exactly why a failure report is built from this
+        and not from ``Result=``."""
+        if key not in rt.registry.models:
+            return _refusal(404, "unknown_model", f"no model {key!r} in the registry")
+        lines = max(1, min(int(lines), 1000))
+        unit = f"{rt.settings.unit_prefix}{key}"
+        tail = await asyncio.to_thread(_units.journal_tail, unit, lines)
+        return JSONResponse({"key": key, "unit": unit, "lines": tail})
+
+    @app.get("/api/wire")
+    async def wire_diff() -> dict[str, Any]:
+        return await asyncio.to_thread(_wire_payload, rt, False)
+
+    @app.post("/api/wire/apply")
+    async def wire_apply() -> dict[str, Any]:
+        payload = await asyncio.to_thread(_wire_payload, rt, True)
+        rt.hub.publish(
+            "notice",
+            {
+                "level": "info",
+                "reason": "wired",
+                "message": "wire --apply: "
+                + (", ".join(t["name"] for t in payload["targets"] if t["changed"]) or "no changes"),
+            },
+        )
+        return payload
+
+    @app.get("/api/doctor")
+    async def doctor() -> dict[str, Any]:
+        results = await asyncio.to_thread(_doctor.run_doctor, rt.settings.models_path)
+        return {
+            "ok": _doctor.all_ok(results),
+            "checks": [{"name": r.name, "ok": r.ok, "detail": r.detail} for r in results],
+        }
+
+    @app.get("/api/events")
+    async def events(request: Request) -> StreamingResponse:
+        return StreamingResponse(
+            _event_stream(rt, request),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+
+def _wire_payload(rt: Runtime, apply: bool) -> dict[str, Any]:
+    """The dry-run diff for every client config, and optionally the write.
+
+    Same code path either way — the diff shown is literally the diff applied,
+    which is the property that makes an Apply button trustworthy.
+    """
+    resolve_ctx = _wire.make_default_ctx_resolver(rt.registry)
+    targets = []
+    for target in _wire.WIRE_TARGETS:
+        before = _wire.read_existing(target.path)
+        after = target.render(rt.registry, before, resolve_ctx=resolve_ctx)
+        changed = before != after
+        backup: str | None = None
+        if changed and apply:
+            backup_dir = rt.settings.state_dir / "backups" / date.today().isoformat()
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            backup_path = backup_dir / str(target.path).lstrip("/").replace("/", "_")
+            backup_path.write_text(before)
+            target.path.parent.mkdir(parents=True, exist_ok=True)
+            target.path.write_text(after)
+            backup = str(backup_path)
+        targets.append(
+            {
+                "name": target.name,
+                "path": str(target.path),
+                "changed": changed,
+                "diff": _wire.unified_diff(target.name, before, after) if changed else "",
+                "backup": backup,
+            }
+        )
+    return {"applied": apply, "targets": targets}
+
+
+async def _event_stream(rt: Runtime, request: Request) -> AsyncIterator[bytes]:
+    """One SSE connection.
+
+    Opens with the current state and the recent notices, so a page that loads
+    after everything interesting happened is not blank until the next change.
+    Ends when the hub hands it the sentinel (shutdown) or the client goes away.
+    """
+    sub = rt.hub.subscribe()
+    try:
+        if rt.state:
+            yield _frame("state", rt.state)
+        for notice in rt.hub.notices[-50:]:
+            # ``replay: true`` is not decoration. The page wants this backlog —
+            # a page opened after a failure should still show the failure — but
+            # a CLI watching for the end of the start IT just requested must
+            # not stop on a "ready" from an hour ago. Without the flag,
+            # `servedeck start` exits 0 the instant it connects, reporting the
+            # previous boot's outcome as this one's.
+            yield _frame("notice", {**notice["data"], "replay": True})
+        while True:
+            if await request.is_disconnected():
+                return
+            try:
+                event = await asyncio.wait_for(sub.queue.get(), timeout=KEEPALIVE_S)
+            except asyncio.TimeoutError:
+                yield b": keepalive\n\n"
+                continue
+            if event is None:  # shutdown sentinel
+                return
+            yield _frame(event["type"], event["data"])
+    finally:
+        rt.hub.unsubscribe(sub)
+
+
+def _frame(event_type: str, data: Any) -> bytes:
+    return f"event: {event_type}\ndata: {json.dumps(data, default=str)}\n\n".encode()
+
+
+def _register_page(app: FastAPI) -> None:
+    @app.get("/")
+    async def index() -> Any:
+        target = WEB / "index.html"
+        if not target.is_file():  # pragma: no cover - only in a broken install
+            return PlainTextResponse("servedeck: web/index.html is missing", status_code=500)
+        return FileResponse(target)
+
+    @app.get("/{asset:path}")
+    async def asset(asset: str) -> Any:
+        """Serve ``web/`` by explicit name.
+
+        Registered after every API and gateway route, and resolved against
+        ``WEB`` so a ``..`` cannot escape it. A StaticFiles mount would be
+        shorter, but the previous app's catch-all was registered first and the
+        mount it added later was never reached — an asset route that is dead
+        and silent is worse than one written out.
+        """
+        candidate = (WEB / asset).resolve()
+        if not str(candidate).startswith(str(WEB.resolve()) + "/") or not candidate.is_file():
+            return PlainTextResponse("not found", status_code=404)
+        return FileResponse(candidate)

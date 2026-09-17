@@ -16,17 +16,18 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from . import config as _config
+from . import limits as _limits
 
 # ---------------------------------------------------------------------------
 # Constants (SPEC.md §3) — provenance noted inline.
 # ---------------------------------------------------------------------------
 
-# Hardware and safety constants. All come from servedeck.config so a different
-# card, or a different launcher, needs no code change. They are read at import
-# time; call capacity.refresh_limits() after changing config in a long-lived
-# process (tests do this).
-_cfg = _config.get()
+# Hardware and safety constants. They come from servedeck.limits — four
+# environment-overridable numbers, all that is left of the 283-line config.py
+# now that every model fact lives in models.toml (REDESIGN R1). Read at import
+# time; call capacity.refresh_limits() after changing the environment in a
+# long-lived process (tests do this).
+_cfg = _limits.get()
 
 #: Total VRAM. 0 means detection failed -- compute() then refuses to guess.
 GPU_TOTAL_MIB: int = _cfg.gpu_total_mib
@@ -57,25 +58,20 @@ FLASHNEXT_MIN_UTIL: float = 0.90
 
 
 def _cfg_markers() -> tuple[str, ...]:
-    """Marker paths, from $SERVEDECK_TRAINING_MARKERS or servedeck.toml.
+    """Marker paths, from $SERVEDECK_TRAINING_MARKERS or the built-in defaults.
 
     The env var wins so a test (or a one-off run) can override without editing
-    the file. `training_markers` in the config used to be parsed and then
-    never read by anything — config that silently does nothing is worse than
-    no config, because it reads as a guard that is switched on.
+    anything. See servedeck.limits.training_markers().
     """
-    import os
-    raw = os.environ.get("SERVEDECK_TRAINING_MARKERS", "")
-    if raw:
-        return tuple(p for p in raw.split(":") if p)
-    return tuple(_config.get().training_markers)
+    return _limits.training_markers()
 
 
 def refresh_limits() -> None:
-    """Re-read hardware limits from config (after config.reset())."""
+    """Re-read hardware limits from the environment (after limits.reset())."""
     global _cfg, GPU_TOTAL_MIB, GPU_TOTAL_GIB, OVERHEAD_GIB_DEFAULT
     global VRAM_GUARD_HEADROOM_MIB, TRAINING_MARKER_PATHS
-    _cfg = _config.get()
+    _limits.reset()
+    _cfg = _limits.get()
     GPU_TOTAL_MIB = _cfg.gpu_total_mib
     GPU_TOTAL_GIB = GPU_TOTAL_MIB / 1024
     OVERHEAD_GIB_DEFAULT = _cfg.overhead_gib
@@ -84,7 +80,7 @@ def refresh_limits() -> None:
 
 # A "lock file" convention: if any of these paths exists, something else wants
 # the GPU (a training run, a benchmark) and Servedeck must stand down rather
-# than start a server. Configure via `training_markers` in servedeck.toml.
+# than start a server. Configure via $SERVEDECK_TRAINING_MARKERS.
 # capacity.py stays pure — it never stat()s anything; a caller that is allowed
 # I/O checks existence and reports hits via LiveFacts.training_markers.
 TRAINING_MARKER_PATHS: tuple[str, ...] = tuple(_cfg_markers())

@@ -18,7 +18,15 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Topic :: System :: Monitoring",
 ]
-dependencies = ["fastapi>=0.115", "uvicorn>=0.30", "httpx>=0.27"]
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+  "httpx>=0.27",
+  # tomllib (stdlib, read-only) parses models.toml; tomli-w is the write side,
+  # used by `servedeck wire --apply` to rewrite ~/.codex/config.toml and
+  # ~/.kimi-code/config.toml (servedeck/wire.py).
+  "tomli-w>=1.0",
+]
 
 [project.optional-dependencies]
 # dukpy embeds duktape: tests/test_ui.py runs web/app.js's rendering functions
@@ -27,7 +35,7 @@ dependencies = ["fastapi>=0.115", "uvicorn>=0.30", "httpx>=0.27"]
 dev = ["pytest>=8", "dukpy>=0.5"]
 
 [project.scripts]
-servedeck = "servedeck.__main__:main"
+servedeck = "servedeck.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/pctablet505/servedeck"
@@ -47,3 +55,6 @@ servedeck = ["py.typed", "web/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+  "slow: boots a real model on the GPU; skipped unless the card has room",
+]
