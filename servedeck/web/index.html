@@ -66,7 +66,7 @@
                  disagree with itself. -->
             <div class="status-meta smeta mono" id="sMeta">connecting…</div>
           </div>
-          <span class="queued mono" id="queued" role="status"><span id="qN">—</span> in flight</span>
+          <span class="queued mono" id="queued" role="status"><span id="qN">—</span> running · <span id="qW">—</span> waiting</span>
         </div>
 
         <!-- Prefill, decode and TTFT are three different questions and one number
@@ -172,63 +172,46 @@
            1..64 -- a thumb that cannot be aimed at a number, and the number is
            the whole point of the field. -->
       <div class="alloc">
-        <div class="field frow">
-          <span class="k">GPU utilization</span>
-          <input type="range" id="util" min="40" max="98" value="96" title="0.40 to 0.98 — the share of the card vLLM may reserve" aria-label="GPU memory utilization" aria-describedby="utilV">
-          <span class="v mono" id="utilV">0.96</span>
-        </div>
-
-        <div class="field frow">
-          <span class="k">Parallel agents</span>
-          <input type="number" id="agents" class="num" min="1" max="64" value="1" title="--max-num-seqs: the scheduler's ceiling on concurrent sequences" aria-label="Parallel agents" aria-describedby="agentsFit">
-          <span class="s mono" id="agentsFit">—</span>
-          <!-- The recommendation lives in the live panel below the fold, as
-               evidence (it is measured off the last 100 requests). This button
-               closes the loop without moving that evidence: it writes the
-               recommended count into the field above. It was a manual scroll-
-               up-and-type before, which is the round trip the owner's "badly
-               organised" complaint is about. -->
-          <button type="button" class="btn tiny" id="useRec" disabled title="nothing recommended yet">Use recommended</button>
-        </div>
-
-        <div class="field frow">
-          <span class="k" title="--max-model-len: the longest context ONE request may use. The KV pool is shared; vLLM admits what fits and queues the rest.">Max context</span>
-          <!-- A slider, not a fixed ladder. It defaults to the model's own
-               max_position_embeddings and its ceiling is lower only when the
-               KV budget cannot hold even ONE request of that length. It is
-               per request, not per agent: it used to be the pool divided by
-               the agent count above, which launched the 27B at 110,592 on a
-               1.6M-token pool and failed the next longer prompt. -->
-          <input type="range" id="ctx" min="8192" max="262144" step="4096" value="262144" aria-label="Maximum context per request" aria-describedby="ctxV ctxBound ctxNote">
-          <span class="v mono" id="ctxV">—</span>
-          <span class="s mono" id="ctxBound">—</span>
-        </div>
-        <!-- Why the context is below the model's own, whenever it is: the
-             pool cannot hold one full-length request, the running server was
-             started lower, or the operator lowered it. Empty at full native
-             context. -->
-        <div class="ctxnote" id="ctxNote" role="status"></div>
-
-        <div class="field">
-          <!-- One derived figure, not three. The other two cells were echoes:
-               "Parallel agents" here restated the input of the same name (a
-               division the badge wrongly called "measured"), and "Max single
-               context" restated the context slider's own ceiling. The KV budget
-               is the one figure here that is not a mirror of a control, and it
-               is the one the measured/estimated badge actually describes — the
-               engine's resolved KV size is a measurement, the calculator's is
-               not — so the badge moved onto it. -->
-          <div class="derived one">
-            <div class="dcell">
-              <div class="k">KV budget <span class="tag" id="dBadge">—</span></div>
-              <div class="n mono" id="dKv">—</div>
-              <div class="s mono" id="dKvTok">—</div>
+        <!-- 2026-09-17: the three controls sit side by side. They were three
+             full-width rows with a number box wedged between two sliders, and
+             a 90px "KV budget" box under them restating the VRAM bar. -->
+        <div class="agrid">
+          <div class="acell">
+            <div class="k">GPU utilization <span class="tu">share of the card vLLM may reserve</span></div>
+            <div class="ctl">
+              <input type="range" id="util" min="40" max="98" value="96" title="0.40 to 0.98" aria-label="GPU memory utilization" aria-describedby="utilV">
+              <span class="v mono" id="utilV">0.96</span>
             </div>
           </div>
-
-          <div class="alert crit" id="alertC" role="alert"><b>⚠</b><span id="alertCT"></span></div>
-          <div class="alert warn" id="alertW" role="alert"><b>!</b><span id="alertWT"></span></div>
+          <div class="acell">
+            <div class="k" title="--max-model-len: the longest context ONE request may use. The KV pool is shared; vLLM admits what fits and queues the rest.">Max context <span class="tu">per request</span></div>
+            <div class="ctl">
+              <input type="range" id="ctx" min="8192" max="262144" step="4096" value="262144" aria-label="Maximum context per request" aria-describedby="ctxV ctxBound ctxNote">
+              <span class="v mono" id="ctxV">—</span>
+            </div>
+            <div class="s mono" id="ctxBound">—</div>
+          </div>
+          <div class="acell">
+            <div class="k" title="--max-num-seqs: the scheduler's ceiling on concurrent sequences">Parallel agents <span class="tu">--max-num-seqs</span></div>
+            <div class="ctl">
+              <input type="number" id="agents" class="num" min="1" max="64" value="1" aria-label="Parallel agents" aria-describedby="agentsFit">
+              <button type="button" class="btn tiny" id="useRec" disabled title="nothing recommended yet">Use recommended</button>
+            </div>
+            <div class="s mono"><span id="agentsFit">—</span><span id="agentsRec"></span></div>
+          </div>
         </div>
+        <div class="ctxnote" id="ctxNote" role="status"></div>
+        <!-- One line, not a box: the pool this configuration buys, its
+             provenance, and what the KV offload parks in host RAM beside it. -->
+        <div class="kvline">
+          <span class="k">KV budget</span>
+          <span class="tag" id="dBadge">—</span>
+          <span class="mono big" id="dKv">—</span>
+          <span class="mono" id="dKvTok">—</span>
+          <span class="mono" id="kvOffload"></span>
+        </div>
+        <div class="alert crit" id="alertC" role="alert"><b>⚠</b><span id="alertCT"></span></div>
+        <div class="alert warn" id="alertW" role="alert"><b>!</b><span id="alertWT"></span></div>
       </div>
 
       <!-- Live preflight, painted from the estimate's own findings. This was
@@ -247,7 +230,6 @@
            detached from the three fields that decide it. -->
       <div class="actions">
         <button class="btn pri" id="apply" disabled>Apply &amp; restart</button>
-        <button class="btn" id="smoke">Smoke test</button>
         <button class="btn" id="stop">Stop</button>
         <span class="dirty" id="dirty" role="status">unsaved changes</span>
       </div>
@@ -271,8 +253,6 @@
              that never reset, and drawing them in one row at one size made a
              593-since-boot preemption read identically to "preempting now". -->
         <div class="lrow">
-          <div><div class="lk">Running <span class="tb">now</span></div><div class="n mono" id="mRun">—</div></div>
-          <div><div class="lk">Waiting <span class="tb">now</span></div><div class="n mono" id="mWait">—</div></div>
           <div><div class="lk">Preemptions <span class="tb">since boot</span></div><div class="n mono" id="mPre">—</div></div>
           <div><div class="lk">Prefix cache <span class="tb">lifetime</span></div><div class="n mono" id="hitRate">—</div></div>
         </div>
@@ -300,30 +280,6 @@
         <div class="lsub mono" id="winMeta">—</div>
       </div>
 
-      <div class="lcol">
-        <div class="lk">Run this many agents in parallel</div>
-        <div class="lbig mono" id="recN">—</div>
-        <div class="lsub" id="recBasis">—</div>
-        <!-- The arithmetic, on screen, so the number can be checked rather
-             than trusted. -->
-        <div class="lsub mono" id="recMath">—</div>
-        <div class="lsub" id="recP99">—</div>
-        <!-- Long and short requests sharing the live pool: how many at the
-             running server's full --max-model-len fit at once, and how many
-             at the recent p50/p90 fit beside 1-3 of them. Two or three long
-             agents and many short ones is how this box is used; one "context
-             per agent" figure could not describe that. -->
-        <div class="lk mixk">Long + short at once <span class="tb">live pool</span></div>
-        <div class="lsub mono" id="mixFull">—</div>
-        <table class="mix mono" id="mixTbl" aria-label="Smaller requests that fit beside one, two or three full-length ones"></table>
-        <div class="lsub" id="mixNote"></div>
-        <div class="hint" id="recCal">—</div>
-        <!-- The disabled "Set subagents" input, its button and a two-line hint
-             about max_concurrent_threads_per_session were deleted: Servedeck has
-             no endpoint that writes that value, so the whole control was a claim
-             it could not keep. The "Use recommended" button beside the agents
-             field is the action that DOES exist. -->
-      </div>
     </div>
 
     <div class="oversub" id="oversub"></div>

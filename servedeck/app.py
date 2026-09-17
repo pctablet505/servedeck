@@ -438,7 +438,12 @@ async def build_state(rt: Runtime) -> dict[str, Any]:
             "metrics": None,
         }
         if view is not None and view.ready:
-            snapshot = await rt.poller_for(key, model.port).scrape(rt.client)
+            poller = rt.poller_for(key, model.port)
+            # The request-size histogram's open-ended top bucket is drawn up
+            # to the engine's own --max-model-len; without a ceiling the page
+            # cannot place a 129k-token request. v1 set this every poll too.
+            poller.ceiling_tokens = ctx or None
+            snapshot = await poller.scrape(rt.client)
             payload = snapshot.to_dict()
             row["metrics"] = {
                 "reachable": payload["reachable"],

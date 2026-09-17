@@ -75,3 +75,18 @@ def test_the_scripts_state_words_are_the_ones_the_backend_emits() -> None:
         assert word in APP_JS
     for phase in _app._legacy.PHASES:
         assert f"{phase}:" in APP_JS or f'"{phase}"' in APP_JS, f"the page has no label for phase {phase}"
+
+
+def test_the_2026_09_17_ux_pass_holds() -> None:
+    """The owner's list: the allocator is one row of three controls, the
+    recommendation column and the dead Smoke button are gone, running and
+    waiting are on the status chip and nowhere else."""
+    ids = set(re.findall(r'id="([A-Za-z0-9_]+)"', INDEX))
+    for present in ("util", "ctx", "agents", "useRec", "agentsRec", "dBadge", "dKv", "dKvTok",
+                    "kvOffload", "qN", "qW", "mPre", "hitRate", "pctP90", "oversub", "apply", "stop"):
+        assert present in ids, present
+    for gone in ("smoke", "mRun", "mWait", "recN", "recMath", "mixTbl", "recCal"):
+        assert gone not in ids, gone
+    assert INDEX.count('class="acell"') == 3
+    render_ctx = APP_JS.split("function renderCtx")[1].split("\nfunction ")[0]
+    assert "ctxLabel(" not in render_ctx, "the context bound must print the exact figure"

@@ -208,3 +208,14 @@ def test_a_pinned_ptrace_scope_is_the_configured_state(tmp_path) -> None:
     relaxed = [c for c in codes(loose) if "PTRACE" in c and c != "PTRACE_BLOCKS_PLE"]
     assert relaxed, "the unpinned case still warns (guard against silencing everything)"
     assert not any(c in codes(pinned) for c in relaxed)
+
+
+def test_the_kv_offload_is_read_from_argv_and_sized_like_the_pool() -> None:
+    argv = ARGV + ["--kv-offloading-size", "40"]
+    assert lp.live_facts({"reachable": False}, argv)["kv_offload_gib"] == 40.0
+    assert "kv_offload_gib" not in lp.live_facts({"reachable": False}, ARGV)
+    # 9.3 GiB holds 297,926 tokens on the GPU; 40 GiB of host RAM at that
+    # rate parks ~1.28M tokens. Unknown inputs stay unknown, never zero.
+    assert lp.offload_tokens_for(40, 297926, 9.3) == int(40 * 297926 / 9.3)
+    assert lp.offload_tokens_for(None, 297926, 9.3) is None
+    assert lp.offload_tokens_for(40, 0, 9.3) is None

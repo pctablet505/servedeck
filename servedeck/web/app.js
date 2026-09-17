@@ -247,7 +247,7 @@ function tokenCell(t, key, w) {
   if (!has) {
     since = f.total_reason || t.started_reason || "no reading";
   } else if (typeof t.started_ago_s === "number" && isFinite(t.started_ago_s)) {
-    since = "server started " + durTxt(t.started_ago_s) + " ago";
+    since = "";   // the header line already says how long the server has been up
   } else {
     since = "server start time unknown — " + (t.started_reason || "no reading");
   }
@@ -501,7 +501,7 @@ function agentsFitNote(full, ctxLen) {
     return {text: "—", title: "the KV budget for this configuration is not known yet"};
   }
   return {
-    text: `${full.n} at ${ctxLabel(ctxLen)} at once`,
+    text: `fits ${full.n} × ${fmt(ctxLen)}`,
     title: `${fmt(full.pool_tokens)} KV ÷ ${fmt(full.cost_tokens)} per ${fmt(ctxLen)}-token ` +
       `request = ${full.fit_n} × ${full.headroom} headroom = ${full.n} full-length at once ` +
       `(calibrated per-request cost, fixed per-sequence page included). Shorter requests ` +
@@ -543,14 +543,14 @@ function renderCtx(d) {
   // Name which limit is binding. The range itself is in the slider's title;
   // the tick row that used to spell it out cost a line per field.
   set("ctxBound", r.binding === "kv"
-    ? "KV fits " + ctxLabel(fit)
-    : r.binding === "running" ? "running " + ctxLabel(r.ceiling)
-    : "model " + ctxLabel(modelMax));
+    ? "KV fits " + fmt(fit)
+    : r.binding === "running" ? "running " + fmt(r.ceiling)
+    : "model " + fmt(modelMax));
   const bound = $("ctxBound");
   if (bound) bound.title = r.binding === "kv"
     ? `one request can use at most ${fmt(fit)} tokens of this KV budget; the model allows ${fmt(modelMax)}`
     : `the checkpoint's own max_position_embeddings is ${fmt(modelMax)}`;
-  el.title = `${ctxLabel(r.min)} to ${ctxLabel(r.max)} per request — ${
+  el.title = `${fmt(r.min)} to ${fmt(r.max)} per request — ${
     r.binding === "kv" ? "limited by what one request's KV needs" : "limited by the model"
   }. The KV pool is shared: vLLM admits what fits and queues the rest.`;
   const note = ctxNoteOf(c, r, modelMax, d && d.ctx_fit_reason);
@@ -762,11 +762,15 @@ async function doEstimate() {
  * configuration on screen. Real free disk lives in the model rail's .dfline,
  * measured by statvfs.
  */
-function paintPreflight(d) {
+function paintPreflight(d, shown) {
   const el = $("pref");
   if (!el) return;
   el.innerHTML = "";
-  const findings = (d && d.findings) || [];
+  const all = (d && d.findings) || [];
+  // The alert box above already shows one finding in full; a chip repeating
+  // its title beside it is the same fact twice.
+  const findings = all.filter((f) => !(shown || []).includes(f.code));
+  if (all.length && !findings.length) return;
   const add = (cls, mark, text, title) => {
     const s = document.createElement("span");
     s.className = "chk " + cls;
@@ -845,11 +849,12 @@ function paintEstimate(d) {
   const liveCtx = liveFacts.ctx;
   const measured = servingNow && liveFacts.kv_tokens &&
                    (!liveCtx || liveCtx === ctx) ? liveFacts.kv_tokens : null;
+  // The badge beside the figure already says "measured"/"estimated"; the
+  // token line adds provenance only when it differs from the badge.
   set("dKvTok", measured
-    ? fmt(measured) + " tokens · measured"
-    : fmt(d.kv_tokens) + " tokens · " + (d.kv_source === "measured" ? "measured"
-      : d.kv_source === "measured_other_ctx" ? "measured at another context"
-      : d.kv_source === "estimated" ? "estimated" : "unknown"));
+    ? fmt(measured) + " tokens"
+    : fmt(d.kv_tokens) + " tokens" + (d.kv_source === "measured_other_ctx"
+      ? " · measured at another context" : ""));
   const kvTok = $("dKvTok");
   if (kvTok) {
     const g = d.kv_geometry;
@@ -882,7 +887,7 @@ function paintEstimate(d) {
     e.style.width = (pct || 0) + "%";
     if (label !== undefined) e.textContent = (pct > 10 ? label : "");
   };
-  paintPreflight(d);
+  paintPreflight(d, showFindings(d.findings || []));
   seg("segW", bar.weights_pct, "weights");
   seg("segK", bar.kv_pct, "KV");
   seg("segO", bar.overhead_pct);
@@ -899,13 +904,19 @@ function paintEstimate(d) {
   const gib = (v) => (typeof v === "number" ? `${v.toFixed(1)} GiB` : "—");
   set("vramTxt",
     `weights ${gib(d.weights_gib)} · KV ${gib(d.kv_gib)} · budget ${gib(d.budget_gib)}`);
-
-  showFindings(d.findings || []);
+  set("kvOffload", (typeof d.offload_gib === "number" && d.offload_gib > 0)
+    ? `${d.offload_gib} GiB host RAM for parked KV` +
+      (d.offload_tokens ? ` ≈ ${fmt(d.offload_tokens)} tokens` : "")
+    : "");
+  const ko = $("kvOffload");
+  if (ko) ko.title = "--kv-offloading-size: evicted contexts are copied to pinned host RAM and " +
+    "reloaded on their next turn instead of being prefilled again. It does not raise the " +
+    "per-request context or how many run at once.";
 }
 
 function showFindings(findings) {
   const crit = $("alertC"), warn = $("alertW");
-  if (!crit || !warn) return;
+  if (!crit || !warn) return [];
   crit.classList.remove("on");
   warn.classList.remove("on");
   const block = findings.find((f) => f.level === "block");
@@ -913,10 +924,14 @@ function showFindings(findings) {
   if (block) {
     crit.classList.add("on");
     $("alertCT").innerHTML = `<b>${block.title}</b> ${block.detail}`;
-  } else if (wf) {
+    return [block.code];
+  }
+  if (wf) {
     warn.classList.add("on");
     $("alertWT").innerHTML = `<b>${wf.title}</b> ${wf.detail}`;
+    return [wf.code];
   }
+  return [];
 }
 
 /* --------------------------------------------------- live utilization --- */
@@ -1216,7 +1231,9 @@ function paintTelemetry(t) {
   const q = document.querySelector(".queued");
   const running = reachable ? (liveMetrics.running || 0) : 0;
   set("qN", running);
-  if (q) q.className = "queued mono" + (running > 0 ? " on" : "");
+  const waiting = reachable ? (liveMetrics.waiting || 0) : 0;
+  set("qW", waiting);
+  if (q) q.className = "queued mono" + (running > 0 || waiting > 0 ? " on" : "");
   set("mWait", reachable ? liveMetrics.waiting : "—");
   set("mPre", reachable ? liveMetrics.preemptions : "—");
 
@@ -1369,6 +1386,9 @@ function paintRequestStats() {
   set("winMeta", winSpan(w));
   reqHist(w);
 
+  set("agentsRec", rec
+    ? `recommended ${rec.n} (p90 ${fmt(rec.prompt_tokens)} tok)`
+    : "");
   if (rec) {
     set("recN", rec.n);
     const ur = $("useRec");

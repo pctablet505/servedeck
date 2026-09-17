@@ -233,6 +233,9 @@ def live_facts(snapshot: Mapping[str, Any] | None, argv: Sequence[str]) -> dict[
     ctx = int_flag(argv, "--max-model-len")
     if ctx:
         facts["ctx"] = ctx
+    offload = float_flag(argv, "--kv-offloading-size")
+    if offload:
+        facts["kv_offload_gib"] = offload
     if "util_effective" not in facts:
         util = float_flag(argv, "--gpu-memory-utilization")
         if util:
@@ -520,6 +523,14 @@ def kv_geometry(repo_id: str, ctx: int, kv: str | None, ssm: str | None) -> dict
         return None
 
 
+def offload_tokens_for(offload_gib: float | None, kv_tokens: int, kv_gib: float) -> int | None:
+    """How many tokens the KV offload parks: the host buffer at the same
+    bytes-per-token the GPU pool resolved to. None when either is unknown."""
+    if not offload_gib or offload_gib <= 0 or kv_tokens <= 0 or kv_gib <= 0:
+        return None
+    return int(offload_gib * (kv_tokens / kv_gib))
+
+
 def own_gpu_mib(pids: Sequence[int]) -> int:
     """VRAM held by our own model processes: the holder's pid tree, plus any
     ``VLLM::`` worker (vLLM renames its engine processes) — never "anything
@@ -579,9 +590,12 @@ def estimate_payload(
     fit, fit_reason = _native_ctx_fit(
         repo_id, util, entry, kv_dtype, ssm_dtype, native=mi.model_max_ctx, known=known,
     )
+    offload_gib = float_flag(list(model.flags), "--kv-offloading-size") if model else None
     return {
         "kv_gib": round(r.kv_gib, 2),
         "kv_tokens": r.kv_tokens,
+        "offload_gib": offload_gib,
+        "offload_tokens": offload_tokens_for(offload_gib, r.kv_tokens, r.kv_gib),
         "budget_gib": round(r.budget_gib, 2),
         "concurrency_x": round(r.concurrency_x, 2),
         "agents_at_ctx": r.agents_at_ctx,
