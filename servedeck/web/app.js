@@ -85,23 +85,23 @@ function secsTxt(v) {
  * has taken it over.
  */
 function windowFigure(live, last, ageS, state, reason, fmtFn, kind) {
-  // `kind` says WHAT the window figure is -- every running request together
-  // (prefill, decode) or a mean per request (TTFT) -- so it cannot be read as
-  // the same kind of number as the line under it; see streamLifeTxt().
-  const what = kind ? kind + ", " : "";
+  // `kind` says WHAT the window figure is (all requests together, or a mean
+  // per request). Captions are short since the 2026-09-17 redesign: the tile's
+  // title carries the long explanation, the line under the number only says
+  // what the reader acts on.
   if (typeof live === "number" && isFinite(live)) {
-    return { value: fmtFn(live), na: false, note: "now · " + what + "last 2 s window" };
+    return { value: fmtFn(live), na: false, note: (kind ? kind + " · " : "") + "2 s window" };
   }
-  // Switch on the CODE, never on the English. metrics.REASON_CODE is the
-  // table; test_ui.py checks the codes named here are all in it.
-  const head = (state === "idle") ? "idle" : "n/a";
-  let note = reason || "no reading";
+  // Switch on the state CODE, never on the English.
+  const idle = state === "idle";
+  const head = idle ? "idle" : "n/a";
+  // "idle" is already the big word; the backend's sentence under it repeated it.
+  let note = idle ? "" : (reason || "no reading");
   if (typeof last === "number" && isFinite(last)) {
     const ago = agoTxt(ageS);
-    note = note + " · last " + fmtFn(last) + (kind ? " (" + kind + ")" : "") +
-      (ago ? ", " + ago : "");
+    note = (note ? note + " · " : "") + "last " + fmtFn(last) + (ago ? ", " + ago : "");
   }
-  return { value: head, na: true, note: note };
+  return { value: head, na: true, note: note || "nothing ran recently" };
 }
 
 /* The LIFETIME line of the TTFT cell.
@@ -112,9 +112,9 @@ function windowFigure(live, last, ageS, state, reason, fmtFn, kind) {
  * window figure, and "per second of prefill time" did not say so.
  */
 function lifeTxt(v, fmtFn, basis, n) {
-  if (typeof v !== "number" || !isFinite(v)) return "lifetime n/a";
-  const count = (typeof n === "number" && n > 0) ? " over " + fmt(n) + " requests" : "";
-  return "lifetime " + fmtFn(v) + " " + basis + count;
+  if (typeof v !== "number" || !isFinite(v)) return "";
+  const count = (typeof n === "number" && n > 0) ? " · " + fmt(n) + " requests" : "";
+  return "lifetime " + basis + " " + fmtFn(v) + count;
 }
 
 /* The LIFETIME line of the prefill and decode cells: ONE request's speed.
@@ -131,9 +131,9 @@ function lifeTxt(v, fmtFn, basis, n) {
  * which it is, first.
  */
 function streamLifeTxt(v, fmtFn, n) {
-  if (typeof v !== "number" || !isFinite(v)) return "per request: n/a";
-  const count = (typeof n === "number" && n > 0) ? " over " + fmt(n) + " requests" : "";
-  return "per request: " + fmtFn(v) + " (lifetime mean" + count + ")";
+  if (typeof v !== "number" || !isFinite(v)) return "";
+  const count = (typeof n === "number" && n > 0) ? " · " + fmt(n) + " requests" : "";
+  return "per request " + fmtFn(v) + count;
 }
 
 /* The throughput strip: prefill, decode and TTFT, always all three, and for
@@ -153,7 +153,7 @@ function paintThroughput() {
   // together, per wall second) and the lifetime line is PER REQUEST (one
   // stream's speed); streamLifeTxt() says why they cannot be the same kind.
   // TTFT is a mean per request on both lines, so it keeps lifeTxt().
-  const together = "all requests together";
+  const together = "all requests";
   const cells = [
     ["thPrefill",
      windowFigure(m.prefill_tok_s, m.prefill_tok_s_last, m.prefill_last_age_s,
@@ -165,13 +165,13 @@ function paintThroughput() {
      streamLifeTxt(m.gen_tok_s_avg, rate1, m.gen_requests)],
     ["thTtft",
      windowFigure(m.ttft_s, m.ttft_s_last, m.ttft_last_age_s,
-                  m.ttft_state, m.ttft_reason, secsTxt, "mean per request"),
+                  m.ttft_state, m.ttft_reason, secsTxt, "mean"),
      lifeTxt(m.ttft_s_avg, secsTxt, "mean", m.ttft_requests)],
   ];
   cells.forEach(function (row) {
     const id = row[0], f = row[1], life = row[2];
     const n = $(id), sub = $(id + "S"), lifeEl = $(id + "L");
-    if (n) { n.textContent = f.value; n.className = "n mono" + (f.na ? " na" : ""); }
+    if (n) { n.textContent = f.value; n.classList.toggle("na", !!f.na); }
     if (sub) sub.textContent = f.note;
     if (lifeEl) lifeEl.textContent = life;
   });
@@ -1248,14 +1248,14 @@ function paintTelemetry(t) {
   set("mRun2", reachable ? (liveMetrics.running || 0) : "—");
   set("mWait2", reachable ? (liveMetrics.waiting || 0) : "—");
   set("preNote", reachable
-    ? (liveMetrics.preemptions > 8 ? "high — the agent count is above what the pool holds"
-       : liveMetrics.preemptions ? "a few; watch whether it climbs" : "none")
+    ? (liveMetrics.preemptions > 8 ? "too many agents for the pool"
+       : liveMetrics.preemptions ? "a few — watch whether it climbs" : "none")
     : "—");
 
   const w = $("mWait");
   if (w) w.className = "n mono" + (reachable && liveMetrics.waiting > 0 ? " hot" : "");
   const p = $("mPre");
-  if (p) p.className = "n mono" + (reachable && liveMetrics.preemptions > 8 ? " bad" : "");
+  if (p) p.classList.toggle("bad", !!(reachable && liveMetrics.preemptions > 8));
 
   paintRequestStats();
   paintThroughput();

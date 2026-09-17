@@ -9,7 +9,9 @@
 <body>
 <div class="wrap">
 
-  <div class="top">
+  <!-- Header: who this is, the one URL a client is pointed at, and the card's
+       memory right now. Three facts, one line. -->
+  <header class="top">
     <div class="brand">
       <h1>Servedeck</h1>
       <span class="sub">local model control</span>
@@ -19,301 +21,241 @@
       <span class="dot"></span>
       GPU <span id="gpuUsed">—</span> / <span id="gpuTotal">—</span> MiB
     </div>
-  </div>
+  </header>
 
+  <!-- Vital signs. One glance answers the three questions this page exists for:
+       what is serving, how fast is it, how full is it.
+
+       Every tile is ONE number with one caption. The sentences that used to sit
+       under each figure (its sampling window, its lifetime companion, the metric
+       it comes from) are titles now: read on hover, by the person already asking
+       about that one figure, instead of nine grey paragraphs competing with the
+       numbers at all times. -->
+  <section class="panel hero">
+    <div class="hero-head">
+      <span class="pill" id="pill"><span class="d"></span><span id="pillTxt">Serving</span></span>
+      <h2 class="hero-name" id="sModel">—</h2>
+      <span class="queued mono" id="queued" role="status"><span id="qN">—</span> running · <span id="qW">—</span> waiting</span>
+    </div>
+    <div class="hero-meta smeta mono" id="sMeta">connecting…</div>
+
+    <!-- Boot progress. Hidden unless a boot is actually running. -->
+    <div class="phases" id="phases">
+      <div class="eta">
+        <span>Elapsed <span class="el mono" id="elapsed">—</span></span>
+        <span id="etaTxt"></span>
+      </div>
+      <div class="ptrack" id="ptrack"></div>
+      <div class="plabels" id="plabels"></div>
+      <div class="pnote" id="pnote"></div>
+    </div>
+
+    <div class="kpis">
+      <div class="kpi">
+        <div class="kpi-k" title="Generated tokens per wall-clock second over the last poll, every running request together. The dim line is ONE request's decode speed: generated tokens over the summed decode time of every finished request, in which thirteen requests decoding side by side count thirteen seconds per second.">Decode <span class="u">tok/s</span></div>
+        <div class="kpi-n mono" id="thDecode">n/a</div>
+        <div class="kpi-s" id="thDecodeS">—</div>
+        <div class="kpi-s dim" id="thDecodeL">—</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-k" title="Computed (non-cached) prompt tokens per wall-clock second over the last poll, every running request together. The dim line is ONE request's prefill speed, from vllm:request_prefill_time_seconds.">Prefill <span class="u">tok/s</span></div>
+        <div class="kpi-n mono" id="thPrefill">n/a</div>
+        <div class="kpi-s" id="thPrefillS">—</div>
+        <div class="kpi-s dim" id="thPrefillL">—</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-k" title="vllm:time_to_first_token_seconds, measured from request ARRIVAL — a request queued behind others carries that wait in its TTFT.">First token <span class="u">seconds</span></div>
+        <div class="kpi-n mono" id="thTtft">n/a</div>
+        <div class="kpi-s" id="thTtftS">—</div>
+        <div class="kpi-s dim" id="thTtftL">—</div>
+      </div>
+      <div class="kpi wide">
+        <div class="kpi-k" title="KV cache blocks the engine is holding for in-flight requests. 0 when idle: this is not how much pool exists, it is how much of it is in use right now.">KV cache <span class="u">in use</span></div>
+        <div class="kpi-n mono" id="kvPct">—</div>
+        <div class="kpi-s mono" id="kvTok">—</div>
+        <canvas id="spark" width="300" height="30" aria-label="KV cache usage over time"></canvas>
+      </div>
+      <div class="kpi">
+        <div class="kpi-k" title="vllm:num_requests_waiting{reason=capacity}: requests the scheduler holds back because the KV pool is full. Above zero for long means the agent count is above what this configuration holds.">Waiting for KV <span class="u">now</span></div>
+        <div class="kpi-n mono" id="mWaitCap">—</div>
+        <div class="kpi-s">held back by a full pool</div>
+        <div class="kpi-s dim">running <span class="mono" id="mRun2">—</span> · waiting <span class="mono" id="mWait2">—</span></div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-k" title="vllm:num_preemptions_total: KV evicted and recomputed — work already paid for, thrown away. The empirical signal that the agent count is too high for the pool.">Preemptions <span class="u">since start</span></div>
+        <div class="kpi-n mono" id="mPre">—</div>
+        <div class="kpi-s" id="preNote">—</div>
+      </div>
+    </div>
+  </section>
 
   <div class="grid">
-    <div class="col">
-    <!-- model rail -->
-    <div class="panel">
-      <div class="panel-h"><span>Models on disk</span><span class="mono" id="mcount">—</span></div>
-      <!-- Real, measured, and unit-labelled. The previous version of this page
-           carried a hardcoded "412 GiB disk" span that nothing computed; this
-           one is statvfs on the filesystem holding the hub cache, refreshed
-           every 15 s so a large deletion is visible without a reload. -->
-      <div class="dfline mono"><span id="dhub">—</span><span id="dfree">—</span></div>
-      <div class="mlist" id="mlist" role="listbox" aria-label="Models in the local hub cache"></div>
-    </div>
 
-      <!-- What the box is: the GPU by name, and the host RAM the KV offload
-           control is set against. Live figures, no estimates. -->
-      <div class="panel">
+    <!-- Left: what can run, and what it runs on. -->
+    <div class="col">
+      <section class="panel">
+        <div class="panel-h"><span>Models</span><span class="mono" id="mcount">—</span></div>
+        <div class="dfline mono"><span id="dhub">—</span><span id="dfree">—</span></div>
+        <div class="mlist" id="mlist" role="listbox" aria-label="Models in the local hub cache"></div>
+      </section>
+
+      <section class="panel">
         <div class="panel-h"><span>Machine</span><span class="mono" style="font-size:10px">nvidia-smi · /proc</span></div>
-        <div class="lcol">
-          <div class="lk">GPU</div>
-          <div class="lsub mono" id="gpuName">—</div>
-          <div class="lk" style="margin-top:10px">Host RAM</div>
-          <div class="lsub mono" id="hostRam">—</div>
-          <div class="lsub mono" id="hostPinned"></div>
-        </div>
-      </div>
-      <div class="panel notes">
-        <div class="panel-h"><span>Reading this page</span></div>
-        <div class="lcol foot"><b>Live data.</b> Capacity comes from the running engine where it can: the KV size a
-    server reports on <span class="mono">/metrics</span> is labelled
-    <span class="tag meas">measured</span>, and only a model that has never booted here
-    falls back to the per-architecture <span class="tag est">estimated</span> calculator.
-    Figures are never carried over from a different model.</div>
-      </div>
+        <dl class="facts">
+          <dt>GPU</dt>
+          <dd class="mono" id="gpuName">—</dd>
+          <dt>Host RAM</dt>
+          <dd class="mono" id="hostRam">—</dd>
+          <dd class="mono dim" id="hostPinned"></dd>
+        </dl>
+      </section>
+      <section class="panel notes">
+        <div class="panel-h"><span>About the figures</span></div>
+        <p class="foot pad"><b>Live data.</b> Capacity comes from the running engine where it can: the KV size a server
+    reports on <span class="mono">/metrics</span> is labelled <span class="tag meas">measured</span>,
+    and only a model that has never booted here falls back to the per-architecture
+    <span class="tag est">estimated</span> calculator. Figures are never carried over from a
+    different model.</p>
+      </section>
     </div>
 
+    <!-- Right: the only interactive part of the page, and the panel that says
+         whether the configuration set in it is a good idea. -->
     <div class="col">
-    <!-- main -->
-    <div class="panel">
-      <div class="status">
-        <div class="status-row">
-          <span class="pill" id="pill"><span class="d"></span><span id="pillTxt">Serving</span></span>
-          <div>
-            <div class="status-model" id="sModel">—</div>            <!-- Identity only: address, context, uptime. The three throughput
-                 figures that used to be here are the strip below, which shows
-                 each one with its reason and its lifetime companion instead of
-                 a bare number -- and a figure shown twice is a figure that can
-                 disagree with itself. -->
-            <div class="status-meta smeta mono" id="sMeta">connecting…</div>
-          </div>
-          <span class="queued mono" id="queued" role="status"><span id="qN">—</span> running · <span id="qW">—</span> waiting</span>
+      <section class="panel">
+        <div class="panel-h">
+          <span>Configure</span>
+          <span class="dirty" id="dirty">unsaved changes</span>
         </div>
 
-        <!-- Prefill, decode and TTFT are three different questions and one number
-             cannot answer them: a 17 s time-to-first-token and a slow decode look
-             identical when only one figure is on screen.
-
-             Every cell has the SAME three lines at all times, and no line is ever
-             empty or borrowed by another cell:
-               .n  the current window reading, or "idle" when nothing ran
-               .s  what that line is (window, or the last value and its age)
-               .l  the lifetime companion, which never decays and never moves up
-                   into .n -- the two are different quantities (the window figure
-                   is AGGREGATE, every running request together per second of
-                   WALL clock; the prefill/decode lifetime figure is PER REQUEST,
-                   one stream's speed over summed per-request time) and the panel
-                   used to swap one for the other marked only by a "~", then
-                   labelled them alike until 858.6 tok/s over "lifetime 68.0 tok/s"
-                   was read as a slow server.
-             Units are on the label AND on the number, so a figure read on its own
-             still carries one.
-
-             This strip used to sit at the bottom of the live panel while a
-             summary of the same three figures sat up here. The summary lost:
-             it had no reason for an absent figure, no age for a stale one, and
-             no lifetime companion -- so "prefill idle" next to a decode number
-             was the whole story. The strip is the better rendering, so it moved
-             up and the summary shrank to the facts only it carries. -->
-        <div class="thru" id="thru">
-          <div class="tcell">
-            <div class="lk" title="The large figure is every running request together: computed (non-cached) prompt tokens per wall-clock second over the last poll. The per-request line is ONE request's prefill speed: computed prompt tokens ÷ the summed prefill time of every finished request (vllm:request_prefill_time_seconds), in which two requests prefilling side by side count two seconds per second.">Prefill <span class="tu">prompt tokens/second</span></div>
-            <div class="n mono" id="thPrefill">n/a</div>
-            <div class="s" id="thPrefillS">—</div>
-            <div class="l" id="thPrefillL">—</div>
-          </div>
-          <div class="tcell">
-            <div class="lk" title="The large figure is every running request together: generated tokens per wall-clock second over the last poll. The per-request line is ONE request's decode speed: generated tokens ÷ the summed decode time of every finished request (vllm:request_decode_time_seconds), in which thirteen requests decoding side by side count thirteen seconds per second.">Decode <span class="tu">generated tokens/second</span></div>
-            <div class="n mono" id="thDecode">n/a</div>
-            <div class="s" id="thDecodeS">—</div>
-            <div class="l" id="thDecodeL">—</div>
-          </div>
-          <div class="tcell">
-            <div class="lk" title="from vllm:time_to_first_token_seconds, which is measured from request ARRIVAL — a request queued behind others carries that wait in its TTFT">Time to first token <span class="tu">seconds, mean · includes queue wait</span></div>
-            <div class="n mono" id="thTtft">n/a</div>
-            <div class="s" id="thTtftS">—</div>
-            <div class="l" id="thTtftL">—</div>
-          </div>
-        </div>
-
-        <!-- Token accounting: how many tokens went in, how many came out, and how
-             much of the input the prefix cache served instead of the engine
-             computing it. Painted by paintTokens() from the `tokens` block of
-             the metrics payload (servedeck/tokens.py).
-
-             Every total is "since this server started" and says how long ago
-             that was: the counters are born at 0 with the process, so a bare
-             total is meaningless across a restart. The window line is a
-             counter delta over the ~60 s of scrapes it names, not a total over
-             an uptime. A 2 s window is useless here: vLLM counts a prompt once,
-             whole, when its prefill completes, so two seconds hold either
-             nothing or a 30,000-token jump. -->
-        <div class="thru tok" id="tok">
-          <div class="tcell">
-            <div class="lk" id="tkInK" title="vllm:prompt_tokens_total: the prompt tokens of every request whose prefill has completed (counted at its first token), including the ones served from the prefix cache. Resets to 0 when the server restarts.">Input (prompt) <span class="tu">tokens since this server started</span></div>
-            <div class="n mono" id="tkIn">n/a</div>
-            <div class="s" id="tkInS">—</div>
-            <div class="l" id="tkInW">—</div>
-            <div class="s" id="tkInR" title="From the vllm:request_prompt_tokens histogram, over the last requests that finished while Servedeck was watching. A range is a request known only to one of vLLM's buckets; a single number is exact.">—</div>
-          </div>
-          <div class="tcell">
-            <div class="lk" id="tkOutK" title="vllm:generation_tokens_total: every token the server has generated, counted as it is produced. Resets to 0 when the server restarts.">Output (generated) <span class="tu">tokens since this server started</span></div>
-            <div class="n mono" id="tkOut">n/a</div>
-            <div class="s" id="tkOutS">—</div>
-            <div class="l" id="tkOutW">—</div>
-            <div class="s" id="tkOutR" title="From the vllm:request_generation_tokens histogram, over the last requests that finished while Servedeck was watching. A range is a request known only to one of vLLM's buckets; a single number is exact.">—</div>
-          </div>
-          <div class="tcell">
-            <div class="lk" id="tkCacheK" title="vllm:prompt_tokens_cached_total ÷ vllm:prompt_tokens_total. Cached tokens skipped prefill; computed ones are the prefill work the engine actually did. Not the same ratio as Prefix cache below (hits ÷ queries): a query is counted every time the scheduler looks a request up, again after a preemption, while a cached token is counted once, when its prefill completes.">Input from prefix cache <span class="tu">share of input (prompt) tokens</span></div>
-            <div class="n mono" id="tkCache">n/a</div>
-            <div class="s" id="tkCacheS">—</div>
-            <div class="l" id="tkCacheW">—</div>
-            <div class="s" title="vllm:prefix_cache_hits ÷ queries, lifetime: a query is counted every time the scheduler looks a request up">lookups served by the cache, lifetime: <span id="hitRate">—</span></div>
-          </div>
-        </div>
-
-        <!-- Live: the engine right now. Same three-cell grammar as the two
-             strips above; the KV figure is the one that decides how many more
-             agents fit, so it sits with the throughput it gates, not in a
-             sidebar (2026-09-17). -->
-        <div class="thru live" id="livestrip">
-          <div class="tcell">
-            <div class="lk" title="KV cache blocks in use right now: in-flight requests only, 0 when idle">KV cache in use <span class="tu">of the pool · in flight</span></div>
-            <div class="n mono" id="kvPct">—</div>
-            <div class="s mono" id="kvTok">—</div>
-            <canvas id="spark" width="420" height="34" aria-label="KV cache usage over time"></canvas>
-          </div>
-          <div class="tcell">
-            <div class="lk" title="vllm:num_requests_waiting{reason=capacity}: requests the scheduler holds back because the KV pool is full">Waiting for KV <span class="tu">requests, now</span></div>
-            <div class="n mono" id="mWaitCap">—</div>
-            <div class="s">queued because the pool is full</div>
-            <div class="l">running <span class="mono" id="mRun2">—</span> · waiting <span class="mono" id="mWait2">—</span></div>
-          </div>
-          <div class="tcell">
-            <div class="lk" title="vllm:num_preemptions_total: KV evicted and recomputed, i.e. work already paid for being thrown away">Preemptions <span class="tu">since this server started</span></div>
-            <div class="n mono" id="mPre">—</div>
-            <div class="s">evictions the scheduler had to recompute</div>
-            <div class="l" id="preNote">—</div>
-          </div>
-        </div>
-
-        <div class="phases" id="phases">
-          <!-- The ETA string was a literal. history.py computes a real one
-               per model from measured boots and says when it is falling back
-               to a calibration figure instead; until that is painted here,
-               the slot stays empty rather than asserting a number. -->
-          <div class="eta">
-            <span>Elapsed <span class="el mono" id="elapsed">—</span></span>
-            <span id="etaTxt"></span>
-          </div>
-          <div class="ptrack" id="ptrack"></div>
-          <div class="plabels" id="plabels"></div>
-          <div class="pnote" id="pnote"></div>
-        </div>
-      </div>
-
-      <!-- One line per control. Each field used to be three (label, a
-           full-width slider, a tick row), which made the allocator taller than
-           the panels it feeds. The tick rows carried the range, which now rides
-           in each control's title, and the agent count, which was a slider over
-           1..64 -- a thumb that cannot be aimed at a number, and the number is
-           the whole point of the field. -->
-      <div class="alloc">
-        <!-- 2026-09-17: the three controls sit side by side. They were three
-             full-width rows with a number box wedged between two sliders, and
-             a 90px "KV budget" box under them restating the VRAM bar. -->
-        <div class="agrid">
-          <div class="acell">
-            <div class="k">GPU utilization <span class="tu">share of the card vLLM may reserve</span></div>
-            <div class="ctl">
-              <input type="range" id="util" min="40" max="98" value="96" title="0.40 to 0.98" aria-label="GPU memory utilization" aria-describedby="utilV">
-              <span class="v mono" id="utilV">0.96</span>
+        <div class="alloc">
+          <div class="agrid">
+            <div class="acell">
+              <div class="k">GPU utilization <span class="u">share of the card vLLM may reserve</span></div>
+              <div class="ctl">
+                <input type="range" id="util" min="40" max="98" value="96" title="0.40 to 0.98" aria-label="GPU memory utilization" aria-describedby="utilV">
+                <span class="v mono" id="utilV">0.96</span>
+              </div>
+            </div>
+            <div class="acell">
+              <div class="k" title="--max-model-len: the longest context ONE request may use. The KV pool is shared; vLLM admits what fits and queues the rest.">Max context <span class="u">tokens per request</span></div>
+              <div class="ctl">
+                <input type="range" id="ctx" min="8192" max="262144" step="4096" value="262144" aria-label="Maximum context per request" aria-describedby="ctxV ctxBound ctxNote">
+                <span class="v mono" id="ctxV">—</span>
+              </div>
+              <div class="s mono" id="ctxBound">—</div>
+            </div>
+            <div class="acell">
+              <div class="k" title="--max-num-seqs: the scheduler's ceiling on concurrent sequences">Parallel agents <span class="u">concurrent sequences</span></div>
+              <div class="ctl">
+                <input type="number" id="agents" class="num" min="1" max="64" value="1" aria-label="Parallel agents" aria-describedby="agentsFit">
+                <button type="button" class="btn tiny" id="useRec" disabled title="nothing recommended yet">Use recommended</button>
+              </div>
+              <div class="s mono"><span id="agentsFit">—</span><span id="agentsRec"></span></div>
+            </div>
+            <div class="acell">
+              <div class="k" title="--kv-offloading-size: pinned host RAM that keeps evicted contexts, so an agent's next turn reloads instead of prefilling again. It does not raise the per-request context, nor how many run at once.">KV offload <span class="u">host RAM, GiB</span></div>
+              <div class="ctl">
+                <input type="number" id="offload" class="num" min="0" max="160" step="4" value="0" aria-label="KV offload size in GiB" aria-describedby="offloadNote">
+                <span class="unit">GiB</span>
+              </div>
+              <div class="s mono" id="offloadNote">—</div>
             </div>
           </div>
-          <div class="acell">
-            <div class="k" title="--max-model-len: the longest context ONE request may use. The KV pool is shared; vLLM admits what fits and queues the rest.">Max context <span class="tu">per request</span></div>
-            <div class="ctl">
-              <input type="range" id="ctx" min="8192" max="262144" step="4096" value="262144" aria-label="Maximum context per request" aria-describedby="ctxV ctxBound ctxNote">
-              <span class="v mono" id="ctxV">—</span>
+
+          <div class="ctxnote" id="ctxNote" role="status"></div>
+
+          <!-- What those four controls buy, as one picture. Measured from the
+               running engine where it can be; the badge says which. -->
+          <div class="vram">
+            <div class="vram-head">
+              <span class="lbl">VRAM for this configuration <span class="tag" id="dBadge">—</span></span>
+              <span class="val mono" id="vramTxt">—</span>
             </div>
-            <div class="s mono" id="ctxBound">—</div>
-          </div>
-          <div class="acell">
-            <div class="k" title="--max-num-seqs: the scheduler's ceiling on concurrent sequences">Parallel agents <span class="tu">--max-num-seqs</span></div>
-            <div class="ctl">
-              <input type="number" id="agents" class="num" min="1" max="64" value="1" aria-label="Parallel agents" aria-describedby="agentsFit">
-              <button type="button" class="btn tiny" id="useRec" disabled title="nothing recommended yet">Use recommended</button>
+            <div class="bar" id="bar">
+              <div class="seg weights" id="segW">weights</div>
+              <div class="seg kv" id="segK">KV</div>
+              <div class="seg overhead" id="segO"></div>
+              <div class="seg free" id="segF"></div>
             </div>
-            <div class="s mono"><span id="agentsFit">—</span><span id="agentsRec"></span></div>
-          </div>
-          <div class="acell">
-            <div class="k" title="--kv-offloading-size: pinned host RAM that keeps evicted contexts so an agent's next turn reloads instead of prefilling again. It does not raise the per-request context or how many run at once.">KV offload <span class="tu">host RAM, GiB</span></div>
-            <div class="ctl">
-              <input type="number" id="offload" class="num" min="0" max="160" step="4" value="0" aria-label="KV offload size in GiB" aria-describedby="offloadNote">
-              <span class="v mono" style="min-width:0">GiB</span>
+            <div class="legend">
+              <span><i style="background:var(--accent)"></i>model weights</span>
+              <span><i style="background:var(--ok)"></i>KV cache — this is what buys context &amp; agents</span>
+              <span><i style="background:var(--line-strong)"></i>activations, CUDA graphs</span>
+              <span><i style="border:1px solid var(--line-strong)"></i>unallocated</span>
             </div>
-            <div class="s mono" id="offloadNote">—</div>
           </div>
+          <span id="kvOffload" hidden></span>
+
+          <div class="alert crit" id="alertC" role="alert"><b>⚠</b><span id="alertCT"></span></div>
+          <div class="alert warn" id="alertW" role="alert"><b>!</b><span id="alertWT"></span></div>
         </div>
-        <div class="ctxnote" id="ctxNote" role="status"></div>
-        <div class="vram">
-          <div class="vram-head">
-            <span class="lbl">VRAM for this configuration <span class="tag" id="dBadge">—</span></span>
-            <span class="val mono" id="vramTxt">—</span>
-          </div>
-          <div class="bar" id="bar">
-            <div class="seg weights" id="segW">weights</div>
-            <div class="seg kv" id="segK">KV</div>
-            <div class="seg overhead" id="segO"></div>
-            <div class="seg free" id="segF"></div>
-          </div>
-          <div class="legend">
-            <span><i style="background:var(--accent)"></i>model weights</span>
-            <span><i style="background:var(--ok)"></i>KV cache — this is what buys context &amp; agents</span>
-            <span><i style="background:var(--line-strong)"></i>activations, CUDA graphs</span>
-            <span><i style="border:1px solid var(--line-strong)"></i>unallocated</span>
-          </div>
+
+        <div class="pref" id="pref"></div>
+
+        <div class="actions">
+          <button class="btn pri" id="apply" disabled>Apply &amp; restart</button>
+          <button class="btn" id="stop">Stop</button>
         </div>
-        <span id="kvOffload" hidden></span>
-        <div class="alert crit" id="alertC" role="alert"><b>⚠</b><span id="alertCT"></span></div>
-        <div class="alert warn" id="alertW" role="alert"><b>!</b><span id="alertWT"></span></div>
-      </div>
+      </section>
 
-      <!-- Live preflight, painted from the estimate's own findings. This was
-           four static spans claiming the GPU was free, the weights cached,
-           ptrace_scope relaxed and several hundred GiB of disk left. None of
-           the four was ever computed, and all four were on screen whenever
-           the backend was unreachable and the rest of the page was empty.
-           Free disk is now measured for real, but it belongs beside the
-           models it constrains (the .dfline above), not in a strip about
-           whether this configuration can start. -->
-      <div class="pref" id="pref"></div>
-
-      <!-- The action bar sits directly under the controls it applies and the
-           preflight that gates them. It used to sit below a dead banner and a
-           row of disabled checkboxes, so the primary action was visually
-           detached from the three fields that decide it. -->
-      <div class="actions">
-        <button class="btn pri" id="apply" disabled>Apply &amp; restart</button>
-        <button class="btn" id="stop">Stop</button>
-        <span class="dirty" id="dirty" role="status">unsaved changes</span>
-      </div>
-    </div>
-
+      <section class="panel">
+        <div class="panel-h">
+          <span>Request size <span class="u">what your agents actually send</span></span>
+          <span class="mono" style="font-size:10px">last 100 · /metrics</span>
+        </div>
+        <div class="pad">
+          <div class="bignum mono" id="pctP90">—</div>
+          <div class="dim">p90 prompt tokens — the agent count is sized on this</div>
+          <canvas id="reqHist" width="440" height="96" aria-label="Prompt-token counts over the last 100 finished requests. Exact requests are drawn in fine bins; requests known only to a vLLM bucket are drawn as a translucent band over that bucket's range. Median, p90 and p99 are marked."></canvas>
+          <div class="dim mono" id="winMeta">—</div>
+        </div>
+        <div class="oversub" id="oversub"></div>
+      </section>
     </div>
   </div>
 
-
-  <div class="panel" id="reqPanel" style="margin-top:16px">
-    <div class="panel-h"><span>Request size <span style="text-transform:none;font-weight:400;letter-spacing:0">(prompt tokens, last 100 finished requests)</span></span><span class="mono" style="font-size:10px">/metrics · 2s</span></div>
-    <div class="lcol">
-    <div class="lbig mono" id="pctP90">—</div>
-    <div class="lsub">p90 — the agent count is sized on this</div>
-    <canvas id="reqHist" width="440" height="96" aria-label="Prompt-token counts over the last 100 finished requests. Exact requests are drawn in fine bins; requests known only to a vLLM bucket are drawn as a translucent band over that bucket's range. Median, p90 and p99 are marked."></canvas>
-    <div class="lsub mono" id="winMeta">—</div>
-  
+  <!-- Totals since this server started. Reference, not a live reading: they
+       only reset when the engine does, so they sit below the fold rather than
+       beside figures that change every two seconds. -->
+  <section class="panel" id="trafficPanel">
+    <div class="panel-h"><span>Traffic</span><span class="mono" style="font-size:10px">since this server started</span></div>
+    <div class="thru tok" id="tok">
+      <div class="tcell">
+        <div class="lk" id="tkInK" title="vllm:prompt_tokens_total: the prompt tokens of every request whose prefill has completed, including the ones served from the prefix cache. Resets to 0 when the server restarts.">Input <span class="tu">prompt tokens</span></div>
+        <div class="n mono" id="tkIn">n/a</div>
+        <div class="s" id="tkInS">—</div>
+        <div class="l" id="tkInW">—</div>
+        <div class="s" id="tkInR" title="From the vllm:request_prompt_tokens histogram, over the last requests that finished while Servedeck was watching. A range is a request known only to one of vLLM's buckets; a single number is exact.">—</div>
+      </div>
+      <div class="tcell">
+        <div class="lk" id="tkOutK" title="vllm:generation_tokens_total: every token the server has generated, counted as it is produced. Resets to 0 when the server restarts.">Output <span class="tu">generated tokens</span></div>
+        <div class="n mono" id="tkOut">n/a</div>
+        <div class="s" id="tkOutS">—</div>
+        <div class="l" id="tkOutW">—</div>
+        <div class="s" id="tkOutR" title="From the vllm:request_generation_tokens histogram, over the last requests that finished while Servedeck was watching.">—</div>
+      </div>
+      <div class="tcell">
+        <div class="lk" id="tkCacheK" title="vllm:prompt_tokens_cached_total over vllm:prompt_tokens_total. Cached tokens skipped prefill; computed ones are the prefill work the engine actually did. Not the same ratio as the lifetime hit rate below (hits over queries): a query is counted every time the scheduler looks a request up, again after a preemption, while a cached token is counted once.">From prefix cache <span class="tu">share of input</span></div>
+        <div class="n mono" id="tkCache">n/a</div>
+        <div class="s" id="tkCacheS">—</div>
+        <div class="l" id="tkCacheW">—</div>
+        <div class="s">lookups served, lifetime: <span id="hitRate">—</span></div>
+      </div>
     </div>
-    <div class="oversub" id="oversub"></div>
-  </div>
+  </section>
 
-  <div class="panel log folded" id="logPanel">
+  <section class="panel log folded" id="logPanel">
     <div class="panel-h">
       <span>Server log</span>
       <span style="display:flex;align-items:center;gap:8px">
         <span class="mono" style="font-size:10px">serve.log</span>
-        <!-- The log used to hold 190px of the page permanently to display a
-             stream nobody was reading while they were reading something else.
-             Collapsed by default; the count says whether opening it is worth
-             the click. -->
         <button type="button" class="fold" id="logFold" aria-expanded="false" aria-controls="log">show</button>
       </span>
     </div>
     <div class="logbody mono" id="log" aria-live="polite"></div>
-  </div>
+  </section>
+
 
 </div><script src="app.js"></script>
 </body>

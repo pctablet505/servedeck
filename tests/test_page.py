@@ -77,65 +77,60 @@ def test_the_scripts_state_words_are_the_ones_the_backend_emits() -> None:
         assert f"{phase}:" in APP_JS or f'"{phase}"' in APP_JS, f"the page has no label for phase {phase}"
 
 
-def test_the_2026_09_17_ux_pass_holds() -> None:
-    """The owner's list: the allocator is one row of three controls, the
-    recommendation column and the dead Smoke button are gone, running and
-    waiting are on the status chip and nowhere else."""
+def test_the_allocator_keeps_its_four_controls() -> None:
     ids = set(re.findall(r'id="([A-Za-z0-9_]+)"', INDEX))
-    for present in ("util", "ctx", "agents", "useRec", "agentsRec", "dBadge", "vramTxt", "segW",
-                    "kvOffload", "qN", "qW", "mPre", "hitRate", "pctP90", "oversub", "apply", "stop",
-                    "kvPct", "spark", "gpuName", "hostRam"):
+    for present in ("util", "ctx", "agents", "useRec", "agentsRec", "offload", "offloadNote",
+                    "dBadge", "vramTxt", "segW", "apply", "stop", "dirty"):
         assert present in ids, present
     for gone in ("smoke", "mRun", "mWait", "recN", "recMath", "mixTbl", "recCal", "dKv", "dKvTok"):
         assert gone not in ids, gone
     assert INDEX.count('class="acell"') == 4
-    for present in ("offload", "offloadNote"):
-        assert present in ids, present
-    # Two columns, nothing spanning under the rail: the KV picture sits under
-    # the models, the request histogram under the main panel.
-    assert INDEX.count('class="col"') == 2 and 'class="panel live"' not in INDEX
     render_ctx = APP_JS.split("function renderCtx")[1].split("\nfunction ")[0]
     assert "ctxLabel(" not in render_ctx, "the context bound must print the exact figure"
 
 
-def test_every_div_is_closed() -> None:
-    """A missing </div> nests the rest of the page inside the grid (seen
-    2026-09-17: the server log and footer rendered as grid cells)."""
-    assert len(re.findall(r"<div\b", INDEX)) == INDEX.count("</div>"), "div_nesting"
+def test_every_id_the_script_paints_exists_or_is_retired() -> None:
+    """Retired ids are painted through set(), which no-ops on a missing element."""
+    html = set(re.findall(r'id="([A-Za-z0-9_]+)"', INDEX))
+    painted = set(re.findall(r'\$\("([A-Za-z0-9_]+)"\)', APP_JS)) | set(re.findall(r'set\("([A-Za-z0-9_]+)"', APP_JS))
+    retired = {"adoptBtn", "dKv", "dKvTok", "mRun", "mWait", "mixFull", "mixNote", "mixTbl",
+               "recBasis", "recCal", "recMath", "recN", "recP99", "smoke"}
+    assert painted - html <= retired, sorted(painted - html - retired)
 
 
-def test_information_sits_with_its_question() -> None:
-    """The IA pass (2026-09-17): the VRAM bar is inside the allocator it
-    describes; the KV gauge is in the status row; preemptions are in the
-    request-size panel; the prefix-cache hit rate is in the prefix-cache cell;
-    the GPU name is in the Machine panel, not the header."""
-    alloc = INDEX.split('<div class="alloc">')[1].split('<div class="pref"')[0]
-    assert 'class="vram"' in alloc and INDEX.count('class="vram"') == 1
-    status = INDEX.split('<div class="status">')[1].split('<div class="alloc">')[0]
-    assert 'id="queued"' in status and 'id="livestrip"' in status
-    live = INDEX.split('id="livestrip"')[1].split('<div class="phases"')[0]
-    assert 'id="kvPct"' in live and 'id="mPre"' in live and 'id="mWaitCap"' in live
-    req = INDEX.split('id="reqPanel"')[1].split('id="logPanel"')[0]
-    assert 'id="oversub"' in req and 'id="mPre"' not in req
-    cache_cell = INDEX.split('id="tkCacheK"')[1].split("</div>\n          </div>")[0]
-    assert 'id="hitRate"' in cache_cell
-    header = INDEX.split('<div class="top">')[1].split('<div class="grid">')[0]
-    assert 'id="gpuName"' not in header and 'id="gpuUsed"' in header
+def test_the_page_reads_top_down_by_question() -> None:
+    """2026-09-17 redesign: vital signs first (what serves, how fast, how full),
+    then models beside the controls, then diagnostics and reference."""
+    order = [INDEX.index(k) for k in ('class="panel hero"', 'class="grid"', 'id="trafficPanel"', 'id="logPanel"')]
+    assert order == sorted(order)
+    hero = INDEX.split('class="panel hero"')[1].split('class="grid"')[0]
+    for kpi in ("thDecode", "thPrefill", "thTtft", "kvPct", "mWaitCap", "mPre", "sModel", "queued"):
+        assert f'id="{kpi}"' in hero, kpi
+    assert hero.count('class="kpi') >= 6
+    grid = INDEX.split('class="grid"')[1].split('id="trafficPanel"')[0]
+    left, right = grid.split('<div class="col">')[1:3]
+    assert 'id="mlist"' in left and 'id="gpuName"' in left and 'id="hostRam"' in left
+    assert 'class="panel notes"' in left, "the figures note fills the sidebar, not a footer"
+    assert 'class="alloc"' in right and 'id="reqHist"' in right and 'id="oversub"' in right
+    traffic = INDEX.split('id="trafficPanel"')[1].split('id="logPanel"')[0]
+    assert 'id="tkIn"' in traffic and 'id="hitRate"' in traffic
+    header = INDEX.split('<header class="top">')[1].split("</header>")[0]
+    assert 'id="gpuUsed"' in header and 'id="gpuName"' not in header
 
 
-def test_the_big_blocks_are_direct_children_of_the_wrapper() -> None:
-    """A balanced div count is not enough (2026-09-17: one stray close at the
-    top and one missing close inside the allocator balanced each other and put
-    the log and footer inside the grid). Walk the nesting instead."""
+def test_the_nesting_is_the_intended_tree() -> None:
+    """A balanced div count is not enough (2026-09-17 twice): walk the tree."""
     depth = 0
     at = {}
     for line in INDEX.split("\n"):
-        for key in ('class="grid"', 'id="logPanel"', 'class="panel notes"', 'class="vram"', 'class="alloc"', 'id="reqPanel"'):
-            if key in line:
+        for key in ('class="panel hero"', 'class="grid"', 'id="trafficPanel"', 'id="logPanel"',
+                    'class="alloc"', 'class="vram"', 'class="col"'):
+            if key in line and key not in at:
                 at[key] = depth
         depth += len(re.findall(r"<div\b", line)) - line.count("</div>")
+        depth += len(re.findall(r"<section\b", line)) - line.count("</section>")
     assert depth == 0
-    assert at['class="grid"'] == 1 and at['id="logPanel"'] == 1
-    assert at['class="panel notes"'] == 3, "the reading note is a panel inside the sidebar column"
-    assert at['id="reqPanel"'] == 1, "request size spans the page below both columns"
-    assert at['class="vram"'] == at['class="alloc"'] + 1, "the VRAM bar is a child of the allocator"
+    assert at['class="panel hero"'] == 1 and at['class="grid"'] == 1
+    assert at['id="trafficPanel"'] == 1 and at['id="logPanel"'] == 1
+    assert at['class="col"'] == 2
+    assert at['class="vram"'] == at['class="alloc"'] + 1
