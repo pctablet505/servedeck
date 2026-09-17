@@ -95,3 +95,9 @@ def test_the_2026_09_17_ux_pass_holds() -> None:
     assert INDEX.count('class="col"') == 2 and 'class="panel live"' not in INDEX
     render_ctx = APP_JS.split("function renderCtx")[1].split("\nfunction ")[0]
     assert "ctxLabel(" not in render_ctx, "the context bound must print the exact figure"
+
+
+def test_every_div_is_closed() -> None:
+    """A missing </div> nests the rest of the page inside the grid (seen
+    2026-09-17: the server log and footer rendered as grid cells)."""
+    assert len(re.findall(r"<div\b", INDEX)) == INDEX.count("</div>"), "div_nesting"

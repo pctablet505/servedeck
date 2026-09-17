@@ -442,3 +442,4 @@ input[type=range]:focus-visible{outline:2px solid var(--accent);outline-offset:3
 .agrid{grid-template-columns:repeat(4,1fr)}
 @media (max-width: 1180px){.agrid{grid-template-columns:1fr 1fr}}
 @media (max-width: 900px){.agrid{grid-template-columns:1fr}}
+.acell .s{white-space:normal}
