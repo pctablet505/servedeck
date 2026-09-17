@@ -67,6 +67,7 @@ class LiveView:
     restarts: int
     port: int | None = None
     unknown: bool = False
+    adopted: bool = False
 
     @property
     def unit_state(self) -> str:
@@ -179,6 +180,7 @@ class RegistryRoutes:
                 restarts=getattr(row, "restarts", 0),
                 port=getattr(row, "port", None),
                 unknown=bool(getattr(row, "unknown", False)),
+                adopted=bool(getattr(row, "adopted", False)),
             )
             snapshot[view.key] = view
         self._live = snapshot

@@ -1037,10 +1037,9 @@ class ModelSpecAdapter:
 class _RegistryAdapter:
     """P1's ``Registry`` as P3's ``control.Registry`` Protocol.
 
-    One method, ``get``. The Protocol's ``models()`` was removed: ``Control``
-    never needed the whole list — everything it does is keyed — and a second
-    way to enumerate models is a second place for the registry's order to be
-    decided.
+    ``get`` for every keyed action, ``keys`` for port adoption only (see
+    ``control.Registry``). There is still no ``models()``: nothing decides
+    order here.
     """
 
     def __init__(self, registry: _models.Registry) -> None:
@@ -1055,6 +1054,9 @@ class _RegistryAdapter:
         if spec is None:
             raise KeyError(key)
         return spec
+
+    def keys(self) -> list[str]:
+        return list(self.specs)
 
 
 def create_app(

@@ -74,6 +74,9 @@ class FakeRegistry:
     def get(self, key: str) -> FakeSpec:
         return self._by_key[key]
 
+    def keys(self) -> list[str]:
+        return list(self._by_key)
+
 
 class FakeSystemd:
     """An in-memory systemd that answers the five argv shapes units.py builds.
@@ -235,6 +238,9 @@ def make_control(systemd, registry, tmp_path, *, probe=None, free=(50000,),
         cgroup_pids=cgroup_pids or (lambda unit: [4242]),
         clock=FakeClock(),
         sleep=lambda _s: None,
+        # No socket table in the fakes: a port that "answers" in a test is a
+        # unit's port, never an adoption, unless the test installs a listener.
+        listener_pid=lambda port: None,
     )
 
 
@@ -1357,3 +1363,110 @@ def test_control_can_only_ever_name_model_units(tmp_path) -> None:
         for name in named:
             assert units.valid_unit_name(name.removeprefix("--unit="))
     assert "qwen-vllm" in systemd.units, "an untouched unit must stay untouched"
+
+
+# --------------------------------------------------------------------------
+# Adoption of an unmanaged listener (2026-09-17)
+# --------------------------------------------------------------------------
+
+
+def _probe_for(port_ids: dict[int, list[str]]):
+    return lambda port: port_ids.get(port)
+
+
+def test_live_adopts_a_registered_model_serving_without_a_unit(tmp_path) -> None:
+    """Cutover: Flash-Next keeps serving on :8001 from v1's launch while v2
+    takes over. No `model-flashnext` unit exists, but the port answers with
+    the registered id, so it is live, ready, and routable — as adopted."""
+    systemd = FakeSystemd()
+    c = make_control(systemd, FakeRegistry(FLASH, BIG27), tmp_path,
+                     probe=_probe_for({8001: ["Qwen3.8-Flash-Next"]}))
+    c._listener_pid = lambda port: 27110 if port == 8001 else None
+    rows = c.live()
+    assert [r.key for r in rows] == ["flashnext"]
+    row = rows[0]
+    assert row.adopted and row.ready and row.pid == 27110 and row.port == 8001
+    assert row.unit == control.ADOPTED_UNIT and row.sub_state == "adopted"
+    assert c.live_main() == row, "an adopted main-slot model holds the main slot"
+
+
+def test_a_foreign_listener_on_a_registered_port_is_not_adopted(tmp_path) -> None:
+    """:8002 held by an unrelated web app (seen 2026-09-17) answers /v1/models
+    with nothing of ours, or not at all. Not a model; doctor's business."""
+    c = make_control(FakeSystemd(), FakeRegistry(FLASH), tmp_path,
+                     probe=_probe_for({8001: ["something-else"]}))
+    assert c.live() == []
+
+
+def test_a_unit_owned_model_is_never_double_listed_as_adopted(tmp_path) -> None:
+    systemd = FakeSystemd()
+    systemd.add("model-flashnext", main_pid=555)
+    c = make_control(systemd, FakeRegistry(FLASH), tmp_path,
+                     probe=_probe_for({8001: ["Qwen3.8-Flash-Next"]}))
+    rows = c.live()
+    assert len(rows) == 1 and not rows[0].adopted and rows[0].pid == 555
+
+
+def test_start_refuses_while_an_adopted_model_holds_the_main_slot(tmp_path) -> None:
+    c = make_control(FakeSystemd(), FakeRegistry(FLASH, BIG27), tmp_path,
+                     probe=_probe_for({8001: ["Qwen3.8-Flash-Next"]}))
+    c._listener_pid = lambda port: 27110
+    got = c.start("qwen27b")
+    assert isinstance(got, control.Refusal) and got.reason == "main_slot_busy"
+    assert got.live_key == "flashnext"
+
+
+def test_stop_of_an_adopted_model_signals_its_pid_and_waits_for_the_port(tmp_path) -> None:
+    """No unit to `systemctl stop`: SIGTERM the listener, wait until the port
+    stops answering, account the VRAM of the pid tree (the API server holds
+    nothing; its engine children hold it all)."""
+    alive = {"up": True}
+    kills: list[tuple[int, int]] = []
+
+    def kill(pid, sig):
+        kills.append((pid, sig))
+        if pid == 27110:
+            alive["up"] = False
+
+    c = make_control(
+        FakeSystemd(), FakeRegistry(FLASH), tmp_path,
+        probe=lambda port: ["Qwen3.8-Flash-Next"] if alive["up"] else None,
+        used=lambda: {27110: 0, 27200: 81000, 27201: 900},
+    )
+    c._listener_pid = lambda port: 27110 if alive["up"] else None
+    c._kill = kill
+    c._descendants = lambda pid: [27200, 27201] if pid == 27110 else []
+    c.adopt()
+    assert c.load_desired().main == "flashnext"
+    got = c.stop("flashnext")
+    assert isinstance(got, control.StopResult)
+    assert got.was_live and got.unit == control.ADOPTED_UNIT
+    assert got.held_mib == 81900
+    assert kills == [(27110, 15)], "one SIGTERM to the listener, no SIGKILL when it exits"
+    assert c.load_desired().main is None
+    assert c.live() == []
+
+
+def test_stop_of_an_adopted_model_escalates_to_sigkill_on_timeout(tmp_path) -> None:
+    kills: list[tuple[int, int]] = []
+    c = make_control(FakeSystemd(), FakeRegistry(FLASH), tmp_path,
+                     probe=lambda port: ["Qwen3.8-Flash-Next"])
+    c._listener_pid = lambda port: 27110
+    c._kill = lambda pid, sig: kills.append((pid, sig))
+    c._descendants = lambda pid: [27200]
+    got = c.stop("flashnext", timeout_s=1.0)
+    assert isinstance(got, control.StopResult)
+    assert kills[0] == (27110, 15)
+    assert (27200, 9) in kills and (27110, 9) in kills, "the whole tree gets SIGKILL after the deadline"
+
+
+def test_reconcile_leaves_an_adopted_desired_main_alone(tmp_path) -> None:
+    """Desired says flashnext; an adopted process already serves it. Starting a
+    second copy would boot 80 GiB into an occupied card."""
+    systemd = FakeSystemd()
+    c = make_control(systemd, FakeRegistry(FLASH), tmp_path,
+                     probe=_probe_for({8001: ["Qwen3.8-Flash-Next"]}))
+    c._listener_pid = lambda port: 27110
+    c._save_desired(c.load_desired().with_main("flashnext"))
+    rec = c.reconcile()
+    assert rec.already_live == ["flashnext"] and rec.started == [] and systemd.started == []

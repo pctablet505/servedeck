@@ -36,7 +36,10 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
+import signal
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -196,17 +199,22 @@ class ModelSpec(Protocol):
 
 @runtime_checkable
 class Registry(Protocol):
-    """What the supervisor needs from the registry: one lookup.
+    """What the supervisor needs from the registry: a lookup and the key list.
 
-    There is no ``models()`` here. Nothing in this module ever enumerates the
-    registry — discovery is ``systemctl list-units`` plus a probe, and every
-    other entry point is given a key. A method declared but never called is a
-    contract P1 has to satisfy for nothing, and the first place a wrong
-    assumption about ordering or laziness would hide.
+    There is no ``models()`` here. Every action entry point is given a key.
+    ``keys()`` exists for exactly one reader, :meth:`Control.live`'s adoption
+    of an unmanaged listener (2026-09-17): a registered model may be serving
+    on its port without a ``model-*`` unit — the process v1 launched at
+    cutover, or a hand launch — and the only way to notice is to probe the
+    registered ports. Order carries no meaning here.
     """
 
     def get(self, key: str) -> ModelSpec:
         """The spec for ``key``. Raises :class:`KeyError` if unknown."""
+        ...
+
+    def keys(self) -> Sequence[str]:
+        """Every registry key, for port adoption. Order is not significant."""
         ...
 
 
@@ -229,6 +237,14 @@ class LiveModel:
     #: know. Never acted on automatically: without a spec there is no slot,
     #: no port and no way to tell a stray from a model.
     unknown: bool = False
+    #: True when no unit owns this model but its registered port answers
+    #: ``/v1/models`` with its id: a process servedeck did not launch (v1's,
+    #: or a hand launch). Routed and stoppable (by pid), never restarted.
+    adopted: bool = False
+
+
+#: The ``unit`` an adopted model reports. Not a systemd name on purpose.
+ADOPTED_UNIT = "(adopted)"
 
 
 @dataclass(frozen=True)
@@ -343,6 +359,36 @@ def http_probe(port: int, timeout_s: float = _PROBE_TIMEOUT_S) -> list[str] | No
     return [item["id"] for item in data if isinstance(item, dict) and isinstance(item.get("id"), str)]
 
 
+def listener_pid(port: int) -> int | None:
+    """The pid listening on ``127.0.0.1:port``/``0.0.0.0:port``, from ``ss``."""
+    try:
+        out = subprocess.run(
+            ["ss", "-Hltnp", f"sport = :{port}"], capture_output=True, text=True, timeout=5
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"pid=(\d+)", out)
+    return int(m.group(1)) if m else None
+
+
+def descendants(pid: int) -> list[int]:
+    """``pid``'s descendants from ``/proc/*/task/*/children`` (empty off Linux)."""
+    out: list[int] = []
+    stack = [pid]
+    while stack:
+        p = stack.pop()
+        try:
+            for task in Path(f"/proc/{p}/task").iterdir():
+                kids = (task / "children").read_text().split()
+                for k in kids:
+                    child = int(k)
+                    out.append(child)
+                    stack.append(child)
+        except OSError:
+            continue
+    return out
+
+
 def _cgroup_pids(unit: str, run: Runner | None = None) -> list[int]:
     """Every pid in the unit's cgroup, from
     ``/sys/fs/cgroup/<ControlGroup>/cgroup.procs``.
@@ -397,6 +443,9 @@ class Control:
         cgroup_pids: Callable[[str], list[int]] | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        listener_pid: Callable[[int], int | None] | None = None,
+        kill: Callable[[int, int], None] | None = None,
+        descendants: Callable[[int], list[int]] | None = None,
     ) -> None:
         if unit_prefix not in (UNIT_PREFIX, "sd-test-"):
             raise ValueError(
@@ -421,6 +470,9 @@ class Control:
         self._cgroup_pids = cgroup_pids or (lambda unit: _cgroup_pids(unit, run=self._run))
         self._clock = clock
         self._sleep = sleep
+        self._listener_pid = listener_pid or globals()["listener_pid"]
+        self._kill = kill or os.kill
+        self._descendants = descendants or globals()["descendants"]
 
     # -- small helpers ----------------------------------------------------
 
@@ -515,6 +567,43 @@ class Control:
                     pid=state.main_pid,
                     ready=ready,
                     restarts=state.n_restarts,
+                )
+            )
+        # Adoption (2026-09-17): a registered model serving on its port with
+        # no unit — v1's launch at cutover, or a hand launch. Only a listener
+        # that names the registered id counts; a foreign process on the port
+        # is doctor's finding, not a model.
+        seen = {model.key for model in out}
+        for key in self.registry.keys():
+            if key in seen:
+                continue
+            spec = self._spec(key)
+            if spec is None:
+                continue
+            # A real listener first (the socket table), then the identity
+            # question. A probe answer with no listener pid cannot happen on
+            # a box; in the suite it is the shape of every "port answers"
+            # fake, and none of those is an adoption.
+            pid = self._listener_pid(spec.port)
+            if pid is None:
+                continue
+            ids = self._probe(spec.port)
+            if not ids:
+                continue
+            names = {spec.id, *spec.served_names()}
+            if not (names & set(ids)):
+                continue
+            out.append(
+                LiveModel(
+                    key=key,
+                    unit=ADOPTED_UNIT,
+                    port=spec.port,
+                    state="active",
+                    sub_state="adopted",
+                    pid=pid,
+                    ready=True,
+                    restarts=0,
+                    adopted=True,
                 )
             )
         return out
@@ -880,6 +969,9 @@ class Control:
         unit = self.unit_for(key)
         if not units.valid_unit_name(unit):
             return Refusal(reason="bad_key", message=f"{key!r} is not a usable model key", key=key)
+        adopted = next((m for m in self.live() if m.key == key and m.adopted), None)
+        if adopted is not None:
+            return self._stop_adopted(key, adopted, timeout_s)
         # Confirmed, because a false "not there" skips the VRAM accounting
         # below and would let the next switch boot into an occupied card.
         was_live = not units.gone(unit, run=self._run, sleep=self._sleep)
@@ -897,6 +989,40 @@ class Control:
         self._save_desired(current)
         return StopResult(
             key=key, unit=unit, was_live=was_live, held_mib=held, free_before_mib=free_before
+        )
+
+    def _stop_adopted(self, key: str, model: LiveModel, timeout_s: float) -> StopResult | Refusal:
+        """Stop a model no unit owns: SIGTERM its listener pid, wait for the
+        port to stop answering, SIGKILL the tree if it will not. The VRAM
+        accounting sums the pid and its descendants, because vLLM's API
+        server holds nothing and its engine-core children hold everything."""
+        free_before = self._free_mib()
+        usage = self._used_by_pids()
+        tree = [model.pid, *self._descendants(model.pid)]
+        held = None if usage is None else sum(usage.get(p, 0) for p in tree)
+        try:
+            self._kill(model.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError as exc:
+            return Refusal(reason="stop_failed", message=f"kill {model.pid}: {exc}", key=key)
+        deadline = self._clock() + timeout_s
+        while self._probe(model.port) is not None or self._listener_pid(model.port) is not None:
+            if self._clock() >= deadline:
+                for p in reversed(tree):
+                    try:
+                        self._kill(p, signal.SIGKILL)
+                    except OSError:
+                        pass
+                break
+            self._sleep(0.5)
+        current = self.load_desired()
+        if current.main == key:
+            current = current.with_main(None)
+        current = current.without_resident(key)
+        self._save_desired(current)
+        return StopResult(
+            key=key, unit=ADOPTED_UNIT, was_live=True, held_mib=held, free_before_mib=free_before
         )
 
     def _held_mib(self, unit: str) -> int | None:
