@@ -37,6 +37,11 @@ from . import kvcalc
 KNOWN_ARCHS: dict[str, str] = {
     "Qwen3_5ForConditionalGeneration": "inline",
     "Qwen4ExpForConditionalGeneration": "flashnext",
+    # dealignai/GLM-5.3-Flash-ABLITERATED-NVFP4 config.json (2026-09-17); the
+    # checkpoint sat on disk for a week while the page said "not on disk".
+    "Glm5NextForConditionalGeneration": "glm53",
+    # LiquidAI/LFM2.5-350M, the opt-in resident; served from the stock build.
+    "Lfm2ForCausalLM": "stock",
 }
 
 def arch_backends() -> dict[str, str]:

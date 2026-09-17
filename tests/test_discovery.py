@@ -365,6 +365,8 @@ def test_known_archs_map_is_exactly_the_two_documented_entries() -> None:
     assert KNOWN_ARCHS == {
         "Qwen3_5ForConditionalGeneration": "inline",
         "Qwen4ExpForConditionalGeneration": "flashnext",
+        "Glm5NextForConditionalGeneration": "glm53",
+        "Lfm2ForCausalLM": "stock",
     }
     assert len(set(KNOWN_ARCHS.values())) == len(KNOWN_ARCHS), "map must stay 1:1"
 

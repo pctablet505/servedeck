@@ -476,6 +476,16 @@ def test_notice_levels_style_differently() -> None:
     assert got[2] == got[0], "an unlabelled notice must not be styled as an error"
 
 
+def test_the_dropdown_defaults_to_the_running_model_not_the_first_option() -> None:
+    """2026-09-17: the select opened on the 27B while Flash-Next held the slot."""
+    assert _run('defaultSelection("", "flashnext", ["qwen27b", "flashnext", "glm53"])') == "flashnext"
+    assert _run('defaultSelection("glm53", "flashnext", ["qwen27b", "flashnext", "glm53"])') == "glm53", (
+        "a choice the user made survives a repaint"
+    )
+    assert _run('defaultSelection("", null, ["qwen27b", "flashnext"])') == "qwen27b"
+    assert _run('defaultSelection("", null, [])') == ""
+
+
 def test_a_model_that_is_not_downloaded_says_so_in_the_dropdown() -> None:
     """The main-slot dropdown is one click away from a 90 GiB download. The
     option carries the on-disk answer /api/models already computed."""

@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import json
 import tomllib
-from collections.abc import Callable, Sequence
+from collections.abc import Collection, Callable, Sequence
 from pathlib import Path
 from typing import NamedTuple
 
@@ -232,11 +232,23 @@ def is_local_ref(url: str) -> bool:
 
 
 def check_client_config(
-    kind: str, path: str | Path, *, timeout: float = 2.0, http_get: HttpGet | None = None
+    kind: str,
+    path: str | Path,
+    *,
+    timeout: float = 2.0,
+    http_get: HttpGet | None = None,
+    known_names: Collection[str] = (),
 ) -> list[CheckResult]:
     """``kind`` is one of "vscode" / "codex" / "kimi". Missing file is not a
     failure (nothing to check yet); a file present with no model references is
-    reported as such rather than silently producing zero results."""
+    reported as such rather than silently producing zero results.
+
+    ``known_names`` is every id, alias and preset the registry serves through
+    the gateway. A client entry for one of those that the endpoint does not
+    list right now is *wired, not running* — the gateway answers it with a 503
+    and a reason until the model is started — not a failure. Without it (the
+    2026-09-17 cutover night) three stopped models made the page say "13 of
+    29 failing" with nothing wrong."""
     p = Path(path)
     if not p.is_file():
         return [CheckResult(f"{kind} config", True, f"{p} not present")]
@@ -276,6 +288,13 @@ def check_client_config(
             continue
         if model_id in ids:
             results.append(CheckResult(name, True, f"ok — {models_url} serves {model_id!r}"))
+        elif model_id in known_names:
+            results.append(
+                CheckResult(
+                    name, True, f"wired — {model_id!r} is in the registry but not running; "
+                    f"{models_url} will list it once it is started"
+                )
+            )
         else:
             results.append(
                 CheckResult(name, False, f"missing — {models_url} serves {ids!r}, not {model_id!r}")
@@ -482,8 +501,17 @@ def run_doctor(
             "kimi": _wire.KIMI_CONFIG_PATH,
         }
     )
+    known_names: set[str] = set()
+    for m in registry.models.values():
+        known_names.add(m.id)
+        known_names.update(m.aliases)
+        known_names.update(m.presets)
     for kind, path in files.items():
-        results.extend(check_client_config(kind, path, timeout=timeout, http_get=http_get))
+        results.extend(
+            check_client_config(
+                kind, path, timeout=timeout, http_get=http_get, known_names=known_names
+            )
+        )
 
     for m in registry.models.values():
         results.append(check_port(m, timeout=timeout, http_get=http_get))

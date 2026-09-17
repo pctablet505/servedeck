@@ -147,6 +147,16 @@ function modelOption(r) {
   return r.id + " — " + disk;
 }
 
+/* Which option the main-slot select should show: what the user picked if they
+ * picked anything, else the model that holds the slot, else the first option.
+ * A select that opens on the 27B while Flash-Next is running reads as "the
+ * 27B is running" to anyone glancing at it (2026-09-17). */
+function defaultSelection(want, holderKey, keys) {
+  if (want && keys.indexOf(want) >= 0) return want;
+  if (holderKey && keys.indexOf(holderKey) >= 0) return holderKey;
+  return keys.length ? keys[0] : "";
+}
+
 /* An SSE `progress` frame as one line. */
 function progressText(p) {
   if (!p) return "";
@@ -462,12 +472,15 @@ function paintRegistry() {
   const sel = $("mainSel");
   const want = sel.value;
   clear(sel);
+  const keys = [];
   REG.filter(function (r) { return r.slot === "main"; }).forEach(function (r) {
     const o = el("option", "", modelOption(r));
     o.value = r.key;
     sel.appendChild(o);
+    keys.push(r.key);
   });
-  if (want) sel.value = want;
+  const holder = mainHolder();
+  sel.value = defaultSelection(want, holder ? holder.key : null, keys);
 }
 
 function mainHolder() {

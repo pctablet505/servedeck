@@ -101,6 +101,29 @@ def test_client_config_vscode_missing_when_id_absent(tmp_path):
     assert "missing" in results[0].detail
 
 
+def test_client_config_registered_but_stopped_model_is_wired_not_failing(tmp_path):
+    """2026-09-17: every client is wired through the gateway, which lists only
+    the models that are up. An entry for a registry model that is stopped is
+    the normal state of most entries, not a failure."""
+    p = tmp_path / "chatLanguageModels.json"
+    p.write_text(
+        json.dumps(
+            [{"name": "servedeck", "models": [
+                {"id": "Qwen3.8-27B-NVFP4", "url": "http://127.0.0.1:8010/v1/chat/completions"},
+                {"id": "Nope", "url": "http://127.0.0.1:8010/v1/chat/completions"},
+            ]}]
+        )
+    )
+    get = _stub_get({"http://127.0.0.1:8010/v1/models": _models_response("Qwen3.8-Flash-Next")})
+    results = doctor.check_client_config(
+        "vscode", p, http_get=get, known_names={"Qwen3.8-27B-NVFP4", "qwen27b"}
+    )
+    by_name = {r.name: r for r in results}
+    assert by_name["vscode: Qwen3.8-27B-NVFP4"].ok is True
+    assert "not running" in by_name["vscode: Qwen3.8-27B-NVFP4"].detail
+    assert by_name["vscode: Nope"].ok is False, "an id the registry does not know is still missing"
+
+
 def test_client_config_unreachable(tmp_path):
     p = tmp_path / "chatLanguageModels.json"
     p.write_text(
