@@ -795,6 +795,18 @@ def _main_holder(rt: Runtime, live: dict[str, _routes.LiveView]) -> str | None:
     return None
 
 
+def _claim(rt: Runtime, action: str, key: str, label: str) -> None:
+    """Mark servedeck busy in the handler, before the work is scheduled.
+
+    ``_run_mutation`` used to set ``busy`` itself, which happens only once the
+    event loop gets round to the task — so two Applies arriving in the same
+    tick both passed ``_precheck`` and both ran, restarting the model twice.
+    A handler calls this immediately after a clean precheck, with no ``await``
+    in between, which is what makes the check-then-claim atomic.
+    """
+    rt.busy = {"action": action, "key": key, "label": label}
+
+
 async def _run_mutation(
     rt: Runtime, label: str, work: Callable[[], Any], *, action: str = "", key: str = ""
 ) -> None:
@@ -1253,6 +1265,7 @@ def _register_api(app: FastAPI, rt: Runtime) -> None:
         refusal = _precheck(rt, key, "start")
         if refusal is not None:
             return refusal
+        _claim(rt, "start", key, f"start {key}")
         asyncio.create_task(
             _run_mutation(
                 rt,
@@ -1269,6 +1282,7 @@ def _register_api(app: FastAPI, rt: Runtime) -> None:
         refusal = _precheck(rt, key, "stop")
         if refusal is not None:
             return refusal
+        _claim(rt, "stop", key, f"stop {key}")
         asyncio.create_task(
             _run_mutation(rt, f"stop {key}", lambda: rt.control.stop(key), action="stop", key=key)
         )
@@ -1279,6 +1293,7 @@ def _register_api(app: FastAPI, rt: Runtime) -> None:
         refusal = _precheck(rt, key, "switch")
         if refusal is not None:
             return refusal
+        _claim(rt, "switch", key, f"switch {key}")
         asyncio.create_task(
             _run_mutation(
                 rt,
@@ -1292,6 +1307,9 @@ def _register_api(app: FastAPI, rt: Runtime) -> None:
 
     @app.post("/api/adopt")
     async def adopt() -> JSONResponse:
+        if rt.busy is not None:
+            return _refusal(409, "busy", f"servedeck is already running {rt.busy['label']}", busy=rt.busy)
+        _claim(rt, "adopt", "", "adopt")
         asyncio.create_task(
             _run_mutation(rt, "adopt", lambda: rt.control.adopt(), action="adopt")
         )

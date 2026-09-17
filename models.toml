@@ -114,6 +114,14 @@ flags = [
     "--long-prefill-token-threshold", "1024",
     "--watermark", "0.10",
     "--kv-offloading-size", "40",
+    # Without this, vLLM's shutdown timeout is 0, which means "abort": the API
+    # server SIGTERMs the engine and force-kills it immediately (fork:
+    # vllm/v1/utils.py shutdown(), deadline = now + timeout). The engine never
+    # reaches CPUOffloadingWorker.shutdown(), so cudaHostUnregister and the
+    # unlink of /dev/shm/vllm_offload_*.mmap never run and 40 GiB of host RAM
+    # is orphaned on EVERY restart, not just on a crash. 30 s also drains
+    # in-flight requests instead of dropping an agent's generation mid-stream.
+    "--shutdown-timeout", "30",
 ]
 
 [models.flashnext.reasoning]
@@ -214,6 +222,9 @@ flags = [
     "--kv-cache-dtype", "auto",
     "--enable-prefix-caching",
     "--speculative-config", '{"method":"mtp","num_speculative_tokens":2}',
+    # As for flashnext: 125 GiB of pinned host memory has to be unregistered
+    # inside the engine's own shutdown, and timeout 0 force-kills before it can.
+    "--shutdown-timeout", "30",
 ]
 
 [models.glm53.reasoning]

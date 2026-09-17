@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import pathlib
 import subprocess
 from dataclasses import dataclass, field
 
@@ -241,7 +242,7 @@ def make_control(systemd, registry, tmp_path, *, probe=None, free=(50000,),
         # No socket table in the fakes: a port that "answers" in a test is a
         # unit's port, never an adoption, unless the test installs a listener.
         listener_pid=lambda port: None,
-        reap_offload=lambda: [],
+        reap_offload=lambda **_kw: [],
     )
 
 
@@ -453,7 +454,10 @@ def test_start_builds_the_unit_from_the_registry_and_the_live_card(tmp_path) -> 
 
     argv = systemd.started[0]
     assert argv[:4] == ["systemd-run", "--user", "--unit=model-flashnext", "--collect"]
-    assert "-p" in argv and "Restart=on-failure" in argv
+    # Restart=always: vLLM exits 0 when its engine dies, so on-failure would
+    # never fire (units.DEFAULT_RESTART). TimeoutStopSec must outlast vLLM's
+    # own --shutdown-timeout, which is what unlinks the 40 GiB offload buffer.
+    assert "Restart=always" in argv and "TimeoutStopSec=120" in argv
     assert "--setenv=VLLM_USE_FLASHINFER_SAMPLER=0" in argv
     # The computed utilisation reaches vLLM, not a configured one.
     command = argv[argv.index("--") + 1 :]
@@ -1528,23 +1532,115 @@ def test_an_unmapped_offload_buffer_is_reaped_and_a_live_one_is_not(tmp_path) ->
     other = shm / "psm_1234"
     for f in (leaked, live, other):
         f.write_bytes(b"x" * 4096)
-    removed = control.reap_offload_regions(shm, paths_in_use=lambda: {str(live)})
+    scan = control.OffloadScan(paths=frozenset({str(live)}))
+    removed = control.reap_offload_regions(shm, scan=lambda: scan)
     assert removed == [(str(leaked), 4096)]
     assert not leaked.exists()
     assert live.exists(), "a buffer a process still maps is a running engine's"
     assert other.exists(), "only vLLM offload buffers are ever touched"
 
 
-def test_paths_in_use_sees_this_process_mapping_a_file(tmp_path) -> None:
+def test_an_untrusted_scan_reaps_nothing(tmp_path) -> None:
+    """The failure this guard exists for: an unreadable /proc entry is
+    indistinguishable from no holder, and "no holder" means "delete 40 GiB".
+    Proven 2026-09-18 against a synthetic /proc — the reaper deleted a live
+    buffer as soon as its holder's maps file became unreadable."""
+    shm = tmp_path / "shm"
+    shm.mkdir()
+    buf = shm / "vllm_offload_live.mmap"
+    buf.write_bytes(b"x" * 4096)
+    untrusted = control.OffloadScan(trusted=False, why="/proc/1234 could not be read")
+    assert control.reap_offload_regions(shm, scan=lambda: untrusted) == []
+    assert buf.exists(), "a buffer must survive a scan that could not see every engine"
+
+
+def test_offload_scan_sees_a_vllm_process_mapping_a_buffer(tmp_path) -> None:
+    """The scan reads only vLLM processes, so it must find this one by argv."""
     import mmap
     f = tmp_path / "vllm_offload_self.mmap"
     f.write_bytes(b"\0" * 4096)
+    me = pathlib.Path("/proc") / str(os.getpid())
     with open(f, "r+b") as fh:
         m = mmap.mmap(fh.fileno(), 4096)
         try:
-            assert str(f) in control._paths_in_use()
+            found = control.offload_scan(engine_pids=lambda _proc: ([me], True))
+            assert found.trusted and str(f) in found.paths
         finally:
             m.close()
+
+
+def test_an_unreadable_engine_makes_the_scan_untrusted(tmp_path) -> None:
+    """ptrace_scope hides a sibling engine's maps: say so, do not read it as
+    an absent holder. The pid below is this process's, with an unreadable
+    /proc dir standing in for the permission error."""
+    fake_proc = tmp_path / "proc"
+    (fake_proc / "4242").mkdir(parents=True)
+    (fake_proc / "4242" / "maps").write_text("")
+    (fake_proc / "4242" / "maps").chmod(0o000)
+    try:
+        result = control.offload_scan(
+            proc=fake_proc, engine_pids=lambda _p: ([fake_proc / "4242"], True)
+        )
+    finally:
+        (fake_proc / "4242" / "maps").chmod(0o644)
+    assert not result.trusted and "4242" in result.why
+
+
+def test_the_scan_is_untrusted_when_proc_cannot_be_listed(tmp_path) -> None:
+    result = control.offload_scan(engine_pids=lambda _p: ([], False))
+    assert not result.trusted
+
+
+def test_a_live_model_whose_pids_cannot_be_listed_blocks_the_reaper(tmp_path) -> None:
+    """servedeck knows the model is up; if it cannot enumerate the engine's
+    processes it cannot prove a buffer is orphaned, so it reaps nothing."""
+    systemd = FakeSystemd()
+    systemd.add("model-flashnext", main_pid=1000)
+    reaped: list[str] = []
+    ctl = make_control(systemd, FakeRegistry(FLASH), tmp_path,
+                       probe=lambda port: ["Qwen3.8-Flash-Next"],
+                       cgroup_pids=lambda unit: [])
+    ctl._reap_offload = lambda **_kw: reaped.append("reaped") or []
+    assert ctl.offload_witnesses() is None
+    assert ctl.reap_offload() == []
+    assert not reaped, "the reaper must not even be asked without witnesses"
+
+
+def test_witnesses_are_the_live_engines_pids(tmp_path) -> None:
+    systemd = FakeSystemd()
+    systemd.add("model-flashnext", main_pid=1000)
+    ctl = make_control(systemd, FakeRegistry(FLASH), tmp_path,
+                       probe=lambda port: ["Qwen3.8-Flash-Next"],
+                       cgroup_pids=lambda unit: [1000, 1001, 1002])
+    assert ctl.offload_witnesses() == [1000, 1001, 1002]
+
+
+def test_a_witness_that_is_not_a_vllm_process_is_still_read(tmp_path) -> None:
+    """The witness list is how a model whose argv does not say "vllm" (an
+    adopted or renamed engine) still gets its mappings counted."""
+    import mmap
+    buf = tmp_path / "vllm_offload_witness.mmap"
+    buf.write_bytes(b"\0" * 4096)
+    systemd = FakeSystemd()
+    systemd.add("model-flashnext", main_pid=os.getpid())
+    ctl = make_control(systemd, FakeRegistry(FLASH), tmp_path,
+                       probe=lambda port: ["Qwen3.8-Flash-Next"],
+                       cgroup_pids=lambda unit: [os.getpid()])
+    ctl._reap_offload = control.reap_offload_regions
+    with open(buf, "r+b") as fh:
+        m = mmap.mmap(fh.fileno(), 4096)
+        try:
+            # tmp_path stands in for /dev/shm; the scan is the real one.
+            assert ctl._reap_offload(  # type: ignore[call-arg]
+                shm_dir=tmp_path,
+                scan=lambda: control.offload_scan(
+                    witness_pids=ctl.offload_witnesses() or [],
+                    engine_pids=lambda _p: ([], True),
+                ),
+            ) == []
+        finally:
+            m.close()
+    assert buf.exists(), "the witness maps it, so it is live"
 
 
 def test_stop_reaps_after_the_unit_is_gone_and_start_reaps_before_launch(tmp_path) -> None:
@@ -1553,7 +1649,7 @@ def test_stop_reaps_after_the_unit_is_gone_and_start_reaps_before_launch(tmp_pat
     systemd.add("model-flashnext", main_pid=1000)
     ctl = make_control(systemd, FakeRegistry(FLASH), tmp_path,
                        probe=lambda port: ["Qwen3.8-Flash-Next"])
-    def reap():
+    def reap(**_kw):
         calls.append("reap")
         return [("/dev/shm/vllm_offload_x.mmap", 40 * 2**30)]
     ctl._reap_offload = reap

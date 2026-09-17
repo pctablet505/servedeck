@@ -89,6 +89,7 @@ __all__ = [
     "SHOW_PROPERTIES",
     "DEFAULT_RESTART",
     "DEFAULT_RESTART_SEC",
+    "DEFAULT_TIMEOUT_STOP_SEC",
     "DEFAULT_START_LIMIT_INTERVAL_SEC",
     "DEFAULT_START_LIMIT_BURST",
 ]
@@ -127,8 +128,23 @@ _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 #: `start_transient_argv` and `start_transient`, which meant changing one left
 #: the other silently winning — the argv builder's value is dead, because the
 #: wrapper always passes its own. A drift that no test could see.
-DEFAULT_RESTART = "on-failure"
+#: ``always``, not ``on-failure``, and this is measured, not stylistic: when
+#: vLLM's engine core dies, the watchdog sets ``server.should_exit`` and the
+#: API server returns from ``serve_http`` normally, so the process exits **0**
+#: (fork: ``vllm/entrypoints/launcher.py`` watchdog_loop + terminate_if_errored;
+#: recorded in LOCAL_LLM_SETUP.md:294-298 from a live kill of EngineCore).
+#: systemd reads 0 as a clean run, so ``on-failure`` fires zero times and a
+#: model whose engine died stays down until somebody notices. v1's unit carried
+#: ``Restart=always`` for exactly this reason. The start limit below is what
+#: keeps ``always`` from crash-looping a model that cannot boot at all.
+DEFAULT_RESTART = "always"
 DEFAULT_RESTART_SEC = 10
+#: Long enough for vLLM's own ``--shutdown-timeout`` drain plus the unwind of
+#: pinned host memory: ``cudaHostUnregister`` on a 40 GiB KV-offload buffer and
+#: the unlink of ``/dev/shm/vllm_offload_*.mmap`` happen inside the engine's
+#: shutdown, and systemd killing the unit first is what orphaned 40 GiB of
+#: host RAM on every restart. Must exceed the model's own shutdown timeout.
+DEFAULT_TIMEOUT_STOP_SEC = 120
 #: See `start_transient_argv`: systemd's own 5-per-10s limit can never fire
 #: with a 10s restart delay, so a model that cannot boot restarts forever.
 DEFAULT_START_LIMIT_INTERVAL_SEC = 300
@@ -247,6 +263,7 @@ def start_transient_argv(
     unset_env: Sequence[str] = (),
     start_limit_interval_sec: int = DEFAULT_START_LIMIT_INTERVAL_SEC,
     start_limit_burst: int = DEFAULT_START_LIMIT_BURST,
+    timeout_stop_sec: int = DEFAULT_TIMEOUT_STOP_SEC,
 ) -> list[str]:
     """The exact argv :func:`start_transient` runs. Shape::
 
@@ -258,6 +275,7 @@ def start_transient_argv(
                     -p RestartSec=<restart_sec>
                     -p StartLimitIntervalSec=<start_limit_interval_sec>
                     -p StartLimitBurst=<start_limit_burst>
+                    -p TimeoutStopSec=<timeout_stop_sec>
                     -p WorkingDirectory=<cwd>
                     -p UnsetEnvironment=<NAME>   (one per name, sorted)
                     --setenv=<K>=<V>             (one per var, keys sorted)
@@ -333,6 +351,8 @@ def start_transient_argv(
         "-p",
         f"StartLimitBurst={start_limit_burst}",
         "-p",
+        f"TimeoutStopSec={timeout_stop_sec}",
+        "-p",
         f"WorkingDirectory={os.fspath(cwd)}",
     ]
     for entry in unset:
@@ -358,6 +378,7 @@ def start_transient(
     unset_env: Sequence[str] = (),
     start_limit_interval_sec: int = DEFAULT_START_LIMIT_INTERVAL_SEC,
     start_limit_burst: int = DEFAULT_START_LIMIT_BURST,
+    timeout_stop_sec: int = DEFAULT_TIMEOUT_STOP_SEC,
     run: Runner | None = None,
 ) -> None:
     """Launch ``argv`` as the transient user unit ``<name>.service``.
@@ -389,6 +410,7 @@ def start_transient(
             unset_env,
             start_limit_interval_sec,
             start_limit_burst,
+            timeout_stop_sec,
         ),
     )
 

@@ -124,6 +124,7 @@ def test_start_transient_argv_is_exact() -> None:
         "--collect",
         "--description=servedeck model LFM2.5-350M (lfm2)",
         "-p",
+        # this test passes restart= explicitly: the override wins
         "Restart=on-failure",
         "-p",
         "RestartSec=10",
@@ -135,6 +136,11 @@ def test_start_transient_argv_is_exact() -> None:
         "StartLimitIntervalSec=300",
         "-p",
         "StartLimitBurst=3",
+        # Long enough for vLLM's --shutdown-timeout drain plus the unwind of
+        # pinned host memory; systemd killing the unit first is what orphaned
+        # 40 GiB of /dev/shm on every restart.
+        "-p",
+        "TimeoutStopSec=120",
         "-p",
         "WorkingDirectory=/opt/venv",
         # sorted by key, so the argv is deterministic and assertable
@@ -219,7 +225,10 @@ def test_unset_env_becomes_one_unset_environment_property_per_name() -> None:
         "--collect",
         "--description=model-lfm2",
         "-p",
-        "Restart=on-failure",
+        # always, not on-failure: vLLM exits 0 when its engine core dies
+        # (launcher.py's watchdog returns from serve_http), so on-failure
+        # never fires and a dead model stays dead. See units.DEFAULT_RESTART.
+        "Restart=always",
         "-p",
         "RestartSec=10",
         # The crash-loop ceiling. systemd's defaults (10s window, 5 starts)
@@ -230,6 +239,11 @@ def test_unset_env_becomes_one_unset_environment_property_per_name() -> None:
         "StartLimitIntervalSec=300",
         "-p",
         "StartLimitBurst=3",
+        # Long enough for vLLM's --shutdown-timeout drain plus the unwind of
+        # pinned host memory; systemd killing the unit first is what orphaned
+        # 40 GiB of /dev/shm on every restart.
+        "-p",
+        "TimeoutStopSec=120",
         "-p",
         "WorkingDirectory=/opt/venv",
         # sorted, and before --setenv, so the argv is deterministic

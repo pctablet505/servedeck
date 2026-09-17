@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from dataclasses import dataclass
 
 from servedeck import control, legacy_page as lp, models as _models, parallelism, reqstats
@@ -271,9 +273,65 @@ def test_start_on_the_serving_model_is_refused_and_restart_relaunches(tmp_path) 
             assert r.status_code == 409 and "already serving" in r.json()["error"]
             r = c.post("/api/server/restart", json={"repo_id": "org/A", "max_num_seqs": 4})
             assert r.status_code == 202
+            # Wait for the first mutation to finish before asking for another:
+            # servedeck is single-flight on purpose, so a second restart while
+            # the first is in flight is a 409 (see the busy test below), and a
+            # test that raced the two was flaky rather than wrong.
+            for _ in range(200):
+                if ("switch", "a", True) in calls:
+                    break
+                time.sleep(0.01)
             r = c.post("/api/server/restart", json={"repo_id": "org/B"})
             assert r.status_code == 202
     finally:
         _app._main_holder = orig
-    import time; time.sleep(0.3)
+    for _ in range(200):
+        if ("switch", "b", False) in calls:
+            break
+        time.sleep(0.01)
     assert ("switch", "a", True) in calls and ("switch", "b", False) in calls
+
+
+def test_a_second_apply_while_one_is_in_flight_is_refused(tmp_path) -> None:
+    """Two Applies in the same tick both used to be accepted, because busy was
+    set inside the background task rather than when the POST was accepted —
+    so the model restarted twice (found 2026-09-18)."""
+    from fastapi.testclient import TestClient
+    from servedeck import app as _app
+    from servedeck.settings import Settings
+
+    started = threading.Event()
+    release = threading.Event()
+    calls: list[str] = []
+
+    class Ctl:
+        def live(self):
+            return []
+        def adopt(self, **_kw):
+            return None
+        def reconcile(self, *_a, **_kw):
+            return None
+        def switch(self, key, **kw):
+            calls.append(key)
+            started.set()
+            release.wait(5)
+            return None
+
+    reg = _registry(tmp_path)
+    settings = Settings(listen_host="127.0.0.1", listen_port=8099, models_path=tmp_path / "models.toml",
+                        state_dir=tmp_path / "state", unit_prefix="sd-test-")
+    app = _app.create_app(settings, registry=reg, control=Ctl(), reconcile=False, poll=False)
+    orig = _app._main_holder
+    _app._main_holder = lambda rt, live: "a"
+    try:
+        with TestClient(app) as c:
+            first = c.post("/api/server/restart", json={"repo_id": "org/A"})
+            assert first.status_code == 202
+            second = c.post("/api/server/restart", json={"repo_id": "org/A"})
+            assert second.status_code == 409, "a second Apply must not restart the model again"
+            assert second.json()["error"].startswith("servedeck is busy")
+            release.set()
+    finally:
+        release.set()
+        _app._main_holder = orig
+    assert calls == ["a"], f"the model was restarted {len(calls)}x"

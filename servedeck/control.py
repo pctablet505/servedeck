@@ -367,43 +367,109 @@ def http_probe(port: int, timeout_s: float = _PROBE_TIMEOUT_S) -> list[str] | No
 OFFLOAD_REGION_GLOB = "vllm_offload_*.mmap"
 
 
-def _paths_in_use(proc: Path = Path("/proc")) -> set[str]:
-    """Every file any readable process maps or holds open (maps + fd links)."""
-    used: set[str] = set()
+@dataclass(frozen=True)
+class OffloadScan:
+    """Which offload buffers are mapped, and whether ``/proc`` could be read.
+
+    ``trusted`` is the whole point: an unreadable holder is indistinguishable
+    from no holder, and "no holder" means "delete 40 GiB". Untrusted scans
+    delete nothing and say why.
+    """
+
+    paths: frozenset[str] = frozenset()
+    trusted: bool = True
+    why: str = ""
+
+
+def _engine_pids(proc: Path) -> tuple[list[Path], bool]:
+    """Every vLLM process's ``/proc`` dir, and whether the listing worked.
+
+    Only a vLLM process can hold a vLLM offload buffer (the engine, its
+    ``VLLM::EngineCore`` and its ``VLLM::Worker`` children all carry the name
+    in their argv), so only those are read. Reading ``maps`` for all ~500
+    processes on the box every poll would cost far more than it proves.
+    """
     try:
         pids = [p for p in proc.iterdir() if p.name.isdigit()]
     except OSError:
-        return used
+        return [], False
+    out: list[Path] = []
     for p in pids:
         try:
-            for line in (p / "maps").read_text().splitlines():
+            cmdline = (p / "cmdline").read_bytes()
+        except OSError:
+            continue  # the process exited, or it is not ours: not an engine we launched
+        if b"vllm" in cmdline.lower():
+            out.append(p)
+    return out, True
+
+
+def offload_scan(
+    proc: Path = Path("/proc"),
+    witness_pids: Collection[int] = (),
+    engine_pids: Callable[[Path], tuple[list[Path], bool]] = _engine_pids,
+) -> OffloadScan:
+    """The offload buffers vLLM processes map or hold open.
+
+    Every pid in ``witness_pids`` (the pids of the models servedeck knows are
+    live) must be readable, and so must every vLLM process found in ``/proc``.
+    ``kernel.yama.ptrace_scope`` decides whether we can read a sibling
+    engine's ``maps`` at all — it is 0 on this box for Flash-Next's PLE
+    handoff, not for this — so the scan states its own trustworthiness
+    instead of letting a permission error read as an absent holder.
+    """
+    dirs, listed = engine_pids(proc)
+    if not listed:
+        return OffloadScan(trusted=False, why=f"{proc} could not be listed")
+    seen = {int(d.name) for d in dirs}
+    for pid in witness_pids:
+        if pid not in seen:
+            path = proc / str(pid)
+            if path.exists():
+                dirs.append(path)
+    paths: set[str] = set()
+    for d in dirs:
+        read_something = exited = False
+        try:
+            for line in (d / "maps").read_text().splitlines():
                 parts = line.split(None, 5)
                 if len(parts) == 6:
-                    used.add(parts[5].removesuffix(" (deleted)"))
+                    paths.add(parts[5].removesuffix(" (deleted)"))
+            read_something = True
+        except FileNotFoundError:
+            exited = True  # it went away while we walked: it holds nothing now
         except OSError:
-            pass
+            pass  # a permission error, which is the case this guard is for
         try:
-            for fd in (p / "fd").iterdir():
+            for fd in (d / "fd").iterdir():
                 try:
-                    used.add(os.readlink(fd))
+                    paths.add(os.readlink(fd))
                 except OSError:
                     pass
+            read_something = True
         except OSError:
             pass
-    return used
+        if not (read_something or exited):
+            return OffloadScan(
+                trusted=False,
+                why=f"/proc/{d.name} (a vLLM process) could not be read; "
+                    "kernel.yama.ptrace_scope hides it",
+            )
+    return OffloadScan(paths=frozenset(paths), trusted=True)
 
 
 def reap_offload_regions(
     shm_dir: Path = Path("/dev/shm"),
-    paths_in_use: Callable[[], set[str]] = _paths_in_use,
+    scan: Callable[[], OffloadScan] = offload_scan,
 ) -> list[tuple[str, int]]:
-    """Delete KV-offload buffers that no process maps or holds open.
+    """Delete KV-offload buffers that no vLLM process maps or holds open.
 
     vLLM unlinks the buffer only in its graceful ``cleanup()``. An engine that
     is SIGKILLed, crashes, or loses the GPU (Xid 79/154 on this card) leaves
     the whole ``--kv-offloading-size`` (40 GiB for Flash-Next) pinned in tmpfs
     until reboot, and every relaunch adds another under a fresh engine id.
-    A file some process still maps is a live buffer and is never touched.
+    A buffer some process still maps is live and is never touched; neither is
+    any buffer at all when the scan could not see every engine.
     Returns ``(path, bytes)`` for what was removed.
     """
     try:
@@ -412,10 +478,15 @@ def reap_offload_regions(
         return []
     if not candidates:
         return []
-    in_use = paths_in_use()
+    result = scan()
+    if not result.trusted:
+        log.warning(
+            "not reaping %d KV offload buffer(s): %s", len(candidates), result.why or "unknown"
+        )
+        return []
     removed: list[tuple[str, int]] = []
     for path in candidates:
-        if str(path) in in_use:
+        if str(path) in result.paths:
             continue
         try:
             size = path.stat().st_size
@@ -564,9 +635,38 @@ class Control:
         self._descendants = descendants or globals()["descendants"]
         self._reap_offload = reap_offload or reap_offload_regions
 
-    def reap_offload(self) -> list[tuple[str, int]]:
-        """Remove KV offload buffers no process maps (see reap_offload_regions)."""
-        return self._reap_offload()
+    def offload_witnesses(self, live: Sequence[LiveModel] | None = None) -> list[int] | None:
+        """The pids that must be visible before a buffer counts as orphaned.
+
+        ``None`` means servedeck believes a model is live but cannot list its
+        processes, which is a reason to reap nothing at all.
+        """
+        pids: list[int] = []
+        for model in self.live() if live is None else live:
+            if model.state != "active" and model.sub_state != "adopted":
+                continue
+            if model.adopted:
+                if not model.pid:
+                    return None
+                pids.append(model.pid)
+                pids.extend(self._descendants(model.pid))
+                continue
+            found = self._cgroup_pids(model.unit)
+            if not found:
+                return None
+            pids.extend(found)
+        return pids
+
+    def reap_offload(self, live: Sequence[LiveModel] | None = None) -> list[tuple[str, int]]:
+        """Remove KV offload buffers no vLLM process maps (see reap_offload_regions)."""
+        witnesses = self.offload_witnesses(live)
+        if witnesses is None:
+            log.warning(
+                "not reaping KV offload buffers: servedeck cannot list the processes of a "
+                "model it believes is live"
+            )
+            return []
+        return self._reap_offload(scan=lambda: offload_scan(witness_pids=witnesses))
 
     # -- small helpers ----------------------------------------------------
 
@@ -802,8 +902,9 @@ class Control:
         key: str,
         timeout_s: float = 900.0,
         on_progress: ProgressCallback | None = None,
-        restart: str = "on-failure",
-        restart_sec: int = 10,
+        restart: str = units.DEFAULT_RESTART,
+        restart_sec: int = units.DEFAULT_RESTART_SEC,
+        timeout_stop_sec: int = units.DEFAULT_TIMEOUT_STOP_SEC,
         util: float | None = None,
         argv_overrides: Mapping[str, str | None] | None = None,
     ) -> StartResult | Refusal:
@@ -823,7 +924,7 @@ class Control:
 
         # A buffer leaked by a crashed or killed engine would otherwise hold
         # host RAM this boot's own offload buffer needs.
-        self._reap_offload()
+        self.reap_offload()
 
         unit = self.unit_for(key)
         current = self.live()
@@ -898,6 +999,7 @@ class Control:
                 cwd=str(Path(spec.venv_bin).parent),
                 restart=restart,
                 restart_sec=restart_sec,
+                timeout_stop_sec=timeout_stop_sec,
                 description=f"servedeck model {spec.id} ({key})",
                 unset_env=unset_env,
                 run=self._run,
@@ -1098,7 +1200,7 @@ class Control:
         self._save_desired(current)
         return StopResult(
             key=key, unit=unit, was_live=was_live, held_mib=held, free_before_mib=free_before,
-            reaped=tuple(self._reap_offload()),
+            reaped=tuple(self.reap_offload()),
         )
 
     def _stop_adopted(self, key: str, model: LiveModel, timeout_s: float) -> StopResult | Refusal:
@@ -1133,7 +1235,7 @@ class Control:
         self._save_desired(current)
         return StopResult(
             key=key, unit=ADOPTED_UNIT, was_live=True, held_mib=held, free_before_mib=free_before,
-            reaped=tuple(self._reap_offload()),
+            reaped=tuple(self.reap_offload()),
         )
 
     def _held_mib(self, unit: str) -> int | None:

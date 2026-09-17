@@ -845,6 +845,7 @@ def register(app: FastAPI, rt: Any) -> None:
                 key, on_progress=_app._progress_publisher(rt.hub, key, rt.boot),
                 util=util, argv_overrides=argv,
             )
+        _app._claim(rt, verb, key, label)
         _app.asyncio.create_task(_app._run_mutation(rt, label, work, action=verb, key=key))
         return JSONResponse({"accepted": True, "action": action, "key": key}, status_code=202)
 
@@ -865,6 +866,7 @@ def register(app: FastAPI, rt: Any) -> None:
             return JSONResponse(
                 {"error": f"servedeck is busy: {rt.busy.get('label')}"}, status_code=409
             )
+        _app._claim(rt, "stop", holder, f"stop {holder}")
         _app.asyncio.create_task(
             _app._run_mutation(
                 rt, f"stop {holder}", lambda: rt.control.stop(holder), action="stop", key=holder
