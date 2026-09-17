@@ -825,11 +825,20 @@ def register(app: FastAPI, rt: Any) -> None:
         model = rt.registry.models[key]
         if holder is not None and model.slot == "main":
             same = holder == key
-            label, verb = (f"restart {key}", "switch") if same else (f"switch {key}", "switch")
+            if same and action != "restart":
+                # v1's contract: a start on a model that is already serving
+                # would be ignored, so it is refused, and only restart relaunches.
+                return JSONResponse(
+                    {"error": f"{key} is already serving; POST /api/server/restart to apply "
+                              "new settings, or stop it first"},
+                    status_code=409,
+                )
+            label = f"restart {key}" if same else f"switch {key}"
             work = lambda: rt.control.switch(  # noqa: E731
                 key, on_progress=_app._progress_publisher(rt.hub, key, rt.boot),
                 util=util, argv_overrides=argv, relaunch=same,
             )
+            verb = "switch"
         else:
             label, verb = f"start {key}", "start"
             work = lambda: rt.control.start(  # noqa: E731

@@ -249,15 +249,10 @@ def test_qwen27b_argv_and_env_match_frozen_snapshot(registry):
     # snapshot — not just one. CUDA_HOME and VLLM_USE_FLASHINFER_SAMPLER must
     # match exactly; PATH only by its <venv>/bin:<CUDA_HOME>/bin prefix (the
     # rest is the capturing shell's own PATH — see the env fixture's header).
-    # HF_HUB_OFFLINE=1 is a deliberate one-way addition (2026-09-17): every
-    # model launches from the hub cache; the Flash-Next launcher already did,
-    # and the first v2 launch without it died on a gated-repo 401.
-    v2_only_by_design = {"HF_HUB_OFFLINE"}
-    assert set(legacy_env) == set(v2_env) - v2_only_by_design, (
+    assert set(legacy_env) == set(v2_env), (
         f"env var set differs: snapshot only {set(legacy_env) - set(v2_env)}, "
-        f"v2 only {set(v2_env) - set(legacy_env) - v2_only_by_design}"
+        f"v2 only {set(v2_env) - set(legacy_env)}"
     )
-    assert v2_env["HF_HUB_OFFLINE"] == "1"
     assert legacy_env["CUDA_HOME"] == v2_env["CUDA_HOME"]
     assert legacy_env["VLLM_USE_FLASHINFER_SAMPLER"] == v2_env["VLLM_USE_FLASHINFER_SAMPLER"] == "0"
     expected_prefix = f"{vllm_bin.rsplit('/bin/vllm', 1)[0]}/bin:{v2_env['CUDA_HOME']}/bin:"

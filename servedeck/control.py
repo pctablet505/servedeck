@@ -284,6 +284,9 @@ class StopResult:
     #: if nvidia-smi could not say.
     held_mib: int | None = None
     free_before_mib: int | None = None
+    #: KV offload buffers removed from /dev/shm after the engine exited
+    #: (``(path, bytes)``); non-empty means it did not clean up after itself.
+    reaped: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -357,6 +360,71 @@ def http_probe(port: int, timeout_s: float = _PROBE_TIMEOUT_S) -> list[str] | No
     if not isinstance(data, list):
         return None
     return [item["id"] for item in data if isinstance(item, dict) and isinstance(item.get("id"), str)]
+
+
+#: vLLM's CPU KV offload buffer (vllm/v1/kv_offload/cpu/shared_offload_region.py):
+#: a named file in /dev/shm — host RAM — sized by --kv-offloading-size.
+OFFLOAD_REGION_GLOB = "vllm_offload_*.mmap"
+
+
+def _paths_in_use(proc: Path = Path("/proc")) -> set[str]:
+    """Every file any readable process maps or holds open (maps + fd links)."""
+    used: set[str] = set()
+    try:
+        pids = [p for p in proc.iterdir() if p.name.isdigit()]
+    except OSError:
+        return used
+    for p in pids:
+        try:
+            for line in (p / "maps").read_text().splitlines():
+                parts = line.split(None, 5)
+                if len(parts) == 6:
+                    used.add(parts[5].removesuffix(" (deleted)"))
+        except OSError:
+            pass
+        try:
+            for fd in (p / "fd").iterdir():
+                try:
+                    used.add(os.readlink(fd))
+                except OSError:
+                    pass
+        except OSError:
+            pass
+    return used
+
+
+def reap_offload_regions(
+    shm_dir: Path = Path("/dev/shm"),
+    paths_in_use: Callable[[], set[str]] = _paths_in_use,
+) -> list[tuple[str, int]]:
+    """Delete KV-offload buffers that no process maps or holds open.
+
+    vLLM unlinks the buffer only in its graceful ``cleanup()``. An engine that
+    is SIGKILLed, crashes, or loses the GPU (Xid 79/154 on this card) leaves
+    the whole ``--kv-offloading-size`` (40 GiB for Flash-Next) pinned in tmpfs
+    until reboot, and every relaunch adds another under a fresh engine id.
+    A file some process still maps is a live buffer and is never touched.
+    Returns ``(path, bytes)`` for what was removed.
+    """
+    try:
+        candidates = sorted(shm_dir.glob(OFFLOAD_REGION_GLOB))
+    except OSError:
+        return []
+    if not candidates:
+        return []
+    in_use = paths_in_use()
+    removed: list[tuple[str, int]] = []
+    for path in candidates:
+        if str(path) in in_use:
+            continue
+        try:
+            size = path.stat().st_size
+            path.unlink()
+        except OSError:
+            continue
+        log.warning("reaped orphaned KV offload buffer %s (%.1f GiB)", path, size / 2**30)
+        removed.append((str(path), size))
+    return removed
 
 
 def apply_argv_overrides(argv: list[str], overrides: Mapping[str, str | None] | None) -> list[str]:
@@ -466,6 +534,7 @@ class Control:
         listener_pid: Callable[[int], int | None] | None = None,
         kill: Callable[[int, int], None] | None = None,
         descendants: Callable[[int], list[int]] | None = None,
+        reap_offload: Callable[[], list[tuple[str, int]]] | None = None,
     ) -> None:
         if unit_prefix not in (UNIT_PREFIX, "sd-test-"):
             raise ValueError(
@@ -493,6 +562,11 @@ class Control:
         self._listener_pid = listener_pid or globals()["listener_pid"]
         self._kill = kill or os.kill
         self._descendants = descendants or globals()["descendants"]
+        self._reap_offload = reap_offload or reap_offload_regions
+
+    def reap_offload(self) -> list[tuple[str, int]]:
+        """Remove KV offload buffers no process maps (see reap_offload_regions)."""
+        return self._reap_offload()
 
     # -- small helpers ----------------------------------------------------
 
@@ -746,6 +820,10 @@ class Control:
         spec = self._spec(key)
         if spec is None:
             return Refusal(reason="unknown_model", message=f"no model {key!r} in the registry", key=key)
+
+        # A buffer leaked by a crashed or killed engine would otherwise hold
+        # host RAM this boot's own offload buffer needs.
+        self._reap_offload()
 
         unit = self.unit_for(key)
         current = self.live()
@@ -1019,7 +1097,8 @@ class Control:
         current = current.without_resident(key)
         self._save_desired(current)
         return StopResult(
-            key=key, unit=unit, was_live=was_live, held_mib=held, free_before_mib=free_before
+            key=key, unit=unit, was_live=was_live, held_mib=held, free_before_mib=free_before,
+            reaped=tuple(self._reap_offload()),
         )
 
     def _stop_adopted(self, key: str, model: LiveModel, timeout_s: float) -> StopResult | Refusal:
@@ -1053,7 +1132,8 @@ class Control:
         current = current.without_resident(key)
         self._save_desired(current)
         return StopResult(
-            key=key, unit=ADOPTED_UNIT, was_live=True, held_mib=held, free_before_mib=free_before
+            key=key, unit=ADOPTED_UNIT, was_live=True, held_mib=held, free_before_mib=free_before,
+            reaped=tuple(self._reap_offload()),
         )
 
     def _held_mib(self, unit: str) -> int | None:

@@ -241,6 +241,7 @@ def make_control(systemd, registry, tmp_path, *, probe=None, free=(50000,),
         # No socket table in the fakes: a port that "answers" in a test is a
         # unit's port, never an adoption, unless the test installs a listener.
         listener_pid=lambda port: None,
+        reap_offload=lambda: [],
     )
 
 
@@ -1509,3 +1510,56 @@ def test_switch_to_the_running_model_refuses_unless_relaunch(tmp_path) -> None:
     assert not isinstance(result.started, Refusal)
     launched = " ".join(systemd.started[-1])
     assert "--max-num-seqs 4" in launched, "the new setting reaches the relaunch"
+
+
+
+# --------------------------------------------------------------------------
+# Orphaned KV offload buffers (2026-09-17)
+# --------------------------------------------------------------------------
+
+
+def test_an_unmapped_offload_buffer_is_reaped_and_a_live_one_is_not(tmp_path) -> None:
+    """vLLM unlinks /dev/shm/vllm_offload_<engine>.mmap only on a graceful
+    exit; a killed or crashed engine leaves 40 GiB of host RAM pinned."""
+    shm = tmp_path / "shm"
+    shm.mkdir()
+    leaked = shm / "vllm_offload_dead.mmap"
+    live = shm / "vllm_offload_live.mmap"
+    other = shm / "psm_1234"
+    for f in (leaked, live, other):
+        f.write_bytes(b"x" * 4096)
+    removed = control.reap_offload_regions(shm, paths_in_use=lambda: {str(live)})
+    assert removed == [(str(leaked), 4096)]
+    assert not leaked.exists()
+    assert live.exists(), "a buffer a process still maps is a running engine's"
+    assert other.exists(), "only vLLM offload buffers are ever touched"
+
+
+def test_paths_in_use_sees_this_process_mapping_a_file(tmp_path) -> None:
+    import mmap
+    f = tmp_path / "vllm_offload_self.mmap"
+    f.write_bytes(b"\0" * 4096)
+    with open(f, "r+b") as fh:
+        m = mmap.mmap(fh.fileno(), 4096)
+        try:
+            assert str(f) in control._paths_in_use()
+        finally:
+            m.close()
+
+
+def test_stop_reaps_after_the_unit_is_gone_and_start_reaps_before_launch(tmp_path) -> None:
+    calls: list[str] = []
+    systemd = FakeSystemd()
+    systemd.add("model-flashnext", main_pid=1000)
+    ctl = make_control(systemd, FakeRegistry(FLASH), tmp_path,
+                       probe=lambda port: ["Qwen3.8-Flash-Next"])
+    def reap():
+        calls.append("reap")
+        return [("/dev/shm/vllm_offload_x.mmap", 40 * 2**30)]
+    ctl._reap_offload = reap
+    stopped = ctl.stop("flashnext")
+    assert isinstance(stopped, control.StopResult)
+    assert stopped.reaped == (("/dev/shm/vllm_offload_x.mmap", 40 * 2**30),)
+    calls.clear()
+    ctl.start("flashnext")
+    assert calls and calls[0] == "reap", "reaped before the launch"

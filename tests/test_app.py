@@ -1317,3 +1317,16 @@ async def test_a_malformed_health_body_does_not_count_as_bound(settings, registr
         assert (
             await _app._own_port_answers(rt.client, rt.settings.health_url, rt.instance_id)
         ) is False
+
+
+
+def test_the_poll_reaps_orphaned_offload_buffers_and_says_so(settings, registry) -> None:
+    """A unit systemd restarts after a crash never passes through
+    control.start, so the poll is what reclaims the buffer it leaked."""
+    class ReapingControl(FakeControl):
+        def reap_offload(self):
+            return [("/dev/shm/vllm_offload_dead.mmap", 40 * 2**30)]
+    rt = _app.build_runtime(settings, registry=registry, control=ReapingControl())
+    _app._collect_facts(rt)
+    notes = [e["data"] for e in rt.hub.notices]
+    assert any(n.get("reason") == "offload_reaped" and "40.0 GiB" in n["message"] for n in notes)

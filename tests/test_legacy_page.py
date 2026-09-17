@@ -236,3 +236,44 @@ def test_host_ram_is_read_in_gib() -> None:
     ram = lp.host_ram("MemTotal:       190865040 kB\nMemFree: 1 kB\nMemAvailable:   74108072 kB\n")
     assert ram == {"total_gib": 182.0, "available_gib": 70.7}
     assert lp.host_ram("") == {}
+
+
+
+def test_start_on_the_serving_model_is_refused_and_restart_relaunches(tmp_path) -> None:
+    """v1 refused a start on a model already serving; only restart relaunches."""
+    import asyncio
+    from fastapi.testclient import TestClient
+    from servedeck import app as _app
+    from servedeck.settings import Settings
+
+    calls: list[tuple] = []
+
+    class Ctl:
+        def live(self):
+            return []
+        def adopt(self, **_kw):
+            return None
+        def reconcile(self, *_a, **_kw):
+            return None
+        def switch(self, key, **kw):
+            calls.append(("switch", key, kw.get("relaunch")))
+            return None
+
+    reg = _registry(tmp_path)
+    settings = Settings(listen_host="127.0.0.1", listen_port=8099, models_path=tmp_path / "models.toml",
+                        state_dir=tmp_path / "state", unit_prefix="sd-test-")
+    app = _app.create_app(settings, registry=reg, control=Ctl(), reconcile=False, poll=False)
+    orig = _app._main_holder
+    _app._main_holder = lambda rt, live: "a"
+    try:
+        with TestClient(app) as c:
+            r = c.post("/api/server/start", json={"repo_id": "org/A"})
+            assert r.status_code == 409 and "already serving" in r.json()["error"]
+            r = c.post("/api/server/restart", json={"repo_id": "org/A", "max_num_seqs": 4})
+            assert r.status_code == 202
+            r = c.post("/api/server/restart", json={"repo_id": "org/B"})
+            assert r.status_code == 202
+    finally:
+        _app._main_holder = orig
+    import time; time.sleep(0.3)
+    assert ("switch", "a", True) in calls and ("switch", "b", False) in calls

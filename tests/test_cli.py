@@ -168,12 +168,15 @@ def isolated_doctor_client_files(tmp_path, monkeypatch):
     monkeypatch.setattr(wire, "KIMI_CONFIG_PATH", tmp_path / "no-kimi.toml")
 
 
-def test_doctor_command_all_ok_with_safe_ports(safe_toml, isolated_doctor_client_files, tmp_path, capsys):
-    # No --systemd-dir override: check_model_units does a real, read-only
-    # `systemctl --user list-units 'model-*'` (never start/stop/enable —
-    # allowed by the hard rules the same way the live :8007/:8010 GETs are).
-    # There is no real model-a unit, so this is "not running" (ok), not a
-    # failure — confirmed empty by `systemctl --user list-units 'model-*'`.
+def test_doctor_command_all_ok_with_safe_ports(safe_toml, isolated_doctor_client_files, tmp_path, capsys, monkeypatch):
+    # The unit check is pinned to an empty unit list. It used to run a real
+    # `systemctl --user list-units 'model-*'`, so the test failed whenever the
+    # box was serving a real model (2026-09-17: model-flashnext was live and
+    # doctor rightly said this one-model test registry does not know it).
+    from servedeck import doctor as _doctor
+    real = _doctor.run_doctor
+    monkeypatch.setattr(_doctor, "run_doctor",
+                        lambda path, **kw: real(path, unit_run=_no_units, **kw))
     rc = cli.main(["doctor", "--models-toml", str(safe_toml)])
     out = capsys.readouterr().out
     assert "registry loads" in out
@@ -238,3 +241,10 @@ def test_console_script_points_at_cli_main():
     pyproject = REPO_ROOT / "pyproject.toml"
     data = tomllib.loads(pyproject.read_text())
     assert data["project"]["scripts"]["servedeck"] == "servedeck.cli:main"
+
+
+
+def _no_units(argv):
+    """A systemctl stand-in that knows no units: list-units prints nothing."""
+    import subprocess
+    return subprocess.CompletedProcess(list(argv), 0, stdout="", stderr="")

@@ -303,6 +303,21 @@ def _unit_started_at(rt: Runtime, unit: str, pid: int) -> float | None:
 
 def _collect_facts(rt: Runtime) -> dict[str, Any]:
     """The blocking half of a state build: systemd, nvidia-smi, desired state."""
+    # A crashed unit is restarted by systemd (Restart=on-failure) without
+    # passing through control.start, so the reaper also runs here, every poll:
+    # a buffer the dead engine left in /dev/shm is gone seconds later, long
+    # before the restarted engine allocates its own.
+    reap = getattr(rt.control, "reap_offload", None)
+    if callable(reap):
+        try:
+            for path, size in reap():
+                rt.hub.publish("notice", {
+                    "level": "warn", "reason": "offload_reaped",
+                    "message": f"freed {size / 2**30:.1f} GiB of host RAM: {path} was left "
+                               "behind by a vLLM engine that did not shut down cleanly",
+                })
+        except Exception:  # noqa: BLE001 - the reaper must never break the poll
+            log.exception("offload reaper failed")
     live = rt.routes.refresh()
     uptimes: dict[str, float | None] = {}
     for key, view in live.items():
