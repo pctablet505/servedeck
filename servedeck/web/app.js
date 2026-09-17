@@ -1222,9 +1222,19 @@ function paintTelemetry(t) {
   set("kvPct", reachable ? Math.round(kvp * 100) + "%" : "—");
   // Prefix cache hit rate is the "is caching working?" number. It is NOT
   // kv_cache_usage_perc, which is in-flight occupancy and drops to 0 when idle.
+  // Both tiers: a lookup reaches the CPU-offload tier only by missing the GPU
+  // one, so the GPU rate alone FALLS as the 40 GiB offload does more work.
   const hr = liveMetrics.prefix_hit_rate;
   const hrEl = $("hitRate");
-  if (hrEl) hrEl.textContent = (reachable && hr != null) ? (hr * 100).toFixed(1) + "%" : "—";
+  if (hrEl) {
+    hrEl.textContent = (reachable && hr != null) ? (hr * 100).toFixed(1) + "%" : "—";
+    const g = liveMetrics.prefix_hit_rate_gpu, c = liveMetrics.prefix_hit_rate_cpu;
+    hrEl.title = (reachable && g != null)
+      ? "GPU tier " + (g * 100).toFixed(1) + "%"
+        + (c != null ? "; of the lookups that missed it, the CPU offload served "
+            + (c * 100).toFixed(1) + "%" : "")
+      : "";
+  }
   // Must be a fraction of what the RUNNING engine allocated. Using the
   // selected model's estimate here showed 1.6M tokens for a server that has
   // 272k - the selected model was not the one running.

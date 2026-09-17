@@ -246,12 +246,20 @@ def _cmd_status(args: argparse.Namespace) -> int:
     print(f"gateway  {state['gateway_url']}")
     print(f"gpu      {_fmt_num(gpu.get('free_mib'))} MiB free of {_fmt_num(gpu.get('total_mib'))}")
     if head.get("source"):
+        # Two ALTERNATIVES, never a sum. Each figure is what the whole pool
+        # holds of one request shape, computed independently, so "1 + 12"
+        # described a mix that cannot exist: by the same cost model one
+        # full-context request already needs more than the pool (it is the
+        # max(1, ...) clamp, not a fit), which leaves nothing for the twelve.
         print(
             f"headroom {head['full_context_requests']} full-context "
-            f"({_fmt_num(head['full_ctx'])}) + {head['small_requests']} "
+            f"({_fmt_num(head['full_ctx'])}), OR {head['small_requests']} "
             f"{_fmt_num(head['small_request_tokens'])}-token requests "
             f"— {head['source']}"
         )
+        mixed = head.get("mixed")
+        if mixed:
+            print(f"         mixed: {mixed}")
     elif head.get("unavailable"):
         print(f"headroom unknown — {head['unavailable']}")
     for stray in state.get("unknown_units") or []:

@@ -862,3 +862,30 @@ def test_a_build_without_the_histogram_reports_an_empty_window_not_a_crash() -> 
     snaps = _scrape_all([_exposition(), _exposition()], [100.0, 102.0])
     assert snaps[1].prompt_stats["n"] == 0
     assert snaps[1].prompt_stats["p90"] is None
+
+
+def test_the_hit_rate_counts_both_cache_tiers() -> None:
+    """With a 40 GiB CPU-offload buffer the GPU-tier rate alone is the wrong
+    number: a lookup reaches the CPU tier only by missing the GPU one, so the
+    GPU rate FALLS as the offload starts working. The live engine on
+    2026-09-18 read 30.4% GPU, 89.3% of GPU misses served from host RAM, and
+    92.6% overall — the page was showing 30.4%."""
+    text = "\n".join([
+        'vllm:prefix_cache_queries_total{engine="0"} 1000.0',
+        'vllm:prefix_cache_hits_total{engine="0"} 300.0',
+        'vllm:external_prefix_cache_queries_total{engine="0"} 700.0',
+        'vllm:external_prefix_cache_hits_total{engine="0"} 630.0',
+    ])
+    snap = _scrape_all([text], [1.0])[0]
+    assert snap.prefix_hit_rate_gpu == 0.3
+    assert snap.prefix_hit_rate_cpu == 0.9
+    assert snap.prefix_hit_rate == pytest.approx(0.93), "300 + 630 of 1000 lookups"
+    d = snap.to_dict()
+    assert d["prefix_hit_rate"] == 0.93 and d["prefix_hit_rate_gpu"] == 0.3
+
+
+def test_the_hit_rate_is_none_before_any_lookup() -> None:
+    """None, not 0%: an engine that has served nothing has no hit rate, and
+    0% reads as a broken cache."""
+    snap = _scrape_all([""], [1.0])[0]
+    assert snap.prefix_hit_rate is None and snap.prefix_hit_rate_gpu is None

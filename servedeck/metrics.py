@@ -130,6 +130,15 @@ CACHE_CONFIG = "vllm:cache_config_info"
 SUCCESS_TOTAL = "vllm:request_success_total"
 PREFIX_HITS = "vllm:prefix_cache_hits_total"
 PREFIX_QUERIES = "vllm:prefix_cache_queries_total"
+#: The CPU-offload tier's counters. Every lookup starts at the GPU tier and
+#: only a GPU MISS reaches this one — measured on the live engine, external
+#: queries equal GPU queries minus GPU hits exactly. So the GPU-tier rate on
+#: its own is not "is caching working": with a 40 GiB offload buffer it FALLS
+#: as the offload starts doing work. On 2026-09-18 the engine's own counters
+#: read 30.4% at the GPU tier, 89.3% of GPU misses served from host RAM, and
+#: 92.6% of all lookups served from one tier or the other.
+EXTERNAL_PREFIX_HITS = "vllm:external_prefix_cache_hits_total"
+EXTERNAL_PREFIX_QUERIES = "vllm:external_prefix_cache_queries_total"
 #: When the process that owns every counter on this page started, as a unix
 #: timestamp. prometheus_client's own process collector, not a vLLM family;
 #: present in every full live exposition recorded under tests/fixtures
@@ -390,7 +399,12 @@ class MetricsSnapshot:
     kv_cache_max_concurrency: float | None = None
     kv_cache_gpu_util: float | None = None
     requests_succeeded: int = 0
-    prefix_hit_rate: float | None = None   # None = no queries yet, NOT 0%
+    #: Lookups served from EITHER cache tier (GPU or the CPU-offload buffer),
+    #: over all lookups. None = no queries yet, NOT 0%.
+    prefix_hit_rate: float | None = None
+    #: The two tiers separately, for the split the page shows beside it.
+    prefix_hit_rate_gpu: float | None = None
+    prefix_hit_rate_cpu: float | None = None
     #: Input / output token totals since the serving process started, their
     #: rates over a ~60 s window, and the prefix-cache share of the input. Built
     #: by tokens.TokenLedger; the default is the unreachable block, so a
@@ -443,6 +457,12 @@ class MetricsSnapshot:
             "requests_succeeded": self.requests_succeeded,
             "prefix_hit_rate": (
                 None if self.prefix_hit_rate is None else round(self.prefix_hit_rate, 4)
+            ),
+            "prefix_hit_rate_gpu": (
+                None if self.prefix_hit_rate_gpu is None else round(self.prefix_hit_rate_gpu, 4)
+            ),
+            "prefix_hit_rate_cpu": (
+                None if self.prefix_hit_rate_cpu is None else round(self.prefix_hit_rate_cpu, 4)
             ),
             "tokens": self.tokens,
             "error": self.error,
@@ -635,7 +655,12 @@ class MetricsPoller:
         # working". kv_cache_usage_perc is unrelated: it is in-flight block
         # occupancy and correctly drops to 0 between requests.
         hits, queries = _first(p, PREFIX_HITS), _first(p, PREFIX_QUERIES)
-        snap.prefix_hit_rate = (hits / queries) if queries > 0 else None
+        ext_hits, ext_queries = _first(p, EXTERNAL_PREFIX_HITS), _first(p, EXTERNAL_PREFIX_QUERIES)
+        snap.prefix_hit_rate_gpu = (hits / queries) if queries > 0 else None
+        snap.prefix_hit_rate_cpu = (ext_hits / ext_queries) if ext_queries > 0 else None
+        # Combined against the GPU tier's query count, because that is every
+        # lookup: a lookup reaches the CPU tier only by missing the GPU one.
+        snap.prefix_hit_rate = ((hits + ext_hits) / queries) if queries > 0 else None
 
         gen_total = _first(p, GEN_TOK_TOTAL)
         # Prefill work = prompt tokens that were actually computed. A token

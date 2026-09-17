@@ -377,6 +377,8 @@ def _headroom(
         # available branch throws on the other one.
         "full_cost_tokens": None,
         "small_cost_tokens": None,
+        "mixed": None,
+        "mixed_rows": None,
     }
     if main_key is None:
         base["unavailable"] = "no model holds the main slot"
@@ -402,16 +404,41 @@ def _headroom(
         prompt_tokens=SMALL_REQUEST_TOKENS,
         basis=f"{SMALL_REQUEST_TOKENS}-token request",
     )
+    # The two figures above are ALTERNATIVES — each is what the whole pool
+    # holds of one request shape. Printing them as "1 + 12" claimed a mix
+    # that the same cost model forbids, so the honest mixed answer comes from
+    # the module that actually shares the pool between shapes.
+    mixed = _parallelism.mixed_capacity(
+        pool_tokens=int(pool),
+        full_ctx=full_ctx,
+        sizes={"small": (float(SMALL_REQUEST_TOKENS), True)},
+        max_num_seqs=(snapshot or {}).get("max_num_seqs"),
+    )
+    beside = {big: row.get("small", 0) for big, row in mixed.rows}
     base.update(
         pool_tokens=int(pool),
         full_context_requests=full.n_before_clamp,
         full_cost_tokens=full.cost_tokens,
         small_requests=small.n_before_clamp,
         small_cost_tokens=small.cost_tokens,
+        mixed=_mixed_sentence(beside, full_ctx),
+        mixed_rows=beside,
         source="measured from the running engine",
         note=_parallelism.calibration_note(main_id),
     )
     return base
+
+
+def _mixed_sentence(beside: dict[int, int], full_ctx: int) -> str | None:
+    """"one full-context request leaves room for N small ones" — the figure
+    the two headline numbers cannot be added into."""
+    if not beside:
+        return None
+    parts = [
+        f"{big} full-context + {small} of {SMALL_REQUEST_TOKENS:,}"
+        for big, small in sorted(beside.items())
+    ]
+    return "; ".join(parts)
 
 
 async def build_state(rt: Runtime) -> dict[str, Any]:

@@ -1,117 +1,78 @@
 # Servedeck
 
-One control plane for the local LLMs on one box: a registry, a supervisor, a
-normalising gateway and a page.
+One control plane for the local LLMs on this box. `models.toml` is the registry
+(`qwen27b`, `flashnext`, `glm53`, `lfm2`); a user unit running `python -m servedeck`
+serves a page, a JSON API and an OpenAI-compatible gateway on
+**http://127.0.0.1:8010** (gateway under `/v1`); each model runs as its own
+transient unit `model-<key>` started with `systemd-run`, so restarting servedeck
+never touches a running engine. It replaced v1's `llm` shell launcher (now a shim
+at `~/.local/bin/llm` that prints "servedeck owns this box" and exits 2), the two
+reasoning-mirroring proxies on :8005/:8006, and hand-edited client configs.
+Loopback only, no external network requests, never `sudo`.
 
-- **One file describes every model** — `models.toml`. Names, aliases, port,
-  context, parsers, flags, environment.
-- **One URL for every client** — `http://127.0.0.1:8010/v1`. VS Code, Codex,
-  Kimi, Claude Code and scripts all point at it, whichever model is loaded.
-- **One command to run one** — `servedeck switch glm53`. The model runs as its
-  own transient systemd unit, so restarting servedeck never touches it.
+Every client — Codex, Kimi CLI, VS Code chat — points at that `/v1` and asks for
+the model named **`main`**, the gateway alias for whatever holds the main slot,
+so nothing needs reconfiguring when the model changes.
 
-Binds loopback only, makes no external network requests, and never runs `sudo`.
-
----
-
-## Requirements
-
-- Linux with a user systemd instance (`systemctl --user`), Python 3.11+
-- An NVIDIA GPU with `nvidia-smi` on `PATH`
-- A vLLM venv per build, named in `[builds]` in `models.toml`
-
-## Install
+## The five commands
 
 ```bash
-git clone https://github.com/pctablet505/servedeck && cd servedeck
-uv venv .venv
-uv pip install -e '.[dev]'
+servedeck status              # what is live: slot, ctx, KV %, run/wait, tok/s, uptime, headroom
+servedeck switch flashnext    # put this model in the main slot, evicting whatever is there
+servedeck start lfm2          # start (or stop) one model, streaming its boot log until READY
+servedeck doctor              # prove the registry against reality before believing anything else
+servedeck wire --apply        # rewrite the client configs (no flag = dry-run diff)
 ```
 
-Then describe your models in `models.toml` — see
-**[docs/CONFIGURATION.md](docs/CONFIGURATION.md)** — and check it:
+`start`, `stop`, `switch`, `log` and `adopt` drive the running dashboard over
+HTTP and fall back to the same supervisor in-process when it is down, saying
+which on the first line. `models`, `adopt`, `log` and `smoke` also exist — see
+[docs/OPERATIONS.md](docs/OPERATIONS.md).
+
+## The page
+
+`http://127.0.0.1:8010` — v1's dashboard, served on the v2 backend via
+`servedeck/legacy_page.py`: gateway URL and GPU memory in the header; what is
+serving, with decode and prefill tok/s, time to first token, KV in use,
+requests held back by a full pool, preemptions; the model list and machine
+facts; a **Configure** panel (utilisation, max context, parallel agents, KV
+offload, then Apply & restart or Stop); the prompt-size histogram the agent
+count is sized on; traffic totals and a folded server log.
+
+## Logs
 
 ```bash
-.venv/bin/servedeck models
-.venv/bin/servedeck doctor
+journalctl --user -u servedeck -f          # servedeck itself, including its own logger
+journalctl --user -u model-flashnext -f    # one model's engine (unit is model-<key>)
+servedeck log flashnext -n 200             # the same journal, through the CLI
 ```
 
-## Run the server
+## When something is wrong
 
-```bash
-python -m servedeck                  # http://127.0.0.1:8010
-python -m servedeck --no-reconcile   # serve, but start nothing from desired.json
-```
+Run `servedeck doctor`. Besides the registry it checks the host rows that
+explain most surprises: `kernel.yama.ptrace_scope` (must be 0, or the KV-offload
+reaper cannot see a sibling engine and Flash-Next's PLE handoff fails), desired
+state naming a model that is not running, weights on disk, leaked
+`/dev/shm/vllm_offload_*.mmap` buffers at 40 GiB each, and the GPU power cap.
+Playbooks: [docs/OPERATIONS.md](docs/OPERATIONS.md#recovery).
 
-Or as a unit, which is how it should run on a box you care about:
+## The rest of the docs
 
-```bash
-cp systemd/servedeck.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now servedeck
-journalctl --user -u servedeck -f
-```
+| Doc | What it answers |
+| --- | --- |
+| [docs/OPERATIONS.md](docs/OPERATIONS.md) | Daily use: switching, the page, reboot behaviour, logs, recovery |
+| [docs/CLIENTS.md](docs/CLIENTS.md) | Codex, Kimi, VS Code wiring, `reasoning_content`, presets, adding a tool |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Registry, units, gateway, adoption, offload reaper, state, the poll |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | `models.toml` and `servedeck.toml`: every key and its default |
+| [docs/HOST.md](docs/HOST.md) | GPU, power cap, Xid history, sysctl, RAM, /dev/shm, PCIe, disk |
+| [docs/BUILDS.md](docs/BUILDS.md) | The three vLLM builds: forks, patches, venvs, rebuilding, drift checks |
+| [docs/models/flashnext.md](docs/models/flashnext.md) | Flash-Next: flags and their reasons, measured performance, ceilings |
+| [docs/models/qwen27b.md](docs/models/qwen27b.md) | Qwen3.8-27B: same |
+| [docs/models/glm53.md](docs/models/glm53.md) | GLM-5.3: same |
+| [docs/models/lfm2.md](docs/models/lfm2.md) | LFM2.5-350M: same |
+| [docs/DECISIONS.md](docs/DECISIONS.md) | The owner's standing rules, dated, each with its reason |
 
-The unit template assumes the checkout is at `~/Projects/servedeck`; edit
-`WorkingDirectory` and `ExecStart` if it is not.
-
-## The CLI
-
-```
-servedeck models              # the registry: key, id, slot, port, build, ctx
-servedeck status              # what is live, KV usage, tok/s, uptime, headroom
-servedeck start  <key>        # start a model and stream its boot
-servedeck stop   <key>
-servedeck switch <key>        # replace whatever holds the exclusive main slot
-servedeck adopt               # record already-running units as desired
-servedeck log    <key> -n 200 # tail its journal
-servedeck smoke  <key>        # one chat + one tool call, through the gateway
-servedeck wire [--apply]      # regenerate VS Code / Codex / Kimi configs
-servedeck doctor              # prove the registry against reality
-```
-
-`start`, `stop`, `switch`, `log` and `adopt` drive the dashboard over HTTP when
-it is up, and fall back to driving the same supervisor in-process when it is
-not — saying which on the first line. A CLI whose only mode is "ask the thing
-that is not running" fails exactly when it is needed.
-
-`smoke` goes **through the gateway, on the model's public name**, never at the
-model's own port. That is the point: what it proves is that the name a client
-is configured with reaches the weights.
-
-## What the page shows
-
-Driven entirely by `/api/state`, with an SSE stream for boot progress.
-
-- **Live models** — id and aliases, slot, port, context, KV usage, requests in
-  flight, tok/s, uptime, restarts.
-- **Headroom** — free VRAM, and how many full-context and 4k requests still fit
-  in the engine's *own reported* KV pool. When that number is unknown the panel
-  says so instead of estimating.
-- **Controls** — start, stop, switch, wire, doctor. Each is one POST plus a
-  stream of the unit's journal until READY or failure.
-
-## Docs
-
-- **[CONFIGURATION.md](docs/CONFIGURATION.md)** — `models.toml` and the five
-  environment variables
-- **[SPEC.md](docs/SPEC.md)** — every route, every response shape
-- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** — the module map and the
-  dependency rules
-- **[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** — the failures that
-  actually happened, and what v2 does about them
-- **[REDESIGN-2026-09-12.md](docs/REDESIGN-2026-09-12.md)** — why v2 looks like
-  this
-
-## Tests
-
-```bash
-.venv/bin/python -m pytest -q
-```
-
-The end-to-end tests drive the real `systemd-run` path under the `sd-test-`
-unit namespace, so they can never create, adopt or stop a real model unit.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+Development: `uv venv .venv && uv pip install -e '.[dev]'`, then
+`.venv/bin/python -m pytest -q`. The end-to-end tests drive the real
+`systemd-run` path under the `sd-test-` unit namespace, so they can never
+create, adopt or stop a real model unit. MIT — see [LICENSE](LICENSE).

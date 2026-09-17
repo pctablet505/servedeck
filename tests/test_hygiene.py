@@ -154,6 +154,14 @@ def _tracked_files() -> list[Path]:
         rel = path.relative_to(ROOT)
         if rel.parts[0] in {".git", ".venv", "builds", "dist", "state", ".pytest_cache"}:
             continue
+        # docs/imported-2026-09/ is a verbatim archive of documents and
+        # launchers from trees that were never in git (local_llm,
+        # vllm-qwen38next, coldstart). Sweeping it would assert things about
+        # history rather than about this project: every rule below — the
+        # pre-rename name, pgrep, /tmp paths — is exactly what those files
+        # are kept as evidence OF.
+        if rel.parts[:2] == ("docs", "imported-2026-09"):
+            continue
         out.append(path)
     return sorted(out)
 

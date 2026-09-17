@@ -1433,3 +1433,28 @@ def test_a_cross_origin_write_to_the_control_api_is_refused(settings, registry) 
         # Reads are not writes, and the gateway is deliberately left open: a
         # local tool calling /v1 from a browser page cannot change anything.
         assert c.get("/api/state", headers={"Origin": "https://evil.example"}).status_code == 200
+
+
+def test_the_headroom_line_gives_alternatives_and_a_real_mix(settings, registry) -> None:
+    """"1 full-context + 12 small" was two independently computed maxima
+    printed as a sum: by the same cost model one full-context request already
+    needs more than the whole pool (the 1 is a max(1, ...) clamp, not a fit),
+    which leaves nothing for the twelve. Found 2026-09-18."""
+    key = next(iter(registry.models))
+    ctx = registry.models[key].ctx
+    head = _app._headroom(
+        main_key=key,
+        main_id=registry.models[key].id,
+        full_ctx=ctx if isinstance(ctx, int) else 32768,
+        snapshot={"kv_cache_size_tokens": 280813, "max_num_seqs": 16},
+        free_mib=4000,
+    )
+    assert head["source"], head
+    # Each headline figure is what the WHOLE pool holds of that shape.
+    assert head["full_context_requests"] >= 1 and head["small_requests"] >= 1
+    # And the mixed answer is computed by the module that shares the pool,
+    # so the two cannot be added into a fiction.
+    assert head["mixed_rows"] is not None
+    for big, small in head["mixed_rows"].items():
+        if big and head["full_cost_tokens"] > head["pool_tokens"]:
+            assert small == 0, "nothing fits beside a request bigger than the pool"
