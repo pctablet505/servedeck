@@ -25,79 +25,63 @@
 
 <main>
 
-<!-- The one thing most visits are for: what holds the main slot right now,
-     and the four things you can do about it. Always visible, no scrolling
-     -- everything else is a collapsed block below. -->
-<section class="primary">
-  <div class="row main-row">
-    <div class="main-id">
-      <span class="strong" id="mainName"></span>
-      <span class="sub" id="mainState"></span>
-    </div>
-    <span class="stat">ctx <span class="num" id="mainCtx"></span></span>
-    <span class="stat">KV <span class="num" id="mainKv"></span></span>
-    <span class="stat">q <span class="num" id="mainQueue"></span></span>
-    <span class="stat">rate <span class="num" id="mainRate"></span></span>
-    <span class="stat">up <span class="num" id="mainUptime"></span></span>
-    <span class="stat">restarts <span class="num" id="mainRestarts"></span></span>
+<section>
+  <h2>Live</h2>
+  <div class="scroll">
+    <table class="grid">
+      <thead><tr>
+        <th>model</th><th>slot</th><th>unit</th><th>ctx</th><th>KV</th>
+        <th>running / waiting</th><th>tok/s</th><th>uptime</th><th>restarts</th><th></th>
+      </tr></thead>
+      <tbody id="liveBody"></tbody>
+    </table>
   </div>
+  <p class="note" id="liveNote"></p>
+  <pre class="log" id="logOut"></pre>
+</section>
+
+<section>
+  <h2>Main slot</h2>
   <div class="row">
     <select id="mainSel"></select>
     <button id="mainBtn" type="button">Start</button>
-    <button id="mainStopBtn" type="button">Stop</button>
-    <button id="mainRestartBtn" type="button">Restart</button>
   </div>
   <p class="note" id="mainNote"></p>
   <p class="prog" id="mainProg"></p>
+  <pre class="log" id="mainLog"></pre>
 </section>
 
-<details id="moreDetails">
-  <summary>More models</summary>
+<section>
+  <h2>Residents</h2>
   <div class="cards" id="resList"></div>
-  <div id="liveWrap" hidden>
-    <div class="scroll">
-      <table class="grid">
-        <thead><tr>
-          <th>model</th><th>slot</th><th>unit</th><th>ctx</th><th>KV</th>
-          <th>running / waiting</th><th>tok/s</th><th>uptime</th><th>restarts</th><th></th>
-        </tr></thead>
-        <tbody id="liveBody"></tbody>
-      </table>
-    </div>
-    <p class="note" id="liveNote"></p>
-    <pre class="log" id="logOut"></pre>
-  </div>
-</details>
+</section>
 
-<details id="logDetails">
-  <summary>Log</summary>
-  <pre class="log" id="mainLog"></pre>
-</details>
-
-<details id="headroomDetails">
-  <summary>Headroom</summary>
+<section>
+  <h2>Headroom</h2>
   <ul class="lines" id="hrList"></ul>
-</details>
+</section>
 
-<details id="wiringDetails">
-  <summary>Wiring &amp; doctor</summary>
+<section>
+  <h2>Wiring</h2>
   <div class="row">
     <button id="wireBtn" type="button">Regenerate client configs</button>
     <button id="wireApply" type="button" hidden>Apply</button>
   </div>
   <pre class="log" id="wireOut"></pre>
-  <div class="scroll">
-    <table class="grid">
-      <thead><tr><th>check</th><th>ok</th><th>detail</th></tr></thead>
-      <tbody id="docTable"></tbody>
-    </table>
+  <div id="docWrap" hidden>
+    <div class="scroll">
+      <table class="grid">
+        <thead><tr><th>check</th><th>ok</th><th>detail</th></tr></thead>
+        <tbody id="docTable"></tbody>
+      </table>
+    </div>
   </div>
-</details>
+</section>
 
-<details id="eventsDetails">
-  <summary>Events</summary>
+<section>
+  <h2>Events</h2>
   <ol class="events" id="evList"></ol>
-</details>
+</section>
 
 </main>
 

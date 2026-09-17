@@ -101,35 +101,24 @@ main {
   margin: 0 auto;
   padding: 16px;
   display: grid;
-  gap: 12px;
+  gap: 16px;
 }
 
-.primary, details {
+section {
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: var(--r);
   padding: 12px 14px;
 }
-.primary { border-color: var(--accent); }
-
-details > summary + * { margin-top: 10px; }
-details[open] > :not(summary):not(:first-of-type) { margin-top: 8px; }
-
-summary {
-  cursor: pointer;
+section h2 {
+  margin: 0 0 10px;
   font-size: 12px;
-  font-weight: 600;
   text-transform: uppercase;
   letter-spacing: .08em;
   color: var(--muted);
 }
-summary:hover { color: var(--ink); }
 
 .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-.main-row { row-gap: 6px; }
-.main-id { display: flex; align-items: baseline; gap: 8px; min-width: 150px; }
-.main-id .strong { font-size: 15px; }
-.stat { font-size: 12px; color: var(--muted); white-space: nowrap; }
 .scroll { overflow-x: auto; }
 
 /* -- tables ------------------------------------------------------------- */

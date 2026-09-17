@@ -351,22 +351,6 @@ def test_uptime_switches_units_at_ninety_seconds_and_at_an_hour() -> None:
     assert got == ["89s", "1m", "1h 30", EM], got
 
 
-def test_main_state_text_is_one_of_the_four_words() -> None:
-    """The primary panel's state word. A holder's own `ready` flag always
-    wins over what the page remembers about how it got there -- once the unit
-    is live, that is the only truth left to show."""
-    ready = {"ready": True}
-    booting_holder = {"ready": False}
-    got = _run(
-        "[mainStateText(" + json.dumps(ready) + ", false, false),"
-        " mainStateText(" + json.dumps(booting_holder) + ", false, true),"
-        " mainStateText(null, true, false),"
-        " mainStateText(null, false, true),"
-        " mainStateText(null, false, false)]"
-    )
-    assert got == ["READY", "booting", "booting", "FAILED", "stopped"], got
-
-
 def test_a_live_row_with_no_throughput_never_says_zero_tok_s(state_doc: dict) -> None:
     """`gen_tok_s: null` with `gen_state: "idle"` means nothing ran in the
     sampling window. The cell says so; it does not invent a rate."""
@@ -615,40 +599,6 @@ def test_every_element_the_painters_write_to_exists_in_the_page() -> None:
     assert not (html_ids - js_ids), (
         f"index.html has element(s) no painter ever fills: {sorted(html_ids - js_ids)}"
     )
-
-
-#: The one primary panel is the whole answer for the common case: start,
-#: stop, switch, or restart the main model, plus the columns the old Live
-#: table carried, all without scrolling. Every id below must exist in the
-#: served HTML -- it is what makes that panel the thing you land on.
-PRIMARY_PANEL_IDS = (
-    "mainName", "mainState", "mainCtx", "mainKv", "mainQueue", "mainRate",
-    "mainUptime", "mainRestarts", "mainSel", "mainBtn", "mainStopBtn",
-    "mainRestartBtn", "mainNote", "mainProg",
-)
-
-#: Everything else is opt-in: a <details> the operator expands, never open by
-#: default in what the server actually sends over the wire (app.js may open
-#: one at runtime -- localStorage, or an auto-open condition -- but that is a
-#: client-side decision, not something baked into the markup).
-SECONDARY_BLOCK_IDS = ("moreDetails", "logDetails", "headroomDetails", "wiringDetails", "eventsDetails")
-
-
-def test_the_primary_panel_is_whole_and_every_secondary_block_starts_collapsed() -> None:
-    for element_id in PRIMARY_PANEL_IDS:
-        assert f'id="{element_id}"' in INDEX_HTML, f"the primary panel is missing #{element_id}"
-
-    details_tags = re.findall(r"<details\b[^>]*>", INDEX_HTML)
-    assert len(details_tags) == len(SECONDARY_BLOCK_IDS), (
-        f"expected exactly {len(SECONDARY_BLOCK_IDS)} <details> blocks, found {len(details_tags)}: "
-        f"{details_tags}"
-    )
-    for tag in details_tags:
-        assert not re.search(r"\bopen\b", tag), f"a <details> block ships open by default: {tag}"
-    for block_id in SECONDARY_BLOCK_IDS:
-        assert any(f'id="{block_id}"' in tag for tag in details_tags), (
-            f"secondary block #{block_id} is not a <details> element"
-        )
 
 
 def test_the_page_ships_no_external_reference() -> None:
