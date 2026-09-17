@@ -119,3 +119,19 @@ def test_information_sits_with_its_question() -> None:
     assert 'id="hitRate"' in cache_cell
     header = INDEX.split('<div class="top">')[1].split('<div class="grid">')[0]
     assert 'id="gpuName"' not in header and 'id="gpuUsed"' in header
+
+
+def test_the_big_blocks_are_direct_children_of_the_wrapper() -> None:
+    """A balanced div count is not enough (2026-09-17: one stray close at the
+    top and one missing close inside the allocator balanced each other and put
+    the log and footer inside the grid). Walk the nesting instead."""
+    depth = 0
+    at = {}
+    for line in INDEX.split("\n"):
+        for key in ('class="grid"', 'id="logPanel"', 'class="foot"', 'class="vram"', 'class="alloc"'):
+            if key in line:
+                at[key] = depth
+        depth += len(re.findall(r"<div\b", line)) - line.count("</div>")
+    assert depth == 0
+    assert at['class="grid"'] == 1 and at['id="logPanel"'] == 1 and at['class="foot"'] == 1
+    assert at['class="vram"'] == at['class="alloc"'] + 1, "the VRAM bar is a child of the allocator"

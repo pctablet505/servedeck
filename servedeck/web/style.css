@@ -450,3 +450,5 @@ input[type=range]:focus-visible{outline:2px solid var(--accent);outline-offset:3
 .kvgauge .gbig{font-size:18px;font-weight:600;letter-spacing:-.02em}
 .kvgauge canvas{align-self:center;width:180px;height:28px}
 .status-row .queued{margin-left:0}
+.kvgauge .lk{white-space:nowrap}
+.kvgauge canvas{flex:0 0 180px}

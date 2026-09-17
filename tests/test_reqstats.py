@@ -390,14 +390,14 @@ def test_exact_observations_are_binned_finer_than_the_engine_buckets() -> None:
     assert len(fine["bins"]) > 1, fine["bins"]
 
 
-def test_the_fine_step_keeps_the_exact_observations_inside_about_40_bars() -> None:
+def test_the_fine_step_keeps_the_picture_inside_about_20_bars() -> None:
     """A fixed width is either too coarse to add granularity or too fine to
-    read. The step is the smallest round one that fits the span in ~40 bars."""
+    read. The step is the smallest round one that fits the axis in ~20 bars."""
     win = RequestWindow()
     feed_exact(win, [20_001.0 + i * 5_000.0 for i in range(30)])  # span ~170k
     fine = win.stats().to_dict()["fine"]
     span = 20_001.0 + 29 * 5_000.0 - 20_001.0
-    assert span / fine["step"] <= 40, f"{fine['step']} gives too many bars"
+    assert span / fine["step"] <= 20, f"{fine['step']} gives too many bars"
     # and the next-coarser step would have been too few to be worth it
     assert span / fine["step"] > 1, fine["step"]
 
@@ -506,3 +506,30 @@ def test_a_transient_scrape_failure_does_not_clear_the_window() -> None:
     w.observe(cumulative({1000.0: 5}), hist_sum=5 * 1000.0, hist_count=5.0)
 
     assert len(w) == 5, "a transient failure emptied a window the engine never reset"
+
+
+
+def test_a_wide_axis_from_an_interval_widens_the_bars_too() -> None:
+    """2026-09-17: 100 exact requests between 30k and 50k beside one request
+    known only to be in (100000, 262144] were drawn as 100 slivers, because
+    the step came from the exact span while the axis ran to 262k. The step
+    now follows the axis: ~16k bars over 262k, never a hundred."""
+    import math
+    win = RequestWindow(maxlen=200)
+    base = [(1000.0, 0), (10000.0, 0), (20000.0, 0), (50000.0, 0), (100000.0, 0), (math.inf, 0)]
+    win.observe(base, hist_sum=0.0, hist_count=0.0, ceiling=262144, ts=100.0)
+    total = 0.0; count = 0
+    for k in range(100):
+        v = 30000 + k * 200
+        total += v; count += 1
+        win.observe([(1000.0, 0), (10000.0, 0), (20000.0, 0), (50000.0, count), (100000.0, count), (math.inf, count)],
+                    hist_sum=total, hist_count=count, ceiling=262144, ts=101.0 + k)
+    st = win.stats()
+    assert st.exact_n == 100
+    assert st.fine["step"] >= 2000 and len(st.fine["bins"]) <= 20
+    # one request the engine only bounded to (100k, ceiling]
+    count += 1; total += 150000
+    win.observe([(1000.0, 0), (10000.0, 0), (20000.0, 0), (50000.0, 100), (100000.0, 100), (math.inf, count)],
+                hist_sum=total, hist_count=count, ceiling=262144, ts=300.0)
+    st = win.stats()
+    assert st.fine["step"] >= 20000 and len(st.fine["bins"]) <= 20, st.fine["step"]

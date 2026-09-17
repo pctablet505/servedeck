@@ -168,13 +168,17 @@ class Bucket:
 
 
 #: Round bin widths for the fine histogram, ascending. The step is the smallest
-#: of these that keeps the exact observations inside ~40 bars, so a workload
-#: spanning 20k..185k gets ~5k bars and a narrow one gets finer ones. A ladder,
-#: not a fixed width, because a fixed width is either too coarse to add
-#: granularity or too fine to be readable depending on the range.
+#: of these that keeps the bars inside ~20 across the AXIS the page draws (the
+#: widest exact or interval-bounded request), so a 0..262k axis gets ~16k bars
+#: and a 0..40k one gets 2k bars. It used to be ~40 bars across the span of
+#: the exact observations alone; on a 262k axis that drew 100 requests as 100
+#: slivers (owner, 2026-09-17: "100 sticks"). A ladder, not a fixed width,
+#: because a fixed width is either too coarse or too fine depending on range.
 _FINE_STEPS: tuple[int, ...] = (
     500, 1000, 2000, 2500, 5000, 10000, 20000, 25000, 50000, 100000,
 )
+#: How many fine bars, at most, across the drawn axis.
+_FINE_BARS = 20
 
 
 @dataclass(frozen=True)
@@ -423,8 +427,8 @@ class RequestWindow:
         gets its token count exactly from delta(_sum) -- and collapsing 90 exact
         counts into 3 bars throws away precision the window actually has.
 
-        So the exact observations are binned on a round step chosen to keep them
-        inside ~40 bars, and the interval observations are returned separately,
+        So the exact observations are binned on a round step chosen to keep the
+        picture inside ~20 bars across its axis, and the interval observations are returned separately,
         still as intervals, for the page to draw as a translucent underlay. The
         two are never added into one bar: an exact count and a "somewhere in
         (20k,50k]" count are different kinds of knowledge, and stacking them
@@ -451,10 +455,13 @@ class RequestWindow:
                 ],
             }
 
-        span = exact[-1] - exact[0]
+        axis = exact[-1]
+        for (_lo, hi) in intervals:
+            if hi != math.inf:
+                axis = max(axis, hi)
         step = _FINE_STEPS[-1]
         for cand in _FINE_STEPS:
-            if span / cand <= 40 or cand == _FINE_STEPS[-1]:
+            if axis / cand <= _FINE_BARS or cand == _FINE_STEPS[-1]:
                 step = cand
                 break
         base = (exact[0] // step) * step
