@@ -78,7 +78,10 @@ id      = "Qwen3.8-27B-NVFP4"
 # entries for this model read GPU_MEM_UTIL="0.95", which is also
 # qwen-server-run.sh's live value and the one memory note
 # qwen27b-xid-root-cause.md records the owner choosing deliberately.
-util    = 0.95
+# 2026-09-27 (owner): the GPU is shared by design (LLM + training + eval concurrently, each on a memory
+# budget). 0.40 leaves ~53 GiB for training beside lfm2 (0.05), keeps the native 262k context, and sits in
+# the proven-safe zone (Xid 13+31 were seen at 0.62/0.92; zero since Aug 24 at 0.47). Was 0.95.
+util    = 0.40
 aliases = ["RadixArk/Qwen3.8-27B-NVFP4", "qwen27b", "inline"]
 repo    = "RadixArk/Qwen3.8-27B-NVFP4"
 slot    = "main"
