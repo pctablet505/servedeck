@@ -316,7 +316,8 @@ TORCH_CUDA_ARCH_LIST = "12.0f"
 id       = "LFM2.5-350M"
 repo     = "LiquidAI/LFM2.5-350M"
 slot     = "resident"
-vram_mib = 3300
+vram_mib = 4895                    # util floor2(4895/97887) = 0.05: owner 2026-09-27 "assign around 5gb gpu to
+                                    # that model" (was 3300 = 0.03); 4894 would floor to 0.04
 port     = 8007
 build    = "stock"
 ctx      = 32768                   # not native (128,000): lfm2-350m.service sizes this
