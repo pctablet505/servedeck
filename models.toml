@@ -187,17 +187,16 @@ VLLM_PLE_CPU_OFFLOAD = "1"
 VLLM_PLE_FP8_CHECKPOINT = "1"
 PYTORCH_ALLOC_CONF = "expandable_segments:True"
 TORCH_CUDA_ARCH_LIST = "12.0f"
-# Targeted DEBUG for the KV-offload stall of 2026-09-30: the engine parked with
-# requests queued and the GPU idle three times in 5h51m (4.7, 14.7 and 4.2 min,
-# 6.7% of wall clock), and the only two lines that would name the stuck request
-# are logger.debug -- v1/core/sched/scheduler.py:771 ("is still in
-# WAITING_FOR_REMOTE_KVS state") and offloading/scheduler.py:1587 ("Skipping
-# stale completed job"). Global VLLM_LOGGING_LEVEL=DEBUG floods the journal, so
-# this config file raises those two loggers only and leaves `vllm` at INFO.
-# VLLM_LOGGING_CONFIG_PATH REPLACES the default config wholesale
-# (vllm/logger.py:179-201), which is why the file restates formatter/handler.
-# Remove this line once the stall is diagnosed and fixed.
-VLLM_LOGGING_CONFIG_PATH = "/home/pctablet505/Projects/servedeck/config/flashnext-kvoffload-debug.logging.json"
+# To watch the KV-offload scheduler again, add back:
+#   VLLM_LOGGING_CONFIG_PATH = "<repo>/config/flashnext-kvoffload-debug.logging.json"
+# That file raises v1/core/sched/scheduler.py and the offloading scheduler to
+# DEBUG and leaves every other logger at INFO; plain VLLM_LOGGING_LEVEL=DEBUG
+# floods the journal instead (measured ~600 lines/min at DEBUG on those two
+# alone). It is off by default because it is a diagnostic, not a setting: the
+# stall it was added for on 2026-09-30 is fixed by
+# builds/patches/flashnext-sched-hol-deadlock-on-external-kv-hit.patch. Note
+# VLLM_LOGGING_CONFIG_PATH REPLACES vLLM's default logging config wholesale
+# (vllm/logger.py:179-201), which is why that file restates formatter/handler.
 
 # --------------------------------------------------------------------------------
 # GLM-5.3-Flash (ABLITERATED, NVFP4) — ~/Projects/vllm-glm53/serve-opt.sh
