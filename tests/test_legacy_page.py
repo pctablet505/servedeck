@@ -393,3 +393,125 @@ def test_the_offload_field_cannot_offer_more_than_dev_shm_holds(tmp_path, monkey
         own_pids=[], ptrace_scope=0, state="READY",
     )
     assert out["offload_max_gib"] == 11, "12 GiB of tmpfs, less 1 GiB of slack"
+
+
+# --------------------------------------------------------------------------
+# What the Configure panel starts from when nothing is running
+# --------------------------------------------------------------------------
+
+
+MODELS_TOML_PINNED = """
+[gpu]
+total_mib = 97887
+margin_mib = 1024
+
+[builds.stock]
+venv = "/opt/stock"
+cuda_home = "/opt/stock/cu13"
+
+[models.flashnext]
+id = "Flash-Next"
+repo = "org/flash"
+slot = "main"
+port = 8001
+build = "stock"
+ctx = 262144
+util = 0.96
+flags = ["--max-num-seqs", "16", "--kv-offloading-size", "40"]
+
+[models.bare]
+id = "Bare"
+repo = "org/bare"
+slot = "main"
+port = 8002
+build = "stock"
+ctx = 4096
+"""
+
+
+def _rows(tmp_path):
+    path = tmp_path / "models.toml"
+    path.write_text(MODELS_TOML_PINNED)
+    registry = _models.load(path)
+    return {
+        r["key"]: r
+        for r in lp.model_rows(registry, [], ctx_for=lambda *a, **k: None, live_keys={})
+    }
+
+
+def test_the_panel_is_told_every_launch_setting_the_registry_pins(tmp_path) -> None:
+    """The Configure panel POSTs util, ctx, max_num_seqs AND kv_offload_gib on
+    every Apply, whether or not the operator touched each control. Only `util`
+    had a registry value to start from, so with nothing running -- the normal
+    case when configuring a launch -- the agent count sat at the page's
+    hardcoded 1 and Apply shipped `--max-num-seqs 1`, overriding the
+    registry's 16 for someone who had only moved the utilisation slider.
+
+    It then stuck: start() records a ready launch into desired.json, and every
+    later start, reconcile and recovery replays it. Seen live 2026-09-20 --
+    eight agents assigned, one running, and five of the seven waiting held for
+    reason="deferred", which is the scheduler's cap and not the KV pool.
+    """
+    rows = _rows(tmp_path)
+    assert rows["flashnext"]["util_pinned"] == 0.96
+    assert rows["flashnext"]["seqs_pinned"] == 16
+    assert rows["flashnext"]["offload_pinned"] == 40.0
+
+
+def test_a_model_that_pins_nothing_reports_none_not_a_default(tmp_path) -> None:
+    """None means "derive it". A zero or a 1 here would be indistinguishable
+    from a registry that really asked for one sequence, which is the failure
+    being fixed -- so the absence has to stay absent."""
+    rows = _rows(tmp_path)
+    assert rows["bare"]["seqs_pinned"] is None
+    assert rows["bare"]["offload_pinned"] is None
+
+
+def test_registry_flag_lookup_is_positional_and_survives_junk() -> None:
+    class M:
+        flags = ("--max-num-seqs", "16", "--kv-offloading-size", "40", "--trailing")
+
+    assert lp._registry_flag_int(M(), "--max-num-seqs") == 16
+    assert lp._registry_flag_float(M(), "--kv-offloading-size") == 40.0
+    assert lp._registry_flag(M(), "--trailing") is None, "a flag with no value has none"
+    assert lp._registry_flag_int(M(), "--absent") is None
+
+    class Equals:
+        flags = ("--max-num-seqs=8",)
+
+    assert lp._registry_flag_int(Equals(), "--max-num-seqs") == 8
+
+    class Bad:
+        flags = ("--max-num-seqs", "lots")
+
+    assert lp._registry_flag_int(Bad(), "--max-num-seqs") is None, "never raise on junk"
+
+
+def test_the_page_falls_back_to_the_pinned_agent_count() -> None:
+    """The JS half of the same fix, asserted on the source because there is no
+    JS runtime here. `runSeqs || seqsPinned` is the whole contract: prefer the
+    running engine, fall back to the registry, and never silently keep 1."""
+    from pathlib import Path
+
+    js = (Path(lp.__file__).parent / "web" / "app.js").read_text(encoding="utf-8")
+    assert "seqs_pinned" in js and "offload_pinned" in js
+    assert "const wantSeqs = runSeqs || seqsPinned;" in js
+
+
+def test_the_apply_confirmation_describes_a_launch_with_nothing_running() -> None:
+    """Every comparison in dirtyBits used to be gated on a LIVE reading, so
+    with nothing running -- the usual state when configuring a launch -- the
+    confirmation listed no changes at all and the operator confirmed a launch
+    nobody had described to them. It is the second half of the same defect:
+    `--max-num-seqs 1` shipped both silently and invisibly.
+
+    Asserted on the source, as there is no JS runtime here. The contract is
+    that each comparison has a registry fallback.
+    """
+    from pathlib import Path
+
+    js = (Path(lp.__file__).parent / "web" / "app.js").read_text(encoding="utf-8")
+    assert "function dirtyBits(facts, sizing, want, pinned) {" in js
+    assert "const refUtil = facts.util_effective || base.util;" in js
+    assert "const refSeqs = sizing.max_num_seqs || base.seqs;" in js
+    assert "seqs: m.seqs_pinned" in js, "the caller must pass the registry's values"

@@ -665,11 +665,27 @@ def _recover_desired(rt: Runtime) -> None:
             ),
         })
         _claim(rt, "start", key, f"recover {key}")
+        # The settings the operator last applied, exactly as control.reconcile
+        # replays them. Recovery is the SAME condition reconcile handles --
+        # "desired names it, nothing is running it" -- and until 2026-09-18 it
+        # was the one path that answered by discarding them: start() with no
+        # util recomputes it from free VRAM, which on a card this recovery just
+        # emptied is 0.98, the value with the OOM-under-concurrency history.
+        # Seen live: an operator restart at util 0.97 / 1 seq / 20 GiB offload
+        # came back from a recovery lap as 0.98 / 16 / 40, and because that
+        # launch requested nothing, start() did not record it either -- so
+        # desired state still read 0.97 while the card ran 0.98.
+        stored = want.launch_for(key)
         asyncio.create_task(
             _run_mutation(
                 rt,
                 f"recover {key}",
-                lambda k=key: rt.control.start(k, on_progress=_progress_publisher(rt.hub, k, rt.boot)),
+                lambda k=key, s=stored: rt.control.start(
+                    k,
+                    on_progress=_progress_publisher(rt.hub, k, rt.boot),
+                    util=s.util,
+                    argv_overrides=s.argv or None,
+                ),
                 action="start",
                 key=key,
             )

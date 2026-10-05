@@ -46,7 +46,7 @@ import urllib.request
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from servedeck import desired as desired_mod
 from servedeck import gpu, units
@@ -73,6 +73,39 @@ __all__ = [
 ]
 
 log = logging.getLogger(__name__)
+
+
+def _argv_int(argv: Sequence[str], flag: str) -> int | None:
+    """The int value of ``flag`` in an argv list, or None."""
+    value = _argv_str(argv, flag)
+    try:
+        return int(value) if value is not None else None
+    except ValueError:
+        return None
+
+
+def _spec_ctx(spec: Any) -> int | None:
+    """The registry's context length for a model, when it is a number.
+
+    ``models.toml`` allows ``ctx = "native"``, which means "whatever the
+    checkpoint says" and is not a measurement key.
+    """
+    for attr in ("ctx_tokens", "ctx"):
+        value = getattr(spec, attr, None)
+        if isinstance(value, int) and value > 0:
+            return value
+    return None
+
+
+def _argv_str(argv: Sequence[str], flag: str) -> str | None:
+    """The value of ``flag`` in an argv list, or None if absent or last."""
+    for i, token in enumerate(argv):
+        if token == flag and i + 1 < len(argv):
+            return argv[i + 1]
+        if token.startswith(flag + "="):
+            return token.split("=", 1)[1]
+    return None
+
 
 UNIT_PREFIX = "model-"
 
@@ -749,6 +782,99 @@ class Control:
             return self._total_mib
         return gpu.total_mib()
 
+    def _record_boot(
+        self,
+        key: str,
+        spec: Any,
+        unit: str,
+        argv: Sequence[str],
+        since: str,
+    ) -> None:
+        """Re-fit this model's capacity constants from the boot that just came up.
+
+        Best-effort by construction: a model is serving by the time this runs,
+        and no failure to *measure* it may turn into a failure to *start* it.
+        Every branch that cannot produce a number returns instead of guessing,
+        because a fabricated observation is worse than none — the resolver
+        picks the most recent entry, so one bad record shadows every good one.
+        """
+        try:
+            from servedeck import bootfacts as _bootfacts
+            from servedeck import capacity as _capacity
+            from servedeck import discovery as _discovery
+
+            # Anchored at this unit's own start, not a tail: a tail's line
+            # count would have to cover both the chattiest possible boot
+            # (torch.compile plus 97 FlashInfer JIT objects) and any traffic
+            # that arrived before this ran. Measured against the live unit, a
+            # 2000-line tail found nothing at all.
+            lines = units.journal_since(unit, since, run=self._run)
+            facts = _bootfacts.parse(lines)
+            if facts.kv_tokens is None and facts.kv_gib is None:
+                log.debug("boot of %s printed no KV figures; not recorded", key)
+                return
+
+            repo_id = getattr(spec, "repo", None) or getattr(spec, "id", key)
+            # The backend string the RESOLVER keys on, which is the one
+            # discover_models() derives from the hub cache -- not models.toml's
+            # `build`. They differ here: the hub says "flashnext" where the
+            # registry says "qwen38next", and resolve_inputs filters
+            # observations by the hub's value. An entry tagged with the other
+            # one is written, kept, and then silently skipped at read time,
+            # which is indistinguishable from never having measured at all.
+            backend = next(
+                (
+                    e.backend
+                    for e in _discovery.discover_models()
+                    if e.repo_id == repo_id and e.backend
+                ),
+                getattr(spec, "build", None) or "",
+            )
+            store = _discovery.load_observations()
+            # Weights are a property of the checkpoint, not of the launch, and
+            # this boot does not print them in a form worth re-deriving. Carry
+            # the last measured value for this repo forward so the overhead
+            # residual is fitted against the same weights the panel predicts
+            # with; without it the residual would absorb the weights error too.
+            weights_gib = next(
+                (
+                    (o.get("measured") or {}).get("weights_gib")
+                    for o in reversed(store)
+                    if o.get("repo_id") == repo_id
+                    and (o.get("measured") or {}).get("weights_gib") is not None
+                ),
+                None,
+            )
+            obs = _bootfacts.observation(
+                repo_id=repo_id,
+                backend=backend,
+                facts=facts,
+                weights_gib=weights_gib,
+                basis_gib=_capacity.GPU_TOTAL_GIB,
+                # The resolver's tier 1 is an EXACT ctx match, so an
+                # observation recorded with ctx=None can never be found by it
+                # -- it sits in the store looking like data and shadows
+                # nothing, while the panel keeps using an older entry. A launch
+                # that does not pass --max-model-len still has a context: the
+                # registry's.
+                ctx=_argv_int(argv, "--max-model-len") or _spec_ctx(spec),
+                max_num_seqs=_argv_int(argv, "--max-num-seqs"),
+                kv_cache_dtype=_argv_str(argv, "--kv-cache-dtype"),
+                ts=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            )
+            if obs is None:
+                return
+            _discovery.append_observation(obs)
+            log.info(
+                "measured %s: kv %s tokens, overhead %s GiB at util %s",
+                key,
+                facts.kv_tokens,
+                (obs["measured"] or {}).get("overhead_gib"),
+                facts.util,
+            )
+        except Exception:  # noqa: BLE001 - measuring must never fail a boot
+            log.warning("could not record a measurement for %s", key, exc_info=True)
+
     def load_desired(self) -> Desired:
         return desired_mod.load(self.desired_path)
 
@@ -1147,6 +1273,15 @@ class Control:
         )
         result = replace(result, util=util, argv=argv)
         if result.ready:
+            # Measure this boot before anything else. `append_observation`'s
+            # own docstring claimed it was "written after every boot reaching
+            # READY"; it had three tests and zero callers, so the store had not
+            # been written since 2026-09-02 and the capacity panel spent three
+            # weeks replaying an August measurement of a model that had since
+            # gained MTP-3 and the offload connector. The panel was 1.15 GiB
+            # optimistic, which is how it came to green-light a Flash-Next
+            # launch at util 0.95 that the engine then refused.
+            self._record_boot(key, spec, unit, argv, since)
             current_desired = self.load_desired()
             # Record what actually worked, so a servedeck restart or a reboot
             # repeats THIS launch rather than the registry defaults with the

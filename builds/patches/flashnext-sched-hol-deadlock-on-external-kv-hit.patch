@@ -1,0 +1,25 @@
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1063,6 +1063,22 @@
+                     # manager
+                     if request.has_encoder_inputs:
+                         self.encoder_cache_manager.free(request)
++                    if not self.running:
++                        # Nothing is running and nothing was admitted this step, so
++                        # breaking here makes ZERO forward progress: the engine
++                        # re-runs the identical failed admission every step (~790/s
++                        # measured) with the GPU at 0%. Measured 2026-09-30: a
++                        # request with a 122,304-token host-KV hit did not fit the
++                        # pool and head-of-line blocked the whole queue for up to
++                        # 14.7 min, logging "hit 122304 offloaded tokens" 149,584
++                        # times while 5 requests waited. Defer this one instead and
++                        # let a smaller request behind it run, finish, free KV and
++                        # unblock it. Bounded: every deferral moves the request into
++                        # step_skipped_waiting, so both queues drain and the while
++                        # loop still terminates within this step.
++                        request_queue.pop_request()
++                        step_skipped_waiting.prepend_request(request)
++                        continue
+                     break
+ 
+                 # KVTransfer: the connector uses this info to determine

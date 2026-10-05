@@ -109,6 +109,7 @@ class FakeControl:
         self.results: dict[str, Any] = {}
         self.reconcile_arg: Any = None
         self.progress_lines: list[str] = []
+        self.start_kwargs: list[dict[str, Any]] = []
 
     def live(self) -> list[FakeLive]:
         return list(self.rows)
@@ -118,6 +119,10 @@ class FakeControl:
         return self.results.get(name, default)
 
     def start(self, key: str, timeout_s: float = 900.0, on_progress=None, **_kw) -> Any:
+        # What the caller ASKED for, not just that it asked. Recovery and
+        # reconcile answer the same condition, and the bug that hid here was a
+        # difference in these kwargs alone: `calls` looked identical.
+        self.start_kwargs.append(dict(_kw))
         for line in self.progress_lines:
             if on_progress is not None:
                 on_progress(_control.Progress(kind="line", text=line))
@@ -1386,6 +1391,68 @@ def test_the_poll_relaunches_a_desired_model_that_is_gone_then_gives_up(settings
     notes = [e["data"] for e in rt.hub.notices if e["data"].get("reason") == "recovering"]
     assert len(notes) == _app.RECOVERY_ATTEMPTS
     assert "the last one" in notes[-1]["message"]
+
+
+def test_the_poll_relaunches_at_the_settings_the_operator_applied(settings, registry) -> None:
+    """Recovery must replay desired state's `launch`, exactly as reconcile does.
+
+    Seen live 2026-09-18 22:30: an operator restart at util 0.97 / 1 seq /
+    20 GiB offload was overtaken by a recovery lap, which called start() with
+    no util and no argv. start() then recomputed utilisation from the free
+    VRAM of a card recovery had just emptied -- 0.98, the value this box has
+    an OOM-under-concurrency history at -- and relaunched at registry defaults
+    (16 seqs, 40 GiB offload). Because that launch requested nothing, start()
+    did not record it either, so desired state still read 0.97 while the card
+    ran 0.98: the panel, desired.json and the engine all disagreed.
+
+    control.reconcile has replayed `launch` since schema 3 ("without this a
+    reboot silently re-tuned the box"). Recovery answers the same condition --
+    desired names it, nothing is running it -- so it must answer it the same
+    way.
+    """
+    import asyncio as _asyncio
+
+    control = FakeControl()  # nothing is running
+    rt = _app.build_runtime(settings, registry=registry, control=control)
+    key = next(iter(registry.models))
+    want = _desired.Desired(main=key).with_launch(
+        key,
+        _desired.Launch(util=0.97, argv={"--max-num-seqs": "1", "--kv-offloading-size": "20"}),
+    )
+    _desired.save(want, settings.desired_path)
+    rt.routes.refresh()
+
+    async def poll_once() -> None:
+        _app._recover_desired(rt)
+        await _asyncio.sleep(0)  # let the mutation task run
+
+    _asyncio.run(poll_once())
+
+    assert control.calls == [f"start:{key}"]
+    assert control.start_kwargs == [
+        {"util": 0.97, "argv_overrides": {"--max-num-seqs": "1", "--kv-offloading-size": "20"}}
+    ], "recovery discarded the operator's settings and let start() re-derive them"
+
+
+def test_the_poll_relaunches_a_model_that_never_had_stored_settings(settings, registry) -> None:
+    """The other half: `launch` is absent for a model the operator has never
+    tuned. Recovery must then pass None/None so start() derives them, rather
+    than forwarding an empty dict as if it were a request for no flags."""
+    import asyncio as _asyncio
+
+    control = FakeControl()
+    rt = _app.build_runtime(settings, registry=registry, control=control)
+    key = next(iter(registry.models))
+    _desired.save(_desired.Desired(main=key), settings.desired_path)
+    rt.routes.refresh()
+
+    async def poll_once() -> None:
+        _app._recover_desired(rt)
+        await _asyncio.sleep(0)
+
+    _asyncio.run(poll_once())
+
+    assert control.start_kwargs == [{"util": None, "argv_overrides": None}]
 
 
 def test_the_poll_leaves_a_live_model_alone_and_forgets_its_attempts(settings, registry) -> None:

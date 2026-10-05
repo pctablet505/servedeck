@@ -141,6 +141,10 @@ def test_start_transient_argv_is_exact() -> None:
         # 40 GiB of /dev/shm on every restart.
         "-p",
         "TimeoutStopSec=120",
+        # A host-RAM ceiling, so an engine is OOM-killed in its own cgroup
+        # rather than the kernel killing the desktop (no swap on this box).
+        "-p",
+        "MemoryMax=172G",
         "-p",
         "WorkingDirectory=/opt/venv",
         # sorted by key, so the argv is deterministic and assertable
@@ -244,6 +248,10 @@ def test_unset_env_becomes_one_unset_environment_property_per_name() -> None:
         # 40 GiB of /dev/shm on every restart.
         "-p",
         "TimeoutStopSec=120",
+        # A host-RAM ceiling, so an engine is OOM-killed in its own cgroup
+        # rather than the kernel killing the desktop (no swap on this box).
+        "-p",
+        "MemoryMax=172G",
         "-p",
         "WorkingDirectory=/opt/venv",
         # sorted, and before --setenv, so the argv is deterministic

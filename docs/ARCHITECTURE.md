@@ -165,7 +165,52 @@ stalling the poller. The poll also closes the gap systemd cannot:
 running — the state `--collect` plus an exit-0 engine death makes
 indistinguishable from "nobody wanted it" — three times, ≥60 s apart, one model
 per poll, with a `recovering` notice each time, then stops and leaves the
-notice standing.
+notice standing. It relaunches with the **stored `launch` settings**, exactly as
+reconcile does. Until 2026-09-18 it called `start()` bare, so a recovery lap
+silently re-tuned the box: an operator restart at util 0.97 / 1 seq / 20 GiB
+offload came back as 0.98 / 16 / 40, because a launch that requests no
+utilisation gets one derived from the free VRAM of the card recovery had just
+emptied — and because that launch requested nothing, it was not recorded either,
+leaving `desired.json` reading 0.97 while the card ran 0.98.
+
+## Measuring the boot that just succeeded
+
+Every boot that reaches ready is measured, and the measurement is what the
+capacity panel predicts with. `control._record_boot` re-reads the unit's journal,
+parses vLLM's own memory accounting (`servedeck/bootfacts.py` — the
+`Free memory on device … Desired GPU memory utilization is …` line and
+`GPU KV cache size: N tokens`), and appends an observation to
+`state/measurements.json`.
+
+The stored `overhead_gib` is a **calibration residual**, `util × GPU_TOTAL_GIB −
+weights − kv`, not a sum of vLLM's printed parts. Only the residual makes the
+panel reproduce the engine: vLLM sizes its budget against CUDA's device total
+(94.97 GiB here) while capacity sizes against nvidia-smi's (95.59 GiB), and the
+residual absorbs that 0.62 GiB by construction. Re-basing capacity onto CUDA's
+total was tried and reverted — every stored `overhead` in the repo is fitted
+against the nvidia-smi basis and already absorbs the same offset, so moving the
+basis without re-fitting all of them broke six calibrations and improved no
+prediction.
+
+Two traps, both of which make a written record unreadable rather than wrong:
+
+- **The backend tag must be the one the resolver keys on.** `resolve_inputs`
+  filters a repo's observations by the backend `discover_models()` derives from
+  the hub cache, which here is `flashnext` where `models.toml` says
+  `build = "qwen38next"`. An entry tagged with the registry's value is stored,
+  kept, and skipped at read time.
+- **The context must be a number.** Tier 1 is an exact `max_model_len` match, so
+  an observation recorded with `ctx = None` can never be found by it.
+
+This existed as dead code for three weeks: `append_observation` had three tests
+and **no callers**, so nothing had been written since 2026-09-02 and the panel
+replayed a 2026-08-28 measurement of a model that had since gained MTP-3
+speculative decoding and the offload connector. Its overhead had grown 4.47 →
+5.62 GiB, so every prediction was 1.15 GiB optimistic — enough that the panel
+answered `can_apply: true, findings: []` for a Flash-Next launch at util 0.95
+and 262,144 tokens that the engine then refused, 2.5 minutes in, twice. With the
+loop closed the panel predicts 245,363 tokens where vLLM measured 245,440, and
+350,040 where vLLM measured 350,043.
 
 ## The KV-offload reaper
 

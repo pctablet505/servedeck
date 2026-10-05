@@ -445,9 +445,54 @@ def model_rows(
                 # so the allocator starts from it instead of a page-wide 0.95
                 # when nothing is running. None means "derive it".
                 "util_pinned": getattr(model, "util", None),
+                # The same treatment for the other two launch settings the
+                # Configure panel sends. It sends ALL of them on Apply, and
+                # only `util` had a registry value to fall back on -- so with
+                # nothing running (the normal case when configuring a launch)
+                # the agent count sat at the page's hardcoded 1 and shipped as
+                # an explicit `--max-num-seqs 1`, overriding the registry's 16
+                # for an operator who had only touched the utilisation slider.
+                # It then stuck: start() records a ready launch into
+                # desired.json, so every later start, reconcile and recovery
+                # replayed the 1. Seen 2026-09-20: eight agents assigned, one
+                # running, five of the seven waiting held back for
+                # reason="deferred" -- the scheduler's cap, not the KV pool.
+                "seqs_pinned": _registry_flag_int(model, "--max-num-seqs"),
+                "offload_pinned": _registry_flag_float(model, "--kv-offloading-size"),
             }
         )
     return rows
+
+
+def _registry_flag(model: Any, flag: str) -> str | None:
+    """The value ``models.toml`` gives ``flag`` for this model, if any.
+
+    The registry stores flags as a flat argv list, so this is a positional
+    lookup, not a mapping: the value is the token after the flag.
+    """
+    flags = list(getattr(model, "flags", ()) or ())
+    for i, token in enumerate(flags):
+        if token == flag and i + 1 < len(flags):
+            return str(flags[i + 1])
+        if token.startswith(flag + "="):
+            return token.split("=", 1)[1]
+    return None
+
+
+def _registry_flag_int(model: Any, flag: str) -> int | None:
+    raw = _registry_flag(model, flag)
+    try:
+        return int(raw) if raw is not None else None
+    except ValueError:
+        return None
+
+
+def _registry_flag_float(model: Any, flag: str) -> float | None:
+    raw = _registry_flag(model, flag)
+    try:
+        return float(raw) if raw is not None else None
+    except ValueError:
+        return None
 
 
 def disk_payload(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:

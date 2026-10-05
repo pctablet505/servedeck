@@ -11,6 +11,34 @@ restarts — then the gateway URL, free VRAM and the headroom estimate. If it sa
 `dashboard not running at http://127.0.0.1:8010`, the models may still be serving:
 they live in their own units.
 
+## Starting servedeck itself
+
+servedeck is a **user** unit — no `sudo`, and it needs your session, so every
+`systemctl` below carries `--user`:
+
+```bash
+systemctl --user status servedeck     # is the control plane up?
+systemctl --user start servedeck      # bring it up
+systemctl --user restart servedeck    # after editing code or models.toml
+systemctl --user enable servedeck     # at login/boot (already enabled here)
+```
+
+**Restarting servedeck does not touch a running model.** Engines are separate
+transient units and servedeck's unit sets `KillMode=process`; a restart is how new
+code is picked up, and the model keeps serving across it. Verify with
+`systemctl --user is-active model-<key>` afterwards.
+
+Then bring up a model — `switch` for the main slot, `start` for a resident:
+
+```bash
+servedeck switch flashnext    # main slot: stops whatever is there first
+servedeck start lfm2          # resident: starts alongside
+```
+
+Neither takes tuning flags. To launch at a utilisation or context other than
+`models.toml`'s, use the page's **Configure** panel (below); the CLI verbs take a
+registry key and nothing else.
+
 ## Everyday actions, and what each costs
 
 | Action | Command | Cost |
@@ -49,11 +77,21 @@ engine-core and worker children hold all of it.
 argv overrides (`--max-model-len`, `--max-num-seqs`, `--kv-offloading-size`) for that
 one launch. A launch above a model's pinned `ctx` is refused, not clamped — GLM is
 validated to 327,680 tokens here and its checkpoint claims 1,048,576. A plain `start`
-on the model already serving returns 409; only restart relaunches. Utilisation is not
-recomputed freely either: `models.toml` pins the value each main model is proven at
-(flashnext 0.96, qwen27b 0.95, glm53 0.95) and `compute_util` refuses with
-`not_enough_vram` when the card cannot fit it, rather than quietly serving at a
-smaller KV budget. The card always keeps `margin_mib = 1024` plus a 700 MiB cushion
+on the model already serving returns 409; only restart relaunches. `models.toml`'s
+`util` (flashnext 0.96, qwen27b 0.95, glm53 0.95) is the value each main model is
+**proven** at and the one a launch uses when nobody asks for another; it is a default,
+**not a clamp**. The Configure panel will send anything from 0.05 to 0.99, and
+`compute_util` only refuses with `not_enough_vram` when the card cannot fit the value
+asked for — so both directions are yours to get wrong, and the panel is the only way
+to set one: `servedeck start` and `servedeck switch` take no `--util` and no
+`--max-model-len`, just a key.
+
+Below the pin the engine may refuse to boot at all (Flash-Next at 0.95 cannot hold one
+262,144-token request); above it, it boots and dies later under concurrency — 0.98 is
+the value with the OOM history on this card. Since 2026-09-18 the panel predicts the
+pool from the **last successful boot of that model** rather than from a constant, so
+it now refuses a launch the engine would refuse, before the 2.5-minute wait; see
+[ARCHITECTURE.md](ARCHITECTURE.md) on measurement recording. The card always keeps `margin_mib = 1024` plus a 700 MiB cushion
 for the CUDA context, cuBLAS/cuDNN kernels and NCCL buffers that
 `--gpu-memory-utilization` does not count.
 
@@ -154,6 +192,15 @@ restarting. Three causes seen here:
 - **CUDA OOM** — either the card was not empty (the switch VRAM wait exists for this)
   or the utilisation was too high for the concurrency that arrived.
   `nvidia-smi --query-compute-apps=pid,used_memory --format=csv` names the holder.
+- **`ValueError: To serve at least one request with the model's max seq len`** —
+  the KV pool is too small for ONE request at this context, and the message names
+  both figures and the context that *would* fit ("the estimated maximum model length
+  is 245440"). This is about the box, not the build: **raise utilisation or lower
+  `--max-model-len`**. It arrives ~2.5 minutes in, after the weights have loaded,
+  because the pool is sized by profiling the loaded model. Flash-Next at the full
+  262,144 needs **util ≥ 0.96**; 0.95 leaves 6.72 GiB against the 7.17 GiB one
+  request costs. Lowering `--kv-offloading-size` does not help — that buffer is host
+  RAM, not VRAM. Seen twice on 2026-09-18, 22:16 and 22:22.
 - **An assert or `ValueError` naming a flag or a shape** — the flag is wrong for the
   build, not the box. Reasons per model in [models/](models/), builds in
   [BUILDS.md](BUILDS.md).

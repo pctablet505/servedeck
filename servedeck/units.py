@@ -79,6 +79,8 @@ __all__ = [
     "list_units_argv",
     "manager_environment_names",
     "journal_tail",
+    "journal_since",
+    "journal_since_argv",
     "journal_follow",
     "start_transient_argv",
     "stop_argv",
@@ -92,6 +94,7 @@ __all__ = [
     "DEFAULT_TIMEOUT_STOP_SEC",
     "DEFAULT_START_LIMIT_INTERVAL_SEC",
     "DEFAULT_START_LIMIT_BURST",
+    "DEFAULT_MEMORY_MAX",
 ]
 
 # --------------------------------------------------------------------------
@@ -149,6 +152,12 @@ DEFAULT_TIMEOUT_STOP_SEC = 120
 #: with a 10s restart delay, so a model that cannot boot restarts forever.
 DEFAULT_START_LIMIT_INTERVAL_SEC = 300
 DEFAULT_START_LIMIT_BURST = 3
+#: Host-RAM ceiling for a model unit (hardware audit RAM-02, 2026-10-04). Above
+#: the largest measured model peak (GLM: 168 GiB at 110 GiB of offload,
+#: models.toml) and below the box's 182 GiB, so a leaking or over-offloaded
+#: engine is OOM-killed inside its own cgroup instead of the kernel killing the
+#: desktop. There is no swap here, so MemoryMax= is the whole limit.
+DEFAULT_MEMORY_MAX = "172G"
 
 #: Exactly the properties :func:`show` asks for, in the documented order.
 SHOW_PROPERTIES = "ActiveState,SubState,Result,NRestarts,MainPID,ExecMainStartTimestamp"
@@ -264,6 +273,7 @@ def start_transient_argv(
     start_limit_interval_sec: int = DEFAULT_START_LIMIT_INTERVAL_SEC,
     start_limit_burst: int = DEFAULT_START_LIMIT_BURST,
     timeout_stop_sec: int = DEFAULT_TIMEOUT_STOP_SEC,
+    memory_max: str = DEFAULT_MEMORY_MAX,
 ) -> list[str]:
     """The exact argv :func:`start_transient` runs. Shape::
 
@@ -276,6 +286,7 @@ def start_transient_argv(
                     -p StartLimitIntervalSec=<start_limit_interval_sec>
                     -p StartLimitBurst=<start_limit_burst>
                     -p TimeoutStopSec=<timeout_stop_sec>
+                    -p MemoryMax=<memory_max>
                     -p WorkingDirectory=<cwd>
                     -p UnsetEnvironment=<NAME>   (one per name, sorted)
                     --setenv=<K>=<V>             (one per var, keys sorted)
@@ -353,6 +364,8 @@ def start_transient_argv(
         "-p",
         f"TimeoutStopSec={timeout_stop_sec}",
         "-p",
+        f"MemoryMax={memory_max}",
+        "-p",
         f"WorkingDirectory={os.fspath(cwd)}",
     ]
     for entry in unset:
@@ -380,6 +393,7 @@ def start_transient(
     start_limit_burst: int = DEFAULT_START_LIMIT_BURST,
     timeout_stop_sec: int = DEFAULT_TIMEOUT_STOP_SEC,
     run: Runner | None = None,
+    memory_max: str = DEFAULT_MEMORY_MAX,
 ) -> None:
     """Launch ``argv`` as the transient user unit ``<name>.service``.
 
@@ -411,6 +425,7 @@ def start_transient(
             start_limit_interval_sec,
             start_limit_burst,
             timeout_stop_sec,
+            memory_max,
         ),
     )
 
@@ -659,6 +674,28 @@ def journal_tail(name: str, lines: int = 40, run: Runner | None = None) -> list[
     """
     run = run or default_runner()
     proc = run(journal_tail_argv(name, lines))
+    if proc.returncode != 0:
+        return []
+    return [ln.rstrip("\n") for ln in (proc.stdout or "").splitlines()]
+
+
+def journal_since_argv(name: str, since: str) -> list[str]:
+    """``journalctl --user -u <name> --no-pager -o cat --since <since>``."""
+    _require_name(name)
+    return ["journalctl", "--user", "-u", name, "--no-pager", "-o", "cat", "--since", since]
+
+
+def journal_since(name: str, since: str, run: Runner | None = None) -> list[str]:
+    """Every journal line for the unit from ``since`` onward — not a tail.
+
+    A tail cannot be used to read a boot back: the line count needed depends on
+    how chatty that boot was (torch.compile and FlashInfer JIT can emit
+    thousands) and, on a unit that is already serving, on how much traffic has
+    arrived since. Anchoring at the unit's own start timestamp is exact and
+    costs nothing extra.
+    """
+    run = run or default_runner()
+    proc = run(journal_since_argv(name, since))
     if proc.returncode != 0:
         return []
     return [ln.rstrip("\n") for ln in (proc.stdout or "").splitlines()]

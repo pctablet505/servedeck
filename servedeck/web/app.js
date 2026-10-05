@@ -1749,18 +1749,32 @@ function paintBoot(b) {
  * comparison, and "has anything been clicked" is the wrong question — moving a
  * slider back to the running value must clear it, and a server adopted at util
  * 0.90 must mark the page's default 0.95 as changed with no click at all. */
-function dirtyBits(facts, sizing, want) {
+function dirtyBits(facts, sizing, want, pinned) {
   const bits = [];
-  if (facts.util_effective && Math.abs(facts.util_effective - want.util) > 0.002) {
+  // What this launch is being compared AGAINST. A running server is the truth
+  // when there is one; with nothing running -- which is when a launch is
+  // usually configured -- every comparison below used to be skipped, because
+  // each was gated on a live reading. The confirmation then listed no changes
+  // at all and the operator confirmed a launch nobody had described. That is
+  // how `--max-num-seqs 1` shipped unseen on 2026-09-18 and stuck through
+  // desired.json until 2026-09-20. The registry's own values stand in.
+  const base = pinned || {};
+  const refUtil = facts.util_effective || base.util;
+  const refSeqs = sizing.max_num_seqs || base.seqs;
+  const refOffload = facts.util_effective
+    ? (typeof facts.kv_offload_gib === "number" ? facts.kv_offload_gib : 0)
+    : base.offload;
+
+  if (refUtil && Math.abs(refUtil - want.util) > 0.002) {
     bits.push(`util ${want.util.toFixed(2)}`);
   }
   if (facts.ctx && facts.ctx !== want.ctx) bits.push(`${fmt(want.ctx)} ctx`);
-  if (sizing.max_num_seqs && sizing.max_num_seqs !== want.agents) {
+  if (refSeqs && refSeqs !== want.agents) {
     bits.push(`${want.agents} agent${want.agents === 1 ? "" : "s"}`);
   }
-  if (typeof want.offload === "number" && facts.util_effective) {
-    const runOff = typeof facts.kv_offload_gib === "number" ? facts.kv_offload_gib : 0;
-    if (runOff !== want.offload) bits.push(`${want.offload} GiB KV offload`);
+  if (typeof want.offload === "number" && typeof refOffload === "number"
+      && refOffload !== want.offload) {
+    bits.push(`${want.offload} GiB KV offload`);
   }
   return bits;
 }
@@ -1774,7 +1788,12 @@ function paintDirty(upIsUp, runCtx) {
   // a changed context was never marked unsaved at all.
   const facts = Object.assign({}, liveFacts || {});
   if (runCtx) facts.ctx = runCtx;
-  const diff = dirtyBits(facts, liveSizing || {}, { util: util, ctx: ctx, agents: agents, offload: offloadGib });
+  const m = MODELS[sel] || {};
+  const diff = dirtyBits(
+    facts, liveSizing || {},
+    { util: util, ctx: ctx, agents: agents, offload: offloadGib },
+    { util: m.util_pinned, seqs: m.seqs_pinned, offload: m.offload_pinned },
+  );
   d.classList.toggle("on", diff.length > 0);
   d.textContent = diff.length ? `unsaved: ${diff.join(", ")}` : "unsaved changes";
 }
@@ -1852,18 +1871,30 @@ function paintState(s) {
   // The running engine's --max-num-seqs, read back into the field that sets
   // it. liveSizing.max_num_seqs is that value (app._sizing_payload reads it off
   // the live process), so the input and the recommendation can never disagree.
+  // With NOTHING running there is nothing to read back -- which is the normal
+  // case when configuring a launch -- so it falls back to the registry's
+  // value, exactly as `util` falls back to util_pinned above. Without that it
+  // sat at the page's initial 1 and Apply shipped `--max-num-seqs 1` for an
+  // operator who had only moved the utilisation slider, capping the box at one
+  // concurrent sequence and then sticking there through desired.json.
   const runSeqs = liveSizing.max_num_seqs;
-  if (!userPicked && runSeqs && runSeqs !== agents) {
-    agents = runSeqs;
+  const seqsPinned = MODELS[sel] && MODELS[sel].seqs_pinned;
+  const wantSeqs = runSeqs || seqsPinned;
+  if (!userPicked && wantSeqs && wantSeqs !== agents) {
+    agents = wantSeqs;
     const a = $("agents");
     if (a) a.value = String(agents);
     estimate();
   }
   // The running server's --kv-offloading-size, read back like util and the
-  // agent count. A server launched without the flag reads back as 0.
-  if (!userPicked && liveFacts.util_effective) {
-    const runOff = typeof liveFacts.kv_offload_gib === "number" ? liveFacts.kv_offload_gib : 0;
-    if (runOff !== offloadGib) {
+  // agent count. A server launched without the flag reads back as 0, and with
+  // nothing running the registry's value stands in -- same reasoning as above.
+  if (!userPicked) {
+    const offPinned = MODELS[sel] && MODELS[sel].offload_pinned;
+    const runOff = liveFacts.util_effective
+      ? (typeof liveFacts.kv_offload_gib === "number" ? liveFacts.kv_offload_gib : 0)
+      : (typeof offPinned === "number" ? offPinned : null);
+    if (runOff !== null && runOff !== offloadGib) {
       offloadGib = runOff;
       const o = $("offload");
       if (o) o.value = String(offloadGib);

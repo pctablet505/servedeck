@@ -1712,7 +1712,7 @@ def test_stop_reaps_after_the_unit_is_gone_and_start_reaps_before_launch(tmp_pat
     calls: list[str] = []
     systemd = FakeSystemd()
     systemd.add("model-flashnext", main_pid=1000)
-    ctl = make_control(systemd, FakeRegistry(FLASH), tmp_path,
+    ctl = make_control(systemd, FakeRegistry(FLASH_262K), tmp_path,
                        probe=lambda port: ["Qwen3.8-Flash-Next"])
     def reap(**_kw):
         calls.append("reap")
@@ -1817,4 +1817,186 @@ def test_a_switch_whose_replacement_fails_keeps_the_desired_model(tmp_path) -> N
     assert isinstance(result.started, Refusal) or not result.started.ready
     assert desired_mod.load(tmp_path / "desired.json").main == "flashnext", (
         "the box must still know which model it wants"
+    )
+
+
+# --------------------------------------------------------------------------
+# Measuring the boot that just succeeded
+# --------------------------------------------------------------------------
+
+#: Flash-Next as models.toml actually launches it: the context length is on
+#: the command line, which is what makes the recorded observation findable by
+#: the resolver's exact-ctx tier.
+FLASH_262K = FakeSpec(
+    key="flashnext", id="Qwen3.8-Flash-Next", slot="main", port=8001,
+    names=["Qwen3.8-Flash-Next", "flashnext"], ctx_tokens=262144,
+    extra_flags=("--max-model-len", "262144"),
+)
+
+_BOOT_MEMORY_LINES = [
+    "(EngineCore pid=42623) INFO 09-18 22:23:41 [gpu_worker.py:298] Free memory on device "
+    "(94.41/94.97 GiB) on startup. Desired GPU memory utilization is (0.97, 92.12 GiB). "
+    "Actual usage is 81.7 GiB for consumed memory (weights + non-torch), 1.78 GiB for peak "
+    "activation, and 0.28 GiB for CUDAGraph memory. Current kv cache memory in use is "
+    "8.64 GiB.",
+    "(EngineCore pid=42623) INFO 09-18 22:23:42 [kv_cache_utils.py:1229] GPU KV cache size: "
+    "315,039 tokens, Maximum concurrency for 262,144 tokens per request: 1.20x",
+]
+
+
+@pytest.fixture
+def isolated_state(tmp_path, monkeypatch):
+    """Point the observation store at tmp_path. Without this these tests write
+    measurements into the real state directory of the box running them."""
+    from servedeck import settings as _settings
+
+    monkeypatch.setenv("SERVEDECK_STATE_DIR", str(tmp_path / "state"))
+    _settings.reset()
+    yield tmp_path / "state"
+    _settings.reset()
+
+
+def test_a_ready_boot_records_what_it_measured(tmp_path, isolated_state, monkeypatch):
+    """The defect this closes: `append_observation` had three tests and no
+    callers, so the store had not been written since 2026-09-02 and the
+    capacity panel replayed an August measurement of a model that had since
+    gained MTP-3 and the KV-offload connector -- 1.15 GiB optimistic, enough
+    to green-light a launch the engine refused."""
+    from servedeck import discovery as _discovery
+
+    systemd = FakeSystemd()
+    ctl = make_control(systemd, FakeRegistry(FLASH_262K), tmp_path,
+                       probe=lambda port: ["Qwen3.8-Flash-Next"])
+    systemd.journal["model-flashnext"] = _BOOT_MEMORY_LINES
+    # A prior observation carrying the weights figure, as the real store does.
+    _discovery.append_observation(
+        {"repo_id": FLASH.id, "backend": "", "ts": "2026-08-28T15:30:49+0530",
+         "inputs": {"util": 0.95, "max_model_len": 262144},
+         "measured": {"weights_gib": 78.47, "kv_gib": 7.86, "kv_tokens": 272062,
+                      "overhead_gib": 4.47}}
+    )
+
+    result = ctl.start("flashnext")
+    assert result.ready
+
+    store = _discovery.load_observations()
+    assert len(store) == 2, "the ready boot was not recorded"
+    latest = store[-1]["measured"]
+    assert latest["kv_tokens"] == 315_039
+    assert latest["weights_gib"] == 78.47, "weights carried forward from the prior entry"
+    # Re-fitted against capacity's basis, not vLLM's: 0.97 * 95.5927 - 78.47 - 8.64.
+    assert latest["overhead_gib"] == pytest.approx(5.615, abs=0.002)
+    assert store[-1]["inputs"]["util"] == 0.97, "the util vLLM resolved, not the one requested"
+    assert store[-1]["inputs"]["max_model_len"] == 262144, (
+        "without a ctx the resolver's exact-ctx tier can never match this entry"
+    )
+
+
+def test_a_boot_whose_journal_says_nothing_records_nothing(tmp_path, isolated_state):
+    """A vLLM release that reformats those lines must cost a measurement, not
+    a start, and must not leave an empty record behind -- the resolver takes
+    the most recent entry for a repo, so an empty one shadows a good one."""
+    from servedeck import discovery as _discovery
+
+    systemd = FakeSystemd()
+    ctl = make_control(systemd, FakeRegistry(FLASH_262K), tmp_path,
+                       probe=lambda port: ["Qwen3.8-Flash-Next"])
+    systemd.journal["model-flashnext"] = ["INFO: a future vLLM says something else"]
+
+    assert ctl.start("flashnext").ready
+    assert _discovery.load_observations() == []
+
+
+def test_measuring_a_boot_can_never_fail_the_boot(tmp_path, isolated_state, monkeypatch):
+    """The model is already serving by the time this runs. Anything that goes
+    wrong while measuring it is a lost data point, never a failed start."""
+    from servedeck import bootfacts as _bootfacts
+
+    systemd = FakeSystemd()
+    ctl = make_control(systemd, FakeRegistry(FLASH_262K), tmp_path,
+                       probe=lambda port: ["Qwen3.8-Flash-Next"])
+    systemd.journal["model-flashnext"] = _BOOT_MEMORY_LINES
+
+    def boom(*a, **k):
+        raise RuntimeError("the store is on a full disk")
+
+    monkeypatch.setattr(_bootfacts, "parse", boom)
+    assert ctl.start("flashnext").ready
+
+
+def test_a_recorded_boot_is_found_again_by_the_resolver_that_reads_it(
+    tmp_path, isolated_state, monkeypatch
+):
+    """Round-trip, because asserting the record's CONTENTS is not enough.
+
+    `resolve_inputs` filters a repo's observations by backend, and the backend
+    it filters on comes from `discover_models()` (the hub cache), not from
+    models.toml's `build`. On this box those two strings differ -- "flashnext"
+    against "qwen38next" -- so an observation tagged with the registry's value
+    is written, kept, and then skipped at read time. That is indistinguishable
+    from never having measured anything, and it is exactly the bug this file's
+    first version shipped: the store gained an entry and the panel did not
+    move a decimal place.
+    """
+    from servedeck import discovery as _discovery
+
+    repo = FLASH.id
+    monkeypatch.setattr(
+        _discovery,
+        "discover_models",
+        lambda *a, **k: [
+            type(
+                "Entry",
+                (),
+                {
+                    "repo_id": repo,
+                    "backend": "hub-name",  # deliberately NOT spec.build
+                    "max_position_embeddings": 262144,
+                    "model_type": "qwen4_exp",
+                    "architectures0": "Qwen4ExpForCausalLM",
+                },
+            )()
+        ],
+    )
+    _discovery.append_observation(
+        {"repo_id": repo, "backend": "hub-name", "ts": "2026-08-28T15:30:49+0530",
+         "inputs": {"util": 0.95, "max_model_len": 262144},
+         "measured": {"weights_gib": 78.47, "kv_gib": 7.86, "kv_tokens": 272062,
+                      "overhead_gib": 4.47}}
+    )
+
+    systemd = FakeSystemd()
+    ctl = make_control(systemd, FakeRegistry(FLASH_262K), tmp_path,
+                       probe=lambda port: ["Qwen3.8-Flash-Next"])
+    systemd.journal["model-flashnext"] = _BOOT_MEMORY_LINES
+    assert ctl.start("flashnext").ready
+
+    resolved = _discovery.resolve_inputs(repo, 0.95, 262144)
+    assert resolved.overhead_gib == pytest.approx(5.615, abs=0.002), (
+        "the boot was recorded but the resolver could not see it"
+    )
+
+
+def test_the_boot_is_read_back_by_timestamp_not_by_tail(tmp_path, isolated_state):
+    """A tail cannot find a boot, and the failure is silent.
+
+    Measured against the live unit on 2026-09-18: `journal_tail(unit, 2000)`
+    returned nothing usable, because the model had been serving for twenty
+    minutes and the boot lines were long past 2000 lines back. The line count
+    would have to cover both the chattiest possible boot (torch.compile plus 97
+    FlashInfer JIT objects) and any traffic that arrived first -- there is no
+    right number. The unit's own start timestamp is exact.
+    """
+    systemd = FakeSystemd()
+    ctl = make_control(systemd, FakeRegistry(FLASH_262K), tmp_path,
+                       probe=lambda port: ["Qwen3.8-Flash-Next"])
+    systemd.journal["model-flashnext"] = _BOOT_MEMORY_LINES
+    assert ctl.start("flashnext").ready
+
+    reads = [c for c in systemd.calls
+             if c and c[0] == "journalctl" and "model-flashnext" in c]
+    assert reads, "the boot was never read back"
+    assert any("--since" in c for c in reads), "the boot was read with a tail"
+    assert not any("-n" in c for c in reads), (
+        "a line count cannot bound a boot's journal; use the start timestamp"
     )

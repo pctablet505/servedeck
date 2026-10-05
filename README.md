@@ -29,6 +29,15 @@ HTTP and fall back to the same supervisor in-process when it is down, saying
 which on the first line. `models`, `adopt`, `log` and `smoke` also exist — see
 [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
+Those commands need the control plane up. It is a **user** unit, started with
+`systemctl --user start servedeck` (`restart` after changing code or
+`models.toml`) — never `sudo`. Restarting it does not disturb a running model:
+engines are separate units and this one sets `KillMode=process`.
+
+None of the CLI verbs take tuning flags — `switch flashnext` launches at the
+`util` and context `models.toml` pins. To launch at different ones, use the
+page's **Configure** panel.
+
 ## The page
 
 `http://127.0.0.1:8010` — v1's dashboard, served on the v2 backend via
@@ -80,8 +89,15 @@ touches nothing on the box:
 ```bash
 .venv/bin/python -m pytest -q -n 12 \
   --ignore=tests/test_e2e_real.py --ignore=tests/test_app_e2e.py \
-  --ignore=tests/test_control_e2e.py --ignore=tests/test_gateway_e2e.py
+  --ignore=tests/test_control_e2e.py --ignore=tests/test_gateway_e2e.py \
+  --ignore=tests/test_cli_control.py
+.venv/bin/python -m pytest -q -n 0 tests/test_cli_control.py
 ```
+
+`test_cli_control.py` is excluded from the parallel run and then run on its
+own: it binds a fixed port, so under `-n 12` its cases contend with each other
+and fail with `httpx.ConnectError` — 10 of 16 on a clean tree. It is not a
+slow file (15 s serially) and nothing is skipped by splitting it out.
 
 The four excluded files are the gate, and they are not free. Three drive the
 real `systemd-run` path — safely, under the `sd-test-` unit namespace, which
