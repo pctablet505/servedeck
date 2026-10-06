@@ -366,6 +366,24 @@ def test_stop_still_raises_on_a_real_failure() -> None:
         units.stop("model-x", run=runner)
 
 
+def test_the_stop_wait_outlasts_systemds_own_stop(monkeypatch) -> None:
+    """`systemctl stop` blocks until the unit is down, and systemd may take
+    TimeoutStopSec for SIGTERM and again for SIGKILL. Our subprocess timeout
+    used to EQUAL TimeoutStopSec (120 s), so a stop that needed the SIGKILL
+    ran our clock out ~2 s before systemd finished (2026-10-06, three times).
+    Pinned on the timeout the production runner actually passes to
+    subprocess.run, not on the constant alone."""
+    seen: list[float] = []
+
+    def fake_run(argv, **kwargs):
+        seen.append(kwargs["timeout"])
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(units.subprocess, "run", fake_run)
+    units.stop("model-x")  # no runner injected: the production default
+    assert seen and seen[0] >= 2 * units.DEFAULT_TIMEOUT_STOP_SEC
+
+
 SHOW_OUTPUT = """ActiveState=active
 SubState=running
 Result=success

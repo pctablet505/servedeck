@@ -1208,6 +1208,15 @@ class ModelSpecAdapter:
     ctx_tokens: int
     venv_bin: str
     ctx_error: str | None = None
+    #: The registry's proven utilisation (``models.toml`` ``util``), which
+    #: ``control.compute_util`` reads with ``getattr(spec, "util", None)``. The
+    #: adapter did not carry it until 2026-10-06, so the getattr always came
+    #: back None and every launch without an explicit util (``servedeck switch
+    #: flashnext``, ``servedeck start``, reconcile) got the free-VRAM figure,
+    #: 0.98 on an idle card, instead of Flash-Next's proven 0.96 -- and ran
+    #: out of memory under load. The page's Apply path passed util explicitly,
+    #: which is why only the CLI verbs showed it.
+    util: float | None = None
 
     @classmethod
     def from_model(cls, model: _models.Model, registry: _models.Registry) -> ModelSpecAdapter:
@@ -1238,6 +1247,7 @@ class ModelSpecAdapter:
             ctx_tokens=ctx,
             venv_bin=_build_venv_bin(build),
             ctx_error=error,
+            util=model.util,
         )
 
     def served_names(self) -> list[str]:

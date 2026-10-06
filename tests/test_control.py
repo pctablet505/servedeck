@@ -958,6 +958,48 @@ def test_stop_clears_the_main_slot_from_desired_state(tmp_path) -> None:
     assert "model-flashnext" not in systemd.units
 
 
+class SlowStopSystemd(FakeSystemd):
+    """`systemctl --user stop` that outlives our wait on it, the way it does
+    when systemd has to SIGKILL a vLLM worker hung in its shutdown: the
+    default runner turns the subprocess timeout into ``UnitError``, while
+    systemd carries on and takes the unit down a moment later."""
+
+    def __call__(self, argv):
+        argv = list(argv)
+        if argv[:3] == ["systemctl", "--user", "stop"]:
+            self.calls.append(argv)
+            self.units.pop(argv[3], None)  # systemd finishes the stop anyway
+            raise units.UnitError(f"{' '.join(argv)}: timed out after 120.0s")
+        return super().__call__(argv)
+
+
+def test_a_stop_that_outruns_our_wait_still_forgets_the_model(tmp_path) -> None:
+    """2026-10-06, three times in one morning: POST /api/server/stop, a vLLM
+    worker hung in shutdown, systemd SIGKILLed it at TimeoutStopSec, our
+    `systemctl stop` wait ran out first, and stop() returned stop_failed
+    BEFORE clearing desired state. The unit then went down, and the poll's
+    recovery ("wanted but not running") relaunched the model ~122 s after
+    the operator stopped it."""
+    systemd = SlowStopSystemd()
+    systemd.add("model-flashnext")
+    desired_mod.save(Desired(main="flashnext", residents=["lfm2"]), tmp_path / "desired.json")
+    ctl = make_control(systemd, FakeRegistry(FLASH, LFM2), tmp_path)
+    result = ctl.stop("flashnext")
+    assert isinstance(result, Refusal) and result.reason == "stop_failed"
+    assert desired_mod.load(tmp_path / "desired.json") == Desired(main=None, residents=["lfm2"])
+
+
+def test_a_switch_whose_stop_outruns_the_wait_keeps_the_intent(tmp_path) -> None:
+    """Over-correction guard: forget_intent=False (what switch uses) must
+    still leave desired state alone when the stop fails."""
+    systemd = SlowStopSystemd()
+    systemd.add("model-flashnext")
+    desired_mod.save(Desired(main="flashnext"), tmp_path / "desired.json")
+    ctl = make_control(systemd, FakeRegistry(FLASH), tmp_path)
+    assert isinstance(ctl.stop("flashnext", forget_intent=False), Refusal)
+    assert desired_mod.load(tmp_path / "desired.json").main == "flashnext"
+
+
 def test_stop_accounts_for_the_whole_cgroup_not_just_mainpid(tmp_path) -> None:
     """vLLM v1's MainPID is the API server and holds no GPU memory; the engine
     core and workers hold all of it. Charging the unit only its MainPID reports

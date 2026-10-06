@@ -107,8 +107,6 @@ Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
 
 #: Default subprocess timeout for the quick introspection calls.
 DEFAULT_TIMEOUT_S = 10.0
-#: `systemctl stop` on a vLLM unit has to wait for the process to die.
-DEFAULT_STOP_TIMEOUT_S = 120.0
 
 #: The only unit names this module will ever act on. ``model-*`` is v2's real
 #: namespace; ``sd-test-*`` is reserved for the test suite. Anything else —
@@ -148,6 +146,18 @@ DEFAULT_RESTART_SEC = 10
 #: shutdown, and systemd killing the unit first is what orphaned 40 GiB of
 #: host RAM on every restart. Must exceed the model's own shutdown timeout.
 DEFAULT_TIMEOUT_STOP_SEC = 120
+#: How long the blocking ``systemctl --user stop`` call may take before we stop
+#: waiting on it. It MUST outlast systemd's own stop: the call returns only when
+#: the unit is down, and systemd spends up to ``TimeoutStopSec`` on SIGTERM and
+#: up to that again on SIGKILL. It used to EQUAL ``TimeoutStopSec`` (120 s), so
+#: every stop in which systemd had to SIGKILL a vLLM worker that hung in its
+#: own shutdown ran our clock out a second or two before systemd finished
+#: (measured 2026-10-06: 06:43:27 -> 06:45:29, 07:19:53 -> 07:21:55 and
+#: 07:55:04 -> 07:57:07, each logging "State 'final-sigterm' timed out.
+#: Killing."). The stop was reported as failed, desired state still named the
+#: model, and the poll's recovery relaunched the model the operator had just
+#: stopped, about 122 s after the stop.
+DEFAULT_STOP_TIMEOUT_S = 2.0 * DEFAULT_TIMEOUT_STOP_SEC + 30.0
 #: See `start_transient_argv`: systemd's own 5-per-10s limit can never fire
 #: with a 10s restart delay, so a model that cannot boot restarts forever.
 DEFAULT_START_LIMIT_INTERVAL_SEC = 300

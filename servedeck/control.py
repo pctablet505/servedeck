@@ -1466,6 +1466,14 @@ class Control:
         boot must leave a box that still knows which model it wants. Erasing
         it first meant a failed Apply & restart left ``main: null`` — nothing
         serving, no record of what had been, and a reboot that started nothing.
+
+        With ``forget_intent=True`` the intent is forgotten BEFORE the unit is
+        asked to stop, not after it is confirmed down. The operator's "stop" is
+        the decision; how long systemd takes to carry it out is not. Recording
+        it afterwards meant that a stop which outran our wait (a vLLM worker
+        hung in shutdown, SIGKILLed by systemd at TimeoutStopSec; 2026-10-06)
+        returned ``stop_failed`` with desired state still naming the model, and
+        the poll's recovery relaunched it as soon as the unit went down.
         """
         unit = self.unit_for(key)
         if not units.valid_unit_name(unit):
@@ -1478,17 +1486,18 @@ class Control:
         was_live = not units.gone(unit, run=self._run, sleep=self._sleep)
         free_before = self._free_mib()
         held = self._held_mib(unit) if was_live else 0
+        if forget_intent:
+            self._forget(key)
         try:
             units.stop(unit, timeout_s=timeout_s, run=self._run)
         except UnitError as exc:
-            return Refusal(reason="stop_failed", message=str(exc), key=key)
-
-        if forget_intent:
-            current = self.load_desired()
-            if current.main == key:
-                current = current.with_main(None)
-            current = current.without_resident(key)
-            self._save_desired(current)
+            message = str(exc)
+            if forget_intent:
+                message += (
+                    f" (desired state no longer names {key}, so nothing will relaunch it; "
+                    "systemd may still be stopping the unit)"
+                )
+            return Refusal(reason="stop_failed", message=message, key=key)
         return StopResult(
             key=key, unit=unit, was_live=was_live, held_mib=held, free_before_mib=free_before,
             reaped=tuple(self.reap_offload()),
@@ -1505,6 +1514,8 @@ class Control:
         usage = self._used_by_pids()
         tree = [model.pid, *self._descendants(model.pid)]
         held = None if usage is None else sum(usage.get(p, 0) for p in tree)
+        if forget_intent:
+            self._forget(key)  # before the kill, for the reason stop() gives
         try:
             self._kill(model.pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -1521,16 +1532,18 @@ class Control:
                         pass
                 break
             self._sleep(0.5)
-        if forget_intent:
-            current = self.load_desired()
-            if current.main == key:
-                current = current.with_main(None)
-            current = current.without_resident(key)
-            self._save_desired(current)
         return StopResult(
             key=key, unit=ADOPTED_UNIT, was_live=True, held_mib=held, free_before_mib=free_before,
             reaped=tuple(self.reap_offload()),
         )
+
+    def _forget(self, key: str) -> None:
+        """Desired state no longer wants ``key`` (main slot or resident)."""
+        current = self.load_desired()
+        if current.main == key:
+            current = current.with_main(None)
+        current = current.without_resident(key)
+        self._save_desired(current)
 
     def _held_mib(self, unit: str) -> int | None:
         """GPU memory held by every process in the unit's cgroup, in MiB.

@@ -1525,3 +1525,39 @@ def test_the_headroom_line_gives_alternatives_and_a_real_mix(settings, registry)
     for big, small in head["mixed_rows"].items():
         if big and head["full_cost_tokens"] > head["pool_tokens"]:
             assert small == 0, "nothing fits beside a request bigger than the pool"
+
+
+# --------------------------------------------------------------------------
+# The registry's proven util must reach the supervisor (2026-10-06)
+# --------------------------------------------------------------------------
+
+
+def test_a_registry_util_pin_reaches_compute_util(tmp_path) -> None:
+    """``servedeck switch flashnext`` launched at 0.98 and ran out of memory:
+    models.toml pins flashnext at util 0.96, but ``ModelSpecAdapter`` (the real
+    spec the supervisor gets) carried no ``util``, so ``compute_util``'s
+    ``getattr(spec, "util", None)`` read None and handed the model the
+    free-VRAM figure. The fakes in test_control.py set the field themselves,
+    which is why no test saw it. This one goes through the production adapter.
+    """
+    path = tmp_path / "models.toml"
+    path.write_text(TOML.replace("ctx = 32768\n", "ctx = 32768\nutil = 0.96\n", 1))
+    adapter = _app._RegistryAdapter(_models.load(path))
+    ctl = _control.Control(
+        adapter, margin_mib=1024, total_mib=100000, desired_path=tmp_path / "desired.json",
+        run=lambda argv: pytest.fail(f"compute_util must not shell out: {argv}"),
+        free_mib=lambda: 99000,
+    )
+    # Free-VRAM arithmetic alone would give floor2((99000 - 1024) / 100000) = 0.97.
+    assert ctl.compute_util(adapter.get("big")) == 0.96
+    # Over-correction guard: a main model with no pin still gets the arithmetic.
+    assert ctl.compute_util(adapter.get("other")) == 0.97
+
+
+def test_the_shipped_registry_pins_reach_the_adapter() -> None:
+    """Every ``util`` in the real models.toml arrives on the spec unchanged."""
+    reg = _models.load(Path(__file__).resolve().parent.parent / "models.toml")
+    adapter = _app._RegistryAdapter(reg)
+    pinned = {k: m.util for k, m in reg.models.items() if m.util is not None}
+    assert pinned, "models.toml pins no util at all; this test would prove nothing"
+    assert {k: adapter.get(k).util for k in pinned} == pinned
