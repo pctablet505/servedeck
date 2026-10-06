@@ -31,7 +31,7 @@ WHAT THIS MODULE DOES
 
 Use it like this::
 
-    import sys; sys.path.insert(0, "/home/pctablet505/Projects/servedeck")
+    import os, sys; sys.path.insert(0, os.path.expanduser("~/Projects/servedeck"))
     from servedeck import batch
     n = batch.plan(prompt_tokens=7_000, output_tokens=12_000).n   # p90s of your job
     outcomes = batch.run(items, my_call, limit=n)

@@ -130,6 +130,14 @@ because vLLM's API server exits **0** when its engine dies. The unit serving rig
 was launched 2026-09-17 22:58 and still carries the old `Restart=on-failure` /
 `TimeoutStopSec=90`; the next launch picks up the new values.
 
+**A stop forgets the model first, then waits.** Flash-Next's workers sometimes hang in their
+own shutdown after the engine has exited, and systemd SIGKILLs them at `TimeoutStopSec`
+(`State 'final-sigterm' timed out. Killing.`, three times on 2026-10-06), so a stop can take
+just over 120 s. servedeck clears the model from desired state before it asks systemd to stop
+the unit, and waits up to `2 x TimeoutStopSec + 30 s` for `systemctl stop`. Until 2026-10-06 it
+did the reverse with a 120 s wait: the wait ran out first, the stop was reported failed with the
+model still wanted, and the poll relaunched it about two minutes after the operator stopped it.
+
 **The poll is the last line of defence.** Every 2 s servedeck re-reads state; if
 desired state names a model and nothing is running it, it relaunches — **3 times, 60 s
 apart**, with a `recovering` notice each time — then stops and leaves the notice

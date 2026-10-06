@@ -177,13 +177,52 @@ Offering more concurrency than this table allows never helps; it converts throug
 preemption. The noise band on aggregate throughput is ±8%. At full context the config serves one
 agent at a time.
 
+The table is for prompt length. A request holds KV for everything it generates as well, so a batch
+job sizes on prompt plus output: `servedeck.batch.safe_concurrency` (7k prompt + 12k output -> 5).
+WM-2B pilot 2 (2026-10-06) ran 64 in flight against that: 27.6 requests waiting on average, 124 s
+in the engine queue per request for 70 s of inference, 7 preemptions in 15 minutes.
+
+Most of the fixed per-sequence cost is Mamba state: in `align` mode each Mamba group reserves
+`2 + num_speculative_blocks` pages per request (`v1/kv_cache_interface.py:733`), and MTP's 3
+speculative tokens make that 5. A smaller `num_speculative_tokens` would raise short-prompt
+concurrency; that trade has not been measured.
+
 ### Prefix caching
 
-The effective match unit is **832 tokens** and `--prefix-match-unit 208` does not change it (see
-*Refuted*). With the usual "never cache the final block" rule, a growing agent conversation needs
-more than 1,664 shared tokens before its first hit and then re-prefills up to 831 tail tokens every
-turn. That is the real prefix-caching limit here, and making 208 effective needs an upstream root
-cause.
+**The rule.** A request whose first S tokens match an earlier request's is served
+`(floor(S / 832) - 1) * 832` tokens from the cache, so nothing below S = 1,664. Two causes, both in
+the fork (found 2026-10-06):
+
+- The block is 832 tokens because the hybrid allocator makes an attention page as large as a Mamba
+  state page (boot log: `Setting attention block size to 832 tokens`). Mamba state exists only at
+  block boundaries (`mamba_cache_mode` `align`), so a hit can only land on a multiple of 832.
+- MTP is an EAGLE-style drafter: it needs the target's hidden state for the token before the first
+  one it computes, so `FullAttentionManager.find_longest_cache_hit` drops the last matched unit
+  (`v1/core/single_type_kv_cache_manager.py:769-773`). Without a finer hash unit that unit is a whole
+  832-token block, and the Mamba state at the shortened position does not exist.
+
+**`--prefix-match-unit` does not help** for prompts that share a system prompt or a document and
+then diverge: the eagle drop becomes one unit, but the attention side then needs a cached hash at
+`k * 832 + unit`, and the fork registers hashes inside a block only at a request's own prompt end.
+Run on the fork's own `KVCacheManager` and `_mamba_block_aligned_split` (CPU, no model), units 16, 64
+and 208 give the same hits as none for every shape below. Turning MTP off would give
+`floor(S / 832) * 832`, at the cost of MTP's decode speedup (acceptance 0.79 per draft token on the
+2026-10-06 WM-2B load), so it is not recommended.
+
+**Checked against the logs.** On EVENT-FACTS' own 2,002 pilot filings the rule predicts 30.5% of
+prompt tokens for prompt p1 (S = 2,278) and 53.2% for p2 (S = 2,678); the engine logged 30.5% and
+53.1%. WM-2B's system prompt is S = 945, so it gets nothing: 0 hits in 9,404,763 queried tokens on
+2026-10-06. The WM-S3 forecast prompt (S = 395) also gets nothing.
+
+**What this means for clients** (rules in [../CLIENTS.md](../CLIENTS.md#batch-jobs)):
+
+- A shared prefix shorter than 1,664 tokens is never reused. Above that, everything except the last
+  832 to 1,663 shared tokens is reused, so extra shared context (instructions, examples, a long
+  document) is nearly free after the first request.
+- N questions about one document cost N full prefills when they are sent together: none of them is
+  cached until one has finished its prefill. Fork simulation, 120k-token document: 960,960 prompt
+  tokens computed for 8 questions sent at once, 128,128 when the first runs alone and the other 7
+  follow (`servedeck.batch.run(..., warm_first=True)`).
 
 ### KV offload
 
@@ -263,6 +302,8 @@ discriminator against the live server: shared prefixes of 500 / 1,000 / 2,000 to
 0 / 0 / 832 hits, which fits an 832-token unit exactly and refutes 208 at all three points. The
 earlier "93.8% hits, TTFT 0.65 s → 0.18 s" result was real but came from an *identical* prompt,
 which hits at any granularity. It is also incompatible with offload. Dropped from the registry.
+The reason it is inert is the MTP drop described under *Prefix caching*; 16 and 64 are inert for
+the same reason (fork simulation, 2026-10-06).
 
 **MARLIN NvFp4 MoE.** Identical to FlashInfer CUTLASS here, 624-656 against 640-651 tok/s. The GLM
 MARLIN finding does not transfer: Qwen's experts are 512x640, GLM's 288x2048.

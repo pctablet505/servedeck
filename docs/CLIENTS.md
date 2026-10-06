@@ -177,6 +177,34 @@ restrict it. The VS Code *Codex* extension was rejected: it hardcodes
 providers and fall back to a cloud model ([codex#4558](https://github.com/openai/codex/issues/4558),
 [#7971](https://github.com/openai/codex/issues/7971)).
 
+## Batch jobs
+
+A job that sends many requests at once (extraction over thousands of filings, one prompt per
+company) is limited by the KV pool, not the GPU, and two mistakes cost hours on 2026-10-06.
+`servedeck.batch` (`servedeck/batch.py`) is the helper; it needs only httpx and the standard
+library, so a job's own venv imports it with `sys.path.insert(0, "<repo>")`.
+
+- **Size on prompt plus output, p90 of each.** `batch.plan(prompt_tokens=..., output_tokens=...)`
+  reads the live pool through the gateway's `/metrics` and applies the dashboard's calibrated
+  per-request cost to the length a request reaches when it finishes. A round number does not
+  work: WM-2B pilot 2 sent 64 where about 5 fit (7k prompt + 12k output), and its requests then
+  spent 124 s queued in the engine for every 70 s of inference.
+- **Run through `batch.run(items, call, limit=n)`.** It keeps at most `n` requests in flight, cuts
+  the limit by a quarter when `/metrics` shows a new preemption or a queue on two polls running,
+  and grows it back slowly. `call(item)` starts only once its slot is granted, so the HTTP timeout
+  set inside it measures the engine's work rather than the job's own backlog.
+- **Shared text goes first, identical, and long or not at all.** Flash-Next reuses
+  `(floor(S / 832) - 1) * 832` tokens of a shared prefix of S tokens and nothing below 1,664 (why:
+  [models/flashnext.md](models/flashnext.md#prefix-caching)). Put the shared instructions,
+  examples or document in the system message and everything per-request after it. Anything that
+  changes before the shared text breaks the match: Flash-Next's chat template writes the
+  reasoning-effort sentence at the start of the system message, so requests that should share a
+  prefix must use the same `reasoning_effort`.
+- **Several questions about one long document: send one first.** Requests sent together all
+  prefill the whole document; with `batch.run(..., warm_first=True)` the first runs alone and the
+  rest find the document cached (120k tokens, 8 questions: 128,128 prompt tokens computed instead
+  of 960,960, fork simulation).
+
 ## Adding another tool
 
 An OpenAI-compatible client needs three things: base URL `http://127.0.0.1:8010/v1`, model
