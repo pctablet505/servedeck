@@ -386,8 +386,17 @@ VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH = "1"
 VLLM_LM_HEAD_A16 = "1"
 VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS = "0"
 VLLM_MTP_NVFP4_LM_HEAD = "1"
-VLLM_MXFP8_LM_HEAD = "0"
+# The output layer quantized to MXFP8 on load (the checkpoint ships it in BF16): 3.90 ms per token
+# for one request instead of 4.17-4.54, 227/702/961 tok/s at 1/8/16 parallel against 207/689/880
+# (sonnet prompts, 2026-10-18); answers to a fixed arithmetic/fact/code/translation set unchanged.
+VLLM_MXFP8_LM_HEAD = "1"
 VLLM_PLE_CPU_OFFLOAD = "1"
+# The 26.8 GiB PLE table stays on NVMe and is read through io_uring (it overrides
+# VLLM_PLE_CPU_OFFLOAD). That keeps ~28 GB out of host RAM: engine RSS 4.1 GB instead of 31.8,
+# after a 110 GiB test job plus this engine ran the box out of memory on 2026-10-18. It costs
+# 7-12% (210/636/846 tok/s at 1/8/16 against 227/702/961 with the table in RAM, 70-226 MB/s of
+# reads). The table does not fit on the GPU: 71.3 GiB of weights plus 26.8 GiB is over the card.
+VLLM_PLE_TABLE_MEMORY = "disk"
 VLLM_QWEN3_8_FLASH_NEXT_HC_TP = "0"
 VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT = "1"
 VLLM_QWEN3_8_FLASH_NEXT_OVERLAP = "1"
