@@ -243,7 +243,9 @@ def _scan_snapshot_files(snapshot: Path, repo_dir: Path | None = None) -> Snapsh
     # must not let a non-safetensors blob claim an inode first, and the whole-
     # tree walk must not stop at the top level. Both are cheap (the entire hub
     # cache stats in ~25 ms warm).
-    st_scan = disksize.scan_tree(snapshot, recursive=False, match=".safetensors")
+    # Recursive: nvidia/Qwen3.8-Flash-Next-FP4-Local keeps every shard under tensors/.
+    st_scan = disksize.scan_tree(snapshot, recursive=True, match=".safetensors")
+    top_scan = disksize.scan_tree(snapshot, recursive=False, match=".safetensors")
     snap_scan = disksize.scan_tree(snapshot, recursive=True)
     # The whole ``models--*`` directory, not just the resolved snapshot: what
     # deleting this model frees is blobs/ plus every snapshot that references
@@ -269,8 +271,9 @@ def _scan_snapshot_files(snapshot: Path, repo_dir: Path | None = None) -> Snapsh
         # Dangling links are a property of the top level, where the snapshot's
         # own entries live; the recursive walk would also count anything broken
         # inside a subdirectory, which is not what the "blobs are on an
-        # unmounted drive" message is about.
-        dangling_count=st_scan.dangling,
+        # unmounted drive" message is about. Hence top_scan, not st_scan, now
+        # that st_scan descends into subdirectories.
+        dangling_count=top_scan.dangling,
         snapshot_files=snap_scan.blobs,
         disk_bytes=all_scan.allocated_bytes,
         disk_local_bytes=all_scan.local_bytes,

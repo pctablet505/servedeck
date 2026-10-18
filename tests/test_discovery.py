@@ -256,6 +256,24 @@ def test_safetensors_gib_sums_multiple_shards(tmp_path: Path) -> None:
     assert round(e.safetensors_gib, 2) == pytest.approx(28.25, abs=0.02)
 
 
+def test_shards_in_a_subdirectory_are_counted(tmp_path: Path) -> None:
+    # nvidia/Qwen3.8-Flash-Next-FP4-Local keeps all 21 shards under tensors/ (its index names
+    # them there); counting only the top level reported "0 safetensors" for a complete download.
+    repo = _make_repo(tmp_path, "models--A--B", config=INLINE_CONFIG)
+    snapshot = repo / "snapshots" / "abc123"
+    blobs = repo / "blobs"
+    blobs.mkdir()
+    (snapshot / "tensors").mkdir()
+    for i, size in enumerate((3 * GIB, 2 * GIB), start=1):
+        blob = blobs / f"shard{i}"
+        with open(blob, "wb") as fh:
+            fh.truncate(size)
+        (snapshot / "tensors" / f"model-{i:05d}-of-00002.safetensors").symlink_to(blob)
+    e = discover_models(tmp_path)[0]
+    assert e.safetensors_count == 2
+    assert e.safetensors_gib == pytest.approx(5.0, abs=0.01)
+
+
 # --------------------------------------------------------------------------- #
 # Servability rules
 # --------------------------------------------------------------------------- #
@@ -842,6 +860,27 @@ def test_a_healthy_snapshot_reports_no_dangling_symlinks(tmp_path) -> None:
     assert scan.dangling_count == 0
     assert scan.safetensors_count == 1
     assert scan.safetensors_bytes > 0
+
+
+def test_a_broken_link_inside_a_subdirectory_is_not_an_offline_blob(tmp_path) -> None:
+    """Shards are counted in subdirectories (FP4-Local keeps them under tensors/), but the
+    offline-blobs count stays a property of the top level: a stray broken link somewhere below
+    is not "your weights are on an unplugged drive". An unplugged drive breaks the top-level
+    entries too (config.json, the index), which is what the count keys on."""
+    from servedeck.discovery import _scan_snapshot_files
+
+    blob = tmp_path / "blobs" / "deadbeef"
+    blob.parent.mkdir()
+    blob.write_bytes(b"x" * 4096)
+    snap = tmp_path / "snapshots" / "abc"
+    (snap / "tensors").mkdir(parents=True)
+    (snap / "config.json").symlink_to(blob)
+    (snap / "tensors" / "model-00001.safetensors").symlink_to(blob)
+    (snap / "tensors" / "stray.json").symlink_to(tmp_path / "not-mounted" / "blob")
+
+    scan = _scan_snapshot_files(snap)
+    assert scan.safetensors_count == 1
+    assert scan.dangling_count == 0
 
 
 def test_the_observation_store_lives_in_the_configured_state_dir(
