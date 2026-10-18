@@ -285,8 +285,15 @@ TORCH_CUDA_ARCH_LIST = "12.0f"
 # B12X_AUTOTUNE=0: with autotuning on, the first boot measures kernels before it serves, and
 # its own counter put that at 30+ minutes (4 of 184 GEMM plans tuned in the first 43 s, with
 # the MoE and norm ops still to come); it was stopped there. Compiled kernels are cached in
-# ~/.cache/b12x either way. No --kv-offloading-size: these forks lack our
-# QSA-ring skip patch (builds/patches/flashnext-kv-offload-skip-qsa-ring.patch).
+# ~/.cache/b12x either way.
+# No --kv-offloading-size, and not for lack of the QSA-ring skip patch: on this b12x path the
+# raw-key ring is a per-slot buffer (lil-vllm b12x_qsa.py), not a KV cache group, so the
+# assert that patch fixed cannot fire (the 08:15 boot had 50 groups, all 3,008-token blocks).
+# The cost is elsewhere. With any KV connector this fork boots Flash-Next only under
+# --recurrent-checkpoint-policy aligned (the "Qwen QSA KV transfer" ValueError in
+# vllm/config/vllm.py), and that switches off request-boundary checkpoint caching, so an agent
+# turn reuses its prefix only up to the last 3,008-token block instead of the previous turn's
+# end. With it on, 81.5% of 162M prompt tokens were cache hits (08:15-13:50 on 2026-10-18).
 # --------------------------------------------------------------------------------
 [models.fp4local]
 id      = "Qwen3.8-Flash-Next-FP4-Local"
