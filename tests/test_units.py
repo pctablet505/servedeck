@@ -145,6 +145,10 @@ def test_start_transient_argv_is_exact() -> None:
         # rather than the kernel killing the desktop (no swap on this box).
         "-p",
         "MemoryMax=172G",
+        # Turns on the cpu controller in app.slice, so under contention the engine's
+        # threads are shared out per group, not one-for-one with every test worker.
+        "-p",
+        "CPUWeight=1000",
         "-p",
         "WorkingDirectory=/opt/venv",
         # sorted by key, so the argv is deterministic and assertable
@@ -252,6 +256,10 @@ def test_unset_env_becomes_one_unset_environment_property_per_name() -> None:
         # rather than the kernel killing the desktop (no swap on this box).
         "-p",
         "MemoryMax=172G",
+        # Turns on the cpu controller in app.slice, so under contention the engine's
+        # threads are shared out per group, not one-for-one with every test worker.
+        "-p",
+        "CPUWeight=1000",
         "-p",
         "WorkingDirectory=/opt/venv",
         # sorted, and before --setenv, so the argv is deterministic

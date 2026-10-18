@@ -168,6 +168,15 @@ DEFAULT_START_LIMIT_BURST = 3
 #: engine is OOM-killed inside its own cgroup instead of the kernel killing the
 #: desktop. There is no swap here, so MemoryMax= is the whole limit.
 DEFAULT_MEMORY_MAX = "172G"
+#: CPU share for a model unit under contention. Model units and testq's scope
+#: are siblings in app.slice, and without any unit setting a CPU weight systemd
+#: leaves the cpu controller off there, so the engine's few threads competed
+#: one-for-one with every pytest worker. Measured 2026-10-18 on fp4local
+#: (2,000-token random prompts, 512 out): with the test queue at load ~53 it gave
+#: 159/339/506/572 tok/s at 1/4/8/16 parallel against 180/439/599/675 on a quiet
+#: box; under a 32-process CPU burn with this weight, 553 at 8 and 661 at 16.
+#: The weight only matters while the CPU is saturated; the engine needs 2-3 cores.
+DEFAULT_CPU_WEIGHT = 1000
 
 #: Exactly the properties :func:`show` asks for, in the documented order.
 SHOW_PROPERTIES = "ActiveState,SubState,Result,NRestarts,MainPID,ExecMainStartTimestamp"
@@ -284,6 +293,7 @@ def start_transient_argv(
     start_limit_burst: int = DEFAULT_START_LIMIT_BURST,
     timeout_stop_sec: int = DEFAULT_TIMEOUT_STOP_SEC,
     memory_max: str = DEFAULT_MEMORY_MAX,
+    cpu_weight: int = DEFAULT_CPU_WEIGHT,
 ) -> list[str]:
     """The exact argv :func:`start_transient` runs. Shape::
 
@@ -297,6 +307,7 @@ def start_transient_argv(
                     -p StartLimitBurst=<start_limit_burst>
                     -p TimeoutStopSec=<timeout_stop_sec>
                     -p MemoryMax=<memory_max>
+                    -p CPUWeight=<cpu_weight>
                     -p WorkingDirectory=<cwd>
                     -p UnsetEnvironment=<NAME>   (one per name, sorted)
                     --setenv=<K>=<V>             (one per var, keys sorted)
@@ -375,6 +386,8 @@ def start_transient_argv(
         f"TimeoutStopSec={timeout_stop_sec}",
         "-p",
         f"MemoryMax={memory_max}",
+        "-p",
+        f"CPUWeight={cpu_weight}",
         "-p",
         f"WorkingDirectory={os.fspath(cwd)}",
     ]

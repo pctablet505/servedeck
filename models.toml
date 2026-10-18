@@ -282,10 +282,14 @@ TORCH_CUDA_ARCH_LIST = "12.0f"
 # ready in 168 s, 805,463 KV tokens at util 0.96, ~190 tok/s single-stream, 1,027 tok/s
 # aggregate at 16 parallel. With the card's full env it had also answered a 159,036-token
 # prompt in 12.1 s.
-# B12X_AUTOTUNE=0: with autotuning on, the first boot measures kernels before it serves, and
-# its own counter put that at 30+ minutes (4 of 184 GEMM plans tuned in the first 43 s, with
-# the MoE and norm ops still to come); it was stopped there. Compiled kernels are cached in
-# ~/.cache/b12x either way.
+# B12X_AUTOTUNE=0 runs every b12x kernel on its default config and never reads tuned winners
+# (lil-flashinfer b12x/preparation/session.py, _warmup_only). Tuning gains nothing measurable
+# here: with the 184 GEMM and MoE plans tuned, 180/439/599/675 tok/s at 1/4/8/16 parallel
+# against 197/431/584/716 untuned (2,000-token random prompts, 512 out, quiet CPU, 2026-10-18),
+# and a first tuned boot spends minutes measuring (~19 s per linear-attention prefill plan).
+# Also tested 2026-10-18 and kept: VLLM_B12X_MOE_FP4_FORCE_A16=1. Decode MoE is half of a decode
+# step's GPU time (torch profile, 8 parallel), but the A4 kernel was no faster on a
+# quiet CPU (180/377/580/698 tok/s at 1/4/8/16 vs 180/439/599/675, 2,000-token random prompts).
 # No --kv-offloading-size, and not for lack of the QSA-ring skip patch: on this b12x path the
 # raw-key ring is a per-slot buffer (lil-vllm b12x_qsa.py), not a KV cache group, so the
 # assert that patch fixed cannot fire (the 08:15 boot had 50 groups, all 3,008-token blocks).
