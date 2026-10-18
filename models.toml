@@ -290,6 +290,13 @@ TORCH_CUDA_ARCH_LIST = "12.0f"
 # Also tested 2026-10-18 and kept: VLLM_B12X_MOE_FP4_FORCE_A16=1. Decode MoE is half of a decode
 # step's GPU time (torch profile, 8 parallel), but the A4 kernel was no faster on a
 # quiet CPU (180/377/580/698 tok/s at 1/4/8/16 vs 180/439/599/675, 2,000-token random prompts).
+# Also tested 2026-10-18 and left out (sonnet prompts unless noted; run-to-run noise is ~10%):
+# 2 or 4 speculative tokens; VLLM_B12X_BF16_GEMV=1 (one request 4.45 ms/token vs 3.90: its plans run
+# untuned); VLLM_B12X_PAGED_DECODE=1 (Flash-Next's QSA layers do not use it); full tuning including
+# the linear-attention prefill plans (222/733/884 tok/s at 1/8/16 and 23.98 ms/token at 60k context
+# vs 229/725/917 and 24.0 untuned); --max-num-batched-tokens 12035 (KV 805k -> 593k tokens, and eight
+# 60k-token requests finished in 49.8 s instead of 45.6). Batched decode is power-bound here: at 16
+# parallel the card sits at its 425 W cap with SM clocks 2.3-2.6 of 3.09 GHz.
 # No --kv-offloading-size, and not for lack of the QSA-ring skip patch: on this b12x path the
 # raw-key ring is a per-slot buffer (lil-vllm b12x_qsa.py), not a KV cache group, so the
 # assert that patch fixed cannot fire (the 08:15 boot had 50 groups, all 3,008-token blocks).
@@ -391,12 +398,6 @@ VLLM_MTP_NVFP4_LM_HEAD = "1"
 # (sonnet prompts, 2026-10-18); answers to a fixed arithmetic/fact/code/translation set unchanged.
 VLLM_MXFP8_LM_HEAD = "1"
 VLLM_PLE_CPU_OFFLOAD = "1"
-# The 26.8 GiB PLE table stays on NVMe and is read through io_uring (it overrides
-# VLLM_PLE_CPU_OFFLOAD). That keeps ~28 GB out of host RAM: engine RSS 4.1 GB instead of 31.8,
-# after a 110 GiB test job plus this engine ran the box out of memory on 2026-10-18. It costs
-# 7-12% (210/636/846 tok/s at 1/8/16 against 227/702/961 with the table in RAM, 70-226 MB/s of
-# reads). The table does not fit on the GPU: 71.3 GiB of weights plus 26.8 GiB is over the card.
-VLLM_PLE_TABLE_MEMORY = "disk"
 VLLM_QWEN3_8_FLASH_NEXT_HC_TP = "0"
 VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT = "1"
 VLLM_QWEN3_8_FLASH_NEXT_OVERLAP = "1"
