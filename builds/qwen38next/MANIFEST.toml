@@ -58,6 +58,14 @@ files = [
 # edits (vllm/distributed/kv_transfer/kv_connector/v1/offloading/{config,scheduler}.py:
 # skip non-prefix-cacheable KV groups so --kv-offloading-size boots on Qwen4Exp;
 # the standalone diff is flashnext-kv-offload-skip-qsa-ring.patch beside it).
+# 2026-10-10: both files re-exported from the live tree. Tracked now also holds
+# (a) the PLE offload deadlock fix (vllm/v1/ple_offload/connector.py and
+# tests/v1/worker/test_gpu_model_runner.py; standalone diff
+# ../flashnext-ple-offload-event-race.patch) and (b) the scheduler change of
+# 2026-10-05 (vllm/v1/core/sched/scheduler.py; standalone diff
+# ../flashnext-sched-hol-deadlock-on-external-kv-hit.patch), which the 09-17
+# export predated. Untracked gains tests/v1/worker/test_ple_offload_event_race.py
+# (3 untracked files now). check.sh: 1 FAIL (tracked drift) before, 18 PASS after.
 excluded_branches = [
     "branches/jit-warmup-and-template-errors/0001-*.patch, 0002-*.patch (2 commits over tree.head; local branch 'jit-warmup-and-template-errors', not merged into release/qwen38next_offload)",
     "branches/mm-encoder-offload/0001-*.patch (1 commit over tree.head; local branch 'mm-encoder-offload', not merged)",

@@ -515,3 +515,228 @@ index 000000000..7817d10dc
 +            seq_lens_real=[20, 23, 17],
 +            num_rows_padded=4,
 +        )
+diff --git a/tests/v1/worker/test_ple_offload_event_race.py b/tests/v1/worker/test_ple_offload_event_race.py
+new file mode 100644
+index 000000000..e0c616168
+--- /dev/null
++++ b/tests/v1/worker/test_ple_offload_event_race.py
+@@ -0,0 +1,219 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The PLE request thread must never wait on a batch launched after its own.
++
++With async scheduling the model thread launches batch N+1 while forward N is
++still parked on the CPU worker's result for request N. The request thread
++publishes request N only after N's D2H copies completed. If that completion
++is tracked by state the launch of N+1 also touches, a request thread that
++runs late waits for work queued behind forward N, and forward N waits for the
++request the thread has not published: both wait forever with the GPU idle.
++"""
++
++import contextlib
++import queue
++import threading
++from multiprocessing.reduction import ForkingPickler
++from unittest.mock import Mock
++
++import pytest
++import torch
++import torch.multiprocessing as torch_mp
++
++from vllm.model_executor.layers import ple_offload_layer
++from vllm.model_executor.layers.ple_offload_layer import CpuGpuSemaphore
++from vllm.v1.ple_offload.connector import (
++    PleOffloadConnector,
++    _PendingPleOffloadRequest,
++)
++from vllm.v1.ple_offload.protocol import PleOffloadRequest
++
++
++def test_ple_offload_returns_event_before_publishing_request(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Free the D2H event before the CPU worker can answer the request.
++
++    The model thread launches the batch after next only once this batch has an
++    output, which needs the published request. An event returned after the
++    send could still be out of the pool when that launch asks for one.
++    """
++    monkeypatch.setattr(
++        torch.accelerator, "device_index", lambda _index: contextlib.nullcontext()
++    )
++    monkeypatch.setattr(
++        torch.cuda.nvtx, "range", lambda *_args, **_kwargs: contextlib.nullcontext()
++    )
++    connector = PleOffloadConnector.__new__(PleOffloadConnector)
++    connector.device = torch.device("cuda:0")
++    connector._uses_cuda_inputs = True
++    connector._d2h_event_pool = queue.Queue(maxsize=2)
++    order: list[str] = []
++    event = Mock()
++    event.synchronize.side_effect = lambda: order.append("synchronize")
++    socket = Mock()
++
++    def send(_payload: bytes) -> None:
++        order.append("send")
++        assert connector._d2h_event_pool is not None
++        assert connector._d2h_event_pool.qsize() == 1
++
++    socket.send.side_effect = send
++    pending = _PendingPleOffloadRequest(
++        PleOffloadRequest(dp_rank=0, num_tokens=4, num_reqs=2), event
++    )
++
++    connector._process_request(pending, socket)
++
++    assert order == ["synchronize", "send"]
++    assert connector._d2h_event_pool.get_nowait() is event
++
++
++def test_ple_offload_launch_returns_only_after_the_request_is_published(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Hold the model thread until the request thread has sent the request.
++
++    The forward queued after a launch parks the model stream until the CPU
++    worker answers. A kernel launch that blocks on the parked stream keeps the
++    GIL, so a request still unpublished at that point could never be sent.
++    """
++    monkeypatch.setattr(
++        torch.accelerator, "device_index", lambda _index: contextlib.nullcontext()
++    )
++    monkeypatch.setattr(
++        torch.cuda.nvtx, "range", lambda *_args, **_kwargs: contextlib.nullcontext()
++    )
++    connector = PleOffloadConnector.__new__(PleOffloadConnector)
++    connector.device = torch.device("cuda:0")
++    connector.tp_rank = 0
++    connector.dp_rank = 0
++    connector._uses_cuda_inputs = True
++    connector._request_thread = Mock()
++    connector._request_queue = queue.Queue(maxsize=2)
++    connector._d2h_event_pool = queue.Queue(maxsize=2)
++    connector._d2h_event_pool.put_nowait(Mock())
++    connector._d2h_event_pool.put_nowait(Mock())
++    connector._enqueue_cuda_inputs = Mock()  # type: ignore[method-assign]
++    order: list[str] = []
++    socket = Mock()
++    socket.send.side_effect = lambda _payload: order.append("published")
++    launched = threading.Event()
++
++    def launch() -> None:
++        connector._launch(num_reqs=2, num_tokens=4)
++        order.append("launch returned")
++        launched.set()
++
++    model_thread = threading.Thread(target=launch, daemon=True)
++    model_thread.start()
++    pending = connector._request_queue.get(timeout=5)
++    assert pending is not None
++    assert not launched.wait(timeout=0.2)
++
++    connector._process_request(pending, socket)
++
++    assert launched.wait(timeout=5)
++    model_thread.join(timeout=5)
++    assert order == ["published", "launch returned"]
++
++
++@pytest.mark.skipif(not torch.accelerator.is_available(), reason="GPU is required")
++def test_ple_offload_request_does_not_wait_for_the_next_batch() -> None:
++    """Publish request N while forward N is parked and N+1 is already launched."""
++    socket = Mock()
++    connector = PleOffloadConnector.__new__(PleOffloadConnector)
++    connector.device = torch.device("cuda:0")
++    connector.tp_rank = 0
++    connector.dp_rank = 0
++    original_strategy = torch_mp.get_sharing_strategy()
++    try:
++        torch_mp.set_sharing_strategy("file_descriptor")
++        connector._input_ids_buf = torch.full(
++            (4,), -99, dtype=torch.int32
++        ).share_memory_()
++        connector._query_start_loc_buf = torch.full(
++            (3,), -99, dtype=torch.int32
++        ).share_memory_()
++        connector._ngram_context_buf = None
++        input_buffers = (connector._input_ids_buf, connector._query_start_loc_buf)
++        torch_mp.set_sharing_strategy("file_system")
++        ForkingPickler.dumps(input_buffers)
++    finally:
++        torch_mp.set_sharing_strategy(original_strategy)
++
++    connector._pinned_input_buffers = []
++    connector._request_thread = None
++    connector._request_queue = queue.Queue(maxsize=2)
++    published = threading.Event()
++    publisher: threading.Thread | None = None
++
++    with torch.accelerator.device_index(connector.device.index):
++        connector._input_ids_source = torch.tensor(
++            [7, -1, 11, -1], dtype=torch.int32, device=connector.device
++        )
++        connector._query_start_loc_source = torch.tensor(
++            [0, 2, 4], dtype=torch.int32, device=connector.device
++        )
++        connector._ngram_context_source = None
++        connector._uses_cuda_inputs = True
++        connector._validate_input_sources()
++        connector._pin_input_buffers()
++        connector._d2h_event_pool = queue.Queue(maxsize=2)
++        connector._d2h_event_pool.put_nowait(torch.cuda.Event())
++        connector._d2h_event_pool.put_nowait(torch.cuda.Event())
++        # Everything the test allocates on the GPU exists before the model
++        # stream parks; the model runs on its own stream so the default one
++        # stays free.
++        semaphore = CpuGpuSemaphore(connector.device)
++        placeholder = torch.zeros(1, device=connector.device)
++        model_stream = torch.cuda.Stream(device=connector.device)
++        worker_stream = torch.cuda.Stream(device=connector.device)
++        torch.accelerator.synchronize(connector.device)
++        try:
++            with torch.cuda.stream(model_stream):
++                connector._launch(num_reqs=2, num_tokens=4)
++                # Forward N: the model stream parks until the CPU worker
++                # answers request N.
++                ple_offload_layer._ple_offload_wait_impl(
++                    semaphore.flag_tensor, placeholder, placeholder
++                )
++                # The request thread has taken N but has not run yet.
++                first = connector._request_queue.get_nowait()
++                assert first is not None
++                connector._launch(num_reqs=1, num_tokens=2)
++
++            def publish() -> None:
++                connector._process_request(first, socket)
++                published.set()
++
++            publisher = threading.Thread(target=publish, daemon=True)
++            publisher.start()
++            published_while_parked = published.wait(timeout=10)
++            staged = (
++                connector._input_ids_buf.tolist(),
++                connector._query_start_loc_buf.tolist(),
++            )
++        finally:
++            # What the CPU worker does once it has request N. It also releases
++            # a publisher that wrongly waited for the parked model stream.
++            semaphore.signal(worker_stream)
++            if publisher is not None:
++                publisher.join(timeout=30)
++            model_stream.synchronize()
++            torch.accelerator.synchronize(connector.device)
++            connector._unpin_input_buffers()
++
++    assert published_while_parked, (
++        "request N waited for work queued behind forward N: its D2H event "
++        "was shared with the launch of batch N+1"
++    )
++    assert staged == ([7, -1, 11, -1], [0, 2, 4])
++    socket.send.assert_called_once()
++    assert connector._d2h_event_pool.qsize() == 1
++
++    second = connector._request_queue.get_nowait()
++    assert second is not None
++    connector._process_request(second, socket)
++    assert socket.send.call_count == 2
++    assert connector._d2h_event_pool.qsize() == 2

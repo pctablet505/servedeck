@@ -308,6 +308,7 @@ for this class. `max_output_tokens` is 32000 here.
 | A 401 from the hub minutes into a launch | `HF_HUB_OFFLINE` was not set. With it set, a missing shard instead fails fast with a local-files-only error, and doctor's `weights (flashnext)` row catches that before a launch starts. |
 | Load dies on `ngram_embedding.weight_scale` | `VLLM_PLE_FP8_CHECKPOINT` disagrees with the PLE table on disk, in one direction or the other. |
 | 40 GiB missing from host RAM after a stop | The engine was force-killed before it could unlink its offload buffer. Look for a `vllm_offload_*.mmap` in `/dev/shm` with no live engine behind it; the reaper removes only buffers it can prove are orphaned. |
+| Requests running, zero tokens generated, GPU idle near 90 W, and the engine logging `No available shared memory broadcast block found in 60 seconds` once a minute | A PLE offload deadlock, on a tree without `builds/patches/flashnext-ple-offload-event-race.patch`; it fires when other jobs load the CPU. Patched 2026-10-10 (see BUILDS.md). Check: `grep -c published ~/Projects/vllm-qwen38next/src/vllm/v1/ple_offload/connector.py` prints 3. Restart the model; it does not recover by itself. |
 | A log line saying `max_num_batched_tokens=2048` | That is the `PleOffloadWorker`'s own scheduler, not the engine's. The `APIServer` non-default-args line says 8192, and 8192 is served. |
 
 ## Refuted, and do not retry
