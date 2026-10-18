@@ -1,3 +1,99 @@
+diff --git a/tests/entrypoints/unit_tests/test_postprocess_messages_invalid_arguments.py b/tests/entrypoints/unit_tests/test_postprocess_messages_invalid_arguments.py
+new file mode 100644
+index 000000000..85beb674d
+--- /dev/null
++++ b/tests/entrypoints/unit_tests/test_postprocess_messages_invalid_arguments.py
+@@ -0,0 +1,90 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""One history ``function_call`` with invalid JSON ``arguments`` must not
++make the whole request fail.
++
++Incident, 2026-10-15 23:20Z: a Codex session on Flash-Next stored a
++``function_call`` item whose ``arguments`` is an unterminated JSON string.
++Codex resends its whole history on every ``POST /v1/responses``, and
++``_postprocess_messages`` ran ``json.loads`` on that string, so every later
++request answered HTTP 400 ``Unterminated string starting at: line 1 column 9
++(char 8)``.  The session could not continue until the history was edited by
++hand.
++
++``/v1/responses`` input reaches ``_postprocess_messages`` through
++``construct_input_messages`` (responses/utils.py) and
++``parse_chat_messages_async`` (chat_utils.py); the tests run those two real
++conversion steps on CPU.
++"""
++
++from __future__ import annotations
++
++import json
++
++import pytest
++from openai.types.responses import ResponseFunctionToolCall
++
++from vllm.entrypoints.chat_utils import _postprocess_messages
++from vllm.entrypoints.openai.responses.utils import construct_input_messages
++
++# arguments of the call that ended the stream inside ``cmd`` (shortened).
++_TRUNCATED = (
++    '{"cmd": "cd ~/Projects/x && cat >> RUNLOG.md <<\'EOF\'\\nnote\\n</think>'
++    "\\n\\n<tool_call>\\n<function=exec_command>"
++)
++
++
++def _history(arguments: str) -> list:
++    return [
++        {"type": "message", "role": "user", "content": "go"},
++        ResponseFunctionToolCall(
++            id="fc_1",
++            call_id="call_1",
++            type="function_call",
++            name="exec_command",
++            arguments=arguments,
++        ),
++        {"type": "function_call_output", "call_id": "call_1", "output": "ran"},
++        {"type": "message", "role": "user", "content": "continue"},
++    ]
++
++
++def _convert(arguments: str) -> list:
++    messages = construct_input_messages(request_input=_history(arguments))
++    _postprocess_messages(messages)
++    return messages
++
++
++def _tool_call_arguments(messages: list):
++    (assistant,) = [m for m in messages if m["role"] == "assistant"]
++    (tool_call,) = assistant["tool_calls"]
++    return tool_call["function"]["arguments"]
++
++
++def test_truncated_arguments_are_not_valid_json():
++    # The input really is what the incident sent: the guard for the tests below.
++    with pytest.raises(json.JSONDecodeError, match="Unterminated string"):
++        json.loads(_TRUNCATED)
++
++
++def test_invalid_json_arguments_do_not_fail_the_request():
++    messages = _convert(_TRUNCATED)
++    assert _tool_call_arguments(messages) == {}
++    assert [m["role"] for m in messages] == ["user", "assistant", "tool", "user"]
++
++
++@pytest.mark.parametrize("arguments", ["{", '{"a": ', "not json", '{"a": "b'])
++def test_other_invalid_json_arguments_become_empty_object(arguments):
++    assert _tool_call_arguments(_convert(arguments)) == {}
++
++
++def test_valid_json_arguments_are_still_parsed():
++    assert _tool_call_arguments(_convert('{"cmd": "ls", "n": 3}')) == {
++        "cmd": "ls",
++        "n": 3,
++    }
++
++
++@pytest.mark.parametrize("arguments", ["", "null"])
++def test_empty_arguments_still_become_empty_object(arguments):
++    assert _tool_call_arguments(_convert(arguments)) == {}
 diff --git a/tests/entrypoints/unit_tests/test_reasoning_field_chat_template_roundtrip.py b/tests/entrypoints/unit_tests/test_reasoning_field_chat_template_roundtrip.py
 new file mode 100644
 index 000000000..9cfeb71ea

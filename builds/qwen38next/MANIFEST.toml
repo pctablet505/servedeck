@@ -66,6 +66,12 @@ files = [
 # ../flashnext-sched-hol-deadlock-on-external-kv-hit.patch), which the 09-17
 # export predated. Untracked gains tests/v1/worker/test_ple_offload_event_race.py
 # (3 untracked files now). check.sh: 1 FAIL (tracked drift) before, 18 PASS after.
+# 2026-10-16: both files re-exported again. Tracked also holds the tool-call history fix
+# vllm/entrypoints/chat_utils.py (invalid-JSON history arguments -> {}); standalone diff
+# ../flashnext-responses-history-invalid-arguments.patch. Untracked gains
+# tests/entrypoints/unit_tests/test_postprocess_messages_invalid_arguments.py (4 untracked
+# files now). A parser variant that closed truncated streamed arguments was dropped the same
+# day (truncated commands would run). check.sh: 2 FAIL (tracked + untracked drift) before, all PASS after.
 excluded_branches = [
     "branches/jit-warmup-and-template-errors/0001-*.patch, 0002-*.patch (2 commits over tree.head; local branch 'jit-warmup-and-template-errors', not merged into release/qwen38next_offload)",
     "branches/mm-encoder-offload/0001-*.patch (1 commit over tree.head; local branch 'mm-encoder-offload', not merged)",

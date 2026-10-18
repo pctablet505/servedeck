@@ -434,6 +434,29 @@ index ebc9b87e1..1e37266fd 100644
                  is_sliding_window = (
                      group_config.sliding_window_size_in_chunks is not None
                  )
+diff --git a/vllm/entrypoints/chat_utils.py b/vllm/entrypoints/chat_utils.py
+index 30b6ecc76..c3e550317 100644
+--- a/vllm/entrypoints/chat_utils.py
++++ b/vllm/entrypoints/chat_utils.py
+@@ -1945,7 +1945,17 @@ def _postprocess_messages(messages: list[ConversationMessage]) -> None:
+                 # if arguments is None or empty string, set to {}
+                 if content := function.get("arguments"):
+                     if not isinstance(content, (dict, list)):
+-                        parsed = json.loads(content)
++                        try:
++                            parsed = json.loads(content)
++                        except json.JSONDecodeError:
++                            # A truncated call stays in the history the client
++                            # resends; rejecting it would fail every later turn.
++                            logger.warning(
++                                "Replacing invalid JSON arguments of tool call "
++                                "%r in the conversation history with {}.",
++                                function.get("name"),
++                            )
++                            parsed = None
+                         function["arguments"] = parsed if parsed is not None else {}
+                 else:
+                     function["arguments"] = {}
 diff --git a/vllm/envs.py b/vllm/envs.py
 index 6ee337f14..711c7ef5f 100755
 --- a/vllm/envs.py
