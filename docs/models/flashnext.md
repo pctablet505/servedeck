@@ -46,7 +46,7 @@ with the bracket, or the grep matches its own command line.)
 | `--gpu-memory-utilization` | 0.96 | Pinned in the registry, not computed. See below. |
 | `--max-num-seqs` | 16 | Parallel agents. At 1 the box gave 141 aggregate tok/s; at 16, ~1,040 (2026-09-03). |
 | `--max-num-batched-tokens` | 8192 | Memory-locked here; 16384 and 32768 do not boot at 262k ctx. |
-| `--limit-mm-per-prompt` | `{"image":2,"video":0}` | Images on. Costs 0.81 GiB of weights plus 0.49 GiB of profiling peak and encoder cache (encoder budget 16,384 tokens). |
+| `--limit-mm-per-prompt` | `{"image":256,"video":0}` | Images on. Costs 0.81 GiB of weights plus 0.49 GiB of profiling peak and encoder cache (encoder budget 16,384 tokens); the count itself costs nothing, since the encoder is profiled with one item. 256 because a browser agent resends every screenshot each turn: 2 then 4 failed on the 3rd and 5th (HTTP 400), and 256 is about what the 262,144-token window holds at ~1,000 tokens per 1280x800 shot (2026-10-16: 1 shot = 1,068 prompt tokens, 4 shots = 4,074). |
 | `--kv-cache-dtype` | auto (bf16) | fp8 is hard-blocked by the QSA kernel. |
 | `--enable-prefix-caching` | — | Effective granularity 832 tokens; see below. |
 | `--speculative-config` | mtp, 3 draft tokens | 4 raises acceptance and not throughput; 5 asserts. |

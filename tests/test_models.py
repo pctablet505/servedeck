@@ -188,6 +188,18 @@ def test_resident_model_with_vram_mib_loads(tmp_path):
     assert reg.models["a"].vram_mib == 500
 
 
+def test_the_agent_profile_admits_a_browser_sessions_screenshots():
+    """`flashnext` takes at least 128 images per prompt.
+
+    A browser agent (OpenWork) sends a screenshot per step and resends the whole history each turn.
+    At 4 the gateway answered the 5th with HTTP 400 "At most 4 image(s) may be provided in one prompt".
+    """
+    flags = models.load(REPO_ROOT / "models.toml").models["flashnext"].flags
+    limit = json.loads(flags[list(flags).index("--limit-mm-per-prompt") + 1])
+    assert limit["image"] >= 128
+    assert limit["video"] == 0
+
+
 def test_real_models_toml_loads():
     """The repo-root models.toml (the actual deliverable) must load and validate."""
     reg = models.load(REPO_ROOT / "models.toml")

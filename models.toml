@@ -153,7 +153,13 @@ flags = [
     "--distributed-executor-backend", "mp",
     "--max-num-seqs", "16",
     "--max-num-batched-tokens", "8192",
-    "--limit-mm-per-prompt", '{"image":2,"video":0}',
+    # 2026-10-16: OpenWork's browser work sends a screenshot per step and the whole history
+    # is resent each turn, so 4 failed on the 5th ("At most 4 image(s) may be provided in one
+    # prompt", HTTP 400). 256 is about what the 262,144-token window holds at ~1,000 tokens per
+    # 1280x800 shot (measured: 1 shot = 1,068 prompt tokens, 4 shots = 4,074), so once the reply has
+    # its room the window binds first. The cap costs no VRAM: the encoder is profiled with one item
+    # whatever this says (boot log, 2026-10-16).
+    "--limit-mm-per-prompt", '{"image":256,"video":0}',
     "--kv-cache-dtype", "auto",
     "--enable-prefix-caching",
     "--speculative-config", '{"method":"mtp","num_speculative_tokens":3}',
