@@ -1026,6 +1026,13 @@ async def _run_mutation(
             )
             return
         else:
+            # Refresh liveness BEFORE announcing: a client acts on the notice at
+            # once, and the precheck and the gateway both judge it by this
+            # snapshot. Announced first, a start sent on "stopped" was refused
+            # 409 already_live by the unit just stopped, and a request sent on
+            # "ready" got 503 "still starting" (2026-10-18).
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(rt.routes.refresh)
             _publish_result(rt.hub, label, result)
         finally:
             # `else` runs before `finally`, and the except branch publishes

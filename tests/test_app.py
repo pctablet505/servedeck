@@ -1104,6 +1104,56 @@ async def test_busy_clears_even_when_the_work_raises(runtime) -> None:
     assert reasons.count("exception") == 1, "the outcome was published twice"
 
 
+async def _snapshot_keys_at(runtime, reason: str, work, label: str, key: str) -> list[set[str]]:
+    """Run one mutation; return the liveness snapshot's keys at each ``reason`` notice."""
+    runtime.hub.bind(asyncio.get_running_loop())
+    seen: list[set[str]] = []
+
+    def publish(event_type: str, data: Any) -> None:
+        if event_type == "notice" and data.get("reason") == reason:
+            seen.append(set(runtime.routes.live()))
+
+    monkey = runtime.hub.publish
+    runtime.hub.publish = publish  # type: ignore[method-assign]
+    try:
+        await _app._run_mutation(runtime, label, work, action=label.split()[0], key=key)
+    finally:
+        runtime.hub.publish = monkey  # type: ignore[method-assign]
+    return seen
+
+
+@pytest.mark.anyio
+async def test_a_stopped_model_is_out_of_the_snapshot_when_stopped_is_announced(runtime) -> None:
+    """A start sent the moment "stopped" arrives is judged against the snapshot.
+
+    2026-10-18: a stop finished at 17:44:49.19 and the start POSTed at
+    17:44:49.59 got 409 already_live ("deactivating (stop-sigterm)"), because the
+    snapshot was rebuilt only after the notice had gone out.
+    """
+    set_live(runtime, FakeLive(key="small", unit="sd-test-small", state="deactivating", sub_state="stop-sigterm"))
+
+    def stop():
+        runtime.control.rows = []
+        return runtime.control.stop("small")
+
+    seen = await _snapshot_keys_at(runtime, "stopped", stop, "stop small", "small")
+    assert seen == [set()], "the snapshot still listed the stopped unit when 'stopped' went out"
+
+
+@pytest.mark.anyio
+async def test_a_started_model_is_in_the_snapshot_when_ready_is_announced(runtime) -> None:
+    """The gateway routes by the snapshot, so a client that sends its first
+    request on "ready" got 503 "still starting" until the next poll."""
+    set_live(runtime)
+
+    def start():
+        runtime.control.rows = [FakeLive(key="small", unit="sd-test-small")]
+        return runtime.control.start("small")
+
+    seen = await _snapshot_keys_at(runtime, "ready", start, "start small", "small")
+    assert seen == [{"small"}], "the snapshot did not list the model when 'ready' went out"
+
+
 def test_headroom_has_the_same_keys_whether_or_not_it_is_available() -> None:
     """A key that appears only in one branch makes the document's SHAPE depend
     on its content: a renderer written against the available branch throws on
