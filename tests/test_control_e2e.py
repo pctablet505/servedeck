@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -157,7 +158,9 @@ def stub_unit():
         units.stop(STUB_UNIT, timeout_s=30)
 
 
-def test_start_transient_really_starts_a_unit_and_stop_really_removes_it(stub_unit) -> None:
+def test_start_transient_really_starts_a_unit_and_stop_really_removes_it(
+    needs_unit_network, stub_unit
+) -> None:
     assert wait_until(lambda: units.show(stub_unit).active_state == "active", 20), (
         units.journal_tail(stub_unit, 20)
     )
@@ -176,6 +179,43 @@ def test_start_transient_really_starts_a_unit_and_stop_really_removes_it(stub_un
     assert units.gone(stub_unit) is True
     assert stub_unit not in units.list_units("sd-test-*")
     assert control.http_probe(STUB_PORT) is None
+
+
+def _listens(pid: int, port: int) -> bool:
+    """Whether ``pid``'s own network namespace has a TCP listener on ``port``.
+
+    ``/proc/<pid>/net/tcp`` is that process's view, and it stays readable from inside another
+    namespace, so this proves the stub is up without connecting to it. Its journal cannot: lines
+    from earlier runs of the same unit name match too.
+    """
+    try:
+        rows = Path(f"/proc/{pid}/net/tcp").read_text().splitlines()[1:]
+    except OSError:
+        return False
+    suffix = f":{port:04X}"
+    return any(
+        fields[1].endswith(suffix) and fields[3] == "0A"  # 0A = TCP_LISTEN
+        for fields in (row.split() for row in rows)
+    )
+
+
+def test_the_network_check_agrees_with_a_real_connection(stub_unit, units_share_network) -> None:
+    """The check that skips the port-probing tests must match what a socket sees.
+
+    Under testq the test runs in its own network namespace while the user manager starts the
+    stub on the host's loopback, so a probe can never reach it and every port-probing test used
+    to sit out its whole timeout before failing. Inside testq both sides here say "no"; outside
+    it both must say "yes", and a check that always answers one way fails in the other place.
+    """
+    pid = wait_until(lambda: units.show(stub_unit).main_pid or None, 20)
+    assert pid, units.journal_tail(stub_unit, 20)
+    assert wait_until(lambda: _listens(pid, STUB_PORT), 20), units.journal_tail(stub_unit, 20)
+    try:
+        socket.create_connection(("127.0.0.1", STUB_PORT), timeout=2).close()
+        reachable = True
+    except OSError:
+        reachable = False
+    assert units_share_network is reachable
 
 
 def test_the_unit_is_not_in_the_cgroup_of_whatever_started_it(stub_unit) -> None:
@@ -359,7 +399,9 @@ def test_unset_env_keeps_the_managers_secrets_out_of_the_unit(manager_canary) ->
         units.stop(unit, timeout_s=30)
 
 
-def test_a_model_started_through_control_cannot_read_the_managers_secrets(manager_canary) -> None:
+def test_a_model_started_through_control_cannot_read_the_managers_secrets(
+    needs_unit_network, manager_canary
+) -> None:
     """End to end through `control.start`, checking the one place that cannot
     be argued with: the live process's own `/proc/<pid>/environ`.
 
@@ -395,7 +437,7 @@ def test_a_model_started_through_control_cannot_read_the_managers_secrets(manage
         ctl.stop("stub")
 
 
-def test_wait_ready_sees_real_journal_markers_in_order() -> None:
+def test_wait_ready_sees_real_journal_markers_in_order(needs_unit_network) -> None:
     """The marker detector, against real journald rather than a pipe.
 
     The stub prints vLLM's four lines with the real delays a boot has, so this

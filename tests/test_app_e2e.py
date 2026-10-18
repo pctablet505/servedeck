@@ -296,7 +296,7 @@ class EventCollector:
 # ==========================================================================
 
 
-def test_the_whole_lifecycle_through_the_api(server) -> None:
+def test_the_whole_lifecycle_through_the_api(needs_unit_network, server) -> None:
     """start -> markers on SSE -> ready -> gateway lists it -> gateway reaches
     it -> stop -> the unit is gone."""
     assert stub_row(state())["live"] is False
@@ -397,7 +397,7 @@ def test_the_whole_lifecycle_through_the_api(server) -> None:
     assert httpx.get(f"{BASE}/v1/models", timeout=10.0).json()["data"] == []
 
 
-def test_the_registry_is_what_launched_it(server) -> None:
+def test_the_registry_is_what_launched_it(needs_unit_network, server) -> None:
     """The argv really came from ``models.toml``.
 
     The shim asserts on its own arguments, so a boot that reached the ready
@@ -420,7 +420,7 @@ def test_the_registry_is_what_launched_it(server) -> None:
         wait_until(lambda: not _units.exists(STUB_UNIT), 60)
 
 
-def test_desired_state_records_the_start_and_forgets_the_stop(server) -> None:
+def test_desired_state_records_the_start_and_forgets_the_stop(needs_unit_network, server) -> None:
     """``desired.json`` is what an operator last asked for, not a mirror of
     what is running — that is what makes reconcile bring a crashed model back
     and leave a stopped one alone."""
@@ -434,7 +434,7 @@ def test_desired_state_records_the_start_and_forgets_the_stop(server) -> None:
     assert wait_until(lambda: "stub" not in state()["desired"]["residents"], 30)
 
 
-def test_starting_it_twice_is_refused_without_touching_the_unit(server) -> None:
+def test_starting_it_twice_is_refused_without_touching_the_unit(needs_unit_network, server) -> None:
     httpx.post(f"{BASE}/api/models/stub/start", timeout=10.0)
     try:
         assert wait_until(lambda: stub_row(state())["ready"], timeout_s=90)
@@ -454,7 +454,7 @@ def test_starting_it_twice_is_refused_without_touching_the_unit(server) -> None:
         wait_until(lambda: not _units.exists(STUB_UNIT), 60)
 
 
-def test_the_journal_route_reads_the_real_journal(server) -> None:
+def test_the_journal_route_reads_the_real_journal(needs_unit_network, server) -> None:
     httpx.post(f"{BASE}/api/models/stub/start", timeout=10.0)
     try:
         assert wait_until(lambda: stub_row(state())["ready"], timeout_s=90)

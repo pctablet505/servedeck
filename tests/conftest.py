@@ -15,6 +15,7 @@ Two things must never leak in either direction:
 from __future__ import annotations
 
 import os
+import subprocess
 
 import pytest
 
@@ -99,3 +100,35 @@ def _no_permanent_module_stubs():
         "this test replaced " + ", ".join(leaked) + " and did not restore it; "
         "use monkeypatch.setattr so the next test is not affected"
     )
+
+
+@pytest.fixture(scope="session")
+def units_share_network() -> bool:
+    """Whether a unit the user manager starts listens on THIS process's loopback.
+
+    testq runs every job under ``unshare --net``: a private network namespace with its own empty
+    loopback. ``systemd-run --user`` still reaches the user manager (its socket is a file), so the
+    e2e units start, but on the host's loopback, where no probe from inside the job can reach them.
+    A throwaway unit reports its own namespace and we compare. Any failure to ask counts as "no":
+    a wrong "yes" costs each port-probing test its whole timeout, a wrong "no" only a skip.
+    """
+    try:
+        theirs = subprocess.run(
+            # Not sd-test-*: the e2e modules sweep that glob and would stop or "leak" this probe.
+            ["systemd-run", "--user", f"--unit=sd-netns-probe-{os.getpid()}", "--pipe", "--wait",
+             "--quiet", "--collect", "readlink", "/proc/self/ns/net"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30,
+        ).stdout.strip()
+        return bool(theirs) and theirs == os.readlink("/proc/self/ns/net")
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+@pytest.fixture(scope="session")
+def needs_unit_network(units_share_network: bool) -> None:
+    """Skip a test that must reach a unit's port when this process cannot."""
+    if not units_share_network:
+        pytest.skip(
+            "the units this test starts listen on the host's loopback and this process is in "
+            "another network namespace (testq's no-network sandbox), so no probe can reach them"
+        )
