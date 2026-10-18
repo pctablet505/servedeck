@@ -249,6 +249,32 @@ is no swap here: overshooting is an OOM kill of the session, not a slowdown. The
 decode throughput; there is no swap now, so that preflight replaces the mitigation rather than
 inheriting it.
 
+**Batch profile (`flashnext-batch`, 2026-10-10).** The same checkpoint, build and env on port 8003, for
+batches of single-shot requests (one page picture per request). Three flags differ:
+- no `--kv-offloading-size`: the 40 GiB buffer serves returning agent contexts, and a batch never reads it back
+  (owner 2026-10-10: "we were offloading around 40gb kv cache to RAM while using codex for multiple subagents,
+  but our usecase we might not require that much");
+- no `--speculative-config`: weights 74.2 GiB instead of 79.3, KV cache 532,066 tokens instead of 278,479;
+- `--max-num-seqs 64`; the client sends 48.
+
+Measured 2026-10-10 on 700 fresh page pictures (4,400 prompt tokens a page, thinking on, 80 s windows of the
+server's own counters, card at 511 W):
+
+| Draft head | In flight | Generated tok/s | Prompt tok/s | KV used | Waiting |
+|---|---|---|---|---|---|
+| off | 32 | 569 | 4,164 | 68% | 0 |
+| off | 48 | 703 | 3,772 | 94% | 2 |
+| on (32 slots) | 16 | 676 | 2,837 | 87% | 7 |
+| on (32 slots) | 24 | 717 | 2,414 | 88% | 15 |
+| on (32 slots) | 32 | 539 | 3,435 | 88% | 19 |
+
+Generation tops out near 700 tok/s either way; more requests in flight do not raise it. With the draft head the
+KV cache is full at about 13 running requests and the rest wait; with the draft head and 64 slots the first
+request died with a CUDA out-of-memory error (the card had 4.8 MB free). Host RAM: the unit's anon + shmem
+peaked at 61.3 GiB (file cache 68.8 GiB while the weights were read, reclaimable); `host_ram_gib = 66`. It ran
+beside a 24-worker test suite. Both profiles hold the main slot, so only one runs at a time;
+`tests/test_models.py` fails if their other flags or env drift apart.
+
 ## The reasoning field
 
 **This engine emits `reasoning`, never `reasoning_content`.** Verified live 2026-09-18 on port

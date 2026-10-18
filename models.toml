@@ -204,6 +204,74 @@ TORCH_CUDA_ARCH_LIST = "12.0f"
 # VLLM_LOGGING_CONFIG_PATH REPLACES vLLM's default logging config wholesale
 # (vllm/logger.py:179-201), which is why that file restates formatter/handler.
 
+# >>> batch profile flashnext-batch
+# --------------------------------------------------------------------------------
+# Flash-Next, batch profile (2026-10-10). The same checkpoint, build and env as [models.flashnext].
+# Flags differ in three places:
+#   * no `--kv-offloading-size`. That 40 GiB pinned buffer parks evicted agent contexts so a
+#     returning agent skips its prefill; a batch of single-shot requests (one page per request,
+#     nothing returns) never reads it back.
+#     Owner 2026-10-10: "we were offloading around 40gb kv cache to RAM while using codex
+#     for multiple subagents, but our usecase we might not require that much".
+#   * no `--speculative-config`. Without the draft head the weights take 74.2 GiB instead of 79.3
+#     and the KV cache is 532,066 tokens instead of 278,479, so 48 page requests run at once where
+#     the cache is full at about 13 with it. Generated tokens a second are the same either way
+#     (measured 2026-10-10 on 700 fresh page pictures, 80 s windows, card at 511 W: without it 569
+#     at 32 in flight and 703 at 48; with it 676 at 16, 717 at 24, 539 at 32 with 19 waiting). With
+#     it and 64 slots the first request died with a CUDA out-of-memory error.
+#   * `--max-num-seqs 64` instead of 16: a ceiling; the client sends 48
+#     (owner 2026-10-10: "try as many as it can handle").
+# It holds 61 GiB of host RAM (measured, see host_ram_gib) instead of 91 serving / 114 loading, so a
+# batch can run beside a test suite or a store build. Evidence: the nse-knowledge task folder,
+# charts/PROCESS.md and charts/probe2/.
+# Keep in step: any other change to [models.flashnext] flags or env belongs here too
+# (tests/test_models.py fails on drift).
+# --------------------------------------------------------------------------------
+[models.flashnext-batch]
+id      = "Qwen3.8-Flash-Next-batch"
+util    = 0.96
+# MemAvailable required before launch. Measured 2026-10-10 12:31-12:38 (with the draft head; boot
+# 196 s, then 80 pages at 16 in flight): the unit's anon + shmem peaked at 61.3 GiB, 51.9 of it
+# within 90 s of launch. Its file cache reached 68.8 GiB while the weights were read; that is
+# reclaimable. Lowest MemAvailable in the three later blocks: 53.4 GiB.
+host_ram_gib = 66
+aliases = ["flashnext-batch"]
+repo    = "mazinb/Qwen3.8-Flash-Next-Uncensored-NVFP4"
+slot    = "main"
+port    = 8003
+build   = "qwen38next"
+ctx     = "native"
+vision  = true
+max_output_tokens = 32000
+flags = [
+    "--tensor-parallel-size", "1",
+    "--distributed-executor-backend", "mp",
+    "--max-num-seqs", "64",
+    "--max-num-batched-tokens", "8192",
+    "--limit-mm-per-prompt", '{"image":256,"video":0}',
+    "--kv-cache-dtype", "auto",
+    "--enable-prefix-caching",
+    "--mamba-ssm-cache-dtype", "bfloat16",
+    "--long-prefill-token-threshold", "1024",
+    "--watermark", "0.10",
+    "--shutdown-timeout", "30",
+]
+
+[models.flashnext-batch.reasoning]
+parser = "qwen3"
+mirror_content = true
+
+[models.flashnext-batch.tools]
+parser = "qwen3_coder"
+
+[models.flashnext-batch.env]
+VLLM_PLE_CPU_OFFLOAD = "1"
+VLLM_PLE_FP8_CHECKPOINT = "1"
+PYTORCH_ALLOC_CONF = "expandable_segments:True"
+TORCH_CUDA_ARCH_LIST = "12.0f"
+
+# <<< batch profile flashnext-batch
+
 # --------------------------------------------------------------------------------
 # NVIDIA's Qwen3.8-Flash-Next-FP4-Local (QAD NVFP4, stock refusals) — added 2026-10-18.
 # The checkpoint's expert scales are CSF containers that only b12x decodes, so it runs NVIDIA's

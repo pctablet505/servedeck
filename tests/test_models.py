@@ -8,6 +8,7 @@ real ``models.toml`` at the repo root is exercised separately by
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 from pathlib import Path
@@ -188,6 +189,50 @@ def test_resident_model_with_vram_mib_loads(tmp_path):
     assert reg.models["a"].vram_mib == 500
 
 
+#: Launch flags the batch profile may drop or set differently from the agent profile; anything else must match.
+BATCH_MAY_DIFFER = ("--kv-offloading-size", "--speculative-config", "--max-num-seqs")
+
+
+def _flags_without(flags, names):
+    """`flags` minus each named flag and the value that follows it."""
+    out, skip = [], False
+    for f in flags:
+        if skip:
+            skip = False
+        elif f in names:
+            skip = True
+        else:
+            out.append(f)
+    return out
+
+
+def test_the_batch_profile_is_flashnext_except_for_its_declared_flags():
+    """`flashnext-batch` differs from `flashnext` in launch terms by three declared flags only.
+
+    A batch of single-shot page requests never reads the 40 GiB `--kv-offloading-size` buffer back,
+    runs without the draft head (`--speculative-config`: same tokens a second, twice the KV cache),
+    and raises `--max-num-seqs`. Everything else must stay in step, or a fix made to one profile
+    silently misses the other.
+    """
+    reg = models.load(REPO_ROOT / "models.toml")
+    agent, batch = reg.models["flashnext"], reg.models["flashnext-batch"]
+    assert "--kv-offloading-size" in agent.flags
+    assert "--kv-offloading-size" not in batch.flags
+    assert "--speculative-config" not in batch.flags
+    assert int(batch.flags[list(batch.flags).index("--max-num-seqs") + 1]) >= 48
+    assert batch.host_ram_gib < agent.host_ram_gib
+
+    def in_step(m):
+        """`m` without what each profile sets for itself: its names, port, RAM floor and declared flags."""
+        return dataclasses.replace(
+            m, key="", id="", aliases=(), port=0, host_ram_gib=None,
+            flags=tuple(_flags_without(m.flags, BATCH_MAY_DIFFER)),
+        )
+
+    # The whole record, so parsers, env, vision and output limits drift-check too, not only the flags.
+    assert in_step(batch) == in_step(agent)
+
+
 def test_the_agent_profile_admits_a_browser_sessions_screenshots():
     """`flashnext` takes at least 128 images per prompt.
 
@@ -203,7 +248,7 @@ def test_the_agent_profile_admits_a_browser_sessions_screenshots():
 def test_real_models_toml_loads():
     """The repo-root models.toml (the actual deliverable) must load and validate."""
     reg = models.load(REPO_ROOT / "models.toml")
-    assert set(reg.models) == {"qwen27b", "flashnext", "fp4local", "glm53", "lfm2"}
+    assert set(reg.models) == {"qwen27b", "flashnext", "flashnext-batch", "fp4local", "glm53", "lfm2"}
     assert reg.gpu.total_mib == 97887
     assert reg.gpu.margin_mib == 1024
     assert reg.defaults_env == {
