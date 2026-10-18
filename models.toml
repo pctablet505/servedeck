@@ -199,6 +199,118 @@ TORCH_CUDA_ARCH_LIST = "12.0f"
 # (vllm/logger.py:179-201), which is why that file restates formatter/handler.
 
 # --------------------------------------------------------------------------------
+# NVIDIA's Qwen3.8-Flash-Next-FP4-Local (QAD NVFP4, stock refusals) — added 2026-10-18.
+# The checkpoint's expert scales are CSF containers that only b12x decodes, so it runs NVIDIA's
+# own vLLM and FlashInfer forks on the qwen38next venv, put in front of it by PYTHONPATH; the
+# venv itself is unmodified. What the overlay holds and how it was assembled: docs/BUILDS.md.
+# Flags and env are the model card's RTX PRO 6000 recipe, minus eight variables that change
+# nothing here (see [models.fp4local.env]). Measured 2026-10-18 at the 425 W cap with this env:
+# ready in 168 s, 805,463 KV tokens at util 0.96, ~190 tok/s single-stream, 1,027 tok/s
+# aggregate at 16 parallel. With the card's full env it had also answered a 159,036-token
+# prompt in 12.1 s.
+# B12X_AUTOTUNE=0: with autotuning on, the first boot measures kernels before it serves, and
+# its own counter put that at 30+ minutes (4 of 184 GEMM plans tuned in the first 43 s, with
+# the MoE and norm ops still to come); it was stopped there. Compiled kernels are cached in
+# ~/.cache/b12x either way. No --kv-offloading-size: these forks lack our
+# QSA-ring skip patch (builds/patches/flashnext-kv-offload-skip-qsa-ring.patch).
+# --------------------------------------------------------------------------------
+[models.fp4local]
+id      = "Qwen3.8-Flash-Next-FP4-Local"
+util    = 0.96
+# The engine unit's MemoryPeak was 79.3 GiB after six hours of serving (2026-10-18: boot, 16
+# parallel requests, a 159k-token prompt); the PLE table alone is 26.8 GiB of CUDA-mapped host memory.
+host_ram_gib = 85
+aliases = ["nvidia/Qwen3.8-Flash-Next-FP4-Local", "fp4local"]
+repo    = "nvidia/Qwen3.8-Flash-Next-FP4-Local"
+slot    = "main"
+port    = 8005
+build   = "qwen38next"
+ctx     = "native"                 # text_config.max_position_embeddings = 262144
+vision  = true
+max_output_tokens = 32000
+flags = [
+    "--tensor-parallel-size", "1",
+    "--async-scheduling",
+    "--block-size", "64",
+    "--compilation-config", '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}',
+    "--dtype", "bfloat16",
+    "--enable-chunked-prefill",
+    "--enable-prefix-caching",
+    "--no-enable-flashinfer-autotune",
+    "--gdn-decode-kernel", "b12x",
+    "--linear-backend", "b12x",
+    "--moe-backend", "b12x",
+    "--kv-cache-dtype", "fp8",
+    "--no-language-model-only",
+    "--mamba-cache-mode", "align",
+    "--mamba-ssm-cache-dtype", "auto",
+    "--max-cudagraph-capture-size", "64",
+    "--max-num-batched-tokens", "6019",
+    "--max-num-seqs", "16",
+    "--mm-encoder-tp-mode", "data",
+    "--mm-processor-cache-gb", "0.0",
+    "--limit-mm-per-prompt", '{"image":256,"video":0}',
+    "--quantization", "modelopt_mixed",
+    "--enable-prompt-tokens-details",
+    "--speculative-config", '{"method":"mtp","draft_sample_method":"probabilistic","rejection_sample_method":"standard","moe_backend":"b12x","num_speculative_tokens":3}',
+    # Drains in-flight requests on a stop instead of dropping them (see [models.flashnext]).
+    "--shutdown-timeout", "30",
+]
+
+[models.fp4local.reasoning]
+parser = "qwen3"
+mirror_content = true
+
+[models.fp4local.tools]
+parser = "qwen3_xml"
+
+# Absolute paths: env values reach the unit literally, and nothing expands "~" in them.
+# Dropped from the card's recipe because nothing in the code this runs reads them (grep of
+# lil-vllm, lil-flashinfer, extra-site and the venv's torch/safetensors/triton, 2026-10-18):
+# B12X_DYNAMIC_DIRECT_EXPERT_SCALES, B12X_DYNAMIC_SKIP_SPLIT_BARRIER_RESET,
+# B12X_DYNAMIC_SPLIT_{COMPUTE_MAC,FAST_PREPARE,LOW_SMEM,ROUTE_COMPUTE} and SAFETENSORS_FAST_GPU.
+# Also VLLM_CAUSAL_CONV1D_UPDATE_HOIST=1: it is the default (causal_conv1d.py), and setting it
+# only makes vLLM warn about an unknown variable on every boot.
+# The card targets NVIDIA's newer runtime image, whose b12x reads more knobs than this one.
+[models.fp4local.env]
+PYTHONPATH = "/home/pctablet505/Projects/vllm-qwen38nv/lil-flashinfer:/home/pctablet505/Projects/vllm-qwen38nv/extra-site:/home/pctablet505/Projects/vllm-qwen38nv/lil-vllm"
+# liburing 2.14 built into a private prefix (b12x's io_uring disk backend); no system package.
+PKG_CONFIG_PATH = "/home/pctablet505/Projects/vllm-qwen38nv/prefix/lib/pkgconfig"
+LD_LIBRARY_PATH = "/home/pctablet505/Projects/vllm-qwen38nv/prefix/lib"
+B12X_AUTOTUNE = "0"
+B12X_DENSE_SPLITK_TURBO = "1"
+B12X_DYNAMIC_DETERMINISTIC_OUTPUT = "0"
+B12X_DYNAMIC_WORK_SOURCE = "persistent_grid"
+B12X_W4A16_A4_PREFILL = "1"
+B12X_DISK_BACKEND = "io_uring"
+B12X_MHC_PDL = "1"
+CUDA_BINARY_LOADER_THREAD_COUNT = "8"
+CUDA_DEVICE_ORDER = "PCI_BUS_ID"
+CUDA_MODULE_LOADING = "LAZY"
+CUTE_DSL_ARCH = "sm_120a"
+OMP_NUM_THREADS = "2"
+PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
+TORCHINDUCTOR_LOOP_ORDERING_AFTER_FUSION = "0"
+TORCH_CUDA_ARCH_LIST = "12.0a"
+TORCH_ALLOW_TF32_CUBLAS_OVERRIDE = "1"
+VLLM_B12X_DENSE_ACTIVATION_MODE = "auto"
+VLLM_B12X_MOE_FP4_FORCE_A16 = "1"
+VLLM_COMPUTE_NANS_IN_LOGITS = "0"
+VLLM_DISABLED_KERNELS = "MarlinFP8ScaledMMLinearKernel"
+VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH = "1"
+VLLM_LM_HEAD_A16 = "1"
+VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS = "0"
+VLLM_MTP_NVFP4_LM_HEAD = "1"
+VLLM_MXFP8_LM_HEAD = "0"
+VLLM_PLE_CPU_OFFLOAD = "1"
+VLLM_QWEN3_8_FLASH_NEXT_HC_TP = "0"
+VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT = "1"
+VLLM_QWEN3_8_FLASH_NEXT_OVERLAP = "1"
+VLLM_SSM_CONV_STATE_LAYOUT = "DS"
+VLLM_USE_V2_MODEL_RUNNER = "1"
+VLLM_WORKER_MULTIPROC_METHOD = "spawn"
+
+# --------------------------------------------------------------------------------
 # GLM-5.3-Flash (ABLITERATED, NVFP4) — ~/Projects/vllm-glm53/serve-opt.sh
 # --------------------------------------------------------------------------------
 [models.glm53]

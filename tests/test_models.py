@@ -191,7 +191,7 @@ def test_resident_model_with_vram_mib_loads(tmp_path):
 def test_real_models_toml_loads():
     """The repo-root models.toml (the actual deliverable) must load and validate."""
     reg = models.load(REPO_ROOT / "models.toml")
-    assert set(reg.models) == {"qwen27b", "flashnext", "glm53", "lfm2"}
+    assert set(reg.models) == {"qwen27b", "flashnext", "fp4local", "glm53", "lfm2"}
     assert reg.gpu.total_mib == 97887
     assert reg.gpu.margin_mib == 1024
     assert reg.defaults_env == {

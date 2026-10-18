@@ -5,12 +5,20 @@ Every model in `models.toml` names a `build`, and every build is one venv. Two o
 | build | venv | vLLM | serves | source |
 |---|---|---|---|---|
 | `stock` | `~/Projects/local_llm/.venv-llm-029` | `0.29.0` | `qwen27b`, `lfm2` | plain PyPI wheel, no patches |
-| `qwen38next` | `~/Projects/vllm-qwen38next/.venv-next` | `0.29.0.dev0+qwen38next.cu132` | `flashnext` | editable install of `~/Projects/vllm-qwen38next/src`, branch `release/qwen38next_offload` at `95dc96d1d` |
+| `qwen38next` | `~/Projects/vllm-qwen38next/.venv-next` | `0.29.0.dev0+qwen38next.cu132` | `flashnext`, `fp4local` (overlay, below) | editable install of `~/Projects/vllm-qwen38next/src`, branch `release/qwen38next_offload` at `95dc96d1d` |
 | `glm53` | `~/Projects/vllm-glm53/.venv-glm53` | `0.29.0.dev0+glm53.cu132` | `glm53` | editable install of `~/Projects/vllm-glm53/src`, branch `glm53` at `878631b60` |
 
 All three run Python 3.13.15, torch 2.13.0+cu130, transformers 5.16.1, triton 3.7.1, numpy 2.4.6. FlashInfer differs on purpose: `stock` and `glm53` carry 0.6.18, `qwen38next` carries 0.6.16.post3. Do not harmonise them — GLM-5.3 needs >= 0.6.18 for the SM90 NoPE MLA kernel that 0.6.17 lacks, and the Flash-Next tree was built and validated against 0.6.16.post3.
 
 `lfm2` is declared on `stock` per the v2 registry decision, but the live systemd unit launches it from `.venv-next`'s python. Either venv serves a 350M model; the declaration is what a rebuild would follow.
+
+`fp4local` (added 2026-10-18) also names `qwen38next`, but only for its interpreter, torch and compiled extensions. Its checkpoint's CSF expert scales are decoded only by NVIDIA's b12x kernels, so the model's `PYTHONPATH` env puts three directories of `~/Projects/vllm-qwen38nv/` in front of the editable install:
+
+- `lil-flashinfer`: local-inference-lab's FlashInfer fork, branch `community/karmic-kraken-cu134-sm120` at `6023d031`, which carries b12x and its CSF loader. One local edit: `flashinfer/experimental/b12x/loader/_bounce.c` sets `BOUNCE_SLOTS` to 6 instead of 16. The io_uring bounce ring registers that many 1 MiB buffers, and a user unit's locked-memory limit here is 8 MiB.
+- `extra-site`, installed with `pip --target`: `nvidia-cutlass-dsl` 4.7.1 and its `-libs-*` packages (the venv has 4.6.2), and `flashinfer-python==0.7.2` for its top-level `b12x` alias package, which maps `import b12x` onto `lil-flashinfer`'s copy. That wheel's own `flashinfer` package (457 MB) is shadowed by `lil-flashinfer` and never imported.
+- `lil-vllm`: local-inference-lab's vLLM fork, branch `dev/karmic-kraken` at `8244d1c44`. It compiles nothing of its own: its `*.so` files, `_version.py`, `vllm_flash_attn/{layers,ops,cute}` and the `third_party` build outputs are symlinks into `vllm-qwen38next/src`, so a rebuild there changes what `fp4local` runs too. A missing build output fails late (a missing `vllm_flash_attn/layers` broke KV-cache profiling in the vision encoder), so after updating either tree, re-link whatever `git -C ~/Projects/vllm-qwen38next/src ls-files --others --ignored --exclude-standard vllm` lists that `lil-vllm` lacks.
+
+liburing 2.14, for b12x's io_uring disk backend, is built into `~/Projects/vllm-qwen38nv/prefix`, which the model's `PKG_CONFIG_PATH` and `LD_LIBRARY_PATH` point at. No `check.sh` or manifest covers this overlay yet.
 
 ## Why each fork exists
 

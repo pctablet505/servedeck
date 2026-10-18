@@ -34,7 +34,7 @@ def registry() -> models.Registry:
 def resolve_ctx(registry):
     # glm53.ctx is now a pinned int (327680, not "native" — see models.toml),
     # so it needs no entry here: _fixed_resolver reads m.ctx directly for it.
-    return _fixed_resolver({"qwen27b": 262144, "flashnext": 262144})
+    return _fixed_resolver({"qwen27b": 262144, "flashnext": 262144, "fp4local": 262144})
 
 
 # --------------------------------------------------------------------------- #
@@ -51,11 +51,11 @@ def test_vscode_empty_existing_creates_group(registry, resolve_ctx):
     assert data[0]["apiType"] == "chat-completions"
     ids = [e["id"] for e in data[0]["models"]]
     # The slot first (the stable pick), then one per id and per preset:
-    # 1 + 4 base ids + 3 glm53 presets = 8.
+    # 1 + 5 base ids + 3 glm53 presets = 9.
     assert ids[0] == "main", "the entry that survives a switch is the obvious pick"
     assert ids.count("Qwen3.8-27B-NVFP4") == 1
     assert "glm53-flash-low" in ids and "glm53-flash-high" in ids and "glm53-flash-max" in ids
-    assert len(ids) == 8
+    assert len(ids) == 9
 
 
 def test_vscode_entry_fields(registry, resolve_ctx):

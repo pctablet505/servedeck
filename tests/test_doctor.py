@@ -45,7 +45,7 @@ def _stub_get(mapping: dict[str, httpx.Response | Exception]):
 def test_check_registry_ok_on_real_models_toml():
     r = doctor.check_registry(REPO_ROOT / "models.toml")
     assert r.ok is True
-    assert "4 model(s)" in r.detail
+    assert "5 model(s)" in r.detail
 
 
 def test_check_registry_fails_on_bad_file(tmp_path):
