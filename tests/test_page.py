@@ -168,3 +168,49 @@ def test_an_error_notice_unfolds_the_log() -> None:
     handler = APP_JS.split('addEventListener("notice"')[1].split("});")[0]
     assert 'n.level === "error"' in handler and "logFold" in handler and ".click()" in handler
     assert "n.replay" in handler, "replayed history on page load must not pop the log open"
+
+
+#: Runs app.js's own paintTargetBanner in gjs against stub elements, and prints
+#: the Apply button's label.
+_PAINT_TARGET_BANNER = r"""
+const [, b] = imports.gi.GLib.file_get_contents(ARGV[0]);
+const src = new TextDecoder().decode(b);
+const start = src.indexOf("function paintTargetBanner()");
+eval(src.slice(start, src.indexOf("\n}\n", start) + 2));
+const el = () => ({ textContent: "", className: "", title: "", style: {}, disabled: false });
+const els = { stagedPill: el(), cfgModelName: el(), cfgStateTag: el(), cfgBannerSub: el(),
+              revertActiveBtn: el(), apply: el() };
+els.apply.textContent = "Apply & restart";  // index.html's label
+els.apply.disabled = true;                   // the first paint, before /api/state
+els.apply.title = "busy: STARTING";          // paintState's reason for disabling
+var $ = (id) => els[id];
+var sel = 0;
+var MODELS = JSON.parse(ARGV[1]);
+paintTargetBanner();
+print(JSON.stringify([els.apply.textContent, els.apply.title]));
+"""
+
+
+@pytest.mark.skipif(shutil.which("gjs") is None, reason="needs gjs, GNOME's SpiderMonkey shell")
+@pytest.mark.parametrize(
+    "models, label",
+    [
+        ([{"name": "Alpha", "serving": False}], "Start Alpha"),
+        ([{"name": "Alpha", "serving": False}, {"name": "Beta", "serving": True}], "Switch to Alpha"),
+        ([{"name": "Alpha", "serving": True}], "Apply & restart"),
+    ],
+)
+def test_the_apply_button_names_its_action_even_while_disabled(models, label) -> None:
+    """The button is disabled until /api/state arrives, and with nothing
+    serving the banner is not repainted after that, so a label set only on an
+    enabled button stayed index.html's "Apply & restart" while the banner said
+    the click would START the model (seen on the live page 2026-10-19). The
+    title stays paintState's: it says why the button is disabled."""
+    import json
+
+    r = subprocess.run(
+        ["gjs", "-c", _PAINT_TARGET_BANNER, str(WEB / "app.js"), json.dumps(models)],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert json.loads(r.stdout) == [label, "busy: STARTING"]

@@ -688,9 +688,12 @@ function paintTargetBanner() {
     if (tagEl) { tagEl.textContent = "serving"; tagEl.className = "cfg-state-tag live"; }
     if (subEl) subEl.textContent = "Configuring active serving model. Applying will restart this model with new settings.";
     if (revBtn) revBtn.style.display = "none";
-    if (applyBtn && !applyBtn.disabled) {
+    // The label always: the button is disabled until /api/state arrives, and
+    // with nothing serving nothing repaints the banner after that. The title
+    // only when enabled: while disabled it is paintState's reason why.
+    if (applyBtn) {
       applyBtn.textContent = "Apply & restart";
-      applyBtn.title = "Restart the active model with these settings";
+      if (!applyBtn.disabled) applyBtn.title = "Restart the active model with these settings";
     }
   } else {
     if (pill) { pill.textContent = "Staged (Not Running)"; pill.className = "staged-pill staged"; }
@@ -717,11 +720,13 @@ function paintTargetBanner() {
         }
       };
     }
-    if (applyBtn && !applyBtn.disabled) {
+    if (applyBtn) {
       applyBtn.textContent = servingModel ? `Switch to ${m.name}` : `Start ${m.name}`;
-      applyBtn.title = servingModel
-        ? `Evict ${servingModel.name} and launch ${m.name}`
-        : `Launch ${m.name}`;
+      if (!applyBtn.disabled) {
+        applyBtn.title = servingModel
+          ? `Evict ${servingModel.name} and launch ${m.name}`
+          : `Launch ${m.name}`;
+      }
     }
   }
 }

@@ -388,7 +388,11 @@ def test_unset_env_keeps_the_managers_secrets_out_of_the_unit(manager_canary) ->
     name, value = manager_canary
     unit = "sd-test-unset"
     try:
-        units.start_transient(unit, ["/usr/bin/env"], {"SD_TEST_KEPT": "yes"},
+        # Kept alive after printing: a bare /usr/bin/env exits at once, --collect
+        # unloads the unit, and the property read below then gets an unknown
+        # unit's empty defaults -- it failed that way in most full-suite runs.
+        units.start_transient(unit, ["/bin/sh", "-c", "/usr/bin/env; exec sleep 60"],
+                              {"SD_TEST_KEPT": "yes"},
                               cwd="/tmp", restart="no", unset_env=[name])
         assert units.properties(unit, ("UnsetEnvironment",))["UnsetEnvironment"] == name
         lines = _env_lines_of(unit)

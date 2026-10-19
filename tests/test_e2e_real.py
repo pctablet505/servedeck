@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import shutil
 import socket
 import threading
@@ -196,6 +197,11 @@ class SpecRegistry:
 
     def get(self, key: str) -> RegistrySpec:
         return self.specs[key]
+
+    def keys(self) -> list[str]:
+        # control.Registry gained keys() for port adoption (2026-09-17); without
+        # it every test here errored in Control.live() before booting anything.
+        return list(self.specs)
 
 
 class ControlRoutes:
@@ -483,6 +489,12 @@ def measurements():
 
 
 def require_gpu_room(need_mib: int = MIN_FREE_MIB) -> int:
+    # Opt-in. Every boot below starts here, and a free card is not a go: the
+    # GPU is shared, and a GPU job waits for the owner. Until 2026-10-19 that
+    # held only by accident -- SpecRegistry lacked keys(), so each test errored
+    # in setup before booting anything.
+    if os.environ.get("SERVEDECK_REAL_GPU_TESTS") != "1":
+        pytest.skip("boots real models on the shared GPU; set SERVEDECK_REAL_GPU_TESTS=1 on the owner's go")
     free = gpu.free_mib()
     if free is None:
         pytest.skip("nvidia-smi did not report free VRAM")
@@ -1637,6 +1649,16 @@ def test_8d_a_second_turn_that_resends_reasoning_content_is_accepted(qwen_gatewa
 
 REAL_MODELS_TOML = Path(__file__).resolve().parent.parent / "models.toml"
 
+#: The item-9 tests read the box itself: the hub cache and client configs under
+#: the owner's home, and the live ports. testq runs the suite with a scratch
+#: HOME, where none of that exists, so there they could only ever fail -- every
+#: model "not in the local hub cache", "no real client config exists" -- which
+#: says nothing about servedeck and buries real failures under false ones.
+_REAL_HOME_HIDDEN = Path.home() != Path(pwd.getpwuid(os.getuid()).pw_dir)
+needs_the_real_home = pytest.mark.skipif(
+    _REAL_HOME_HIDDEN, reason="reads the real box; HOME is a scratch dir (testq)"
+)
+
 
 def _servedeck_cli(*args: str) -> tuple[int, str, str]:
     """Run the real console script in a subprocess, as an operator would.
@@ -1658,6 +1680,7 @@ def _servedeck_cli(*args: str) -> tuple[int, str, str]:
     return proc.returncode, proc.stdout, proc.stderr
 
 
+@needs_the_real_home
 def test_9a_doctor_reports_the_real_box_honestly():
     """``servedeck doctor`` against the REAL ``models.toml``.
 
@@ -1724,6 +1747,7 @@ def test_9a_doctor_reports_the_real_box_honestly():
     assert "[OK  ]" in out or "[FAIL]" in out, out
 
 
+@needs_the_real_home
 def test_9b_wire_dry_run_diffs_the_real_client_configs_and_writes_nothing():
     """``servedeck wire`` must be able to show a diff without touching a byte.
 

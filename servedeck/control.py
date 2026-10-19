@@ -1401,6 +1401,11 @@ class Control:
             )
 
         def finish(ready: bool, failure: str | None, aborted: bool = False) -> StartResult:
+            if not ready and not aborted and self._take_abort(key):
+                # The abort's own unit stop can be what this wait saw first (the
+                # unit vanished or failed before the next look at the flag).
+                # It is still the operator's cancel, not a failed boot.
+                failure, aborted = f"boot of {key} was cancelled by operator", True
             journal = [] if ready else units.journal_tail(unit, 40, run=self._run)
             emit("ready" if ready else "failed", failure or f"{key} is ready")
             return StartResult(

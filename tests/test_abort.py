@@ -456,3 +456,54 @@ def test_a_cancel_is_flagged_on_the_result_not_read_from_its_message(tmp_path: P
     ))
     ev = sub.queue.get_nowait()
     assert (ev["data"]["level"], ev["data"]["reason"]) == ("error", "boot_failed")
+
+
+def test_an_abort_seen_first_as_the_unit_vanishing_is_still_a_cancel(tmp_path: Path) -> None:
+    # The abort's own `systemctl stop` can win the race: the health check finds
+    # the unit gone before the loop looks at the flag again. That was reported
+    # as a failed boot (an error notice) and the intent stayed, so recovery
+    # booted the model again.
+    models_path = tmp_path / "models.toml"
+    models_path.write_text(TOML)
+    adapter = _app._RegistryAdapter(_models.load(models_path))
+    shows = {"n": 0}
+    ctl: _control.Control
+
+    def mock_run(argv: list[str]) -> Any:
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        m.stdout = ""
+        if "show" in argv:
+            shows["n"] += 1
+            if shows["n"] == 1:  # wait_ready's "did it appear" read
+                m.stdout = "LoadState=loaded\n"
+            else:  # the health check: the operator clicked, and the stop is done
+                ctl.abort("a", stop_unit=False)
+                m.stdout = "LoadState=not-found\n"
+        return m
+
+    clock_val = 100.0
+
+    def mock_clock() -> float:  # every tick is a health-check tick
+        nonlocal clock_val
+        clock_val += 2.5
+        return clock_val
+
+    class SilentJournal:  # a journalctl that has printed nothing
+        stdout = None
+
+        def poll(self) -> int:
+            return 0
+
+    ctl = _control.Control(
+        adapter, margin_mib=1024, total_mib=100000, unit_prefix="sd-test-",
+        run=mock_run, spawn=lambda argv: SilentJournal(), clock=mock_clock,
+        sleep=lambda dt: None, free_mib=lambda: 90000, desired_path=tmp_path / "desired.json",
+    )
+    ctl._save_desired(ctl.load_desired().with_main("a"))
+    ctl._booting.add("a")
+    res = ctl.wait_ready("a", timeout_s=100.0)
+    assert res.aborted is True, res.failure
+    assert "cancelled by operator" in (res.failure or "")
+    assert ctl.load_desired().main is None
