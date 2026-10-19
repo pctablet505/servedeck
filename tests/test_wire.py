@@ -430,3 +430,29 @@ def test_the_slot_advertises_the_narrowest_main_context(registry, resolve_ctx):
     vscode = json.loads(wire.render_vscode(registry, "", resolve_ctx=resolve_ctx))
     entry = next(e for g in vscode for e in g["models"] if e["id"] == "main")
     assert entry["contextWindow"] == smallest
+
+
+def test_wire_leaves_out_a_model_whose_weights_are_not_downloaded(tmp_path, monkeypatch, registry):
+    """An empty hub cache: no ``ctx = "native"`` model has a readable context.
+    Until 2026-10-19 the resolver raised RegistryError, so one registered but
+    deleted checkpoint (qwen27b) made ``servedeck wire`` crash for every
+    client. Now each such model is left out, and the rest are written."""
+    monkeypatch.setenv("SERVEDECK_HF_HUB_DIR", str(tmp_path))  # nothing downloaded
+    native = [m for m in registry.models.values() if not isinstance(m.ctx, int)]
+    pinned = [m for m in registry.models.values() if isinstance(m.ctx, int)]
+    assert native and pinned  # the registry exercises both kinds
+
+    resolver = wire.make_default_ctx_resolver(registry)
+    for target in wire.WIRE_TARGETS:
+        out = target.render(registry, "", resolve_ctx=resolver)
+        for m in native:
+            assert f'"{m.id}"' not in out, (target.name, m.key)
+    kimi = wire.render_kimi(registry, "", resolve_ctx=resolver)
+    for m in pinned:
+        assert f'[models."servedeck/{m.key}"]' in kimi
+
+    warned: list[str] = []
+    resolver = wire.make_default_ctx_resolver(registry, warn=warned.append)
+    m = native[0]
+    assert resolver(m) == 0 and resolver(m) == 0
+    assert len(warned) == 1 and warned[0].startswith(f"{m.key}: left out")  # once

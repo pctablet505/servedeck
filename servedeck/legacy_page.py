@@ -947,16 +947,13 @@ def register(app: FastAPI, rt: Any) -> None:
 
     def _abort_busy() -> JSONResponse:
         busy_key = rt.busy.get("key") if rt.busy else None
-        _app._trigger_abort(rt, busy_key)
-        rt.hub.publish(
-            "notice",
-            {
-                "level": "warn",
-                "reason": "aborted",
-                "message": "server boot cancelled by operator" + (f" ({busy_key})" if busy_key else ""),
-                "key": busy_key,
-            },
-        )
+        if not _app._trigger_abort(rt, busy_key):
+            # `error` stays a string: the page shows it as the message text.
+            what = f"servedeck is busy ({rt.busy.get('label')})" if rt.busy else "servedeck is idle"
+            return JSONResponse(
+                {"error": f"{what} and no boot is in flight to cancel", "reason": "not_booting"},
+                status_code=409,
+            )
         return JSONResponse({"accepted": True, "action": "abort", "key": busy_key}, status_code=202)
 
     @app.post("/api/server/abort")

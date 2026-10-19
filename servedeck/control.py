@@ -313,6 +313,8 @@ class StartResult:
     journal: list[str] = field(default_factory=list)
     util: float | None = None
     argv: list[str] = field(default_factory=list)
+    #: The operator cancelled this boot (Control.abort); ``failure`` says so in words.
+    aborted: bool = False
 
 
 @dataclass(frozen=True)
@@ -1266,6 +1268,7 @@ class Control:
                 elapsed_s=0.0,
                 markers=[],
                 failure=f"boot of {key} was cancelled by operator",
+                aborted=True,
                 journal=[],
                 util=util,
                 argv=argv,
@@ -1397,7 +1400,12 @@ class Control:
                 )
             )
 
-        def finish(ready: bool, failure: str | None) -> StartResult:
+        def finish(ready: bool, failure: str | None, aborted: bool = False) -> StartResult:
+            if not ready and not aborted and self._take_abort(key):
+                # The abort's own unit stop can be what this wait saw first (the
+                # unit vanished or failed before the next look at the flag).
+                # It is still the operator's cancel, not a failed boot.
+                failure, aborted = f"boot of {key} was cancelled by operator", True
             journal = [] if ready else units.journal_tail(unit, 40, run=self._run)
             emit("ready" if ready else "failed", failure or f"{key} is ready")
             return StartResult(
@@ -1408,10 +1416,11 @@ class Control:
                 markers=list(markers),
                 failure=failure,
                 journal=journal,
+                aborted=aborted,
             )
 
         if self._take_abort(key):
-            return finish(False, f"boot of {key} was cancelled by operator")
+            return finish(False, f"boot of {key} was cancelled by operator", aborted=True)
 
         def consume(lines: list[str]) -> None:
             nonlocal next_marker
@@ -1437,6 +1446,7 @@ class Control:
                     return finish(
                         False,
                         f"boot of {key} was cancelled by operator",
+                        aborted=True,
                     )
                 now = self._clock()
                 if now >= deadline:
@@ -1734,6 +1744,7 @@ class Control:
                             elapsed_s=waited,
                             markers=[],
                             failure=f"boot of {key} was cancelled by operator",
+                            aborted=True,
                             journal=[],
                         ),
                     )
@@ -1792,6 +1803,7 @@ class Control:
                         elapsed_s=waited,
                         markers=[],
                         failure=f"boot of {key} was cancelled by operator",
+                        aborted=True,
                         journal=[],
                     ),
                 )

@@ -35,9 +35,10 @@ ctx = 32768
 
 
 class AbortableFakeControl:
-    def __init__(self) -> None:
+    def __init__(self, booting: tuple[str, ...] = ()) -> None:
         self.aborted: list[str | None] = []
         self._stopped: list[str] = []
+        self.booting = set(booting)
 
     def live(self) -> list[Any]:
         return []
@@ -48,9 +49,12 @@ class AbortableFakeControl:
     def reconcile(self, *_a: Any, **_kw: Any) -> None:
         return None
 
-    def abort(self, key: str | None = None) -> bool:
-        self.aborted.append(key)
-        return True
+    def abort(self, key: str | None = None, *, stop_unit: bool = True) -> bool:
+        # Control.abort's answer: was there a boot to cancel?
+        found = key in self.booting if key is not None else bool(self.booting)
+        if found:
+            self.aborted.append(key)
+        return found
 
     def stop(self, key: str, **_kw: Any) -> _control.StopResult:
         self._stopped.append(key)
@@ -122,7 +126,7 @@ def test_control_abort_stops_wait_ready_loop(tmp_path: Path) -> None:
 
 
 def test_post_models_abort_endpoint(tmp_path: Path) -> None:
-    ctl = AbortableFakeControl()
+    ctl = AbortableFakeControl(booting=("a",))
     app = _app_with_abort(tmp_path, ctl)
     app.state.rt.busy = {"action": "start", "key": "a", "label": "start a"}
     with TestClient(app) as client:
@@ -133,8 +137,9 @@ def test_post_models_abort_endpoint(tmp_path: Path) -> None:
 
 
 def test_post_server_abort_endpoint(tmp_path: Path) -> None:
-    ctl = AbortableFakeControl()
+    ctl = AbortableFakeControl(booting=("a",))
     app = _app_with_abort(tmp_path, ctl)
+    app.state.rt.busy = {"action": "start", "key": "a", "label": "start a"}
     with TestClient(app) as client:
         r = client.post("/api/server/abort")
         assert r.status_code == 202
@@ -143,7 +148,7 @@ def test_post_server_abort_endpoint(tmp_path: Path) -> None:
 
 
 def test_post_server_stop_while_busy_triggers_abort(tmp_path: Path) -> None:
-    ctl = AbortableFakeControl()
+    ctl = AbortableFakeControl(booting=("a",))
     app = _app_with_abort(tmp_path, ctl)
     rt = app.state.rt
     rt.busy = {"action": "start", "key": "a", "label": "start a"}
@@ -257,6 +262,7 @@ def test_publish_result_classifies_operator_abort_as_warn_aborted() -> None:
         markers=[],
         failure="boot of a was cancelled by operator",
         journal=[],
+        aborted=True,
     )
     _app._publish_result(hub, "start a", res)
     ev = sub.queue.get_nowait()
@@ -379,4 +385,125 @@ ctx = 32768
     res = ctl.switch("b")
     assert isinstance(res, _control.SwitchResult)
     assert "cancelled by operator" in (res.started.failure or "")  # type: ignore[union-attr]
+    assert res.started.aborted is True  # type: ignore[union-attr]
+    assert ctl.load_desired().main is None
+
+
+def test_trigger_abort_does_not_swallow_an_error_inside_abort() -> None:
+    # A TypeError fallback, there for a fake without stop_unit, also caught a
+    # real TypeError and ran abort a second time, on the event loop.
+    calls: list[tuple[str | None, bool]] = []
+
+    class Broken:
+        def abort(self, key: str | None = None, *, stop_unit: bool = True) -> bool:
+            calls.append((key, stop_unit))
+            raise TypeError("a defect inside abort")
+
+    rt = MagicMock()
+    rt.control = Broken()
+    with pytest.raises(TypeError, match="a defect inside abort"):
+        _app._trigger_abort(rt, "a")
+    assert calls == [("a", False)]
+
+
+def test_server_abort_with_nothing_booting_is_refused(tmp_path: Path) -> None:
+    ctl = AbortableFakeControl()
+    app = _app_with_abort(tmp_path, ctl)
+    with TestClient(app) as client:
+        r = client.post("/api/server/abort")
+    assert r.status_code == 409
+    assert r.json()["reason"] == "not_booting"
+    assert isinstance(r.json()["error"], str)  # the page shows d.error as text
+
+
+def test_server_stop_while_busy_with_no_boot_is_refused(tmp_path: Path) -> None:
+    # Busy with something that is not a boot (a stop in flight): there is no
+    # boot to cancel, so answering "accepted, abort" would be false.
+    ctl = AbortableFakeControl()
+    app = _app_with_abort(tmp_path, ctl)
+    app.state.rt.busy = {"action": "stop", "key": "a", "label": "stop a"}
+    with TestClient(app) as client:
+        r = client.post("/api/server/stop")
+    assert r.status_code == 409
+    assert r.json()["reason"] == "not_booting"
+
+
+def test_abort_endpoints_leave_the_outcome_notice_to_the_boot(tmp_path: Path) -> None:
+    # The boot's own result announces the cancel (warn/aborted) once it has
+    # happened. A notice from the endpoint as well announced it twice, the
+    # first time before it had happened.
+    ctl = AbortableFakeControl(booting=("a",))
+    app = _app_with_abort(tmp_path, ctl)
+    rt = app.state.rt
+    rt.busy = {"action": "start", "key": "a", "label": "start a"}
+    with TestClient(app) as client:
+        assert client.post("/api/models/a/abort").status_code == 202
+        assert client.post("/api/server/abort").status_code == 202
+    assert [n for n in rt.hub.notices if n["data"].get("reason") == "aborted"] == []
+
+
+def test_a_cancel_is_flagged_on_the_result_not_read_from_its_message(tmp_path: Path) -> None:
+    ctl, _ = _fake_control(tmp_path)
+    ctl._booting.add("a")
+    ctl.abort("a", stop_unit=False)
+    assert ctl.wait_ready("a", timeout_s=100.0).aborted is True
+
+    hub = _app.Hub()
+    sub = hub.subscribe()
+    _app._publish_result(hub, "start a", _control.StartResult(
+        key="a", unit="sd-test-a.service", ready=False, elapsed_s=2.0,
+        failure="request cancelled by operator in the engine log", aborted=False,
+    ))
+    ev = sub.queue.get_nowait()
+    assert (ev["data"]["level"], ev["data"]["reason"]) == ("error", "boot_failed")
+
+
+def test_an_abort_seen_first_as_the_unit_vanishing_is_still_a_cancel(tmp_path: Path) -> None:
+    # The abort's own `systemctl stop` can win the race: the health check finds
+    # the unit gone before the loop looks at the flag again. That was reported
+    # as a failed boot (an error notice) and the intent stayed, so recovery
+    # booted the model again.
+    models_path = tmp_path / "models.toml"
+    models_path.write_text(TOML)
+    adapter = _app._RegistryAdapter(_models.load(models_path))
+    shows = {"n": 0}
+    ctl: _control.Control
+
+    def mock_run(argv: list[str]) -> Any:
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        m.stdout = ""
+        if "show" in argv:
+            shows["n"] += 1
+            if shows["n"] == 1:  # wait_ready's "did it appear" read
+                m.stdout = "LoadState=loaded\n"
+            else:  # the health check: the operator clicked, and the stop is done
+                ctl.abort("a", stop_unit=False)
+                m.stdout = "LoadState=not-found\n"
+        return m
+
+    clock_val = 100.0
+
+    def mock_clock() -> float:  # every tick is a health-check tick
+        nonlocal clock_val
+        clock_val += 2.5
+        return clock_val
+
+    class SilentJournal:  # a journalctl that has printed nothing
+        stdout = None
+
+        def poll(self) -> int:
+            return 0
+
+    ctl = _control.Control(
+        adapter, margin_mib=1024, total_mib=100000, unit_prefix="sd-test-",
+        run=mock_run, spawn=lambda argv: SilentJournal(), clock=mock_clock,
+        sleep=lambda dt: None, free_mib=lambda: 90000, desired_path=tmp_path / "desired.json",
+    )
+    ctl._save_desired(ctl.load_desired().with_main("a"))
+    ctl._booting.add("a")
+    res = ctl.wait_ready("a", timeout_s=100.0)
+    assert res.aborted is True, res.failure
+    assert "cancelled by operator" in (res.failure or "")
     assert ctl.load_desired().main is None

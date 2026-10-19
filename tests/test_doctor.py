@@ -285,13 +285,15 @@ def test_check_port_live_gateway_on_8010():
     its answer depends on which model the box happens to be serving, and during
     the v1 -> v2 cutover it changes owner entirely.  The property under test is
     that check_port reports honestly either way — ok when the expected id is
-    served, and a detail naming the HTTP status when the gateway answers but
-    has no model behind it (a real 503 seen on 2026-09-14).
+    served, a detail naming the HTTP status when the gateway answers but has
+    no model behind it (a real 503 seen on 2026-09-14), and ok "not listening"
+    when nothing answers at all (servedeck stopped, or a test sandbox with no
+    route to it).
     """
     m = _fake_model(key="gw", id="Qwen3.8-27B-NVFP4", port=8010)
     r = doctor.check_port(m, timeout=2.0)
     if r.ok:
-        assert "Qwen3.8-27B-NVFP4" in r.detail or r.detail == "ok", r.detail
+        assert "Qwen3.8-27B-NVFP4" in r.detail or r.detail in ("ok", "not listening"), r.detail
     else:
         assert "HTTP" in r.detail or "expected one of" in r.detail, r.detail
         assert "503" in r.detail or "expected one of" in r.detail, r.detail
@@ -485,8 +487,18 @@ def test_run_doctor_registry_failure_short_circuits(tmp_path):
     assert results[0].ok is False
 
 
-def test_run_doctor_full_pass_with_stubbed_network(tmp_path):
+def test_run_doctor_full_pass_with_stubbed_network(tmp_path, monkeypatch):
     reg = models.load(REPO_ROOT / "models.toml")
+    # Which checkpoints are downloaded is this box's state, like ptrace_scope
+    # below: read for real, the pass depended on the hub cache (red once
+    # qwen27b's weights were deleted). check_weights_present has its own tests.
+    monkeypatch.setattr(
+        doctor,
+        "check_weights_present",
+        lambda registry, hub_dir=None: [
+            doctor.CheckResult(f"weights ({k})", True, "stubbed") for k in registry.models
+        ],
+    )
     responses = {
         f"http://127.0.0.1:{m.port}/v1/models": httpx.ConnectError("refused")
         for m in reg.models.values()
@@ -512,11 +524,12 @@ def test_run_doctor_full_pass_with_stubbed_network(tmp_path):
     # Every port reports "not listening" (ok=True); every model reports "not
     # running" (ok=True; no stray units in the stub); missing client files are
     # also individually ok — nothing here should raise or fail.
-    assert len(results) >= 1 + 3 + 4 + 4  # registry + 3 client files + 4 ports + 4 units
+    n = len(reg.models)  # one port and one unit per registered model, however many there are
+    assert len(results) >= 1 + 3 + n + n  # registry + 3 client files + ports + units
     port_results = [r for r in results if r.name.startswith("port ")]
     assert all(r.ok for r in port_results)
     unit_results = [r for r in results if r.name.startswith("unit (")]
-    assert len(unit_results) == 4
+    assert len(unit_results) == n
     assert all(r.ok for r in unit_results)
     assert doctor.all_ok(results)
 
