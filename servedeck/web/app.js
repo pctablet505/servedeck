@@ -748,7 +748,10 @@ function renderModels() {
   const sig = railSigOf(MODELS) + ":" + q;
   if (sig === railSig) { updateRailSelection(); return; }
   railSig = sig;
-
+  // Which card had focus, and how far the list was scrolled, are restored after
+  // the rebuild. Focus is tracked by repo_id rather than index, because a model
+  // appearing earlier in the list would otherwise move the focus to a different
+  // model under the operator's keyboard.
   const focused = L.querySelector ? L.querySelector(":focus") : null;
   const focusRepo = focused && focused.dataset ? focused.dataset.repo : null;
   const scrollTop = L.scrollTop;
@@ -772,6 +775,7 @@ function renderModels() {
     b.type = "button";
     b.setAttribute("aria-pressed", isSelected ? "true" : "false");
     b.setAttribute("aria-selected", isSelected ? "true" : "false");
+    // The rail is a list of choices, not a list of unrelated buttons.
     b.setAttribute("role", "option");
     b.dataset.repo = m.repo_id || "";
     b.innerHTML =
@@ -782,12 +786,21 @@ function renderModels() {
     b.querySelector(".note").textContent =
       m.unservable_reason || `${m.backend || "?"} · ${fmt(m.model_max_ctx)} ctx`;
     if (!m.servable) {
+      // aria-disabled, NOT the disabled attribute. A disabled button is skipped
+      // by Tab entirely, so an operator who cannot serve a model also cannot
+      // reach the card to read why -- and the reason lives on the card's own
+      // note line, which is only readable if the card can be focused. The
+      // click handler is simply not attached below, and .mcard[aria-disabled]
+      // in the stylesheet carries the dimmed look the attribute used to set.
       b.setAttribute("aria-disabled", "true");
       b.title = m.unservable_reason || "this model cannot be served here";
     } else {
       b.onclick = () => {
         sel = i;
         userPicked = true;
+        // A different model is a new context decision: its own default, or
+        // the running server's value if this is the model it serves. The last
+        // estimate described the previous model, so it bounds nothing now.
         ctxSource = "default";
         lastEstimate = null;
         syncRunCtx(lastState);
@@ -805,6 +818,8 @@ function renderModels() {
   }
 }
 
+/* Selection and the serving tag without a rebuild. Both change on every state
+ * event; neither is a reason to throw away the operator's focus. */
 function updateRailSelection() {
   const L = $("mlist");
   if (!L || !L.children) return;
@@ -2066,6 +2081,8 @@ function paintState(s) {
   controlEnabled = !!s.control_enabled;
   const busy = !!phase;
   const upNow = !!up.up;
+  // Stop only makes sense when something is running, and mid-transition it
+  // cancels the boot instead; Apply only when the machine is not mid-transition.
   const stopBtn = $("stop");
   if (stopBtn) {
     if (busy) {
