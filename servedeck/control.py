@@ -1257,9 +1257,7 @@ class Control:
                 key=key,
             )
 
-        if self._abort_all or key in self._aborted:
-            self._aborted.discard(key)
-            self._abort_all = False
+        if self._take_abort(key):
             self._booting.discard(key)
             return StartResult(
                 key=key,
@@ -1412,9 +1410,7 @@ class Control:
                 journal=journal,
             )
 
-        if self._abort_all or key in self._aborted:
-            self._aborted.discard(key)
-            self._abort_all = False
+        if self._take_abort(key):
             return finish(False, f"boot of {key} was cancelled by operator")
 
         def consume(lines: list[str]) -> None:
@@ -1437,9 +1433,7 @@ class Control:
         stream = units.journal_follow(unit, since, spawn=self._spawn)
         try:
             while True:
-                if self._abort_all or key in self._aborted:
-                    self._aborted.discard(key)
-                    self._abort_all = False
+                if self._take_abort(key):
                     return finish(
                         False,
                         f"boot of {key} was cancelled by operator",
@@ -1554,12 +1548,16 @@ class Control:
         """Cancel an in-flight boot immediately.
 
         Signals wait_ready / switch to exit on its next tick and (when
-        ``stop_unit=True``) stops the booting unit via systemd without erasing
-        desired state. When ``key`` is None, only units currently tracked in
-        ``_booting`` are stopped — never unrelated already-serving models.
+        ``stop_unit=True``) stops the booting unit via systemd. Only a boot
+        this Control is running is touched: ``key`` must be in ``_booting``,
+        and ``key=None`` means every key in it. A model that is already
+        serving is never stopped from here; that is :meth:`stop`. Returns
+        whether there was a boot to cancel.
         """
         import contextlib
         if key is not None:
+            if key not in self._booting:
+                return False
             self._aborted.add(key)
             targets = [key]
         else:
@@ -1571,6 +1569,28 @@ class Control:
                 unit = self.unit_for(k)
                 with contextlib.suppress(Exception):
                     units.stop(unit, timeout_s=15.0, run=self._run)
+        return bool(targets)
+
+    def _take_abort(self, key: str) -> bool:
+        """Consume an operator abort of ``key``'s boot, if there is one.
+
+        A cancel is the operator's stop, not a failed boot, so the intent goes
+        with it. Left in desired state, the poll's recovery sees a model that
+        is wanted and not running and relaunches the boot just cancelled, on
+        its next tick. A main-slot cancel empties the slot: in a switch,
+        desired state still names the old holder (stopped with
+        ``forget_intent=False`` so a FAILED boot gets it back), and
+        relaunching it is a boot the operator did not ask for either.
+        """
+        if not (self._abort_all or key in self._aborted):
+            return False
+        self._aborted.discard(key)
+        self._abort_all = False
+        spec = self._spec(key)
+        current = self.load_desired()
+        if spec is not None and spec.slot == "main":
+            current = current.with_main(None)
+        self._save_desired(current.without_resident(key))
         return True
 
     def _stop_adopted(
@@ -1701,9 +1721,7 @@ class Control:
                     timeout_s=release_timeout_s,
                     on_progress=on_progress,
                 )
-                if self._abort_all or key in self._aborted:
-                    self._aborted.discard(key)
-                    self._abort_all = False
+                if self._take_abort(key):
                     return SwitchResult(
                         stopped=stopped,
                         released=released,
@@ -1761,9 +1779,7 @@ class Control:
                     live_key=key,
                 )
 
-            if self._abort_all or key in self._aborted:
-                self._aborted.discard(key)
-                self._abort_all = False
+            if self._take_abort(key):
                 return SwitchResult(
                     stopped=stopped,
                     released=released,

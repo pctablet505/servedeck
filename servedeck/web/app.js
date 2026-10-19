@@ -2232,14 +2232,14 @@ function wireControls() {
       const unknown = lastEstimate && lastEstimate.confidence === "unknown";
       const curServing = MODELS.find((mod) => mod.serving);
       const isSwitch = !m.serving && !!curServing;
-      const isColdStart = !m.serving && !curServing;
-      const title = isSwitch ? `Switch to ${m.name}?` : isColdStart ? `Start ${m.name}?` : `Restart ${m.name}?`;
-      const confirmText = isSwitch ? `Switch to ${m.name}` : isColdStart ? `Start ${m.name}` : "Restart Server";
+      const isFreshStart = !m.serving && !curServing;
+      const title = isSwitch ? `Switch to ${m.name}?` : isFreshStart ? `Start ${m.name}?` : `Restart ${m.name}?`;
+      const confirmText = isSwitch ? `Switch to ${m.name}` : isFreshStart ? `Start ${m.name}` : "Restart Server";
       let msg = "";
       if (isSwitch) {
         msg = `Evict active model (${curServing.name}) and launch ${m.name} at util ${util.toFixed(2)}, ${fmt(ctx)} context?\n\n` +
               `The server will be unavailable while ${m.name} compiles and boots.`;
-      } else if (unknown || isColdStart) {
+      } else if (unknown || isFreshStart) {
         msg = `Launch ${m.name} at util ${util.toFixed(2)}, ${fmt(ctx)} context?\n\n` +
           (unknown
             ? `Its VRAM footprint cannot be predicted for this architecture, so ` +

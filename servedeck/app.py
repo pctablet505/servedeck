@@ -1505,6 +1505,13 @@ def _register_api(app: FastAPI, rt: Runtime) -> None:
         refusal = _precheck(rt, key, "abort")
         if refusal is not None:
             return refusal
+        if rt.busy is None or rt.busy.get("key") != key:
+            return _refusal(
+                409,
+                "not_booting",
+                f"{key} is not booting; a serving model is stopped with /api/models/{key}/stop",
+                key=key,
+            )
         _trigger_abort(rt, key)
         rt.hub.publish(
             "notice",
