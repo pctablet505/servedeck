@@ -532,7 +532,13 @@ class Sampler:
         )
         day = record["ts"][:10]
         if day not in self._known_days:
-            prune_old_days(self.telemetry_dir, self.retention_days)
+            # By the sampler's own clock, the one that named the file: pruned by
+            # the real date instead, a day-file the injected clock had just
+            # written was deleted as too old (test_sampler_rotates_..., which
+            # went red once its fixed 2026-09-11 fell 14 days behind the date).
+            prune_old_days(
+                self.telemetry_dir, self.retention_days, today=datetime.fromisoformat(record["ts"])
+            )
             self._known_days.add(day)
         append_jsonl_capped(self._path_for_day(day), record, self.max_bytes)
         return record
