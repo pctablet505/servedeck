@@ -1,3 +1,8 @@
+---
+title: "Operating local vLLM: switching and recovery"
+description: "Daily use of Servedeck: switching and starting models, what a restart costs, logs, and recovery for failed boots, leaked /dev/shm buffers and GPU faults."
+---
+
 # Operations
 
 ```bash
@@ -210,7 +215,8 @@ restarting. Three causes seen here:
   request costs. Lowering `--kv-offloading-size` does not help — that buffer is host
   RAM, not VRAM. Seen twice on 2026-09-18, 22:16 and 22:22.
 - **An assert or `ValueError` naming a flag or a shape** — the flag is wrong for the
-  build, not the box. Reasons per model in [models/](models/), builds in
+  build, not the box. Reasons per model in the model pages ([flashnext](models/flashnext.md), [qwen27b](models/qwen27b.md),
+  [glm53](models/glm53.md), [lfm2](models/lfm2.md)), builds in
   [BUILDS.md](BUILDS.md).
 
 A start now preflights the three that used to cost an outage: host RAM against
@@ -313,8 +319,8 @@ naming what holds the slot is a switch in progress. Details: [CLIENTS.md](CLIENT
 `systemctl --user status servedeck` and `ss -ltnp 'sport = :8010'` — something else
 holds the port; stop that first, and never run a second servedeck against the same
 state directory, or both react to a crash. On 2026-09-11 a hand-started copy held
-`:8010` and the unit crash-looped **67 times in 9 minutes**, launching a real vLLM boot
-on every lap, because reconcile ran inside the ASGI lifespan, which uvicorn executes
+`:8010` and the unit crash-looped **67 times in about six minutes** (systemd's restart counter,
+21:36 to 21:42 IST), because reconcile ran inside the ASGI lifespan, which uvicorn executes
 *before* it binds. Now reconcile waits for servedeck's own `/api/health` and compares
 the instance nonce — a 200 from a *different* servedeck does not count — and starts
 nothing if the port has not answered in 60 s (`bind_timeout`); the unit carries

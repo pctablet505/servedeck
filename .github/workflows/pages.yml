@@ -1,0 +1,62 @@
+# Publishes the documentation site to https://servedeck.rlalphalabs.com/ (GitHub Pages, source: GitHub Actions).
+# The site tests gate the deploy: a broken link, a duplicate title or a banned claim stops it.
+# A pull request runs the tests and the strict build, and never deploys.
+name: Docs site
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "docs-theme/**"
+      - "mkdocs.yml"
+      - "tests/test_site.py"
+      - ".github/workflows/pages.yml"
+  pull_request:
+    paths:
+      - "docs/**"
+      - "docs-theme/**"
+      - "mkdocs.yml"
+      - "tests/test_site.py"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install -e . "mkdocs>=1.6" pytest
+      - name: Test the site
+        run: python -m pytest tests/test_site.py -q -rs -p no:cacheprovider
+      - name: Build
+        run: python -m mkdocs build --strict
+      - uses: actions/upload-pages-artifact@v5
+        if: github.event_name != 'pull_request'
+        with:
+          path: site
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

@@ -1,3 +1,8 @@
+---
+title: "LFM2.5-350M: a small resident model beside a big one"
+description: "A 350M-parameter model that costs about 3 GiB of VRAM and boots in about a minute, used for mechanical jobs and as a real vLLM backend for end-to-end tests."
+---
+
 # LFM2.5-350M (`lfm2`)
 
 A 350M-parameter resident that costs about 3 GiB of VRAM and boots in about a minute, kept for two

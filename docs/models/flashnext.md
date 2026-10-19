@@ -1,10 +1,15 @@
+---
+title: "Flash-Next on one GPU: flags and measured speed"
+description: "Qwen3.8 Flash-Next in NVFP4 on one 95.6 GiB GPU: each vLLM launch flag and its reason, KV capacity, measured throughput, host RAM needs and failure signatures."
+---
+
 # Flash-Next
 
 `mazinb/Qwen3.8-Flash-Next-Uncensored-NVFP4`, registry key `flashnext`, port 8001, main slot — the
 model that serves this box every day, and what the gateway aliases `main` and `local` resolve to
 unless an operator switched slots. Start it with `servedeck switch flashnext`. Served ids:
 `Qwen3.8-Flash-Next-Uncensored-NVFP4`, `qwen38-flash-next`, `flashnext`. Registry section
-`[models.flashnext]` in [../../models.toml](../../models.toml); build `qwen38next`, a fork
+`[models.flashnext]` in [models.toml](https://github.com/pctablet505/servedeck/blob/main/models.toml); build `qwen38next`, a fork
 ([../BUILDS.md](../BUILDS.md)).
 
 ## The checkpoint

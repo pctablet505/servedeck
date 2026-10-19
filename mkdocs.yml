@@ -1,0 +1,58 @@
+# The documentation site: https://servedeck.rlalphalabs.com/ (GitHub Pages, built by
+# .github/workflows/pages.yml). `mkdocs build --strict` fails on any broken link or anchor.
+site_name: Servedeck
+site_url: https://servedeck.rlalphalabs.com/
+site_description: A systemd control plane, an OpenAI-compatible /v1 gateway and a live dashboard for native vLLM on one Linux GPU workstation.
+site_author: Rahul Kumar
+repo_url: https://github.com/pctablet505/servedeck
+docs_dir: docs
+site_dir: site
+use_directory_urls: true
+strict: true
+
+# Our own theme: no script, and no font or stylesheet from another host.
+theme:
+  name: null
+  custom_dir: docs-theme
+  static_templates:
+    - 404.html
+
+# The docs keep their upper-case file names; the site serves them in lower case.
+hooks:
+  - docs-theme/lowercase_urls.py
+
+exclude_docs: |
+  imported-2026-09/
+
+nav:
+  - Overview: index.md
+  - Operations: OPERATIONS.md
+  - Clients: CLIENTS.md
+  - Architecture: ARCHITECTURE.md
+  - Configuration: CONFIGURATION.md
+  - Host: HOST.md
+  - Builds: BUILDS.md
+  - Decisions: DECISIONS.md
+  - Models:
+      - Flash-Next: models/flashnext.md
+      - Qwen3.8-27B: models/qwen27b.md
+      - GLM-5.3: models/glm53.md
+      - LFM2.5-350M: models/lfm2.md
+
+plugins: []
+
+markdown_extensions:
+  - tables
+  - fenced_code
+  - toc
+
+validation:
+  nav:
+    omitted_files: warn
+    not_found: warn
+    absolute_links: warn
+  links:
+    not_found: warn
+    absolute_links: warn
+    unrecognized_links: warn
+    anchors: warn

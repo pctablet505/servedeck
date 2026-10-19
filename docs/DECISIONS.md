@@ -1,3 +1,8 @@
+---
+title: "Servedeck decisions and the reasons behind them"
+description: "The rules Servedeck's owner has settled, each dated with its reason: full native context, reasoning always on, one model at a time, loopback only."
+---
+
 # Decisions
 
 These are settled. Do not re-open one without the owner, and do not undo one because its reason is not visible in the code you are editing — the reason is here. Owner rules are not engineering preferences and no measurement overrides them. Open questions are in the last section; everything above it is closed.

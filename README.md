@@ -1,7 +1,9 @@
 # Servedeck
 
-One control plane for the local LLMs on this box. `models.toml` is the registry
-(`qwen27b`, `flashnext`, `glm53`, `lfm2`); a user unit running `python -m servedeck`
+**A systemd control plane, an OpenAI-compatible `/v1` gateway and a live dashboard for native vLLM on one Linux GPU workstation.**
+Documentation: <https://servedeck.rlalphalabs.com/>. Built by [RL Alpha Labs](https://rlalphalabs.com/). MIT licensed.
+
+`models.toml` is the registry (`qwen27b`, `flashnext`, `glm53`, `lfm2`); a user unit running `python -m servedeck`
 serves a page, a JSON API and an OpenAI-compatible gateway on
 **http://127.0.0.1:8010** (gateway under `/v1`); each model runs as its own
 transient unit `model-<key>` started with `systemd-run`, so restarting servedeck
@@ -13,6 +15,21 @@ Loopback only, no external network requests, never `sudo`.
 Every client — Codex, Kimi CLI, VS Code chat — points at that `/v1` and asks for
 the model named **`main`**, the gateway alias for whatever holds the main slot,
 so nothing needs reconfiguring when the model changes.
+
+## Who it is for, and what it is not
+
+It is for you if you run vLLM on one Linux machine with an NVIDIA GPU and want:
+
+- each model supervised by systemd, with no Docker and no root;
+- coding agents (Codex CLI, Kimi CLI, VS Code chat) pointed at one local `/v1`, so changing the model never means editing their configs;
+- live KV-cache use, tokens per second, time to first token and a prompt-size histogram to size how many agents run in parallel.
+
+What it is not:
+
+- **Not zero-downtime.** `servedeck switch` stops the model in the main slot, waits for the GPU to release its memory, then boots the next one. Flash-Next took 137 s warm in a measured boot ([docs/OPERATIONS.md](docs/OPERATIONS.md)).
+- **Not an inference engine or a model downloader.** It supervises the vLLM builds you provide ([docs/BUILDS.md](docs/BUILDS.md)).
+- **Not multi-host or authenticated.** It binds `127.0.0.1` only.
+- **Not finished.** Version 0.1.0, alpha, built around one workstation. The docs are that machine's operating record, with dates.
 
 ## The five commands
 
@@ -72,7 +89,7 @@ Playbooks: [docs/OPERATIONS.md](docs/OPERATIONS.md#recovery).
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | Daily use: switching, the page, reboot behaviour, logs, recovery |
 | [docs/CLIENTS.md](docs/CLIENTS.md) | Codex, Kimi, VS Code wiring, `reasoning_content`, presets, adding a tool |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Registry, units, gateway, adoption, offload reaper, state, the poll |
-| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | `models.toml` and `servedeck.toml`: every key and its default |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | `models.toml`: every key and its default |
 | [docs/HOST.md](docs/HOST.md) | GPU, power cap, Xid history, sysctl, RAM, /dev/shm, PCIe, disk |
 | [docs/BUILDS.md](docs/BUILDS.md) | The three vLLM builds: forks, patches, venvs, rebuilding, drift checks |
 | [docs/models/flashnext.md](docs/models/flashnext.md) | Flash-Next: flags and their reasons, measured performance, ceilings |

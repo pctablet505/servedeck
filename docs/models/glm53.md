@@ -1,3 +1,8 @@
+---
+title: "GLM-5.3 on one GPU with CPU-offloaded experts"
+description: "Serving a 181 GiB GLM-5.3 checkpoint at 15 to 17 tok/s by keeping routed experts in pinned host RAM: flags, host RAM needs, stability, refuted ideas."
+---
+
 # glm53 — GLM-5.3-Flash (ABLITERATED, NVFP4)
 
 A 181.28 GiB checkpoint served from a 95.6 GiB card at 15-17 tok/s, because 163.27 GiB of it (90%)
@@ -34,7 +39,7 @@ is read every token too — the second-largest line in the decode budget.
 
 `[models.glm53]` in `models.toml` transcribes `~/Projects/vllm-glm53/serve-opt.sh` at that script's
 own defaults; a copy is kept at
-[../imported-2026-09/vllm-glm53/serve-opt.sh](../imported-2026-09/vllm-glm53/serve-opt.sh).
+[docs/imported-2026-09/vllm-glm53/serve-opt.sh](https://github.com/pctablet505/servedeck/blob/main/docs/imported-2026-09/vllm-glm53/serve-opt.sh).
 
 **`--cpu-offload-gb 125` and `VLLM_MOE_HOT_SLOTS=54` are one setting, not two.** Measured
 2026-08-31: offload 125 with 68 hot slots 16.76 tok/s, offload 105 with no pinning 13.73, offload
