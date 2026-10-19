@@ -1,3 +1,8 @@
+---
+title: "Qwen3.8-27B NVFP4 on one GPU: flags and crashes"
+description: "Qwen3.8-27B in NVFP4 on vLLM 0.29.0: launch flags, KV pool, measured performance, a crash history with its root cause, and ideas that were refuted."
+---
+
 # Qwen3.8-27B-NVFP4 (`qwen27b`)
 
 `RadixArk/Qwen3.8-27B-NVFP4`, a mixed-precision quantisation of `Qwen/Qwen3.8-27B`: MLP at NVFP4
@@ -9,7 +14,7 @@ group 16, attention and linear-attn at FP8, MTP head and vision tower unquantise
 It is **not running** (2026-09-18: Flash-Next holds 93.5 GiB of the card) and has **never been
 launched under servedeck v2** — the user journal holds zero `model-qwen27b` invocations; its last run
 was under the old shell launcher on 2026-09-12. Read
-[First launch under servedeck](#first-launch-under-servedeck--what-to-watch) first.
+[First launch under servedeck](#first-launch-under-servedeck-what-to-watch) first.
 
 Prefer it over [Flash-Next](flashnext.md) when you want this checkpoint's answers (its shipped audit
 trail records GSM8K 1,319 examples at 97.27% against a ≥96.5% gate, on the publisher's 4x GB300
@@ -184,7 +189,7 @@ proves nothing. Other prebuilt shapes may still be missing.
   `--limit-mm-per-prompt`. `models.toml` carries `vision = true` and `max_output_tokens = 36000`, but
   no image has ever been served by this model on this box: treat vision as untested.
 
-## First launch under servedeck — what to watch
+## First launch under servedeck: what to watch
 
 1. **Offline resolution.** `HF_HUB_OFFLINE=1` is new for this model. The cache holds five snapshots
    and `refs/main` points at `319f741c` (13 files, 20.4 GiB), the one the 09-11 and 09-12 runs loaded,

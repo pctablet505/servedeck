@@ -1,3 +1,8 @@
+---
+title: "Host setup for vLLM on one GPU workstation"
+description: "Measured notes from one RTX PRO 6000 Blackwell workstation: the power cap, the Xid fault history, host RAM and /dev/shm, sysctl settings, PCIe and disk."
+---
+
 # The host
 
 Read live 2026-09-18 01:13 IST, uptime 2 h 37 m, Flash-Next serving; re-read rather than trust it.

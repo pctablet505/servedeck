@@ -1,3 +1,8 @@
+---
+title: "Servedeck models.toml reference"
+description: "Every key of models.toml, the file that sets each model's launch flags, build, GPU settings and presets, and the environment variables and desired-state schema."
+---
+
 # Configuration
 
 `models.toml` in the repo root is the only file you edit. Everything else — the
