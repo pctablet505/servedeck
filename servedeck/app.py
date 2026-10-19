@@ -842,13 +842,17 @@ def _accepted(action: str, key: str, **extra: Any) -> JSONResponse:
     return JSONResponse({"accepted": True, "action": action, "model": key, **extra}, status_code=202)
 
 
-def _trigger_abort(rt: Runtime, key: str | None) -> None:
-    """Signal an abort in-memory immediately and stop the unit off the event loop."""
-    try:
-        rt.control.abort(key, stop_unit=False)
-        asyncio.create_task(asyncio.to_thread(rt.control.abort, key, stop_unit=True))
-    except TypeError:
-        rt.control.abort(key)
+def _trigger_abort(rt: Runtime, key: str | None) -> bool:
+    """Signal an abort in-memory immediately and stop the unit off the event loop.
+
+    Returns whether a boot was in flight to cancel. The announcement is the
+    boot's own result (``_publish_result``: warn/aborted), published once the
+    cancel has happened, so nothing is announced here.
+    """
+    if not rt.control.abort(key, stop_unit=False):
+        return False
+    asyncio.create_task(asyncio.to_thread(rt.control.abort, key, stop_unit=True))
+    return True
 
 
 def _precheck(rt: Runtime, key: str, action: str) -> JSONResponse | None:
@@ -1070,7 +1074,7 @@ def _publish_result(hub: Hub, label: str, result: Any) -> None:
         )
         return
     if isinstance(result, _control.StartResult):
-        aborted = not result.ready and "cancelled by operator" in (result.failure or "")
+        aborted = not result.ready and result.aborted
         hub.publish(
             "notice",
             {
@@ -1505,23 +1509,13 @@ def _register_api(app: FastAPI, rt: Runtime) -> None:
         refusal = _precheck(rt, key, "abort")
         if refusal is not None:
             return refusal
-        if rt.busy is None or rt.busy.get("key") != key:
+        if rt.busy is None or rt.busy.get("key") != key or not _trigger_abort(rt, key):
             return _refusal(
                 409,
                 "not_booting",
                 f"{key} is not booting; a serving model is stopped with /api/models/{key}/stop",
                 key=key,
             )
-        _trigger_abort(rt, key)
-        rt.hub.publish(
-            "notice",
-            {
-                "level": "warn",
-                "reason": "aborted",
-                "message": f"boot of {key} cancelled by operator",
-                "key": key,
-            },
-        )
         return JSONResponse({"accepted": True, "action": "abort", "model": key}, status_code=202)
 
     @app.post("/api/switch/{key}")
