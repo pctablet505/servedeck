@@ -2127,7 +2127,6 @@ function paintState(s) {
   } else if (!unadopted && btn) {
     btn.remove();
   }
-  const stopBtn = $("stop");
   if (stopBtn && unadopted) {
     stopBtn.disabled = true;
     stopBtn.title = "Not managed yet — click 'Manage running server' first";
