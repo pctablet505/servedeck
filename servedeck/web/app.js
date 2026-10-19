@@ -540,6 +540,13 @@ function renderCtx(d) {
   el.value = String(ctx);
 
   set("ctxV", fmt(ctx));
+  const ctxNum = $("ctxNum");
+  if (ctxNum) {
+    ctxNum.min = String(r.min);
+    ctxNum.max = String(r.max);
+    ctxNum.step = String(CTX_STEP);
+    ctxNum.value = String(ctx);
+  }
   // Name which limit is binding. The range itself is in the slider's title;
   // the tick row that used to spell it out cost a line per field.
   set("ctxBound", r.binding === "kv"
@@ -634,33 +641,128 @@ function railCountOf(models) {
   return `${servable}/${n} servable`;
 }
 
+function promptConfirm({ title = "Confirm", message = "", confirmText = "Confirm", danger = false }) {
+  const dlg = $("confirmDialog");
+  if (!dlg || typeof dlg.showModal !== "function") {
+    return Promise.resolve(window.confirm(`${title}\n\n${message}`));
+  }
+  set("confirmTitle", title);
+  set("confirmBody", message);
+  const okBtn = $("confirmOk");
+  if (okBtn) {
+    okBtn.textContent = confirmText;
+    okBtn.className = "btn " + (danger ? "danger" : "pri");
+  }
+  return new Promise((resolve) => {
+    const cancelBtn = $("confirmCancel");
+    const onCancel = (e) => { if (e) e.preventDefault(); cleanup(); dlg.close(); resolve(false); };
+    const onOk = (e) => { if (e) e.preventDefault(); cleanup(); dlg.close(); resolve(true); };
+    function cleanup() {
+      if (cancelBtn) cancelBtn.onclick = null;
+      if (okBtn) okBtn.onclick = null;
+      dlg.onclose = null;
+    }
+    if (cancelBtn) cancelBtn.onclick = onCancel;
+    if (okBtn) okBtn.onclick = onOk;
+    dlg.onclose = () => { cleanup(); resolve(false); };
+    dlg.showModal();
+  });
+}
+
+function paintTargetBanner() {
+  const m = MODELS[sel];
+  if (!m) return;
+  const servingModel = MODELS.find((mod) => mod.serving);
+  const pill = $("stagedPill");
+  const nameEl = $("cfgModelName");
+  const tagEl = $("cfgStateTag");
+  const subEl = $("cfgBannerSub");
+  const revBtn = $("revertActiveBtn");
+  const applyBtn = $("apply");
+
+  if (m.serving) {
+    if (pill) { pill.textContent = "Active Model"; pill.className = "staged-pill active"; }
+    if (nameEl) nameEl.textContent = m.name;
+    if (tagEl) { tagEl.textContent = "serving"; tagEl.className = "cfg-state-tag live"; }
+    if (subEl) subEl.textContent = "Configuring active serving model. Applying will restart this model with new settings.";
+    if (revBtn) revBtn.style.display = "none";
+    if (applyBtn && !applyBtn.disabled) {
+      applyBtn.textContent = "Apply & restart";
+      applyBtn.title = "Restart the active model with these settings";
+    }
+  } else {
+    if (pill) { pill.textContent = "Staged (Not Running)"; pill.className = "staged-pill staged"; }
+    if (nameEl) nameEl.textContent = m.name;
+    if (tagEl) { tagEl.textContent = "staged"; tagEl.className = "cfg-state-tag staged"; }
+    if (subEl) {
+      subEl.textContent = servingModel
+        ? `Active: ${servingModel.name}. Applying will evict ${servingModel.name} and launch ${m.name}.`
+        : `No model is currently serving. Applying will launch ${m.name}.`;
+    }
+    if (revBtn) {
+      revBtn.style.display = servingModel ? "inline-block" : "none";
+      revBtn.textContent = servingModel ? `← Return to active (${servingModel.name})` : "";
+      revBtn.onclick = () => {
+        const sIdx = MODELS.findIndex((mod) => mod.serving);
+        if (sIdx >= 0) {
+          sel = sIdx;
+          userPicked = false;
+          ctxSource = "default";
+          lastEstimate = null;
+          renderModels();
+          renderCtx(null);
+          estimate();
+        }
+      };
+    }
+    if (applyBtn && !applyBtn.disabled) {
+      applyBtn.textContent = `Switch to ${m.name}`;
+      applyBtn.title = `Evict active model and launch ${m.name}`;
+    }
+  }
+}
+
 function renderModels() {
   const L = $("mlist");
   if (!L) return;
   const c = $("mcount");
   if (c) c.textContent = railCountOf(MODELS);
-  const sig = railSigOf(MODELS);
+  paintTargetBanner();
+  const searchInput = $("msearch");
+  const q = (searchInput && searchInput.value || "").toLowerCase().trim();
+  const sig = railSigOf(MODELS) + ":" + q;
   if (sig === railSig) { updateRailSelection(); return; }
   railSig = sig;
-  // Which card had focus, and how far the list was scrolled, are restored after
-  // the rebuild. Focus is tracked by repo_id rather than index, because a model
-  // appearing earlier in the list would otherwise move the focus to a different
-  // model under the operator's keyboard.
+
   const focused = L.querySelector ? L.querySelector(":focus") : null;
   const focusRepo = focused && focused.dataset ? focused.dataset.repo : null;
   const scrollTop = L.scrollTop;
   L.innerHTML = "";
   MODELS.forEach((m, i) => {
+    if (q) {
+      const match = (m.name || "").toLowerCase().includes(q) ||
+                    (m.repo_id || "").toLowerCase().includes(q) ||
+                    (m.quant || "").toLowerCase().includes(q) ||
+                    (m.backend || "").toLowerCase().includes(q);
+      if (!match) return;
+    }
     const b = document.createElement("button");
-    b.className = "mcard";
+    const isServing = !!m.serving;
+    const isSelected = i === sel;
+    if (isServing && isSelected) b.className = "mcard selected-active";
+    else if (isServing) b.className = "mcard serving-card";
+    else if (isSelected) b.className = "mcard selected-staged";
+    else b.className = "mcard";
+
     b.type = "button";
-    b.setAttribute("aria-pressed", i === sel ? "true" : "false");
-    // The rail is a list of choices, not a list of unrelated buttons.
+    b.setAttribute("aria-pressed", isSelected ? "true" : "false");
+    b.setAttribute("aria-selected", isSelected ? "true" : "false");
     b.setAttribute("role", "option");
     b.dataset.repo = m.repo_id || "";
     const tags = [];
     tags.push(`<span class="tag">${m.quant || "—"}</span>`);
-    if (m.serving) tags.push('<span class="tag live">serving</span>');
+    if (isServing) tags.push('<span class="tag live">serving</span>');
+    else if (isSelected) tags.push('<span class="tag staged">staged</span>');
     if (!m.servable) tags.push('<span class="tag est">unservable</span>');
     else tags.push(trustTag(m.trust));
     b.innerHTML =
@@ -671,21 +773,12 @@ function renderModels() {
     b.querySelector(".note").textContent =
       m.unservable_reason || `${m.backend || "?"} · ${fmt(m.model_max_ctx)} ctx`;
     if (!m.servable) {
-      // aria-disabled, NOT the disabled attribute. A disabled button is skipped
-      // by Tab entirely, so an operator who cannot serve a model also cannot
-      // reach the card to read why -- and the reason lives on the card's own
-      // note line, which is only readable if the card can be focused. The
-      // click handler is simply not attached below, and .mcard[aria-disabled]
-      // in the stylesheet carries the dimmed look the attribute used to set.
       b.setAttribute("aria-disabled", "true");
       b.title = m.unservable_reason || "this model cannot be served here";
     } else {
       b.onclick = () => {
         sel = i;
         userPicked = true;
-        // A different model is a new context decision: its own default, or
-        // the running server's value if this is the model it serves. The last
-        // estimate described the previous model, so it bounds nothing now.
         ctxSource = "default";
         lastEstimate = null;
         syncRunCtx(lastState);
@@ -703,16 +796,23 @@ function renderModels() {
   }
 }
 
-/* Selection and the serving tag without a rebuild. Both change on every state
- * event; neither is a reason to throw away the operator's focus. */
 function updateRailSelection() {
   const L = $("mlist");
   if (!L || !L.children) return;
-  MODELS.forEach((m, i) => {
-    const b = L.children[i];
-    if (!b) return;
-    b.setAttribute("aria-selected", i === sel ? "true" : "false");
-    b.setAttribute("aria-pressed", i === sel ? "true" : "false");
+  paintTargetBanner();
+  Array.from(L.children).forEach((b) => {
+    const repo = b.dataset.repo;
+    const i = MODELS.findIndex((mod) => mod.repo_id === repo);
+    if (i < 0) return;
+    const m = MODELS[i];
+    const isServing = !!m.serving;
+    const isSelected = i === sel;
+    if (isServing && isSelected) b.className = "mcard selected-active";
+    else if (isServing) b.className = "mcard serving-card";
+    else if (isSelected) b.className = "mcard selected-staged";
+    else b.className = "mcard";
+    b.setAttribute("aria-selected", isSelected ? "true" : "false");
+    b.setAttribute("aria-pressed", isSelected ? "true" : "false");
   });
 }
 
@@ -1695,6 +1795,31 @@ function paintBoot(b) {
   const order = b.phases || [];
   const booting = bootActive(b);
   wrap.className = "phases" + (booting ? " on" : "");
+
+  const abortBtn = $("abortBoot");
+  if (abortBtn) {
+    abortBtn.style.display = booting ? "inline-block" : "none";
+    if (booting && !abortBtn.onclick) {
+      abortBtn.onclick = async () => {
+        const ok = await promptConfirm({
+          title: "Force stop model boot?",
+          message: "Cancel the in-progress compilation and boot? This will terminate the unit process immediately.",
+          confirmText: "Force Stop",
+          danger: true,
+        });
+        if (!ok) return;
+        abortBtn.disabled = true;
+        try {
+          await post("/api/server/abort");
+          log("boot cancellation requested", "w");
+        } catch (e) {
+          log("abort failed: " + e.message, "e");
+          abortBtn.disabled = false;
+        }
+      };
+    }
+  }
+
   if (!booting) return;
 
   const el = $("elapsed");
@@ -1929,16 +2054,29 @@ function paintState(s) {
   controlEnabled = !!s.control_enabled;
   const busy = !!phase;
   const upNow = !!up.up;
-  ["apply", "stop"].forEach((id) => {
-    const b = $(id);
-    if (!b) return;
-    // Stop only makes sense when something is running; Apply only when the
-    // machine is not mid-transition.
-    b.disabled = !controlEnabled || busy || (id === "stop" && !upNow);
-    b.title = !controlEnabled
+  const stopBtn = $("stop");
+  if (stopBtn) {
+    if (busy) {
+      stopBtn.disabled = !controlEnabled;
+      stopBtn.textContent = "Force stop boot";
+      stopBtn.className = "btn danger";
+      stopBtn.title = "Cancel in-progress boot immediately";
+    } else {
+      stopBtn.textContent = "Stop";
+      stopBtn.className = "btn";
+      stopBtn.disabled = !controlEnabled || !upNow;
+      stopBtn.title = !controlEnabled
+        ? (s.control_note || "supervisor unavailable")
+        : (!upNow ? "nothing running" : "");
+    }
+  }
+  const applyBtn = $("apply");
+  if (applyBtn) {
+    applyBtn.disabled = !controlEnabled || busy;
+    applyBtn.title = !controlEnabled
       ? (s.control_note || "supervisor unavailable")
       : busy ? `busy: ${sv.actual_state}` : "";
-  });
+  }
   const smoke = $("smoke");
   if (smoke) { smoke.disabled = true; smoke.title = "not implemented yet"; }
 
@@ -2038,12 +2176,32 @@ function wireControls() {
   const stop = $("stop");
   if (stop) {
     stop.onclick = async () => {
+      const isBooting = !!(lastState?.supervisor?.phase || (lastState?.boot && bootActive(lastState.boot)));
+      if (isBooting) {
+        const ok = await promptConfirm({
+          title: "Force stop model boot?",
+          message: "Cancel the in-progress compilation and boot? This will terminate the process immediately.",
+          confirmText: "Force Stop",
+          danger: true,
+        });
+        if (!ok) return;
+        stop.disabled = true;
+        try { await post("/api/server/abort"); log("boot cancellation requested", "w"); }
+        catch (e) { log("abort failed: " + e.message, "e"); stop.disabled = false; }
+        return;
+      }
       // Stopping frees the GPU and kills in-flight requests. Confirm, and say
       // exactly what is running so the click is informed.
       const running = liveMetrics.running || 0;
       const what = liveFacts.kv_tokens ? ` (${fmt(liveFacts.kv_tokens)} KV tokens allocated)` : "";
       const extra = running > 0 ? `\n\n${running} request(s) are in flight and will fail.` : "";
-      if (!confirm(`Stop the model server${what}?${extra}`)) return;
+      const ok = await promptConfirm({
+        title: "Stop model server?",
+        message: `Stop the model server${what}?${extra}`,
+        confirmText: "Stop Server",
+        danger: true,
+      });
+      if (!ok) return;
       stop.disabled = true;
       try { await post("/api/server/stop"); log("stop requested", "w"); }
       catch (e) { log("stop failed: " + e.message, "e"); stop.disabled = false; }
@@ -2060,15 +2218,26 @@ function wireControls() {
         return;
       }
       const unknown = lastEstimate && lastEstimate.confidence === "unknown";
-      const msg = unknown
-        ? `Start ${m.name} at util ${util.toFixed(2)}, ${fmt(ctx)} context?\n\n` +
+      const isSwitch = !m.serving;
+      const title = isSwitch ? `Switch to ${m.name}?` : `Restart ${m.name}?`;
+      const confirmText = isSwitch ? `Switch to ${m.name}` : "Restart Server";
+      let msg = "";
+      if (isSwitch) {
+        const curServing = MODELS.find((mod) => mod.serving);
+        msg = (curServing ? `Evict active model (${curServing.name}) and launch ${m.name} at util ${util.toFixed(2)}, ${fmt(ctx)} context?\n\n` : `Launch ${m.name} at util ${util.toFixed(2)}, ${fmt(ctx)} context?\n\n`) +
+              `The server will be unavailable while ${m.name} compiles and boots.`;
+      } else if (unknown) {
+        msg = `Start ${m.name} at util ${util.toFixed(2)}, ${fmt(ctx)} context?\n\n` +
           `Its VRAM footprint cannot be predicted for this architecture, so ` +
           `there is no capacity estimate to check against. Starting it is how ` +
           `the real figure gets measured — the engine will refuse safely if it ` +
-          `does not fit.\n\nThe server will be unavailable for several minutes.`
-        : `Restart with ${m.name} at util ${util.toFixed(2)}, ${fmt(ctx)} context?\n\n` +
+          `does not fit.\n\nThe server will be unavailable for several minutes.`;
+      } else {
+        msg = `Restart with ${m.name} at util ${util.toFixed(2)}, ${fmt(ctx)} context?\n\n` +
           `The server will be unavailable for several minutes.`;
-      if (!confirm(msg)) return;
+      }
+      const ok = await promptConfirm({ title, message: msg, confirmText, danger: isSwitch });
+      if (!ok) return;
       apply.disabled = true;
       // "Apply & restart" means RESTART when something is already serving.
       // /api/server/start is idempotent on the supervisor's side -- it returns
@@ -2145,8 +2314,53 @@ async function init() {
       ctx = +e.target.value;
       const v = $("ctxV");
       if (v) v.textContent = fmt(ctx);   // move the readout with the thumb
+      const cxNum = $("ctxNum");
+      if (cxNum) cxNum.value = String(ctx);
       estimate();
     };
+  }
+
+  const cxNum = $("ctxNum");
+  if (cxNum) {
+    cxNum.oninput = (e) => {
+      const n = Math.round(+e.target.value);
+      if (!isFinite(n) || n <= 0) return;
+      userPicked = true;
+      ctxSource = "operator";
+      const clamped = Math.max(+cxNum.min || MIN_CTX, Math.min(+cxNum.max || DEFAULT_MAX_CTX, n));
+      ctx = ctxTop(clamped);
+      const cxSlider = $("ctx");
+      if (cxSlider) cxSlider.value = String(ctx);
+      set("ctxV", fmt(ctx));
+      estimate();
+    };
+  }
+
+  const presets = $("ctxPresets");
+  if (presets) {
+    presets.onclick = (e) => {
+      const btn = e.target.closest("button[data-preset]");
+      if (!btn) return;
+      const cxSlider = $("ctx");
+      const minVal = cxSlider ? +cxSlider.min : MIN_CTX;
+      const maxVal = cxSlider ? +cxSlider.max : DEFAULT_MAX_CTX;
+      let target = maxVal;
+      if (btn.dataset.preset === "min") target = minVal;
+      else if (btn.dataset.preset === "half") target = ctxTop(Math.round(maxVal / 2));
+      else if (btn.dataset.preset === "max") target = maxVal;
+      userPicked = true;
+      ctxSource = "operator";
+      ctx = target;
+      if (cxSlider) cxSlider.value = String(ctx);
+      if (cxNum) cxNum.value = String(ctx);
+      set("ctxV", fmt(ctx));
+      estimate();
+    };
+  }
+
+  const ms = $("msearch");
+  if (ms) {
+    ms.oninput = () => { renderModels(); };
   }
 
   const ag = $("agents");

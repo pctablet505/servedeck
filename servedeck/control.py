@@ -709,6 +709,8 @@ class Control:
         self._descendants = descendants or globals()["descendants"]
         self._reap_offload = reap_offload or reap_offload_regions
         self._mem_available_gib = mem_available_gib_fn or mem_available_gib
+        self._aborted: set[str] = set()
+        self._abort_all: bool = False
 
     def offload_witnesses(self, live: Sequence[LiveModel] | None = None) -> list[int] | None:
         """The pids that must be visible before a buffer counts as orphaned.
@@ -1122,6 +1124,9 @@ class Control:
         if spec is None:
             return Refusal(reason="unknown_model", message=f"no model {key!r} in the registry", key=key)
 
+        self._aborted.discard(key)
+        self._abort_all = False
+
         # A buffer leaked by a crashed or killed engine would otherwise hold
         # host RAM this boot's own offload buffer needs.
         self.reap_offload()
@@ -1377,6 +1382,10 @@ class Control:
                 journal=journal,
             )
 
+        if self._abort_all or key in self._aborted:
+            self._aborted.discard(key)
+            return finish(False, f"boot of {key} was cancelled by operator")
+
         def consume(lines: list[str]) -> None:
             nonlocal next_marker
             for line in lines:
@@ -1397,6 +1406,12 @@ class Control:
         stream = units.journal_follow(unit, since, spawn=self._spawn)
         try:
             while True:
+                if self._abort_all or key in self._aborted:
+                    self._aborted.discard(key)
+                    return finish(
+                        False,
+                        f"boot of {key} was cancelled by operator",
+                    )
                 now = self._clock()
                 if now >= deadline:
                     return finish(
@@ -1502,6 +1517,25 @@ class Control:
             key=key, unit=unit, was_live=was_live, held_mib=held, free_before_mib=free_before,
             reaped=tuple(self.reap_offload()),
         )
+
+    def abort(self, key: str | None = None) -> bool:
+        """Cancel an in-flight boot immediately.
+
+        Signals wait_ready to exit on its next tick and stops the unit via
+        systemd without erasing desired state.
+        """
+        import contextlib
+        if key is not None:
+            self._aborted.add(key)
+            unit = self.unit_for(key)
+            with contextlib.suppress(Exception):
+                units.stop(unit, timeout_s=15.0, run=self._run)
+        else:
+            self._abort_all = True
+            for model in self.live():
+                with contextlib.suppress(Exception):
+                    units.stop(model.unit, timeout_s=15.0, run=self._run)
+        return True
 
     def _stop_adopted(
         self, key: str, model: LiveModel, timeout_s: float, forget_intent: bool = True

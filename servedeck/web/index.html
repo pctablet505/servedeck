@@ -44,6 +44,7 @@
       <div class="eta">
         <span>Elapsed <span class="el mono" id="elapsed">—</span></span>
         <span id="etaTxt"></span>
+        <button type="button" class="btn danger tiny abort-btn" id="abortBoot" style="display:none" title="Cancel in-progress boot immediately">Force stop boot</button>
       </div>
       <div class="ptrack" id="ptrack"></div>
       <div class="plabels" id="plabels"></div>
@@ -95,6 +96,7 @@
     <div class="col">
       <section class="panel">
         <div class="panel-h"><span>Models</span><span class="mono" id="mcount">—</span></div>
+        <div class="mfilter-wrap"><input type="search" id="msearch" class="msearch" placeholder="Filter models…" aria-label="Filter models"></div>
         <div class="dfline mono"><span id="dhub">—</span><span id="dfree">—</span></div>
         <div class="mlist" id="mlist" role="listbox" aria-label="Models in the local hub cache"></div>
       </section>
@@ -124,8 +126,21 @@
     <div class="col">
       <section class="panel">
         <div class="panel-h">
-          <span>Configure</span>
+          <div class="panel-h-title">
+            <span>Configure</span>
+            <span class="staged-pill active" id="stagedPill">Active Model</span>
+          </div>
           <span class="dirty" id="dirty">unsaved changes</span>
+        </div>
+
+        <div class="cfg-banner" id="cfgBanner">
+          <div class="cfg-banner-main">
+            <span class="cfg-lbl">Target:</span>
+            <strong class="cfg-name mono" id="cfgModelName">—</strong>
+            <span class="cfg-state-tag live" id="cfgStateTag">serving</span>
+          </div>
+          <div class="cfg-banner-sub" id="cfgBannerSub">Configuring active serving model.</div>
+          <button type="button" class="btn tiny" id="revertActiveBtn" style="display:none">← Return to active model</button>
         </div>
 
         <div class="alloc">
@@ -142,6 +157,14 @@
               <div class="ctl">
                 <input type="range" id="ctx" min="8192" max="262144" step="4096" value="262144" aria-label="Maximum context per request" aria-describedby="ctxV ctxBound ctxNote">
                 <span class="v mono" id="ctxV">—</span>
+              </div>
+              <div class="ctx-input-row">
+                <input type="number" id="ctxNum" class="num mono" min="8192" max="262144" step="4096" value="262144" aria-label="Direct context numeric input" title="Type exact context tokens">
+                <div class="ctx-presets" id="ctxPresets" aria-label="Context presets">
+                  <button type="button" class="btn tiny preset-btn" data-preset="min" title="Minimum context">Min</button>
+                  <button type="button" class="btn tiny preset-btn" data-preset="half" title="50% of maximum context">Half</button>
+                  <button type="button" class="btn tiny preset-btn" data-preset="max" title="Maximum feasible context">Max</button>
+                </div>
               </div>
               <div class="s mono" id="ctxBound">—</div>
             </div>
@@ -256,6 +279,18 @@
     <div class="logbody mono" id="log" aria-live="polite"></div>
   </section>
 
+
+  <!-- Non-blocking confirmation modal -->
+  <dialog class="confirm-dialog" id="confirmDialog">
+    <form method="dialog" class="confirm-form">
+      <h3 class="confirm-title" id="confirmTitle">Confirm Action</h3>
+      <p class="confirm-body" id="confirmBody"></p>
+      <div class="confirm-actions">
+        <button type="button" class="btn" id="confirmCancel">Cancel</button>
+        <button type="button" class="btn pri" id="confirmOk">Confirm</button>
+      </div>
+    </form>
+  </dialog>
 
 </div><script src="app.js"></script>
 </body>

@@ -857,6 +857,8 @@ def _precheck(rt: Runtime, key: str, action: str) -> JSONResponse | None:
             f"no model {key!r} in the registry",
             known=list(rt.registry.models),
         )
+    if action == "abort":
+        return None
     live = rt.routes.live()
     if rt.busy is not None:
         return _refusal(
@@ -1487,6 +1489,38 @@ def _register_api(app: FastAPI, rt: Runtime) -> None:
             _run_mutation(rt, f"stop {key}", lambda: rt.control.stop(key), action="stop", key=key)
         )
         return _accepted("stop", key)
+
+    @app.post("/api/models/{key}/abort")
+    async def abort_model(key: str) -> JSONResponse:
+        refusal = _precheck(rt, key, "abort")
+        if refusal is not None:
+            return refusal
+        rt.control.abort(key)
+        rt.hub.publish(
+            "notice",
+            {
+                "level": "warn",
+                "reason": "aborted",
+                "message": f"boot of {key} cancelled by operator",
+                "key": key,
+            },
+        )
+        return JSONResponse({"accepted": True, "action": "abort", "model": key}, status_code=202)
+
+    @app.post("/api/server/abort")
+    async def server_abort() -> JSONResponse:
+        busy_key = rt.busy.get("key") if rt.busy else None
+        rt.control.abort(busy_key)
+        rt.hub.publish(
+            "notice",
+            {
+                "level": "warn",
+                "reason": "aborted",
+                "message": f"boot cancelled by operator" + (f" ({busy_key})" if busy_key else ""),
+                "key": busy_key,
+            },
+        )
+        return JSONResponse({"accepted": True, "action": "abort", "key": busy_key}, status_code=202)
 
     @app.post("/api/switch/{key}")
     async def switch(key: str) -> JSONResponse:
