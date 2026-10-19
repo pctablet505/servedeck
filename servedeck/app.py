@@ -842,6 +842,15 @@ def _accepted(action: str, key: str, **extra: Any) -> JSONResponse:
     return JSONResponse({"accepted": True, "action": action, "model": key, **extra}, status_code=202)
 
 
+def _trigger_abort(rt: Runtime, key: str | None) -> None:
+    """Signal an abort in-memory immediately and stop the unit off the event loop."""
+    try:
+        rt.control.abort(key, stop_unit=False)
+        asyncio.create_task(asyncio.to_thread(rt.control.abort, key, stop_unit=True))
+    except TypeError:
+        rt.control.abort(key)
+
+
 def _precheck(rt: Runtime, key: str, action: str) -> JSONResponse | None:
     """Answer from the snapshot whatever can be answered without a subprocess.
 
@@ -1061,11 +1070,12 @@ def _publish_result(hub: Hub, label: str, result: Any) -> None:
         )
         return
     if isinstance(result, _control.StartResult):
+        aborted = not result.ready and "cancelled by operator" in (result.failure or "")
         hub.publish(
             "notice",
             {
-                "level": "info" if result.ready else "error",
-                "reason": "ready" if result.ready else "boot_failed",
+                "level": "info" if result.ready else ("warn" if aborted else "error"),
+                "reason": "ready" if result.ready else ("aborted" if aborted else "boot_failed"),
                 "message": (
                     f"{label}: {result.key} ready in {result.elapsed_s:.0f}s"
                     if result.ready
@@ -1495,7 +1505,7 @@ def _register_api(app: FastAPI, rt: Runtime) -> None:
         refusal = _precheck(rt, key, "abort")
         if refusal is not None:
             return refusal
-        rt.control.abort(key)
+        _trigger_abort(rt, key)
         rt.hub.publish(
             "notice",
             {
@@ -1506,21 +1516,6 @@ def _register_api(app: FastAPI, rt: Runtime) -> None:
             },
         )
         return JSONResponse({"accepted": True, "action": "abort", "model": key}, status_code=202)
-
-    @app.post("/api/server/abort")
-    async def server_abort() -> JSONResponse:
-        busy_key = rt.busy.get("key") if rt.busy else None
-        rt.control.abort(busy_key)
-        rt.hub.publish(
-            "notice",
-            {
-                "level": "warn",
-                "reason": "aborted",
-                "message": f"boot cancelled by operator" + (f" ({busy_key})" if busy_key else ""),
-                "key": busy_key,
-            },
-        )
-        return JSONResponse({"accepted": True, "action": "abort", "key": busy_key}, status_code=202)
 
     @app.post("/api/switch/{key}")
     async def switch(key: str) -> JSONResponse:

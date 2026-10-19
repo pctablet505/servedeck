@@ -151,3 +151,114 @@ def test_post_server_stop_while_busy_triggers_abort(tmp_path: Path) -> None:
         assert r.status_code == 202
         assert r.json()["action"] == "abort"
         assert "a" in ctl.aborted
+
+
+def test_abort_none_only_stops_booting_units_not_unrelated_live_models(tmp_path: Path) -> None:
+    models_path = tmp_path / "models.toml"
+    models_path.write_text(TOML)
+    adapter = _app._RegistryAdapter(_models.load(models_path))
+    stopped_units: list[str] = []
+
+    def mock_run(argv: list[str]) -> Any:
+        m = MagicMock()
+        m.returncode = 0
+        m.stdout = ""
+        m.stderr = ""
+        if "stop" in argv:
+            stopped_units.append(argv[-1])
+        return m
+
+    ctl = _control.Control(
+        adapter,
+        margin_mib=1024,
+        total_mib=100000,
+        unit_prefix="sd-test-",
+        run=mock_run,
+        free_mib=lambda: 90000,
+    )
+    # When nothing is in _booting, abort(None) must not stop any units
+    ctl.abort(None)
+    assert stopped_units == []
+
+    # When 'a' is tracked as booting, abort(None) stops only 'sd-test-a.service'
+    ctl._booting.add("a")
+    ctl.abort(None)
+    assert "a" in ctl._aborted
+    assert any("sd-test-a" in u for u in stopped_units)
+
+
+def test_switch_abort_during_vram_release_does_not_launch_replacement(tmp_path: Path) -> None:
+    models_path = tmp_path / "models.toml"
+    models_path.write_text(
+        TOML
+        + """
+[models.b]
+id = "Model B"
+repo = "org/B"
+slot = "main"
+port = 8002
+build = "stock"
+ctx = 32768
+"""
+    )
+    adapter = _app._RegistryAdapter(_models.load(models_path))
+    started_units: list[str] = []
+
+    def mock_run(argv: list[str]) -> Any:
+        m = MagicMock()
+        m.returncode = 0
+        m.stdout = ""
+        m.stderr = ""
+        if "systemd-run" in argv:
+            started_units.append(argv[-1])
+        return m
+
+    ctl = _control.Control(
+        adapter,
+        margin_mib=1024,
+        total_mib=100000,
+        unit_prefix="sd-test-",
+        run=mock_run,
+        free_mib=lambda: 90000,
+    )
+    ctl.live_main = lambda *_a, **_kw: _control.LiveModel(  # type: ignore[method-assign]
+        key="a", unit="sd-test-a.service", port=8001, state="active",
+        pid=1234, ready=True, restarts=0, sub_state="running", adopted=False,
+    )
+    ctl.stop = lambda key, **_kw: _control.StopResult(  # type: ignore[method-assign]
+        key=key, unit=f"sd-test-{key}.service", was_live=True, held_mib=20000,
+        free_before_mib=50000, reaped=(),
+    )
+
+    def fake_wait_for_release(**_kw: Any) -> tuple[bool, float, int | None, str | None]:
+        # Operator aborts 'b' while waiting for 'a's VRAM to release
+        ctl.abort("b", stop_unit=False)
+        return True, 1.5, 90000, None
+
+    ctl._wait_for_release = fake_wait_for_release  # type: ignore[method-assign]
+    res = ctl.switch("b")
+    assert isinstance(res, _control.SwitchResult)
+    assert isinstance(res.started, _control.StartResult)
+    assert not res.started.ready
+    assert "cancelled by operator" in (res.started.failure or "")
+    assert started_units == []
+
+
+def test_publish_result_classifies_operator_abort_as_warn_aborted() -> None:
+    hub = _app.Hub()
+    sub = hub.subscribe()
+    res = _control.StartResult(
+        key="a",
+        unit="sd-test-a.service",
+        ready=False,
+        elapsed_s=2.0,
+        markers=[],
+        failure="boot of a was cancelled by operator",
+        journal=[],
+    )
+    _app._publish_result(hub, "start a", res)
+    ev = sub.queue.get_nowait()
+    assert ev["type"] == "notice"
+    assert ev["data"]["level"] == "warn"
+    assert ev["data"]["reason"] == "aborted"
+

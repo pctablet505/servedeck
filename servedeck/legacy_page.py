@@ -945,27 +945,28 @@ def register(app: FastAPI, rt: Any) -> None:
     async def api_server_restart(body: dict[str, Any] | None = None) -> Any:
         return _launch(body or {}, "restart")
 
-    @app.post("/api/server/abort")
-    async def api_server_abort() -> Any:
+    def _abort_busy() -> JSONResponse:
         busy_key = rt.busy.get("key") if rt.busy else None
-        rt.control.abort(busy_key)
+        _app._trigger_abort(rt, busy_key)
         rt.hub.publish(
             "notice",
             {
                 "level": "warn",
                 "reason": "aborted",
-                "message": f"server boot cancelled by operator" + (f" ({busy_key})" if busy_key else ""),
+                "message": "server boot cancelled by operator" + (f" ({busy_key})" if busy_key else ""),
                 "key": busy_key,
             },
         )
         return JSONResponse({"accepted": True, "action": "abort", "key": busy_key}, status_code=202)
 
+    @app.post("/api/server/abort")
+    async def api_server_abort() -> Any:
+        return _abort_busy()
+
     @app.post("/api/server/stop")
     async def api_server_stop() -> Any:
         if rt.busy is not None:
-            busy_key = rt.busy.get("key")
-            rt.control.abort(busy_key)
-            return JSONResponse({"accepted": True, "action": "abort", "key": busy_key}, status_code=202)
+            return _abort_busy()
         holder = _app._main_holder(rt, rt.routes.live())
         if holder is None:
             return JSONResponse({"error": "nothing holds the main slot"}, status_code=409)

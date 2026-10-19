@@ -545,7 +545,9 @@ function renderCtx(d) {
     ctxNum.min = String(r.min);
     ctxNum.max = String(r.max);
     ctxNum.step = String(CTX_STEP);
-    ctxNum.value = String(ctx);
+    if (typeof document === "undefined" || document.activeElement !== ctxNum) {
+      ctxNum.value = String(ctx);
+    }
   }
   // Name which limit is binding. The range itself is in the slider's title;
   // the tick row that used to spell it out cost a line per field.
@@ -716,10 +718,23 @@ function paintTargetBanner() {
       };
     }
     if (applyBtn && !applyBtn.disabled) {
-      applyBtn.textContent = `Switch to ${m.name}`;
-      applyBtn.title = `Evict active model and launch ${m.name}`;
+      applyBtn.textContent = servingModel ? `Switch to ${m.name}` : `Start ${m.name}`;
+      applyBtn.title = servingModel
+        ? `Evict ${servingModel.name} and launch ${m.name}`
+        : `Launch ${m.name}`;
     }
   }
+}
+
+function renderCardTags(m, isSelected) {
+  const isServing = !!m.serving;
+  const tags = [];
+  tags.push(`<span class="tag">${m.quant || "—"}</span>`);
+  if (isServing) tags.push('<span class="tag live">serving</span>');
+  else if (isSelected) tags.push('<span class="tag staged">staged</span>');
+  if (!m.servable) tags.push('<span class="tag est">unservable</span>');
+  else tags.push(trustTag(m.trust));
+  return tags.join("");
 }
 
 function renderModels() {
@@ -759,15 +774,9 @@ function renderModels() {
     b.setAttribute("aria-selected", isSelected ? "true" : "false");
     b.setAttribute("role", "option");
     b.dataset.repo = m.repo_id || "";
-    const tags = [];
-    tags.push(`<span class="tag">${m.quant || "—"}</span>`);
-    if (isServing) tags.push('<span class="tag live">serving</span>');
-    else if (isSelected) tags.push('<span class="tag staged">staged</span>');
-    if (!m.servable) tags.push('<span class="tag est">unservable</span>');
-    else tags.push(trustTag(m.trust));
     b.innerHTML =
       `<span class="r1"><span class="nm"></span><span class="sz mono" title="${diskTitle(m)}">${bytesTxt(m.disk_bytes)}${m.disk_bytes > m.disk_local_bytes ? '<span class="off">↗</span>' : ""}</span></span>
-       <span class="r2">${tags.join("")}</span>
+       <span class="r2">${renderCardTags(m, isSelected)}</span>
        <span class="note"></span>`;
     b.querySelector(".nm").textContent = m.name;
     b.querySelector(".note").textContent =
@@ -813,6 +822,8 @@ function updateRailSelection() {
     else b.className = "mcard";
     b.setAttribute("aria-selected", isSelected ? "true" : "false");
     b.setAttribute("aria-pressed", isSelected ? "true" : "false");
+    const r2 = b.querySelector ? b.querySelector(".r2") : null;
+    if (r2) r2.innerHTML = renderCardTags(m, isSelected);
   });
 }
 
@@ -1799,6 +1810,7 @@ function paintBoot(b) {
   const abortBtn = $("abortBoot");
   if (abortBtn) {
     abortBtn.style.display = booting ? "inline-block" : "none";
+    if (!booting) abortBtn.disabled = false;
     if (booting && !abortBtn.onclick) {
       abortBtn.onclick = async () => {
         const ok = await promptConfirm({
@@ -2218,20 +2230,24 @@ function wireControls() {
         return;
       }
       const unknown = lastEstimate && lastEstimate.confidence === "unknown";
-      const isSwitch = !m.serving;
-      const title = isSwitch ? `Switch to ${m.name}?` : `Restart ${m.name}?`;
-      const confirmText = isSwitch ? `Switch to ${m.name}` : "Restart Server";
+      const curServing = MODELS.find((mod) => mod.serving);
+      const isSwitch = !m.serving && !!curServing;
+      const isColdStart = !m.serving && !curServing;
+      const title = isSwitch ? `Switch to ${m.name}?` : isColdStart ? `Start ${m.name}?` : `Restart ${m.name}?`;
+      const confirmText = isSwitch ? `Switch to ${m.name}` : isColdStart ? `Start ${m.name}` : "Restart Server";
       let msg = "";
       if (isSwitch) {
-        const curServing = MODELS.find((mod) => mod.serving);
-        msg = (curServing ? `Evict active model (${curServing.name}) and launch ${m.name} at util ${util.toFixed(2)}, ${fmt(ctx)} context?\n\n` : `Launch ${m.name} at util ${util.toFixed(2)}, ${fmt(ctx)} context?\n\n`) +
+        msg = `Evict active model (${curServing.name}) and launch ${m.name} at util ${util.toFixed(2)}, ${fmt(ctx)} context?\n\n` +
               `The server will be unavailable while ${m.name} compiles and boots.`;
-      } else if (unknown) {
-        msg = `Start ${m.name} at util ${util.toFixed(2)}, ${fmt(ctx)} context?\n\n` +
-          `Its VRAM footprint cannot be predicted for this architecture, so ` +
-          `there is no capacity estimate to check against. Starting it is how ` +
-          `the real figure gets measured — the engine will refuse safely if it ` +
-          `does not fit.\n\nThe server will be unavailable for several minutes.`;
+      } else if (unknown || isColdStart) {
+        msg = `Launch ${m.name} at util ${util.toFixed(2)}, ${fmt(ctx)} context?\n\n` +
+          (unknown
+            ? `Its VRAM footprint cannot be predicted for this architecture, so ` +
+              `there is no capacity estimate to check against. Starting it is how ` +
+              `the real figure gets measured — the engine will refuse safely if it ` +
+              `does not fit.\n\n`
+            : "") +
+          `The server will be unavailable while ${m.name} compiles and boots.`;
       } else {
         msg = `Restart with ${m.name} at util ${util.toFixed(2)}, ${fmt(ctx)} context?\n\n` +
           `The server will be unavailable for several minutes.`;
@@ -2322,18 +2338,24 @@ async function init() {
 
   const cxNum = $("ctxNum");
   if (cxNum) {
-    cxNum.oninput = (e) => {
-      const n = Math.round(+e.target.value);
+    const commitCtxNum = (snapInput) => {
+      const n = Math.round(+cxNum.value);
       if (!isFinite(n) || n <= 0) return;
+      const minVal = +cxNum.min || MIN_CTX;
+      const maxVal = +cxNum.max || DEFAULT_MAX_CTX;
+      if (!snapInput && (n < minVal || n > maxVal)) return;
       userPicked = true;
       ctxSource = "operator";
-      const clamped = Math.max(+cxNum.min || MIN_CTX, Math.min(+cxNum.max || DEFAULT_MAX_CTX, n));
+      const clamped = Math.max(minVal, Math.min(maxVal, n));
       ctx = ctxTop(clamped);
       const cxSlider = $("ctx");
       if (cxSlider) cxSlider.value = String(ctx);
+      if (snapInput) cxNum.value = String(ctx);
       set("ctxV", fmt(ctx));
       estimate();
     };
+    cxNum.oninput = () => commitCtxNum(false);
+    cxNum.onchange = () => commitCtxNum(true);
   }
 
   const presets = $("ctxPresets");
@@ -2361,6 +2383,16 @@ async function init() {
   const ms = $("msearch");
   if (ms) {
     ms.oninput = () => { renderModels(); };
+    if (typeof document !== "undefined" && document.addEventListener) {
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "/" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+          const tag = (e.target && e.target.tagName || "").toUpperCase();
+          if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+          e.preventDefault();
+          ms.focus();
+        }
+      });
+    }
   }
 
   const ag = $("agents");

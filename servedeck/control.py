@@ -711,6 +711,7 @@ class Control:
         self._mem_available_gib = mem_available_gib_fn or mem_available_gib
         self._aborted: set[str] = set()
         self._abort_all: bool = False
+        self._booting: set[str] = set()
 
     def offload_witnesses(self, live: Sequence[LiveModel] | None = None) -> list[int] | None:
         """The pids that must be visible before a buffer counts as orphaned.
@@ -1124,8 +1125,10 @@ class Control:
         if spec is None:
             return Refusal(reason="unknown_model", message=f"no model {key!r} in the registry", key=key)
 
-        self._aborted.discard(key)
-        self._abort_all = False
+        if key not in self._booting:
+            self._aborted.discard(key)
+            self._abort_all = False
+        self._booting.add(key)
 
         # A buffer leaked by a crashed or killed engine would otherwise hold
         # host RAM this boot's own offload buffer needs.
@@ -1135,6 +1138,7 @@ class Control:
         current = self.live()
         for model in current:
             if model.key == key:
+                self._booting.discard(key)
                 return Refusal(
                     reason="already_live",
                     message=f"{unit} already exists ({model.state}/{model.sub_state}); "
@@ -1145,6 +1149,7 @@ class Control:
         if spec.slot == "main":
             holder = self.live_main(current)
             if holder is not None:
+                self._booting.discard(key)
                 return Refusal(
                     reason="main_slot_busy",
                     message=(
@@ -1158,6 +1163,7 @@ class Control:
         requested_util = None if util is None else float(util)
         computed = self.compute_util(spec)
         if isinstance(computed, Refusal):
+            self._booting.discard(key)
             return computed
         chosen = computed if util is None else float(util)
         if util is not None and chosen != computed:
@@ -1175,6 +1181,7 @@ class Control:
         try:
             unset_env = self.secret_env_names(keep=env)
         except UnitError as exc:
+            self._booting.discard(key)
             return Refusal(
                 reason="env_scan_failed",
                 message=(
@@ -1204,6 +1211,7 @@ class Control:
         if need_ram:
             have = self._mem_available_gib()
             if have is not None and have < need_ram:
+                self._booting.discard(key)
                 return Refusal(
                     reason="not_enough_host_ram",
                     message=(
@@ -1220,6 +1228,7 @@ class Control:
         # experts in host RAM via --cpu-offload-gb, the two add up to more
         # than the box has.
         if "--cpu-offload-gb" in argv and "--kv-offloading-size" in argv:
+            self._booting.discard(key)
             return Refusal(
                 reason="conflicting_offload",
                 message=(
@@ -1237,6 +1246,7 @@ class Control:
         # cvi-scratch servers, repeatedly).
         holder_pid = self._listener_pid(spec.port)
         if holder_pid is not None:
+            self._booting.discard(key)
             return Refusal(
                 reason="port_busy",
                 message=(
@@ -1245,6 +1255,22 @@ class Control:
                     f"bind it. Stop that process, or change this model's port in models.toml"
                 ),
                 key=key,
+            )
+
+        if self._abort_all or key in self._aborted:
+            self._aborted.discard(key)
+            self._abort_all = False
+            self._booting.discard(key)
+            return StartResult(
+                key=key,
+                unit=unit,
+                ready=False,
+                elapsed_s=0.0,
+                markers=[],
+                failure=f"boot of {key} was cancelled by operator",
+                journal=[],
+                util=util,
+                argv=argv,
             )
 
         # Start the follower BEFORE the unit, from a timestamp a couple of
@@ -1267,15 +1293,19 @@ class Control:
                 run=self._run,
             )
         except UnitError as exc:
+            self._booting.discard(key)
             return Refusal(reason="start_failed", message=str(exc), key=key)
 
-        result = self.wait_ready(
-            key,
-            timeout_s=timeout_s,
-            on_progress=on_progress,
-            since=since,
-            started_at=started_at,
-        )
+        try:
+            result = self.wait_ready(
+                key,
+                timeout_s=timeout_s,
+                on_progress=on_progress,
+                since=since,
+                started_at=started_at,
+            )
+        finally:
+            self._booting.discard(key)
         result = replace(result, util=util, argv=argv)
         if result.ready:
             # Measure this boot before anything else. `append_observation`'s
@@ -1384,6 +1414,7 @@ class Control:
 
         if self._abort_all or key in self._aborted:
             self._aborted.discard(key)
+            self._abort_all = False
             return finish(False, f"boot of {key} was cancelled by operator")
 
         def consume(lines: list[str]) -> None:
@@ -1408,6 +1439,7 @@ class Control:
             while True:
                 if self._abort_all or key in self._aborted:
                     self._aborted.discard(key)
+                    self._abort_all = False
                     return finish(
                         False,
                         f"boot of {key} was cancelled by operator",
@@ -1518,23 +1550,27 @@ class Control:
             reaped=tuple(self.reap_offload()),
         )
 
-    def abort(self, key: str | None = None) -> bool:
+    def abort(self, key: str | None = None, *, stop_unit: bool = True) -> bool:
         """Cancel an in-flight boot immediately.
 
-        Signals wait_ready to exit on its next tick and stops the unit via
-        systemd without erasing desired state.
+        Signals wait_ready / switch to exit on its next tick and (when
+        ``stop_unit=True``) stops the booting unit via systemd without erasing
+        desired state. When ``key`` is None, only units currently tracked in
+        ``_booting`` are stopped — never unrelated already-serving models.
         """
         import contextlib
         if key is not None:
             self._aborted.add(key)
-            unit = self.unit_for(key)
-            with contextlib.suppress(Exception):
-                units.stop(unit, timeout_s=15.0, run=self._run)
+            targets = [key]
         else:
             self._abort_all = True
-            for model in self.live():
+            self._aborted.update(self._booting)
+            targets = list(self._booting)
+        if stop_unit:
+            for k in targets:
+                unit = self.unit_for(k)
                 with contextlib.suppress(Exception):
-                    units.stop(model.unit, timeout_s=15.0, run=self._run)
+                    units.stop(unit, timeout_s=15.0, run=self._run)
         return True
 
     def _stop_adopted(
@@ -1637,80 +1673,123 @@ class Control:
                 key=key,
             )
 
-        holder = self.live_main()
-        stopped: StopResult | None = None
-        released = True
-        waited = 0.0
-        free_after = self._free_mib()
+        self._aborted.discard(key)
+        self._abort_all = False
+        self._booting.add(key)
+        try:
+            holder = self.live_main()
+            stopped: StopResult | None = None
+            released = True
+            waited = 0.0
+            free_after = self._free_mib()
 
-        # relaunch=True (2026-09-17): the page's "Apply & restart" on the model
-        # that already holds the slot, with new util/context/agents/offload.
-        # Without it this branch refused "already holds the main slot", the
-        # POST was accepted, and nothing restarted.
-        if holder is not None and (holder.key != key or relaunch):
-            # forget_intent=False: if the replacement fails to boot, desired
-            # state must still name a model, so reconcile and the next reboot
-            # have something to bring back.
-            result = self.stop(holder.key, forget_intent=False)
-            if isinstance(result, Refusal):
-                return result
-            stopped = result
-            released, waited, free_after, reason = self._wait_for_release(
-                free_before=result.free_before_mib,
-                held_mib=result.held_mib,
-                timeout_s=release_timeout_s,
-                on_progress=on_progress,
-            )
-            if reason == "vram_accounting_unavailable":
+            # relaunch=True (2026-09-17): the page's "Apply & restart" on the model
+            # that already holds the slot, with new util/context/agents/offload.
+            # Without it this branch refused "already holds the main slot", the
+            # POST was accepted, and nothing restarted.
+            if holder is not None and (holder.key != key or relaunch):
+                # forget_intent=False: if the replacement fails to boot, desired
+                # state must still name a model, so reconcile and the next reboot
+                # have something to bring back.
+                result = self.stop(holder.key, forget_intent=False)
+                if isinstance(result, Refusal):
+                    return result
+                stopped = result
+                released, waited, free_after, reason = self._wait_for_release(
+                    free_before=result.free_before_mib,
+                    held_mib=result.held_mib,
+                    timeout_s=release_timeout_s,
+                    on_progress=on_progress,
+                )
+                if self._abort_all or key in self._aborted:
+                    self._aborted.discard(key)
+                    self._abort_all = False
+                    return SwitchResult(
+                        stopped=stopped,
+                        released=released,
+                        waited_s=waited,
+                        free_after_mib=free_after,
+                        started=StartResult(
+                            key=key,
+                            unit=self.unit_for(key),
+                            ready=False,
+                            elapsed_s=waited,
+                            markers=[],
+                            failure=f"boot of {key} was cancelled by operator",
+                            journal=[],
+                        ),
+                    )
+                if reason == "vram_accounting_unavailable":
+                    return SwitchResult(
+                        stopped=stopped,
+                        released=False,
+                        waited_s=waited,
+                        free_after_mib=free_after,
+                        started=Refusal(
+                            reason="vram_accounting_unavailable",
+                            message=(
+                                f"nvidia-smi cannot report free VRAM, so there is no way to tell "
+                                f"whether {result.unit} let go. Refusing to boot {key} on the "
+                                f"assumption that it did."
+                            ),
+                            key=key,
+                            live_key=holder.key,
+                        ),
+                    )
+                if not released:
+                    return SwitchResult(
+                        stopped=stopped,
+                        released=False,
+                        waited_s=waited,
+                        free_after_mib=free_after,
+                        started=Refusal(
+                            reason="vram_not_released",
+                            message=(
+                                f"{result.unit} held {result.held_mib} MiB; after {waited:.0f}s only "
+                                f"{(free_after or 0) - (result.free_before_mib or 0)} MiB came back. "
+                                f"Refusing to boot {key} into a card that is still occupied."
+                            ),
+                            key=key,
+                            live_key=holder.key,
+                        ),
+                    )
+            elif holder is not None and holder.key == key:
+                return Refusal(
+                    reason="already_live",
+                    message=f"{key} already holds the main slot",
+                    key=key,
+                    live_key=key,
+                )
+
+            if self._abort_all or key in self._aborted:
+                self._aborted.discard(key)
+                self._abort_all = False
                 return SwitchResult(
                     stopped=stopped,
-                    released=False,
+                    released=released,
                     waited_s=waited,
                     free_after_mib=free_after,
-                    started=Refusal(
-                        reason="vram_accounting_unavailable",
-                        message=(
-                            f"nvidia-smi cannot report free VRAM, so there is no way to tell "
-                            f"whether {result.unit} let go. Refusing to boot {key} on the "
-                            f"assumption that it did."
-                        ),
+                    started=StartResult(
                         key=key,
-                        live_key=holder.key,
+                        unit=self.unit_for(key),
+                        ready=False,
+                        elapsed_s=waited,
+                        markers=[],
+                        failure=f"boot of {key} was cancelled by operator",
+                        journal=[],
                     ),
                 )
-            if not released:
-                return SwitchResult(
-                    stopped=stopped,
-                    released=False,
-                    waited_s=waited,
-                    free_after_mib=free_after,
-                    started=Refusal(
-                        reason="vram_not_released",
-                        message=(
-                            f"{result.unit} held {result.held_mib} MiB; after {waited:.0f}s only "
-                            f"{(free_after or 0) - (result.free_before_mib or 0)} MiB came back. "
-                            f"Refusing to boot {key} into a card that is still occupied."
-                        ),
-                        key=key,
-                        live_key=holder.key,
-                    ),
-                )
-        elif holder is not None and holder.key == key:
-            return Refusal(
-                reason="already_live",
-                message=f"{key} already holds the main slot",
-                key=key,
-                live_key=key,
-            )
 
-        started = self.start(key, timeout_s=timeout_s, on_progress=on_progress, util=util, argv_overrides=argv_overrides)
-        return SwitchResult(
-            stopped=stopped,
-            released=released,
-            waited_s=waited,
-            free_after_mib=free_after,
-            started=started,
-        )
+            started = self.start(key, timeout_s=timeout_s, on_progress=on_progress, util=util, argv_overrides=argv_overrides)
+            return SwitchResult(
+                stopped=stopped,
+                released=released,
+                waited_s=waited,
+                free_after_mib=free_after,
+                started=started,
+            )
+        finally:
+            self._booting.discard(key)
 
     def _wait_for_release(
         self,
