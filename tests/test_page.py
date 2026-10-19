@@ -10,13 +10,39 @@ route the app registers.
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 from servedeck import app as _app
 
 WEB = Path(_app.__file__).parent / "web"
 INDEX = (WEB / "index.html").read_text(encoding="utf-8")
 APP_JS = (WEB / "app.js").read_text(encoding="utf-8")
+
+#: Parses the page script without running it (``new Function`` compiles its
+#: body; the two lines it wraps around the source are taken off the line).
+_PARSE_ONLY = (
+    "const [, b] = imports.gi.GLib.file_get_contents(ARGV[0]);"
+    "try { new Function(new TextDecoder().decode(b)); }"
+    "catch (e) { print(`${e.name}: ${e.message} (line ${e.lineNumber - 2})`);"
+    " imports.system.exit(1); }"
+)
+
+
+@pytest.mark.skipif(shutil.which("gjs") is None, reason="needs gjs, GNOME's SpiderMonkey shell")
+def test_the_page_script_parses() -> None:
+    """A script that does not parse runs none of itself. On 2026-10-19 a second
+    ``const stopBtn`` in paintState left the live page at "connecting..." with
+    an empty model list, and every other test here passed, because they read
+    app.js as text."""
+    r = subprocess.run(
+        ["gjs", "-c", _PARSE_ONLY, str(WEB / "app.js")],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
 
 
 def test_the_page_references_only_files_beside_it() -> None:
