@@ -196,7 +196,7 @@ def registry() -> models.Registry:
     return models.load(REPO_ROOT / "models.toml")
 
 
-def test_qwen27b_argv_and_env_match_frozen_snapshot(registry):
+def test_qwen27b_argv_and_env_match_frozen_snapshot(registry, monkeypatch):
     """The always-run half of the golden test: reads the frozen fixtures, no
     subprocess, no dependency on the live/mutable ~/Projects/local_llm/.config.
     See the module docstring ("FROZEN SNAPSHOT...") and the fixture files'
@@ -206,9 +206,23 @@ def test_qwen27b_argv_and_env_match_frozen_snapshot(registry):
 
     m = registry.models["qwen27b"]
     build = registry.builds[m.build]
+    # The snapshot was taken under the owner's real $HOME, and testq runs the
+    # suite with a scratch HOME, so every `~` in models.toml expanded somewhere
+    # else. Expand against the snapshot's home: its vllm path above the venv.
+    venv_rel = f"/{build.venv.removeprefix('~/')}/bin/vllm"
+    if build.venv.startswith("~/") and legacy_argv[0].endswith(venv_rel):
+        monkeypatch.setenv("HOME", legacy_argv[0][: -len(venv_rel)])
     vllm_bin = str(Path(build.venv).expanduser() / "bin" / "vllm")
-    ctx = models.native_ctx(m.repo)
-    assert ctx == 262144, "native ctx must equal the snapshot's MAX_MODEL_LEN for this comparison to be meaningful"
+    # The context the snapshot launched with, from the snapshot itself. Read
+    # from the hub cache instead, this "always-run" half depended on the
+    # weights being downloaded, and went red once qwen27b's were deleted.
+    ctx = int(_parse_argv(legacy_argv[3:])["--max-model-len"][0])
+    try:
+        native = models.native_ctx(m.repo)
+    except models.RegistryError:
+        native = None  # weights not on this box: the comparison stands on the snapshot
+    if native is not None:
+        assert native == ctx, "native ctx must equal the snapshot's MAX_MODEL_LEN for this comparison to be meaningful"
     v2_argv = models.render_argv(m, vllm_bin, util=0.91, ctx_tokens=ctx, port=m.port)
     v2_env = models.render_env(m, build)
 
