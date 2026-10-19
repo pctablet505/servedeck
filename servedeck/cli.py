@@ -130,7 +130,9 @@ def _cmd_wire(args: argparse.Namespace) -> int:
     reg = _load_or_report(args.models_toml)
     if reg is None:
         return 1
-    resolve_ctx = _wire.make_default_ctx_resolver(reg)
+    resolve_ctx = _wire.make_default_ctx_resolver(
+        reg, warn=lambda msg: print(f"== wire: {msg}", file=sys.stderr)
+    )
 
     for target in _wire.WIRE_TARGETS:
         before = _wire.read_existing(target.path)

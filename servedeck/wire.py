@@ -128,7 +128,8 @@ def render_vscode(
         groups = []
 
     entries: list[dict[str, Any]] = []
-    main_models = [m for m in registry.models.values() if m.slot == "main"]
+    # A context of 0 is unknown (see make_default_ctx_resolver): left out.
+    main_models = [m for m in registry.models.values() if m.slot == "main" and resolve_ctx(m) > 0]
     if main_models:
         # First in the list, so it is the obvious pick: "whatever is serving".
         # Every other entry names one model and 503s whenever the card holds a
@@ -140,6 +141,8 @@ def render_vscode(
         entries.append(_vscode_entry(_MAIN_ROUTE, narrowest, ctx))
     for m in registry.models.values():
         ctx = resolve_ctx(m)
+        if ctx <= 0:
+            continue
         entries.append(_vscode_entry(m.id, m, ctx))
         for preset_name in m.presets:
             entries.append(_vscode_entry(preset_name, m, ctx))
@@ -429,6 +432,8 @@ def render_kimi(
     )
     for key, m in registry.models.items():
         ctx = resolve_ctx(m)
+        if ctx <= 0:
+            continue
         data = {
             "provider": "servedeck",
             "model": m.id,
@@ -442,7 +447,8 @@ def render_kimi(
     # per-model default (servedeck/flashnext) is stale the moment the card is
     # switched, and the owner then has to edit three client configs to get a
     # working local model back.
-    main_models = [m for m in registry.models.values() if m.slot == "main"]
+    # A context of 0 is unknown (see make_default_ctx_resolver): left out.
+    main_models = [m for m in registry.models.values() if m.slot == "main" and resolve_ctx(m) > 0]
     if main_models:
         ctx = _slot_ctx(registry, resolve_ctx)
         caps: list[str] = []
@@ -488,17 +494,32 @@ def _set_kimi_default(text: str, name: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def make_default_ctx_resolver(registry: _models.Registry) -> CtxResolver:
+def make_default_ctx_resolver(
+    registry: _models.Registry, warn: Callable[[str], None] | None = None
+) -> CtxResolver:
     """A real ``resolve_ctx``: ``ctx`` as-is when it is already an int, else
     :func:`servedeck.models.native_ctx` (reads the local hub cache), cached per
-    model so a preset-bearing model's hub lookup happens once per CLI run."""
+    model so a preset-bearing model's hub lookup happens once per CLI run.
+
+    A model whose native context cannot be read -- its weights are not in the
+    local hub cache -- resolves to 0, and every renderer leaves a 0 out: the
+    model cannot serve, and a guessed context would have a client size prompts
+    against it. Until 2026-10-19 the RegistryError propagated, so one
+    registered-but-deleted checkpoint (qwen27b) made `servedeck wire` crash for
+    every client. ``warn`` hears about each such model once.
+    """
     cache: dict[str, int] = {}
 
     def resolve(m: _models.Model) -> int:
         if isinstance(m.ctx, int):
             return m.ctx
         if m.key not in cache:
-            cache[m.key] = _models.native_ctx(m.repo)
+            try:
+                cache[m.key] = _models.native_ctx(m.repo)
+            except _models.RegistryError as exc:
+                cache[m.key] = 0
+                if warn is not None:
+                    warn(f"{m.key}: left out, its context is unknown ({exc})")
         return cache[m.key]
 
     return resolve
