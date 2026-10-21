@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="330" viewBox="0 0 1000 330" role="img" aria-labelledby="t d">
+  <title id="t">How Servedeck works</title>
+  <desc id="d">Clients such as Codex CLI, Kimi CLI and VS Code chat ask for the model main at 127.0.0.1:8010. Servedeck reads models.toml and starts each model as its own systemd user unit, model-key, which runs vllm serve on the NVIDIA GPU.</desc>
+  <style>
+    .s{font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans",Helvetica,Arial,sans-serif}
+    .m{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace}
+    .box{fill:#f8fafc;stroke:#64748b;stroke-width:2}
+    .h{fill:#0f172a;font-size:18px;font-weight:600}
+    .t{fill:#334155;font-size:16px}
+    .q{fill:#475569;font-size:14px}
+    .a{stroke:#b45309;stroke-width:2.5;fill:none}
+    .ah{fill:#b45309}
+    .al{fill:#b45309;font-size:14px}
+  </style>
+  <rect width="1000" height="330" rx="16" fill="#ffffff"/>
+  <rect x="0.5" y="0.5" width="999" height="329" rx="15.5" fill="none" stroke="#e2e8f0"/>
+
+  <rect class="box" x="32" y="100" width="224" height="176" rx="10"/>
+  <text class="s h" x="52" y="136">Clients</text>
+  <text class="s t" x="52" y="174">Codex CLI</text>
+  <text class="s t" x="52" y="202">Kimi CLI</text>
+  <text class="s t" x="52" y="230">VS Code chat</text>
+  <text class="s q" x="52" y="258">or any OpenAI client</text>
+
+  <path class="a" d="M256 193H362"/>
+  <path class="ah" d="M362 186L374 193L362 200Z"/>
+  <text class="m al" x="309" y="180" text-anchor="middle">model: main</text>
+
+  <rect x="410" y="24" width="200" height="50" rx="10" fill="#f8fafc" stroke="#64748b" stroke-width="2" stroke-dasharray="6 4"/>
+  <text class="m t" x="510" y="55" text-anchor="middle">models.toml</text>
+  <text class="s q" x="624" y="55">the registry</text>
+  <path d="M510 74V90" stroke="#64748b" stroke-width="2"/>
+  <path d="M504 90L510 100L516 90Z" fill="#64748b"/>
+
+  <rect class="box" x="374" y="100" width="272" height="176" rx="10"/>
+  <text class="s h" x="394" y="136">Servedeck</text>
+  <text class="m q" x="394" y="160">127.0.0.1:8010</text>
+  <rect x="386" y="178" width="248" height="30" rx="6" fill="#fef3c7"/>
+  <text class="m t" x="394" y="199">/v1</text><text class="s t" x="448" y="199">gateway</text>
+  <text class="m t" x="394" y="230">/api</text><text class="s t" x="448" y="230">control</text>
+  <text class="m t" x="394" y="259">/</text><text class="s t" x="448" y="259">the page</text>
+
+  <path class="a" d="M646 193H768"/>
+  <path class="ah" d="M768 186L780 193L768 200Z"/>
+  <text class="m q" x="712" y="160" text-anchor="middle">systemd-run</text>
+  <text class="m q" x="712" y="179" text-anchor="middle">--user</text>
+
+  <rect class="box" x="780" y="100" width="180" height="116" rx="10"/>
+  <text class="m h" x="800" y="136">model-&lt;key&gt;</text>
+  <text class="s q" x="800" y="162">its own unit</text>
+  <text class="m t" x="800" y="196">vllm serve</text>
+
+  <path class="a" d="M870 216V238"/>
+  <path class="ah" d="M863 238L870 250L877 238Z"/>
+  <rect class="box" x="780" y="250" width="180" height="50" rx="10"/>
+  <text class="s h" x="800" y="282">NVIDIA GPU</text>
+</svg>

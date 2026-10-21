@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="194" height="20" viewBox="0 0 194 20" role="img" aria-label="runs on: Linux · NVIDIA · systemd">
+  <title>runs on: Linux · NVIDIA · systemd</title>
+  <rect width="194" height="20" rx="3" fill="#334155"/>
+  <rect width="54" height="20" rx="3" fill="#0f172a"/>
+  <rect x="51" width="3" height="20" fill="#0f172a"/>
+  <g fill="#ffffff" font-family="system-ui,-apple-system,&quot;Segoe UI&quot;,Roboto,&quot;Noto Sans&quot;,Helvetica,Arial,sans-serif" font-size="11">
+    <text x="7" y="14" textLength="40" lengthAdjust="spacingAndGlyphs">runs on</text>
+    <text x="61" y="14" textLength="126" lengthAdjust="spacingAndGlyphs">Linux · NVIDIA · systemd</text>
+  </g>
+</svg>
