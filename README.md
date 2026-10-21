@@ -1,7 +1,9 @@
-<a href="https://servedeck.rlalphalabs.com/"><picture>
+<a href="https://servedeck.rlalphalabs.com/">
+<picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/hero-dark.svg">
   <img src="assets/hero-light.svg" width="100%" alt="Servedeck. Switch models, not configs. One local /v1 gateway, systemd units and a live dashboard for vLLM on one Linux GPU workstation.">
-</picture></a>
+</picture>
+</a>
 
 **Switch models, not configs.** Servedeck runs each vLLM model as its own systemd user unit and gives every
 client one local, OpenAI-compatible `/v1` address. Clients ask for the model named `main`, so changing the model
