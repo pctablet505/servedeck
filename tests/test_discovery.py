@@ -226,6 +226,32 @@ def test_no_refs_main_falls_back_to_newest_snapshot_dir(tmp_path: Path) -> None:
     assert entries[0].snapshot_path == str(newer)
 
 
+def test_snapshot_refs_main_does_not_name_is_not_servable(tmp_path: Path) -> None:
+    """Units launch offline with no --revision, so huggingface_hub resolves
+    "main" through refs/main. A snapshot fetched by commit (`hf download
+    --revision <sha>`) has no refs/main, and the launch dies with
+    LocalEntryNotFoundError (Ornith, 2026-10-22)."""
+    _make_repo(
+        tmp_path,
+        "models--A--B",
+        use_refs_main=False,
+        config=INLINE_CONFIG,
+        safetensors={"m.safetensors": 100},
+    )
+    [entry] = discover_models(tmp_path)
+    assert not entry.servable
+    assert "refs/main" in (entry.reason or "")
+
+    (tmp_path / "models--A--B" / "refs").mkdir()
+    (tmp_path / "models--A--B" / "refs" / "main").write_text("not-a-snapshot")
+    [entry] = discover_models(tmp_path)
+    assert not entry.servable
+
+    (tmp_path / "models--A--B" / "refs" / "main").write_text("abc123")
+    [entry] = discover_models(tmp_path)
+    assert entry.servable, entry.reason
+
+
 def test_safetensors_size_follows_symlinks(tmp_path: Path) -> None:
     size = 12345
     _make_repo(
@@ -385,6 +411,7 @@ def test_known_archs_map_is_exactly_the_two_documented_entries() -> None:
         "Qwen4ExpForConditionalGeneration": "flashnext",
         "Glm5NextForConditionalGeneration": "glm53",
         "Lfm2ForCausalLM": "stock",
+        "Qwen3_5MoeForConditionalGeneration": "ornith",
     }
     assert len(set(KNOWN_ARCHS.values())) == len(KNOWN_ARCHS), "map must stay 1:1"
 

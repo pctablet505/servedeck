@@ -51,7 +51,7 @@ def _fake_hub(tmp_path, *repos: str):
     """A hub cache holding exactly ``repos``, servable, and nothing else.
 
     Mirrors what `servedeck.discovery` reads: models--<org>--<name>/snapshots/
-    <rev>/config.json plus one safetensors shard.
+    <rev>/config.json plus one safetensors shard, and refs/main naming <rev>.
     """
     import json
 
@@ -60,6 +60,8 @@ def _fake_hub(tmp_path, *repos: str):
         org, _, name = repo.partition("/")
         snap = hub / f"models--{org}--{name}" / "snapshots" / "deadbeef"
         snap.mkdir(parents=True)
+        (snap.parent.parent / "refs").mkdir()
+        (snap.parent.parent / "refs" / "main").write_text("deadbeef")
         (snap / "config.json").write_text(json.dumps({
             # One of discovery.KNOWN_ARCHS, or the entry is "unknown architecture".
             "architectures": ["Qwen3_5ForConditionalGeneration"],

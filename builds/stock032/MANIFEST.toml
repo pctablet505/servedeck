@@ -1,0 +1,49 @@
+# builds/stock032/MANIFEST.toml — captured 2026-10-22.
+# Serves [models.ornith] per models.toml [builds].stock032.
+#
+# A plain PyPI wheel install like builds/stock, one vLLM release later: [tree]
+# and [patches] are empty on purpose. stock stays on 0.29.0 for its models.
+
+[venv]
+path   = "~/Projects/local_llm/.venv-llm-032"
+python = "3.13.15"          # <venv>/bin/python --version
+vllm   = "0.32.0"           # python -c "import vllm; print(vllm.__version__)"
+
+[packages]
+# Read via importlib.metadata (no pip module in this uv-created venv), 2026-10-22.
+torch              = "2.13.0+cu130"
+transformers       = "5.19.0"
+flashinfer_python  = "0.7.0.post1"   # distribution name on PyPI is "flashinfer-python"
+triton             = "3.7.1"
+numpy              = "2.4.6"
+
+[install]
+kind            = "wheel"
+editable_target = ""
+# No direct_url.json under vllm-0.32.0.dist-info; INSTALLER says "uv".
+source = "uv pip install --python <venv>/bin/python vllm==0.32.0 --torch-backend cu130 (from PyPI), then flashinfer-jit-cache and flashinfer-jit-cache-sm120f 0.7.0.post1+cu130 with --no-deps from https://flashinfer.ai/whl/cu130 -- see builds/stock032/build.sh"
+
+[tree]
+checkout = ""
+remote   = ""
+branch   = ""
+head     = ""
+describe = ""
+
+[base]
+anchor        = "n/a"
+commits_ahead = 0
+note = "stock032 is the released vllm==0.32.0 wheel; there is no fork tree to anchor against."
+
+[patches]
+files             = []
+excluded_branches = []
+note = "no patches."
+
+[cuda]
+driver_header = "Driver Version: 595.91.07   CUDA Version: 13.2"  # nvidia-smi, 2026-10-22
+nvcc = "no system CUDA toolkit. The venv's own nvidia/cu13/bin/nvcc is 13.4.92 (nvidia-cuda-nvcc, pulled in by the wheel) against 13.0.96 runtime headers; FlashInfer 0.7's bundled CCCL refuses that pair at JIT time ('CUDA compiler and CUDA toolkit headers are incompatible'), so the kernels must come prebuilt from flashinfer-jit-cache-sm120f. The spec-decode XQA attention kernels it lacks still compile at boot, and do so cleanly."
+flashinfer_sampler = "VLLM_USE_FLASHINFER_SAMPLER=0 is set for every model (models.toml [defaults.env]), as for stock."
+jit_cache = "flashinfer-jit-cache 0.7.0.post1 is a shim whose dependencies are one package per GPU architecture (sm80, sm89, sm90a, sm100a, sm103a, sm120f); only sm120f (187 MB) is installed, with --no-deps. A plain install of the shim pulls all six and did not finish in 15 minutes on this box's Wi-Fi."
+lib64_shim = "<venv>/lib/python3.13/site-packages/nvidia/cu13/lib64 -> lib, created 2026-10-22, as in stock: FlashInfer's JIT links with -L$CUDA_HOME/lib64."
+libcudart_shim = "<venv>/lib/python3.13/site-packages/nvidia/cu13/lib/libcudart.so -> libcudart.so.13, created 2026-10-22, as in stock: without it the boot-time XQA compile fails to link (ld: cannot find -lcudart) after the weights load."

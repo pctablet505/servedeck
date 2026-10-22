@@ -1,7 +1,8 @@
 # Servedeck
 
 One control plane for the local LLMs on this box. `models.toml` is the registry
-(`qwen27b`, `flashnext`, `glm53`, `lfm2`); a user unit running `python -m servedeck`
+(`ornith`, the main model since 2026-10-22, plus `qwen27b`, `glm53`, `lfm2` and others;
+`servedeck models` lists them); a user unit running `python -m servedeck`
 serves a page, a JSON API and an OpenAI-compatible gateway on
 **http://127.0.0.1:8010** (gateway under `/v1`); each model runs as its own
 transient unit `model-<key>` started with `systemd-run`, so restarting servedeck
@@ -18,7 +19,7 @@ so nothing needs reconfiguring when the model changes.
 
 ```bash
 servedeck status              # what is live: slot, ctx, KV %, run/wait, tok/s, uptime, headroom
-servedeck switch flashnext    # put this model in the main slot, evicting whatever is there
+servedeck switch ornith       # put this model in the main slot, evicting whatever is there
 servedeck start lfm2          # start (or stop) one model, streaming its boot log until READY
 servedeck doctor              # prove the registry against reality before believing anything else
 servedeck wire --apply        # rewrite the client configs (no flag = dry-run diff)
@@ -34,7 +35,7 @@ Those commands need the control plane up. It is a **user** unit, started with
 `models.toml`) — never `sudo`. Restarting it does not disturb a running model:
 engines are separate units and this one sets `KillMode=process`.
 
-None of the CLI verbs take tuning flags — `switch flashnext` launches at the
+None of the CLI verbs take tuning flags — `switch ornith` launches at the
 `util` and context `models.toml` pins. To launch at different ones, use the
 page's **Configure** panel.
 
