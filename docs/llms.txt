@@ -21,10 +21,11 @@
 - [Architecture](https://servedeck.rlalphalabs.com/architecture/): one process, a systemd unit per model, the offload reaper and the poll loop.
 - [Configuration](https://servedeck.rlalphalabs.com/configuration/): every key of models.toml.
 - [Host](https://servedeck.rlalphalabs.com/host/): power cap, Xid history, host RAM, sysctl, PCIe and disk.
-- [Builds](https://servedeck.rlalphalabs.com/builds/): the three vLLM builds, their forks and patches.
+- [Builds](https://servedeck.rlalphalabs.com/builds/): the vLLM builds, their forks and patches.
 - [Decisions](https://servedeck.rlalphalabs.com/decisions/): the settled rules and their reasons.
 
 ## Models (measured on one workstation)
+- [Ornith-1.5-122B on one GPU](https://servedeck.rlalphalabs.com/models/ornith/)
 - [Flash-Next](https://servedeck.rlalphalabs.com/models/flashnext/)
 - [Qwen3.8-27B NVFP4](https://servedeck.rlalphalabs.com/models/qwen27b/)
 - [GLM-5.3 with CPU-offloaded experts](https://servedeck.rlalphalabs.com/models/glm53/)

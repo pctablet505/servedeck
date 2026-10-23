@@ -17,7 +17,7 @@ model named `main`. Nothing else is a supported wiring.
 | model names | `GET /v1/models`, which lists every name each **ready** model answers to, with `root` = the id vLLM was started with and `max_model_len` = its context |
 | `main` / `local` | the gateway aliases for whatever holds the exclusive main slot (`routes.py:127`). Client configs name these, so `servedeck switch` does not strand every client |
 | reasoning | arrives as **both** `reasoning` and `reasoning_content`, same value, in the JSON body and in every SSE delta (verified live 2026-09-18: 73 characters in each, identical) |
-| tool calls | parsed server-side by the engine, per model: `qwen3_coder` (flashnext), `qwen3_xml` (qwen27b), `glm47` (glm53), `lfm2`. A client sends ordinary OpenAI `tools` and gets `tool_calls` back |
+| tool calls | parsed server-side by the engine, per model: `qwen3_coder` (flashnext), `qwen3_xml` (ornith, qwen27b), `glm47` (glm53), `lfm2`. A client sends ordinary OpenAI `tools` and gets `tool_calls` back |
 
 Live 2026-09-18 with Flash-Next in the slot, `GET /v1/models` returns five names —
 `Qwen3.8-Flash-Next-Uncensored-NVFP4`, `qwen38-flash-next`, `flashnext`, `main`, `local` —

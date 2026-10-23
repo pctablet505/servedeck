@@ -34,6 +34,7 @@ nav:
   - Builds: BUILDS.md
   - Decisions: DECISIONS.md
   - Models:
+      - Ornith-1.5-122B: models/ornith.md
       - Flash-Next: models/flashnext.md
       - Qwen3.8-27B: models/qwen27b.md
       - GLM-5.3: models/glm53.md

@@ -75,7 +75,7 @@ about how the venv was built. Both keys are required, and the short forms the
 older version of this document showed are **rejected**: `stock = "~/path"`
 raises `builds.stock must be a table with 'venv' and 'cuda_home'`, a `venv`-only
 table raises `builds.stock: missing 'cuda_home'` (`models.py:370-382`). The
-three builds are in [BUILDS.md](BUILDS.md).
+builds are in [BUILDS.md](BUILDS.md).
 
 ### `[models.<key>]`
 
@@ -110,8 +110,8 @@ five, and the live Flash-Next argv on 2026-09-18 is byte-for-byte the rendered
 registry entry. `Restart=always`, `RestartSec=10` and `TimeoutStopSec=120` are
 unit properties in `units.py`, not registry keys; a model's own
 `--shutdown-timeout 30` belongs in `flags`, because it is vLLM's setting.
-Pinned values today: `util` 0.96 flashnext / 0.96 fp4local / 0.40 qwen27b / 0.95 glm53;
-`host_ram_gib` 95 flashnext / 85 fp4local / 155 glm53; `kv_cache_bytes_per_token` 17200 glm53.
+Pinned values today: `util` 0.94 ornith / 0.96 flashnext / 0.96 fp4local / 0.40 qwen27b / 0.95 glm53;
+`host_ram_gib` 8 ornith / 95 flashnext / 85 fp4local / 155 glm53; `kv_cache_bytes_per_token` 17200 glm53.
 
 `[models.<key>.reasoning]` takes `parser` (required if the table exists) →
 `--reasoning-parser`, and `mirror_content` (bool, default false) → the gateway

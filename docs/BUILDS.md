@@ -1,19 +1,20 @@
 ---
-title: "The three vLLM builds Servedeck runs"
+title: "The vLLM builds Servedeck runs"
 description: "Which vLLM build serves which model, why each fork exists, how patches are kept as files, how to rebuild, and the drift checks that catch a stale checkout."
 ---
 
-# The three vLLM builds
+# The vLLM builds
 
-Every model in `models.toml` names a `build`, and every build is one venv. Two of the three are patched source checkouts; one is a plain wheel. Nothing about a build is discovered at launch time — `[builds.<key>]` in `models.toml` gives the venv and its `CUDA_HOME`, and that is all servedeck knows.
+Every model in `models.toml` names a `build`, and every build is one venv. Two are patched source checkouts; two are plain wheels. Nothing about a build is discovered at launch time — `[builds.<key>]` in `models.toml` gives the venv and its `CUDA_HOME`, and that is all servedeck knows.
 
 | build | venv | vLLM | serves | source |
 |---|---|---|---|---|
 | `stock` | `~/Projects/local_llm/.venv-llm-029` | `0.29.0` | `qwen27b`, `lfm2` | plain PyPI wheel, no patches |
+| `stock032` | `~/Projects/local_llm/.venv-llm-032` | `0.32.0` | `ornith` | plain PyPI wheel, no patches, plus FlashInfer's prebuilt sm120f kernels (`builds/stock032/MANIFEST.toml`) |
 | `qwen38next` | `~/Projects/vllm-qwen38next/.venv-next` | `0.29.0.dev0+qwen38next.cu132` | `flashnext`, `fp4local` (overlay, below) | editable install of `~/Projects/vllm-qwen38next/src`, branch `release/qwen38next_offload` at `95dc96d1d` |
 | `glm53` | `~/Projects/vllm-glm53/.venv-glm53` | `0.29.0.dev0+glm53.cu132` | `glm53` | editable install of `~/Projects/vllm-glm53/src`, branch `glm53` at `878631b60` |
 
-All three run Python 3.13.15, torch 2.13.0+cu130, transformers 5.16.1, triton 3.7.1, numpy 2.4.6. FlashInfer differs on purpose: `stock` and `glm53` carry 0.6.18, `qwen38next` carries 0.6.16.post3. Do not harmonise them — GLM-5.3 needs >= 0.6.18 for the SM90 NoPE MLA kernel that 0.6.17 lacks, and the Flash-Next tree was built and validated against 0.6.16.post3.
+The first three run Python 3.13.15, torch 2.13.0+cu130, transformers 5.16.1, triton 3.7.1, numpy 2.4.6; `stock032` (2026-10-22) has the same Python, torch, triton and numpy with transformers 5.19.0 and FlashInfer 0.7.0.post1. FlashInfer differs on purpose: `stock` and `glm53` carry 0.6.18, `qwen38next` carries 0.6.16.post3. Do not harmonise them — GLM-5.3 needs >= 0.6.18 for the SM90 NoPE MLA kernel that 0.6.17 lacks, and the Flash-Next tree was built and validated against 0.6.16.post3.
 
 `lfm2` is declared on `stock` per the v2 registry decision, but the live systemd unit launches it from `.venv-next`'s python. Either venv serves a 350M model; the declaration is what a rebuild would follow.
 

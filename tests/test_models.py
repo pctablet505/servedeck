@@ -248,7 +248,7 @@ def test_the_agent_profile_admits_a_browser_sessions_screenshots():
 def test_real_models_toml_loads():
     """The repo-root models.toml (the actual deliverable) must load and validate."""
     reg = models.load(REPO_ROOT / "models.toml")
-    assert set(reg.models) == {"qwen27b", "flashnext", "flashnext-batch", "fp4local", "glm53", "lfm2"}
+    assert set(reg.models) == {"qwen27b", "flashnext", "flashnext-batch", "fp4local", "glm53", "lfm2", "ornith"}
     assert reg.gpu.total_mib == 97887
     assert reg.gpu.margin_mib == 1024
     assert reg.defaults_env == {

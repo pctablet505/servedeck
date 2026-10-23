@@ -61,6 +61,13 @@ HF_HUB_OFFLINE = "1"
 venv      = "~/Projects/local_llm/.venv-llm-029"
 cuda_home = "~/Projects/local_llm/.venv-llm-029/lib/python3.13/site-packages/nvidia/cu13"
 
+# vLLM 0.32.0 (2026-10-22, for ornith): plain PyPI wheel plus FlashInfer's prebuilt
+# kernels for this card (flashinfer-jit-cache and -sm120f, --no-deps) and the same two
+# symlinks as stock (docs/BUILDS.md). stock stays on 0.29.0 for the models it serves.
+[builds.stock032]
+venv      = "~/Projects/local_llm/.venv-llm-032"
+cuda_home = "~/Projects/local_llm/.venv-llm-032/lib/python3.13/site-packages/nvidia/cu13"
+
 [builds.qwen38next]
 venv      = "~/Projects/vllm-qwen38next/.venv-next"
 cuda_home = "~/Projects/vllm-qwen38next/.venv-next/lib/python3.13/site-packages/nvidia/cu13"
@@ -404,6 +411,73 @@ VLLM_QWEN3_8_FLASH_NEXT_OVERLAP = "1"
 VLLM_SSM_CONV_STATE_LAYOUT = "DS"
 VLLM_USE_V2_MODEL_RUNNER = "1"
 VLLM_WORKER_MULTIPROC_METHOD = "spawn"
+
+# --------------------------------------------------------------------------------
+# Ornith-1.5-122B-NVFP4 -- the main model from 2026-10-22. Owner, that day: "ornith 1.5 122b is now a
+# new model more intelligent and stronger option than that of qwen flash next"; Flash-Next's weights
+# were deleted the same day (its three entries above now fail doctor's weights row).
+# From 2026-10-23 the weights are dealignai's uncensored NVFP4 build (owner: replace them with the
+# uncensored one "that has the best numbers"): dealignai/Ornith-1.5-122B-UNCENSORED-NVFP4 (MIT, revision
+# e6a1c178), 75.7 GB in 50 shards, the same architecture and ModelOpt layout as ornith-ai's build
+# (revision f049036f, 77.7 GB, deleted from the disk). Its experts, including the MTP layer's, are
+# unfused; the MTP experts are FP8 block-quantized (see [models.ornith.env]). It has no KV-cache scales.
+# Architecture Qwen3_5MoeForConditionalGeneration: 48 layers, every 4th full attention (12 layers,
+# 2 KV heads of 256) and the other 36 Gated DeltaNet linear attention; 256 routed experts, top-8, plus
+# a shared expert; one MTP layer; a vision tower; 262,144-token native context. ModelOpt
+# MIXED_PRECISION: attention and linear-attention projections FP8 (W8A8); experts, shared expert and
+# lm_head NVFP4 weight-only (W4A16, group 16); FP8 KV-cache scales in the checkpoint.
+# The card asks for vLLM >= 0.19.1. It runs on the plain 0.32.0 wheel (build stock032); 0.29.0
+# (stock) also serves it, measured equal, and is the fallback: build = "stock" works unchanged.
+# Flags, each measured 2026-10-22 (docs/models/ornith.md): the card's recipe (prefix caching, qwen3
+# reasoning parser, qwen3_xml tool parser); the checkpoint's MTP head at 3 draft tokens (0, 1, 2 and
+# 4 were slower); 32 sequences (16 capped throughput at 32 in flight; 64 added nothing, the card is
+# at its power cap); --mamba-cache-mode align, the only prefix-caching mode 0.32 has (0.29's "all"
+# measured the same); FP8 KV with the checkpoint's scales; 256 images per prompt (OpenWork's browser
+# screenshots, see [models.flashnext]); a 30 s drain on stop. util 0.96 with 16,384 batched tokens
+# runs out of memory at boot.
+# Sampling: generation_config.json (temperature 0.6, top_p 0.95, top_k 20) is vLLM's default for a
+# request that names none, the card's setting for precise coding; its general-task setting is
+# temperature 1.0 with presence_penalty 1.5. Measurements and tuning: docs/models/ornith.md.
+# --------------------------------------------------------------------------------
+[models.ornith]
+id      = "Ornith-1.5-122B-NVFP4"
+# util: the measured fit (KV pool 12.9 GiB = 834,094 tokens, 3.18x at 262,144). host_ram_gib: the
+# engine's anonymous memory peaked at 5,570 MiB across 12 measured boots; the weights' page cache is reclaimable.
+util    = 0.94
+host_ram_gib = 8
+aliases = ["ornith-ai/Ornith-1.5-122B-NVFP4", "Ornith-1.5-122B", "ornith",
+           "dealignai/Ornith-1.5-122B-UNCENSORED-NVFP4", "Ornith-1.5-122B-UNCENSORED"]
+repo    = "dealignai/Ornith-1.5-122B-UNCENSORED-NVFP4"
+slot    = "main"
+port    = 8006
+build   = "stock032"
+ctx     = "native"                 # text_config.max_position_embeddings = 262144
+vision  = true
+max_output_tokens = 32000
+flags = [
+    "--max-num-seqs", "32",
+    "--max-num-batched-tokens", "8192",
+    "--enable-prefix-caching",
+    "--mamba-cache-mode", "align",
+    "--kv-cache-dtype", "fp8",
+    "--speculative-config", '{"method":"mtp","num_speculative_tokens":3}',
+    "--limit-mm-per-prompt", '{"image":256,"video":0}',
+    "--shutdown-timeout", "30",
+]
+
+# The uncensored checkpoint's MTP experts are FP8 block-quantized (weight_scale_inv); vLLM 0.32 sends
+# those to DeepGEMM, whose JIT compile fails here (nvcc and the cu13 headers disagree, 2026-10-23
+# boot log). With DeepGEMM off they take the Triton block-FP8 path.
+[models.ornith.env]
+VLLM_USE_DEEP_GEMM = "0"
+VLLM_MOE_USE_DEEP_GEMM = "0"
+
+[models.ornith.reasoning]
+parser = "qwen3"
+mirror_content = true
+
+[models.ornith.tools]
+parser = "qwen3_xml"
 
 # --------------------------------------------------------------------------------
 # GLM-5.3-Flash (ABLITERATED, NVFP4) — ~/Projects/vllm-glm53/serve-opt.sh

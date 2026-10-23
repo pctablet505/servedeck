@@ -42,6 +42,10 @@ KNOWN_ARCHS: dict[str, str] = {
     "Glm5NextForConditionalGeneration": "glm53",
     # LiquidAI/LFM2.5-350M, the opt-in resident; served from the stock build.
     "Lfm2ForCausalLM": "stock",
+    # ornith-ai/Ornith-1.5-122B-NVFP4 config.json (2026-10-22), the main model
+    # since Flash-Next was removed; served from the stock build. Its own label,
+    # not "stock": the map must stay 1:1 for _reverse_arch_backends().
+    "Qwen3_5MoeForConditionalGeneration": "ornith",
 }
 
 def arch_backends() -> dict[str, str]:
@@ -155,18 +159,21 @@ def _repo_id_from_dirname(dirname: str) -> str:
     return rest.replace("--", "/", 1)
 
 
+def _refs_main(hub_repo_dir: Path) -> str:
+    """The revision refs/main names, or "" when there is none."""
+    try:
+        return (hub_repo_dir / "refs" / "main").read_text().strip()
+    except OSError:
+        return ""
+
+
 def _resolve_snapshot(hub_repo_dir: Path) -> Path | None:
     """snapshot = refs/main content else newest snapshots/ dir; None if no snapshots/."""
-    refs_main = hub_repo_dir / "refs" / "main"
-    if refs_main.is_file():
-        try:
-            rev = refs_main.read_text().strip()
-        except OSError:
-            rev = ""
-        if rev:
-            candidate = hub_repo_dir / "snapshots" / rev
-            if candidate.is_dir():
-                return candidate
+    rev = _refs_main(hub_repo_dir)
+    if rev:
+        candidate = hub_repo_dir / "snapshots" / rev
+        if candidate.is_dir():
+            return candidate
 
     snapshots_dir = hub_repo_dir / "snapshots"
     if not snapshots_dir.is_dir():
@@ -365,6 +372,10 @@ def _build_entry(repo_id: str, hub_dirname: str, snapshot: Path | None) -> Model
         reasons.append("no config.json")
     elif fields["architectures0"] not in known_archs:
         reasons.append(f"unknown architecture {fields['architectures0']!r}")
+    # Units launch offline with no --revision, so huggingface_hub finds the
+    # snapshot only through refs/main; `hf download --revision <sha>` writes none.
+    if _refs_main(snapshot.parent.parent) != snapshot.name:
+        reasons.append(f"refs/main does not name snapshot {snapshot.name}, so an offline launch cannot find it")
 
     servable = not reasons
     reason: str | None = None
