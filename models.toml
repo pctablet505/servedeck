@@ -442,9 +442,10 @@ VLLM_WORKER_MULTIPROC_METHOD = "spawn"
 [models.ornith]
 id      = "Ornith-1.5-122B-NVFP4"
 # util: the measured fit (KV pool 12.9 GiB = 834,094 tokens, 3.18x at 262,144). host_ram_gib: the
-# engine's anonymous memory peaked at 5,570 MiB across 12 measured boots; the weights' page cache is reclaimable.
+# engine's anonymous memory peaked at 5,570 MiB across 12 measured boots (8 GiB with slack), plus the 20 GiB
+# pinned KV-offload buffer in /dev/shm (--kv-offloading-size 20); the weights' page cache is reclaimable.
 util    = 0.94
-host_ram_gib = 8
+host_ram_gib = 28
 aliases = ["ornith-ai/Ornith-1.5-122B-NVFP4", "Ornith-1.5-122B", "ornith",
            "dealignai/Ornith-1.5-122B-UNCENSORED-NVFP4", "Ornith-1.5-122B-UNCENSORED"]
 repo    = "dealignai/Ornith-1.5-122B-UNCENSORED-NVFP4"
@@ -462,6 +463,7 @@ flags = [
     "--kv-cache-dtype", "fp8",
     "--speculative-config", '{"method":"mtp","num_speculative_tokens":3}',
     "--limit-mm-per-prompt", '{"image":256,"video":0}',
+    "--kv-offloading-size", "20",
     "--shutdown-timeout", "30",
 ]
 
