@@ -1,127 +1,103 @@
 # Servedeck
 
-**A systemd control plane, an OpenAI-compatible `/v1` gateway and a live dashboard for native vLLM on one Linux GPU workstation.**
-Documentation: <https://servedeck.rlalphalabs.com/>. Built by [RL Alpha Labs](https://rlalphalabs.com/). MIT licensed.
+One OpenAI-style address for all the vLLM models on a Linux GPU machine. Point every coding agent at it once;
+switching models is then one command, and no agent changes a setting.
 
-`models.toml` is the registry (`ornith`, the main model since 2026-10-22, plus `qwen27b`, `glm53`, `lfm2` and others;
-`servedeck models` lists them); a user unit running `python -m servedeck`
-serves a page, a JSON API and an OpenAI-compatible gateway on
-**http://127.0.0.1:8010** (gateway under `/v1`); each model runs as its own
-transient unit `model-<key>` started with `systemd-run`, so restarting servedeck
-never touches a running engine. It replaced v1's `llm` shell launcher (now a shim
-at `~/.local/bin/llm` that prints "servedeck owns this box" and exits 2), the two
-reasoning-mirroring proxies on :8005/:8006, and hand-edited client configs.
-Loopback only, no external network requests, never `sudo`.
-
-Every client — Codex, Kimi CLI, VS Code chat — points at that `/v1` and asks for
-the model named **`main`**, the gateway alias for whatever holds the main slot,
-so nothing needs reconfiguring when the model changes.
-
-## Who it is for, and what it is not
-
-It is for you if you run vLLM on one Linux machine with an NVIDIA GPU and want:
-
-- each model supervised by systemd, with no Docker and no root;
-- coding agents (Codex CLI, Kimi CLI, VS Code chat) pointed at one local `/v1`, so changing the model never means editing their configs;
-- live KV-cache use, tokens per second, time to first token and a prompt-size histogram to size how many agents run in parallel.
-
-What it is not:
-
-- **Not zero-downtime.** `servedeck switch` stops the model in the main slot, waits for the GPU to release its memory, then boots the next one. Flash-Next took 137 s warm in a measured boot ([docs/OPERATIONS.md](docs/OPERATIONS.md)).
-- **Not an inference engine or a model downloader.** It supervises the vLLM builds you provide ([docs/BUILDS.md](docs/BUILDS.md)).
-- **Not multi-host or authenticated.** It binds `127.0.0.1` only.
-- **Not finished.** Version 0.1.0, alpha, built around one workstation. The docs are that machine's operating record, with dates.
-
-## The five commands
+**[Read the docs at servedeck.rlalphalabs.com →](https://servedeck.rlalphalabs.com/)**
 
 ```bash
-servedeck status              # what is live: slot, ctx, KV %, run/wait, tok/s, uptime, headroom
-servedeck switch ornith       # put this model in the main slot, evicting whatever is there
-servedeck start lfm2          # start (or stop) one model, streaming its boot log until READY
-servedeck doctor              # prove the registry against reality before believing anything else
-servedeck wire --apply        # rewrite the client configs (no flag = dry-run diff)
+# every agent sends its requests to one address, for the model "main":
+curl http://127.0.0.1:8010/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model": "main", "messages": [{"role": "user", "content": "Say hi"}]}'
+# you choose which model answers as "main":
+servedeck switch qwen27b   # stop the running model, wait for the GPU to free, start this one
+servedeck status           # what is running now, with its context length, speed and uptime
 ```
 
-`start`, `stop`, `switch`, `log` and `adopt` drive the running dashboard over
-HTTP and fall back to the same supervisor in-process when it is down, saying
-which on the first line. `models`, `adopt`, `log` and `smoke` also exist — see
-[docs/OPERATIONS.md](docs/OPERATIONS.md).
+Why not plain systemd units: vLLM exits 0 when its engine dies, so `Restart=on-failure` never fires ([measured
+2026-09-18](https://servedeck.rlalphalabs.com/decisions/)); Servedeck restarts the model that should be running.
 
-Those commands need the control plane up. It is a **user** unit, started with
-`systemctl --user start servedeck` (`restart` after changing code or
-`models.toml`) — never `sudo`. Restarting it does not disturb a running model:
-engines are separate units and this one sets `KillMode=process`.
+## Quick start
 
-None of the CLI verbs take tuning flags — `switch ornith` launches at the
-`util` and context `models.toml` pins. To launch at different ones, use the
-page's **Configure** panel.
-
-## The page
-
-`http://127.0.0.1:8010` — v1's dashboard, served on the v2 backend via
-`servedeck/legacy_page.py`: gateway URL and GPU memory in the header; what is
-serving, with decode and prefill tok/s, time to first token, KV in use,
-requests held back by a full pool, preemptions; the model list and machine
-facts; a **Configure** panel (utilisation, max context, parallel agents, KV
-offload, then Apply & restart or Stop); the prompt-size histogram the agent
-count is sized on; traffic totals and a folded server log.
-
-## Logs
+It is not turnkey: it was built around one workstation, and you need Linux, an NVIDIA GPU, systemd user services,
+Python 3.11 or newer and a vLLM build of your own (it does not install vLLM). No Docker, no root.
 
 ```bash
-journalctl --user -u servedeck -f          # servedeck itself, including its own logger
-journalctl --user -u model-flashnext -f    # one model's engine (unit is model-<key>)
-servedeck log flashnext -n 200             # the same journal, through the CLI
+git clone https://github.com/pctablet505/servedeck ~/Projects/servedeck
+cd ~/Projects/servedeck && uv venv .venv && uv pip install -e .
+$EDITOR models.toml                         # your models and your vLLM builds
+cp systemd/servedeck.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now servedeck
+.venv/bin/servedeck doctor                  # check models.toml against the machine
 ```
 
-## When something is wrong
+The unit expects `~/Projects/servedeck`; to clone elsewhere, edit its `WorkingDirectory` and `ExecStart`.
 
-Run `servedeck doctor`. Besides the registry it checks the host rows that
-explain most surprises: `kernel.yama.ptrace_scope` (must be 0, or the KV-offload
-reaper cannot see a sibling engine and Flash-Next's PLE handoff fails), desired
-state naming a model that is not running, weights on disk, leaked
-`/dev/shm/vllm_offload_*.mmap` buffers at 40 GiB each, and the GPU power cap.
-Playbooks: [docs/OPERATIONS.md](docs/OPERATIONS.md#recovery).
+## How it works
 
-## The rest of the docs
+<p>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/diagram-dark.svg">
+  <img src="assets/diagram-light.svg" width="100%" alt="Clients such as Codex CLI, Kimi CLI and VS Code chat send requests for the model main to Servedeck at 127.0.0.1:8010. Servedeck reads models.toml and starts each model as its own systemd user unit, model-key, which runs vllm serve on the GPU.">
+</picture>
+</p>
 
-| Doc | What it answers |
-| --- | --- |
-| [docs/OPERATIONS.md](docs/OPERATIONS.md) | Daily use: switching, the page, reboot behaviour, logs, recovery |
-| [docs/CLIENTS.md](docs/CLIENTS.md) | Codex, Kimi, VS Code wiring, `reasoning_content`, presets, adding a tool |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Registry, units, gateway, adoption, offload reaper, state, the poll |
-| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | `models.toml`: every key and its default |
-| [docs/HOST.md](docs/HOST.md) | GPU, power cap, Xid history, sysctl, RAM, /dev/shm, PCIe, disk |
-| [docs/BUILDS.md](docs/BUILDS.md) | The vLLM builds: forks, patches, venvs, rebuilding, drift checks |
-| [docs/models/flashnext.md](docs/models/flashnext.md) | Flash-Next: flags and their reasons, measured performance, ceilings |
-| [docs/models/qwen27b.md](docs/models/qwen27b.md) | Qwen3.8-27B: same |
-| [docs/models/glm53.md](docs/models/glm53.md) | GLM-5.3: same |
-| [docs/models/lfm2.md](docs/models/lfm2.md) | LFM2.5-350M: same |
-| [docs/DECISIONS.md](docs/DECISIONS.md) | The owner's standing rules, dated, each with its reason |
+Each model runs as its own systemd service, so restarting Servedeck never stops one, and a live page at
+`http://127.0.0.1:8010` shows each model's speed, memory use and waiting requests. Every model is described once, in
+`models.toml`. One real entry, an excerpt with its comments left out:
 
-## Tests
-
-`uv venv .venv && uv pip install -e '.[dev]'`, then the everyday run, which
-touches nothing on the box:
-
-```bash
-.venv/bin/python -m pytest -q -n 12 \
-  --ignore=tests/test_e2e_real.py --ignore=tests/test_app_e2e.py \
-  --ignore=tests/test_control_e2e.py --ignore=tests/test_gateway_e2e.py \
-  --ignore=tests/test_cli_control.py
-.venv/bin/python -m pytest -q -n 0 tests/test_cli_control.py
+```toml
+[models.lfm2]
+id       = "LFM2.5-350M"
+repo     = "LiquidAI/LFM2.5-350M"
+slot     = "resident"
+vram_mib = 4895
+port     = 8007
+build    = "stock"
+ctx      = 32768
 ```
 
-`test_cli_control.py` is excluded from the parallel run and then run on its
-own: it binds a fixed port, so under `-n 12` its cases contend with each other
-and fail with `httpx.ConnectError` — 10 of 16 on a clean tree. It is not a
-slow file (15 s serially) and nothing is skipped by splitting it out.
+`id` is the name it answers to; `repo`, the Hugging Face checkpoint it loads; `slot`, `main` (the one agents get,
+one at a time) or `resident` (stays loaded beside it); `vram_mib`, a resident's GPU memory in MiB; `port`, where its
+own vLLM listens, unseen by clients; `build`, the vLLM build that runs it; `ctx`, its context length in tokens.
 
-The four excluded files are the gate, and they are not free. Three drive the
-real `systemd-run` path — safely, under the `sd-test-` unit namespace, which
-cannot name a real `model-*` unit — but they bind fixed ports, so they must run
-one at a time (`-n 0`) or they contend with each other. `test_e2e_real.py`
-boots real models on the GPU and needs the card to have room. Run the gate
-deliberately, on an idle card, not as part of a normal check.
+## What happens when a model fails to start
 
-MIT — see [LICENSE](LICENSE).
+A restart on 20 October 2026 asked vLLM for a memory setting it refused, so the new engine quit at start; Servedeck
+started it again with the settings of its last good start. All 104 requests sent in the gap got a 503 (service
+unavailable) error. From the machine's logs, in seconds from the request:
+
+| When | What happened |
+|---|---|
+| t+0 s | The restart is asked for, and the running engine begins to stop. |
+| t+21 s | The old engine is stopped; the new one starts. |
+| t+30 s | The new engine quits: vLLM refuses the memory setting. |
+| t+33 s | Servedeck logs `fp4local is wanted but not running; relaunching (attempt 1 of 3)` (`fp4local` is the model's name in `models.toml`) and starts it again. |
+| t+164 s | The model is ready. |
+| t+174 s | Requests are answered again, on the same address. |
+
+The failed first try cost 12 s. The stop (21 s) and the start (131 s) are part of any restart.
+
+## Leftover memory after a crash
+
+A crashed engine can leave its buffer in RAM until reboot, 40 GiB for one model here; Servedeck frees it, and
+deletes nothing it cannot prove is unused.
+
+## Limits
+
+- **Not zero-downtime.** `switch` stops one model before it starts the next; a measured warm start of the
+  Flash-Next model took 137 s (2026-09-17).
+- **Not an inference engine or a model downloader.** It supervises the vLLM builds you provide.
+- **Local only.** It binds `127.0.0.1`, with no login.
+- **Alpha.** Version 0.1.0; the docs are the operating record of the machine it was built on, with dates.
+
+## Where next
+
+- [Operations](https://servedeck.rlalphalabs.com/operations/): daily use, what a switch costs, and recovery.
+- [Configuration](https://servedeck.rlalphalabs.com/configuration/): every key of `models.toml`.
+- [CONTRIBUTING.md](CONTRIBUTING.md): the ground rules, the command and log reference, and how to run the tests.
+
+---
+
+<picture><source media="(prefers-color-scheme: dark)" srcset="assets/mark-dark.svg"><img src="assets/mark-light.svg" width="16" height="16" alt=""></picture>
+<sub>**Real numbers, failures left in.** Servedeck is one of the [open-source tools of RL Alpha Labs](https://rlalphalabs.com/tools/), a one-person research lab for Indian stock markets, built by [pctablet505](https://github.com/pctablet505). MIT licensed, see [LICENSE](LICENSE).</sub>
