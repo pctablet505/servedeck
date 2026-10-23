@@ -1,3 +1,8 @@
+---
+title: "Ornith-1.5-122B on one GPU: MTP and prefix caching"
+description: "Serving Ornith-1.5-122B NVFP4 on vLLM 0.32 with one 96 GB card: measured flags, KV capacity, the MTP sweep, the prefix-cache rule and failure modes."
+---
+
 # Ornith-1.5-122B-NVFP4 (`ornith`)
 
 The main model from 2026-10-22, replacing Flash-Next at the owner's word. Since 2026-10-23 the weights

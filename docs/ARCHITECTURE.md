@@ -1,3 +1,8 @@
+---
+title: "How Servedeck works: a unit per model"
+description: "Servedeck's design: one process for the page, API and gateway, each vLLM model in its own transient systemd unit, and a reconcile loop that re-reads reality."
+---
+
 # Architecture
 
 One Python process holds the page, the JSON API, the `/v1` gateway, the poller
@@ -33,10 +38,10 @@ request paths read only the poller's snapshot, because a coroutine parked on a
 subprocess stalls the gateway mid-stream. **Reconcile runs only once our own
 port answers as us**: `_reconcile_after_bind` polls `/api/health` until its
 `instance` matches this process's id (60 s ceiling, 0.25 s interval). uvicorn
-runs the ASGI lifespan *before* `bind()`, and on 2026-09-11 a lifespan
-reconcile in the process that *lost* the port launched the 27B 70 times in
-9 minutes; a status-code check cannot tell a rival servedeck's good 200 from
-its own.
+runs the ASGI lifespan *before* `bind()`, and on 2026-09-11 a servedeck that
+*lost* the port restarted 67 times in about six minutes (systemd's restart counter,
+21:36 to 21:42 IST), each lap running its lifespan reconcile before any bind; a
+status-code check cannot tell a rival servedeck's good 200 from its own.
 
 Registration order in `create_app` is load-bearing — `/api/*` (including
 `legacy_page.register`), then the gateway, then the page — because

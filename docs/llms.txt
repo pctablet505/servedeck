@@ -1,0 +1,35 @@
+# Servedeck (https://servedeck.rlalphalabs.com/)
+
+> A systemd control plane, an OpenAI-compatible /v1 gateway and a live dashboard for native vLLM on one Linux GPU workstation. Each model runs as its own systemd user unit; clients ask for the model named main. MIT licensed, built by Rahul Kumar (pctablet505) at RL Alpha Labs.
+
+## What it does
+- Starts, stops and switches vLLM models as transient `systemd-run --user` units named `model-<key>`. Restarting Servedeck never touches a running model.
+- Serves one `/v1` endpoint on 127.0.0.1:8010. The alias `main` is whichever model holds the main slot, so a client never needs reconfiguring when the model changes.
+- Shows live KV-cache use, prefill and decode tokens per second, time to first token, preemptions and a prompt-size histogram.
+- Writes the configs of Codex CLI, Kimi CLI and VS Code chat (`servedeck wire --apply`).
+- Checks the host (`servedeck doctor`): `kernel.yama.ptrace_scope`, leaked `/dev/shm/vllm_offload_*.mmap` buffers, weights on disk and the GPU power cap.
+
+## Limits
+- Linux with a systemd user session, one NVIDIA GPU, and vLLM builds you provide. Version 0.1.0, alpha. Loopback only, no authentication.
+- A model switch stops the running model, waits for the GPU to release its memory, then boots the next one. A measured Flash-Next boot took 137 seconds warm.
+- The docs are one workstation's operating record (an RTX PRO 6000 Blackwell), with a date on every measurement.
+
+## Docs
+- [Overview](https://servedeck.rlalphalabs.com/): what it is, the five commands, what it is not.
+- [Operations](https://servedeck.rlalphalabs.com/operations/): switching, restarts, logs and recovery playbooks.
+- [Clients](https://servedeck.rlalphalabs.com/clients/): Codex CLI, Kimi CLI and VS Code chat wiring, and why a client must send reasoning back.
+- [Architecture](https://servedeck.rlalphalabs.com/architecture/): one process, a systemd unit per model, the offload reaper and the poll loop.
+- [Configuration](https://servedeck.rlalphalabs.com/configuration/): every key of models.toml.
+- [Host](https://servedeck.rlalphalabs.com/host/): power cap, Xid history, host RAM, sysctl, PCIe and disk.
+- [Builds](https://servedeck.rlalphalabs.com/builds/): the vLLM builds, their forks and patches.
+- [Decisions](https://servedeck.rlalphalabs.com/decisions/): the settled rules and their reasons.
+
+## Models (measured on one workstation)
+- [Ornith-1.5-122B on one GPU](https://servedeck.rlalphalabs.com/models/ornith/)
+- [Flash-Next](https://servedeck.rlalphalabs.com/models/flashnext/)
+- [Qwen3.8-27B NVFP4](https://servedeck.rlalphalabs.com/models/qwen27b/)
+- [GLM-5.3 with CPU-offloaded experts](https://servedeck.rlalphalabs.com/models/glm53/)
+- [LFM2.5-350M](https://servedeck.rlalphalabs.com/models/lfm2/)
+
+## Source
+- [Repository](https://github.com/pctablet505/servedeck)

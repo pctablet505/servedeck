@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use Servedeck, please cite it as below."
+title: "Servedeck: a systemd control plane, OpenAI-compatible gateway and live dashboard for native vLLM"
+type: software
+authors:
+  - given-names: Rahul
+    family-names: Kumar
+    alias: pctablet505
+version: "0.1.0"
+url: "https://servedeck.rlalphalabs.com/"
+repository-code: "https://github.com/pctablet505/servedeck"
+license: MIT
+abstract: "Servedeck runs each local vLLM model as its own systemd user unit on one Linux GPU workstation, serves one OpenAI-compatible /v1 endpoint that answers to the name main, and shows live KV-cache use and throughput on a local dashboard."
+keywords:
+  - vllm
+  - llm serving
+  - systemd
+  - kv cache
+  - openai-compatible gateway
+  - local llm

@@ -1,3 +1,8 @@
+---
+title: "The vLLM builds Servedeck runs"
+description: "Which vLLM build serves which model, why each fork exists, how patches are kept as files, how to rebuild, and the drift checks that catch a stale checkout."
+---
+
 # The vLLM builds
 
 Every model in `models.toml` names a `build`, and every build is one venv. Two are patched source checkouts; two are plain wheels. Nothing about a build is discovered at launch time — `[builds.<key>]` in `models.toml` gives the venv and its `CUDA_HOME`, and that is all servedeck knows.
@@ -127,7 +132,7 @@ GLM's own boot is slow and looks broken: ~6 minutes, in which 181 GiB of weights
 
 Flash-Next's PLE n-gram table was converted from BF16 to FP8 locally and the BF16 original deleted on 2026-09-10. What serves today is **43 locally generated files, 51,200,268,090 B = 47.684 GiB**, named `model-plefp8-*.safetensors`, living *inside* the HF snapshot directory `~/.cache/huggingface/hub/models--mazinb--Qwen3.8-Flash-Next-Uncensored-NVFP4/snapshots/f2c21eb3d2ff5f24c208ea7e3afba65e2e70f83f/`, referenced by a **hand-edited** `model.safetensors.index.json` that is a regular file where HF wrote a symlink. They are not in any repo and cannot be re-downloaded. Each has link count 2 (verified 2026-09-18): its only second name is the hardlink in `~/.cache/huggingface/ple-fp8-staging` (48 G), which shares the same extents — deleting staging frees nothing while the snapshot copies exist, and deleting both frees everything.
 
-If the FP8 table is lost, regenerate it from BF16 with `ple_fp8/convert_ple_bf16_to_fp8.py` — but the BF16 table is gone, so that first means a 95.368 GiB download. The full route, including the two rollback sidecars now renamed `*.STALE-ple-bf16-deleted` (a deliberate interlock: without the rename, `rollback.sh` would restore the BF16 index *and* delete the 43 FP8 shards, leaving a checkpoint naming files that do not exist) is in [imported-2026-09/vllm-qwen38next/ple_fp8_cleanup/RECOVERY.md](imported-2026-09/vllm-qwen38next/ple_fp8_cleanup/RECOVERY.md). Two things from it that are easy to get wrong: re-arm both sidecars *before* running `rollback.sh`, and do not sweep `blobs/2d2c3617...e407` (28.7 MiB) — it has no symlink pointing at it but it is the rollback target, not an orphan.
+If the FP8 table is lost, regenerate it from BF16 with `ple_fp8/convert_ple_bf16_to_fp8.py` — but the BF16 table is gone, so that first means a 95.368 GiB download. The full route, including the two rollback sidecars now renamed `*.STALE-ple-bf16-deleted` (a deliberate interlock: without the rename, `rollback.sh` would restore the BF16 index *and* delete the 43 FP8 shards, leaving a checkpoint naming files that do not exist) is in [imported-2026-09/vllm-qwen38next/ple_fp8_cleanup/RECOVERY.md](https://github.com/pctablet505/servedeck/blob/main/docs/imported-2026-09/vllm-qwen38next/ple_fp8_cleanup/RECOVERY.md). Two things from it that are easy to get wrong: re-arm both sidecars *before* running `rollback.sh`, and do not sweep `blobs/2d2c3617...e407` (28.7 MiB) — it has no symlink pointing at it but it is the rollback target, not an orphan.
 
 The conversion report claims `bit_exact_fraction: 1.0`, `rms_error: 0.0` and also `clamped_elements: 1`, which cannot both be true; the worst case is one element in 51.2 billion off by ~6.1e-05. With the BF16 table deleted, that can no longer be checked.
 

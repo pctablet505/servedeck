@@ -1,3 +1,8 @@
+---
+title: "Point Codex CLI and VS Code at a local vLLM"
+description: "One local /v1 URL and one model name, main, for every client: wiring for Codex CLI, Kimi CLI and VS Code chat, and why a client must send reasoning back."
+---
+
 # Clients
 
 Every tool on this box talks to one URL — `http://127.0.0.1:8010/v1` — and asks for the

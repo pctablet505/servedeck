@@ -1,3 +1,8 @@
+---
+title: "Servedeck models.toml reference"
+description: "Every key of models.toml, the file that sets each model's launch flags, build, GPU settings and presets, and the environment variables and desired-state schema."
+---
+
 # Configuration
 
 `models.toml` in the repo root is the only file you edit. Everything else — the
@@ -70,7 +75,7 @@ about how the venv was built. Both keys are required, and the short forms the
 older version of this document showed are **rejected**: `stock = "~/path"`
 raises `builds.stock must be a table with 'venv' and 'cuda_home'`, a `venv`-only
 table raises `builds.stock: missing 'cuda_home'` (`models.py:370-382`). The
-three builds are in [BUILDS.md](BUILDS.md).
+builds are in [BUILDS.md](BUILDS.md).
 
 ### `[models.<key>]`
 

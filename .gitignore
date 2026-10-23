@@ -16,3 +16,4 @@ build/
 # dashboard, 300 kB+ within an hour, and carries local paths and model names.
 servedeck.log
 backups/
+site/

@@ -1,13 +1,13 @@
 [project]
 name = "servedeck"
 version = "0.1.0"
-description = "A local web dashboard for a self-hosted LLM server: capacity planning, live metrics, restart supervision"
+description = "A systemd control plane, OpenAI-compatible /v1 gateway and live dashboard for native vLLM on one Linux GPU workstation"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Servedeck contributors" }]
-keywords = ["llm", "vllm", "gpu", "kv-cache", "dashboard", "self-hosted"]
+keywords = ["llm", "vllm", "gpu", "kv-cache", "dashboard", "self-hosted", "systemd", "openai-compatible", "llm-serving", "local-llm"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: GPU :: NVIDIA CUDA",
@@ -32,13 +32,17 @@ dependencies = [
 # dukpy embeds duktape: tests/test_ui.py runs web/app.js's rendering functions
 # in it. Without a JS engine the only coverage of what the page draws is
 # substring matching on the source, which cannot see a rendering defect.
-dev = ["pytest>=8", "dukpy>=0.5"]
+dev = ["pytest>=8", "dukpy>=0.5", "mkdocs>=1.6"]
+# The documentation site (mkdocs.yml, docs-theme/): `mkdocs build --strict`.
+docs = ["mkdocs>=1.6"]
 
 [project.scripts]
 servedeck = "servedeck.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/pctablet505/servedeck"
+Homepage = "https://servedeck.rlalphalabs.com/"
+Documentation = "https://servedeck.rlalphalabs.com/"
+Source = "https://github.com/pctablet505/servedeck"
 Issues = "https://github.com/pctablet505/servedeck/issues"
 
 [build-system]
