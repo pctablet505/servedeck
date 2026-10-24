@@ -25,6 +25,7 @@
 - [Decisions](https://servedeck.rlalphalabs.com/decisions/): the settled rules and their reasons.
 
 ## Models (measured on one workstation)
+- [Nemotron-3.5-Super-VL-120B on one GPU](https://servedeck.rlalphalabs.com/models/nemotron/)
 - [Ornith-1.5-122B on one GPU](https://servedeck.rlalphalabs.com/models/ornith/)
 - [Flash-Next](https://servedeck.rlalphalabs.com/models/flashnext/)
 - [Qwen3.8-27B NVFP4](https://servedeck.rlalphalabs.com/models/qwen27b/)

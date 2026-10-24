@@ -34,6 +34,7 @@ nav:
   - Builds: BUILDS.md
   - Decisions: DECISIONS.md
   - Models:
+      - Nemotron-3.5-Super-VL: models/nemotron.md
       - Ornith-1.5-122B: models/ornith.md
       - Flash-Next: models/flashnext.md
       - Qwen3.8-27B: models/qwen27b.md

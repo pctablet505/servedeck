@@ -248,7 +248,10 @@ def test_the_agent_profile_admits_a_browser_sessions_screenshots():
 def test_real_models_toml_loads():
     """The repo-root models.toml (the actual deliverable) must load and validate."""
     reg = models.load(REPO_ROOT / "models.toml")
-    assert set(reg.models) == {"qwen27b", "flashnext", "flashnext-batch", "fp4local", "glm53", "lfm2", "ornith"}
+    assert set(reg.models) == {
+        "qwen27b", "flashnext", "flashnext-batch", "fp4local", "glm53", "lfm2", "ornith",
+        "thinkingcap", "thinkingcap-abl", "nemotron-abl",
+    }
     assert reg.gpu.total_mib == 97887
     assert reg.gpu.margin_mib == 1024
     assert reg.defaults_env == {
@@ -259,6 +262,37 @@ def test_real_models_toml_loads():
         # one on disk. models.toml carries the full history of this flag.
         "HF_HUB_OFFLINE": "1",
     }
+
+
+def test_thinkingcap_entries_parse_tools_and_keep_the_edit_apart():
+    """Both ThinkingCap entries serve one repo. Without a tool and a reasoning parser a Codex session
+    got the model's ``<tool_call>`` text back and ran nothing (2026-10-24); the edited entry must carry
+    its own id and the worker hook, or launching it serves the unedited model."""
+    reg = models.load(REPO_ROOT / "models.toml")
+    plain, edited = reg.models["thinkingcap"], reg.models["thinkingcap-abl"]
+    assert plain.repo == edited.repo and plain.id != edited.id
+    for m in (plain, edited):
+        assert m.tools is not None and m.tools.parser == "qwen3_coder"
+        assert m.reasoning is not None and m.reasoning.parser == "qwen3"
+    flags = list(edited.flags)
+    assert flags[flags.index("--worker-extension-cls") + 1] == "abl_serve.ServeWorker"
+    assert "--worker-extension-cls" not in plain.flags
+    assert {"ABL_PATCH", "ABL_RUNTIME"} <= set(edited.env) and not {"ABL_PATCH", "ABL_RUNTIME"} & set(plain.env)
+
+
+def test_nemotron_abl_entry_parses_tools_and_reasoning_on_a_build_that_knows_the_arch():
+    """The qwen38next fork has no NemotronH_Omni architecture (vLLM 0.29.0 and 0.32.0 do), the HF config class
+    needs --trust-remote-code, and without the two parsers a Codex session gets raw text (the ThinkingCap
+    failure of 2026-10-24)."""
+    m = models.load(REPO_ROOT / "models.toml").models["nemotron-abl"]
+    assert m.build in {"stock", "stock032"}
+    assert m.repo == "armin1/Nemotron-3.5-Super-VL-120B-A12B-NVFP4-abliterated"
+    assert m.ctx == 1048576, "'native' cannot read llm_config.max_position_embeddings, so the launch failed (2026-10-24)"
+    assert "--trust-remote-code" in m.flags
+    assert m.tools is not None and m.tools.parser == "qwen3_coder"
+    assert m.reasoning is not None and m.reasoning.parser == "nemotron_v3"
+    assert m.env["VLLM_USE_DEEP_GEMM"] == "0" and m.env["VLLM_MOE_USE_DEEP_GEMM"] == "0"
+    assert m.port not in {r.port for k, r in models.load(REPO_ROOT / "models.toml").models.items() if k != "nemotron-abl"}
 
 
 # --------------------------------------------------------------------------- #

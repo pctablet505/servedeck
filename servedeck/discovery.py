@@ -46,6 +46,9 @@ KNOWN_ARCHS: dict[str, str] = {
     # since Flash-Next was removed; served from the stock build. Its own label,
     # not "stock": the map must stay 1:1 for _reverse_arch_backends().
     "Qwen3_5MoeForConditionalGeneration": "ornith",
+    # armin1/Nemotron-3.5-Super-VL-120B-A12B-NVFP4-abliterated config.json (2026-10-24); stock032 build,
+    # which is the first with this architecture registered. Own label for the same 1:1 reason.
+    "NemotronH_Omni_Reasoning_V3": "nemotron",
 }
 
 def arch_backends() -> dict[str, str]:

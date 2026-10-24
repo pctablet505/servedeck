@@ -412,6 +412,7 @@ def test_known_archs_map_is_exactly_the_two_documented_entries() -> None:
         "Glm5NextForConditionalGeneration": "glm53",
         "Lfm2ForCausalLM": "stock",
         "Qwen3_5MoeForConditionalGeneration": "ornith",
+        "NemotronH_Omni_Reasoning_V3": "nemotron",
     }
     assert len(set(KNOWN_ARCHS.values())) == len(KNOWN_ARCHS), "map must stay 1:1"
 

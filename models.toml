@@ -632,3 +632,133 @@ flags = [
 
 [models.lfm2.tools]
 parser = "lfm2"
+
+# --- ThinkingCap-Qwen3.8-Flash-Next (bottlecapai), wired 2026-10-24. Both entries are opt-in: neither starts unless
+# asked. Both run on the qwen38next build (the fork with the Qwen4Exp architecture) with PLE CPU offload, like flashnext.
+#
+# thinkingcap      : the unedited model (the normal one).
+# thinkingcap-abl  : the same weights with the run-3 tmpl_L16 refusal-direction edit. UNCENSORED: it complies with
+#                    requests the normal model refuses, including harmful ones. Not for automated pipelines.
+#                    The edit = attention writers (ABL_PATCH weights) + runtime projections (ABL_RUNTIME, installed by
+#                    abl_serve.ServeWorker at load). It must run eager: the projections are Python-level wrappers.
+#                    Files: <task>/serve/abl_patch.safetensors, <task>/serve/abl_runtime.json (see DECISIONS.md).
+[models.thinkingcap]
+id           = "ThinkingCap-Qwen3.8-Flash-Next-NVFP4"
+repo         = "bottlecapai/ThinkingCap-Qwen3.8-Flash-Next-NVFP4"
+slot         = "main"
+port         = 8011
+build        = "qwen38next"
+ctx          = "native"                 # config.json max_position_embeddings = 262144
+util         = 0.90
+host_ram_gib = 70
+aliases      = ["thinkingcap"]
+flags = [
+    "--enable-prefix-caching",
+    "--limit-mm-per-prompt", "{\"image\": 0, \"video\": 0}",
+    "--max-num-seqs", "32",
+]
+
+[models.thinkingcap.reasoning]
+parser = "qwen3"
+mirror_content = true
+
+[models.thinkingcap.tools]
+parser = "qwen3_coder"
+
+[models.thinkingcap.env]
+VLLM_PLE_CPU_OFFLOAD = "1"
+VLLM_PLE_FP8_CHECKPOINT = "1"
+VLLM_PLE_OFFLOAD_READY_TIMEOUT = "1800"
+VLLM_WORKER_MULTIPROC_METHOD = "spawn"
+VLLM_USE_DEEP_GEMM = "0"
+VLLM_MOE_USE_DEEP_GEMM = "0"
+HF_HUB_OFFLINE = "1"
+PYTORCH_ALLOC_CONF = "expandable_segments:True"
+TORCH_CUDA_ARCH_LIST = "12.0f"
+
+[models.thinkingcap-abl]
+id           = "ThinkingCap-Qwen3.8-Flash-Next-ABL-tmpl-L16"
+repo         = "bottlecapai/ThinkingCap-Qwen3.8-Flash-Next-NVFP4"
+slot         = "main"
+port         = 8012
+build        = "qwen38next"
+ctx          = "native"                 # config.json max_position_embeddings = 262144
+util         = 0.90
+host_ram_gib = 70
+aliases      = ["thinkingcap-abl"]
+flags = [
+    "--enable-prefix-caching",
+    "--limit-mm-per-prompt", "{\"image\": 0, \"video\": 0}",
+    "--max-num-seqs", "32",
+    "--enforce-eager",
+    "--worker-extension-cls", "abl_serve.ServeWorker",
+]
+
+[models.thinkingcap-abl.reasoning]
+parser = "qwen3"
+mirror_content = true
+
+[models.thinkingcap-abl.tools]
+parser = "qwen3_coder"
+
+[models.thinkingcap-abl.env]
+VLLM_PLE_CPU_OFFLOAD = "1"
+VLLM_PLE_FP8_CHECKPOINT = "1"
+VLLM_PLE_OFFLOAD_READY_TIMEOUT = "1800"
+VLLM_WORKER_MULTIPROC_METHOD = "spawn"
+VLLM_USE_DEEP_GEMM = "0"
+VLLM_MOE_USE_DEEP_GEMM = "0"
+HF_HUB_OFFLINE = "1"
+PYTORCH_ALLOC_CONF = "expandable_segments:True"
+TORCH_CUDA_ARCH_LIST = "12.0f"
+ABL_PATCH = "/home/pctablet505/Projects/t0-work/thinkingcap-2026-10-24/serve/abl_patch.safetensors"
+ABL_RUNTIME = "/home/pctablet505/Projects/t0-work/thinkingcap-2026-10-24/serve/abl_runtime.json"
+PYTHONPATH = "/home/pctablet505/Projects/t0-work/thinkingcap-2026-10-24"
+
+# --- Nemotron-3.5-Super-VL-120B-A12B, abliterated NVFP4 build by armin1, wired 2026-10-24 in place of ThinkingCap
+# (whose weights were deleted the same day, so its two entries above fail doctor's weights row). Revision
+# 1e1c8ecf1976ee0ec387c114c1964a6f3506e804, 75.06 GB in 88 shards, licence OpenMDW 1.1 (the base model's).
+# UNCENSORED: the card claims keyword refusals fall from 98% to 2% (the publisher's own harness, not re-measured
+# here). Not for automated pipelines.
+# Architecture NemotronH_Omni_Reasoning_V3 (model_type nemotron_h_omni): 88 layers = 40 Mamba-2, 40 latent-MoE
+# (512 routed experts, 22 per token, 1 shared), 8 attention (2 KV heads of 128), a C-RADIO vision tower and one MTP
+# layer; 1,048,576-token native context. ModelOpt MIXED_PRECISION NVFP4/FP8 with FP8 KV-cache scheme. vLLM 0.29.0 and
+# 0.32.0 register the architecture; the qwen38next fork does not, so build = stock032.
+# --trust-remote-code is needed for the HF config class only (vLLM brings its own model code); the repo's .py files
+# were read before the first boot: no os/subprocess/network/exec calls.
+# Flags: the card's vLLM recipe (reasoning parser nemotron_v3, tool parser qwen3_coder, 8,192 batched tokens). The
+# 16 sequences, util and host_ram_gib are first-boot guesses until measured. Checks and gaps: docs/models/nemotron.md.
+[models.nemotron-abl]
+id           = "Nemotron-3.5-Super-VL-120B-A12B-NVFP4-abliterated"
+repo         = "armin1/Nemotron-3.5-Super-VL-120B-A12B-NVFP4-abliterated"
+slot         = "main"
+port         = 8013
+build        = "stock032"
+ctx          = 1048576                  # llm_config.max_position_embeddings; pinned because "native" only reads the top level / text_config
+util         = 0.90
+host_ram_gib = 24
+aliases      = ["nemotron-abl", "nemotron"]
+vision       = true
+max_output_tokens = 32000
+flags = [
+    "--trust-remote-code",
+    "--max-num-seqs", "16",
+    "--max-num-batched-tokens", "8192",
+    "--enable-prefix-caching",
+    "--mamba-cache-mode", "align",
+    "--limit-mm-per-prompt", "{\"image\": 16, \"video\": 0}",
+    "--kv-offloading-size", "12",
+    "--shutdown-timeout", "30",
+]
+
+[models.nemotron-abl.reasoning]
+parser = "nemotron_v3"
+mirror_content = true
+
+[models.nemotron-abl.tools]
+parser = "qwen3_coder"
+
+# DeepGEMM's JIT fails on this box (nvcc and the cu13 headers disagree), as for ornith.
+[models.nemotron-abl.env]
+VLLM_USE_DEEP_GEMM = "0"
+VLLM_MOE_USE_DEEP_GEMM = "0"
