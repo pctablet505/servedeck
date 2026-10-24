@@ -287,7 +287,7 @@ def test_nemotron_abl_entry_parses_tools_and_reasoning_on_a_build_that_knows_the
     m = models.load(REPO_ROOT / "models.toml").models["nemotron-abl"]
     assert m.build in {"stock", "stock032"}
     assert m.repo == "armin1/Nemotron-3.5-Super-VL-120B-A12B-NVFP4-abliterated"
-    assert m.ctx == 1048576, "'native' cannot read llm_config.max_position_embeddings, so the launch failed (2026-10-24)"
+    assert m.ctx == "native", "native_ctx reads llm_config.max_position_embeddings (1,048,576)"
     assert "--trust-remote-code" in m.flags
     assert m.tools is not None and m.tools.parser == "qwen3_coder"
     assert m.reasoning is not None and m.reasoning.parser == "nemotron_v3"
@@ -686,6 +686,16 @@ def test_native_ctx_reads_text_config_max_position_embeddings(tmp_path):
         tmp_path,
         "org/model",
         {"text_config": {"max_position_embeddings": 1048576}},
+    )
+    assert models.native_ctx("org/model", hub) == 1048576
+
+
+def test_native_ctx_reads_llm_config_max_position_embeddings(tmp_path):
+    """NemotronH nests its language model as `llm_config`; `ctx = "native"` failed to launch it."""
+    hub = _fake_hub(
+        tmp_path,
+        "org/model",
+        {"llm_config": {"max_position_embeddings": 1048576}},
     )
     assert models.native_ctx("org/model", hub) == 1048576
 

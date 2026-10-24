@@ -19,7 +19,7 @@ The checkpoint's facts (layers, experts, quantisation) are in the comment above
 | Setting | Value | Why |
 |---|---|---|
 | build | `stock032` (vLLM 0.32.0) | The qwen38next fork has no `NemotronH_Omni_Reasoning_V3`. 0.29.0 registers it too; only 0.32.0 was booted. |
-| `ctx` | 1,048,576, a number | `"native"` reads `max_position_embeddings` at the top level or in `text_config`; this config keeps it in `llm_config`, and the launch failed with "config.json has no max_position_embeddings". |
+| `ctx` | `native` (1,048,576) | Read from `llm_config.max_position_embeddings`; until 2026-10-25 servedeck looked only at `text_config`, the launch failed, and the entry had to be pinned to the number. |
 | `--trust-remote-code` | on | Needed for the HF config class (`auto_map`); vLLM uses its own model code. The repo's `.py` files were read first. |
 | `--gpu-memory-utilization` | 0.90 | A first guess; it booted. Not tuned. |
 | `--max-num-seqs` | 16 | A first guess. Not tuned. |

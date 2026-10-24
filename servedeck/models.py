@@ -511,7 +511,11 @@ def native_ctx(repo: str, hub_dir: str | Path | None = None) -> int:
             f"native_ctx({repo!r}): no config.json found in the local hub cache "
             "(model not downloaded, or repo id is wrong)"
         )
-    text_config = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else cfg
+    # `llm_config` is NemotronH's name for the nested language model; without it `ctx = "native"` failed
+    # to launch (2026-10-24) and had to be pinned to a number.
+    text_config = next(
+        (cfg[n] for n in ("text_config", "llm_config") if isinstance(cfg.get(n), dict)), cfg
+    )
     value = text_config.get("max_position_embeddings") or cfg.get("max_position_embeddings")
     if not value:
         raise RegistryError(

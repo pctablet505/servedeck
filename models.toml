@@ -734,7 +734,7 @@ repo         = "armin1/Nemotron-3.5-Super-VL-120B-A12B-NVFP4-abliterated"
 slot         = "main"
 port         = 8013
 build        = "stock032"
-ctx          = 1048576                  # llm_config.max_position_embeddings; pinned because "native" only reads the top level / text_config
+ctx          = "native"                 # llm_config.max_position_embeddings = 1048576
 util         = 0.90
 host_ram_gib = 24
 aliases      = ["nemotron-abl", "nemotron"]

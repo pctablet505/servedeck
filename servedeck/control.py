@@ -819,7 +819,13 @@ class Control:
                 log.debug("boot of %s printed no KV figures; not recorded", key)
                 return
 
-            repo_id = getattr(spec, "repo", None) or getattr(spec, "id", key)
+            # A real spec is app.ModelSpecAdapter: the registry entry is `spec.model`, its `id` is the
+            # SERVED name and its `build` is a resolved Build table. Reading `spec.repo` and `spec.build`
+            # off it filed every record under the served name and put an unserialisable object in the
+            # backend field, so nothing was recorded after the v2 cutover. Fakes carry the repo as `id`.
+            entry = getattr(spec, "model", None)
+            repo_id = getattr(spec, "repo", None) or getattr(entry, "repo", None) or getattr(spec, "id", key)
+            build_name = getattr(entry, "build", None) or getattr(spec, "build", None)
             # The backend string the RESOLVER keys on, which is the one
             # discover_models() derives from the hub cache -- not models.toml's
             # `build`. They differ here: the hub says "flashnext" where the
@@ -833,7 +839,7 @@ class Control:
                     for e in _discovery.discover_models()
                     if e.repo_id == repo_id and e.backend
                 ),
-                getattr(spec, "build", None) or "",
+                build_name if isinstance(build_name, str) else "",
             )
             store = _discovery.load_observations()
             # Weights are a property of the checkpoint, not of the launch, and

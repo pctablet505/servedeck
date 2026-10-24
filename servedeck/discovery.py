@@ -322,14 +322,17 @@ def load_model_config(repo_id: str, hub_dir: Path | str | None = None) -> dict[s
 def _extract_config_fields(cfg: dict[str, Any]) -> dict[str, Any]:
     """architectures[0], model_type from root; the rest from text_config, falling
     back to root when text_config is absent (SPEC §4)."""
-    text_config = cfg.get("text_config") or cfg
+    # NemotronH's omni wrapper nests the language model as `llm_config`, not `text_config`: reading only the
+    # latter left its ceiling unknown, and every panel fell back to a default of 262,144 for a 1,048,576 model.
+    text_config = cfg.get("text_config") or cfg.get("llm_config") or cfg
     quant = cfg.get("quantization_config") or {}
     architectures = cfg.get("architectures") or []
     return {
         "architectures0": architectures[0] if architectures else None,
         "model_type": cfg.get("model_type"),
         "max_position_embeddings": text_config.get("max_position_embeddings"),
-        "num_hidden_layers": text_config.get("num_hidden_layers"),
+        "num_hidden_layers": text_config.get("num_hidden_layers")
+        or len(text_config.get("layers_block_type") or []) or None,
         "num_key_value_heads": text_config.get("num_key_value_heads"),
         "head_dim": text_config.get("head_dim"),
         "full_attention_interval": text_config.get("full_attention_interval"),

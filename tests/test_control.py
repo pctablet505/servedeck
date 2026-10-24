@@ -2019,6 +2019,37 @@ def test_a_recorded_boot_is_found_again_by_the_resolver_that_reads_it(
     )
 
 
+def test_a_real_registry_entry_is_recorded_under_its_repo_with_its_build_name(
+    tmp_path, isolated_state, monkeypatch
+):
+    """The fakes above name a model's repo as its `id`, which is why the store stayed empty in production
+    (2026-10-25): the real adapter has no `.repo`, so the record was filed under the SERVED name, and its
+    `.build` is a `Build` table, not a name, so the fallback backend was an object json cannot write --
+    "could not record a measurement ... Build is not JSON serializable" on every boot since the v2 cutover."""
+    from pathlib import Path
+
+    from servedeck import app as _app
+    from servedeck import discovery as _discovery
+    from servedeck import models as _models
+
+    monkeypatch.setattr(_discovery, "discover_models", lambda *a, **k: [])
+    monkeypatch.setattr(_models, "native_ctx", lambda repo, hub_dir=None: 1048576)  # no hub cache here
+    reg = _models.load(Path(__file__).resolve().parent.parent / "models.toml")
+    spec = _app.ModelSpecAdapter.from_model(reg.models["nemotron-abl"], reg)
+    systemd = FakeSystemd()
+    ctl = make_control(systemd, FakeRegistry(spec), tmp_path, free=(97000,),
+                       probe=lambda port: spec.served_names())
+    systemd.journal["model-nemotron-abl"] = _BOOT_MEMORY_LINES
+
+    result = ctl.start("nemotron-abl")
+    assert getattr(result, "ready", False), result
+
+    store = _discovery.load_observations()
+    assert len(store) == 1, "the ready boot was not recorded"
+    assert store[0]["repo_id"] == "armin1/Nemotron-3.5-Super-VL-120B-A12B-NVFP4-abliterated"
+    assert store[0]["backend"] == "stock032"
+
+
 def test_the_boot_is_read_back_by_timestamp_not_by_tail(tmp_path, isolated_state):
     """A tail cannot find a boot, and the failure is silent.
 

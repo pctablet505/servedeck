@@ -41,7 +41,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-Family = Literal["dense_gqa", "hybrid_conv", "hybrid_gdn", "qsa_hybrid", "mla", "unknown"]
+Family = Literal["dense_gqa", "hybrid_conv", "hybrid_gdn", "hybrid_mamba2", "qsa_hybrid", "mla", "unknown"]
 
 #: Substrings that mark a layer as RECURRENT rather than attention — a layer
 #: that keeps a fixed-size state per sequence instead of a K/V entry per token,
@@ -64,6 +64,12 @@ Family = Literal["dense_gqa", "hybrid_conv", "hybrid_gdn", "qsa_hybrid", "mla", 
 #: them, which is why the test is written this way round rather than as "does
 #: it contain 'attention'" — ``linear_attention`` does.
 _RECURRENT_LAYER_MARKERS = ("linear", "conv", "mamba", "recurrent", "ssm")
+
+#: Layer types that keep NO cache at all: a mixture-of-experts or plain MLP block has neither a K/V entry
+#: per token nor a recurrent state. NemotronH lists them in `layers_block_type` between its Mamba and
+#: attention layers; counting them as attention (len - recurrent) made a 8-attention-layer model read as
+#: 48 and its KV rate 6x too large. Exact names, not substrings, so "attention" can never match.
+_NO_CACHE_LAYER_TYPES = ("moe", "mlp", "ffn")
 
 
 def _is_recurrent_layer(layer_type: object) -> bool:
@@ -116,6 +122,11 @@ _FACTORS: dict[str, tuple[float, bool, str]] = {
     # False because one point cannot validate a proportionality.
     "hybrid_conv": (1.0, False, "1 boot (LFM2.5-350M, 1.42 GiB -> 123,229 tokens, +0.7%)"),
     "unknown": (1.0, False, "architecture not recognised"),
+    # hybrid_mamba2 — ONE boot: Nemotron-3.5-Super-VL-120B (8 attention, 40 Mamba-2, 40 MoE layers), fp8 KV,
+    # ctx 1,048,576, no MTP: a 13.29 GiB cache giving 3,272,828 tokens (2026-10-24), 4,360 B/token against
+    # the 4,261 the arithmetic gives. A boot WITH the MTP drafter reads 11.19 GiB -> 2,316,890 tokens
+    # (5,186 B/token, +6% over this factor): the drafter's own attention layer is not modelled.
+    "hybrid_mamba2": (1.0233, False, "1 boot (Nemotron-3.5-Super-VL, 13.29 GiB -> 3,272,828 tokens, no MTP)"),
 }
 
 
@@ -171,8 +182,12 @@ def dtype_bytes(name: str | None, default: int = 2) -> int:
 
 
 def _text_config(cfg: dict[str, Any]) -> dict[str, Any]:
-    tc = cfg.get("text_config")
-    return tc if isinstance(tc, dict) else cfg
+    # `llm_config` is NemotronH's name for the language model nested in its omni wrapper.
+    for name in ("text_config", "llm_config"):
+        tc = cfg.get(name)
+        if isinstance(tc, dict):
+            return tc
+    return cfg
 
 
 def kv_cache_dtype_bytes(cfg: dict[str, Any], override: str | None = None) -> int:
@@ -220,6 +235,27 @@ def _gdn_state_bytes(tc: dict[str, Any], ssm_bytes: int) -> float:
     return float(ssm + conv)
 
 
+def _mamba2_state_bytes(tc: dict[str, Any], ssm_bytes: int) -> float:
+    """Conv + SSM recurrent state for ONE Mamba-2 layer (NemotronH).
+
+    SSM: heads x head_dim x state_size at the SSM dtype. Conv: (kernel-1) taps of
+    heads x head_dim + 2 x groups x state_size channels, held in fp32. Checked against vLLM's own
+    page-size log on this box: 128 x 64 x 128 x 4 + 10,240 x 3 x 4 = 4,317,184 B, and the engine
+    printed "Padding mamba page size by 0.19%" to reach the 4,325,376 B attention page of its
+    4,224-token block (4,325,376 / 4,317,184 = 1.0019).
+    """
+    heads = int(tc.get("mamba_num_heads") or 0)
+    head_dim = int(tc.get("mamba_head_dim") or 0)
+    state = int(tc.get("ssm_state_size") or 0)
+    groups = int(tc.get("n_groups") or 0)
+    kernel = int(tc.get("conv_kernel") or 0)
+    if not (heads and head_dim and state):
+        return 0.0
+    ssm = heads * head_dim * state * ssm_bytes
+    conv_dim = heads * head_dim + 2 * groups * state
+    return float(ssm + conv_dim * max(kernel - 1, 0) * 4)
+
+
 def geometry(
     cfg: dict[str, Any],
     *,
@@ -234,14 +270,15 @@ def geometry(
     describe two different servers.
     """
     tc = _text_config(cfg)
-    layer_types = list(tc.get("layer_types") or [])
+    layer_types = list(tc.get("layer_types") or tc.get("layers_block_type") or [])
     kvb = kv_cache_dtype_bytes(cfg, kv_cache_dtype)
     notes: list[str] = []
     terms: dict[str, float] = {}
 
     n_linear = sum(1 for t in layer_types if _is_recurrent_layer(t))
+    n_cacheless = sum(1 for t in layer_types if str(t).lower() in _NO_CACHE_LAYER_TYPES)
     n_layers = int(tc.get("num_hidden_layers") or len(layer_types) or 0)
-    n_attn = (len(layer_types) - n_linear) if layer_types else n_layers
+    n_attn = (len(layer_types) - n_linear - n_cacheless) if layer_types else n_layers
 
     # ---- MLA (GLM-5.3): one latent vector per token per attention layer.
     if tc.get("kv_lora_rank"):
@@ -299,8 +336,22 @@ def geometry(
         )
         return KvGeometry("dense_gqa", attn, 0.0, f, cal, why, terms, tuple(notes))
 
-    ssm_b = dtype_bytes(mamba_ssm_dtype or tc.get("mamba_ssm_dtype"), 4)
+    ssm_b = dtype_bytes(mamba_ssm_dtype or tc.get("mamba_ssm_dtype") or tc.get("mamba_ssm_cache_dtype"), 4)
     gdn_per_layer = _gdn_state_bytes(tc, ssm_b)
+
+    if gdn_per_layer <= 0.0 and tc.get("mamba_num_heads"):
+        # NemotronH: Mamba-2 layers between MoE blocks, with attention on 8 of 88 layers.
+        state = float(n_linear * _mamba2_state_bytes(tc, ssm_b))
+        terms["mamba2_state_per_seq"] = state
+        f, cal, why = _FACTORS["hybrid_mamba2"]
+        return KvGeometry(
+            "hybrid_mamba2", attn, state, f, cal, why, terms,
+            (
+                *notes,
+                f"{n_attn} of {len(layer_types)} layers keep a K/V cache; {n_linear} Mamba-2 layers hold a "
+                f"per-sequence state and {n_cacheless} MoE layers hold nothing",
+            ),
+        )
 
     if gdn_per_layer <= 0.0 and tc.get("conv_dim"):
         # A short-conv hybrid (LFM2.5): attention layers interleaved with plain

@@ -238,6 +238,33 @@ def test_an_uncalibrated_family_says_it_is_uncalibrated() -> None:
     assert geo.allocator_factor == 1.0
 
 
+def _nemotron_h_omni_config() -> dict:
+    """Nemotron-3.5-Super-VL-120B's config.json, reduced to what sizes its cache."""
+    return {
+        "architectures": ["NemotronH_Omni_Reasoning_V3"],
+        "quantization_config": {"kv_cache_scheme": {"num_bits": 8, "type": "float", "dynamic": False}},
+        "llm_config": {
+            "head_dim": 128, "num_key_value_heads": 2, "num_attention_heads": 32,
+            "mamba_num_heads": 128, "mamba_head_dim": 64, "ssm_state_size": 128, "n_groups": 8,
+            "conv_kernel": 4, "mamba_ssm_cache_dtype": "float32",
+            "layers_block_type": ["mamba"] * 40 + ["moe"] * 40 + ["attention"] * 8,
+        },
+    }
+
+
+def test_a_nemotron_h_hybrid_counts_only_its_attention_layers_and_mamba_states() -> None:
+    """Read as a dense model with the MoE layers counted as attention, a 1,048,576-token model got no
+    geometry at all and the panel said "KV budget too small for one request" with 10.8 GiB free
+    (2026-10-25). Its 8 attention layers keep fp8 K/V, its 40 Mamba-2 layers a fixed state each, and its
+    40 MoE layers nothing. The engine's own boot of this model: 13.29 GiB held 3,272,828 tokens."""
+    geo = kvcalc.geometry(_nemotron_h_omni_config())
+    assert geo.family == "hybrid_mamba2"
+    assert geo.attn_bytes_per_token == 8 * 2 * 2 * 128 * 1  # 8 layers x K,V x 2 heads x 128 dims x fp8
+    # 128 x 64 x 128 x 4 B of SSM + 10,240 channels x 3 taps x 4 B of conv, per layer.
+    assert geo.state_bytes_per_seq == 40 * 4_317_184
+    assert kvcalc.tokens_at(geo, 13.29, 1_048_576) == pytest.approx(3_272_828, rel=0.001)
+
+
 def test_a_config_with_no_attention_geometry_refuses_rather_than_guesses() -> None:
     geo = kvcalc.geometry({"architectures": ["Mystery"], "num_hidden_layers": 4})
     assert geo.family == "unknown"

@@ -451,6 +451,27 @@ def test_fields_come_from_text_config_when_present(tmp_path: Path) -> None:
     assert e.full_attention_interval == 4
 
 
+def test_fields_come_from_llm_config_for_a_nemotron_h_omni_wrapper(tmp_path: Path) -> None:
+    """The ceiling read back as None, so every panel fell to its 262,144 default for a 1,048,576 model
+    (2026-10-25). `num_hidden_layers` is not in that config; the layer list gives it."""
+    cfg = {
+        "architectures": ["NemotronH_Omni_Reasoning_V3"],
+        "model_type": "nemotron_h_omni",
+        "llm_config": {
+            "max_position_embeddings": 1048576,
+            "num_key_value_heads": 2,
+            "head_dim": 128,
+            "layers_block_type": ["mamba", "moe", "attention"] * 4,
+        },
+    }
+    _make_repo(tmp_path, "models--A--B", config=cfg, safetensors={"m.safetensors": GIB})
+    e = discover_models(tmp_path)[0]
+    assert e.max_position_embeddings == 1048576
+    assert e.num_hidden_layers == 12
+    assert e.num_key_value_heads == 2
+    assert e.head_dim == 128
+
+
 def test_fields_fall_back_to_root_when_no_text_config(tmp_path: Path) -> None:
     cfg = {
         "architectures": ["Qwen3_5ForConditionalGeneration"],

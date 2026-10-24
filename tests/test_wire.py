@@ -36,7 +36,7 @@ def resolve_ctx(registry):
     # so it needs no entry here: _fixed_resolver reads m.ctx directly for it.
     return _fixed_resolver(
         {"qwen27b": 262144, "flashnext": 262144, "flashnext-batch": 262144, "fp4local": 262144,
-         "ornith": 262144, "thinkingcap": 262144, "thinkingcap-abl": 262144}
+         "ornith": 262144, "thinkingcap": 262144, "thinkingcap-abl": 262144, "nemotron-abl": 1048576}
     )
 
 
