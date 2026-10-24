@@ -291,6 +291,7 @@ def upstream_payload(
         "model": model.id,
         "model_id": model.repo,
         "identity": {
+            "key": key,
             "repo_id": model.repo,
             "source": "process" if argv else "unit",
             "backend": model.build,
@@ -734,8 +735,14 @@ def estimate_payload(
 # --------------------------------------------------------------------------
 
 
-def key_for_repo(registry: _models.Registry, repo_id: str | None, backend: str | None) -> str | None:
-    """The page posts what v1 knew a model by: its repo id, or a name."""
+def key_for_repo(
+    registry: _models.Registry, repo_id: str | None, backend: str | None, key: str | None = None
+) -> str | None:
+    """The page posts what v1 knew a model by: its repo id, or a name. Two registry
+    entries may serve one repo (an edited serve of the same weights), and the repo
+    cannot tell them apart, so the rail card's own ``key`` wins when it is one."""
+    if isinstance(key, str) and key in registry.models:
+        return key
     if not repo_id:
         return None
     for key, m in registry.models.items():
@@ -860,7 +867,7 @@ def register(app: FastAPI, rt: Any) -> None:
         repo = body.get("repo_id")
         if not repo:
             return JSONResponse({"error": "repo_id is required"}, status_code=400)
-        key = key_for_repo(rt.registry, repo, body.get("backend"))
+        key = key_for_repo(rt.registry, repo, body.get("backend"), body.get("key"))
         model = rt.registry.models.get(key) if key else None
         holder = _app._main_holder(rt, rt.routes.live())
         view = rt.routes.live_view(holder) if holder else None
@@ -886,7 +893,7 @@ def register(app: FastAPI, rt: Any) -> None:
             return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=400)
 
     def _launch(body: dict[str, Any], action: str) -> JSONResponse:
-        key = key_for_repo(rt.registry, body.get("repo_id"), body.get("backend"))
+        key = key_for_repo(rt.registry, body.get("repo_id"), body.get("backend"), body.get("key"))
         if key is None:
             return JSONResponse(
                 {"error": f"no registry model matches {body.get('repo_id')!r}"}, status_code=404

@@ -632,7 +632,7 @@ let railSig = "";
    becoming servable, nor repo_id alone, which would miss a model changing size
    or gaining its blobs. */
 function railSigOf(models) {
-  return (models || []).map((m) => `${m.repo_id}|${m.servable ? 1 : 0}|${m.disk_bytes}`).join(";");
+  return (models || []).map((m) => `${m.key}|${m.repo_id}|${m.servable ? 1 : 0}|${m.disk_bytes}`).join(";");
 }
 
 /* "N models" alone hid the number that actually matters: how many of them this
@@ -754,11 +754,11 @@ function renderModels() {
   if (sig === railSig) { updateRailSelection(); return; }
   railSig = sig;
   // Which card had focus, and how far the list was scrolled, are restored after
-  // the rebuild. Focus is tracked by repo_id rather than index, because a model
+  // the rebuild. Focus is tracked by registry key (two entries can share a repo_id) rather than index, because a model
   // appearing earlier in the list would otherwise move the focus to a different
   // model under the operator's keyboard.
   const focused = L.querySelector ? L.querySelector(":focus") : null;
-  const focusRepo = focused && focused.dataset ? focused.dataset.repo : null;
+  const focusKey = focused && focused.dataset ? focused.dataset.key : null;
   const scrollTop = L.scrollTop;
   L.innerHTML = "";
   MODELS.forEach((m, i) => {
@@ -782,7 +782,7 @@ function renderModels() {
     b.setAttribute("aria-selected", isSelected ? "true" : "false");
     // The rail is a list of choices, not a list of unrelated buttons.
     b.setAttribute("role", "option");
-    b.dataset.repo = m.repo_id || "";
+    b.dataset.key = m.key || "";
     b.innerHTML =
       `<span class="r1"><span class="nm"></span><span class="sz mono" title="${diskTitle(m)}">${bytesTxt(m.disk_bytes)}${m.disk_bytes > m.disk_local_bytes ? '<span class="off">↗</span>' : ""}</span></span>
        <span class="r2">${renderCardTags(m, isSelected)}</span>
@@ -817,8 +817,8 @@ function renderModels() {
     L.appendChild(b);
   });
   L.scrollTop = scrollTop;
-  if (focusRepo && L.querySelector) {
-    const back = L.querySelector(`[data-repo="${focusRepo}"]`);
+  if (focusKey && L.querySelector) {
+    const back = L.querySelector(`[data-key="${focusKey}"]`);
     if (back && back.focus) back.focus();
   }
 }
@@ -830,8 +830,8 @@ function updateRailSelection() {
   if (!L || !L.children) return;
   paintTargetBanner();
   Array.from(L.children).forEach((b) => {
-    const repo = b.dataset.repo;
-    const i = MODELS.findIndex((mod) => mod.repo_id === repo);
+    const key = b.dataset.key;
+    const i = MODELS.findIndex((mod) => mod.key === key);
     if (i < 0) return;
     const m = MODELS[i];
     const isServing = !!m.serving;
@@ -863,7 +863,7 @@ async function doEstimate() {
     const r = await fetch("/api/capacity/estimate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ repo_id: m.repo_id, util, ctx, max_num_seqs: agents,
+      body: JSON.stringify({ repo_id: m.repo_id, key: m.key, util, ctx, max_num_seqs: agents,
                              kv_offload_gib: offloadGib }),
     });
     var d = await r.json();
@@ -2149,7 +2149,9 @@ function paintState(s) {
   if (MODELS.length && (ident.repo_id || names.length)) {
     let servingIdx = -1;
     MODELS.forEach((m, i) => {
-      m.serving = ident.repo_id
+      m.serving = ident.key
+        ? m.key === ident.key
+        : ident.repo_id
         ? m.repo_id === ident.repo_id
         : names.includes(m.repo_id) || names.includes(m.name);
       if (m.serving) servingIdx = i;
@@ -2289,7 +2291,7 @@ function wireControls() {
         ? "/api/server/restart" : "/api/server/start";
       try {
         await post(path, {
-          repo_id: m.repo_id, backend: m.backend, util, ctx, max_num_seqs: agents,
+          repo_id: m.repo_id, key: m.key, backend: m.backend, util, ctx, max_num_seqs: agents,
           kv_offload_gib: offloadGib,
         });
         log(`applying ${m.name} …`, "g");

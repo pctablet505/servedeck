@@ -165,6 +165,71 @@ def test_key_for_repo_accepts_repo_id_name_or_key(tmp_path) -> None:
     assert lp.key_for_repo(reg, None, None) is None
 
 
+def _shared_repo_registry(tmp_path) -> _models.Registry:
+    """Two registry entries on ONE repo: the normal model and an edited serve of the same weights."""
+    p = tmp_path / "models.toml"
+    p.write_text(
+        '[gpu]\ntotal_mib = 100000\nmargin_mib = 1024\n'
+        '[builds.stock]\nvenv = "/opt/v"\ncuda_home = "/opt/cuda"\n'
+        '[models.plain]\nid = "Plain"\nrepo = "org/W"\nslot = "main"\nport = 8001\nbuild = "stock"\nctx = 4096\n'
+        '[models.edited]\nid = "Edited"\nrepo = "org/W"\nslot = "main"\nport = 8002\nbuild = "stock"\nctx = 4096\n'
+    )
+    return _models.load(p)
+
+
+def test_two_entries_on_one_repo_are_told_apart_by_key(tmp_path) -> None:
+    reg = _shared_repo_registry(tmp_path)
+    assert lp.key_for_repo(reg, "org/W", "stock", key="edited") == "edited"
+    assert lp.key_for_repo(reg, "org/W", "stock", key="plain") == "plain"
+    assert lp.key_for_repo(reg, None, None, key="edited") == "edited", "a key alone names the entry"
+    assert lp.key_for_repo(reg, "org/W", "stock") == "plain", "v1 clients without a key keep the first match"
+    assert lp.key_for_repo(reg, "org/W", None, key="nope") == "plain", "an unknown key falls back to the repo"
+
+
+def test_the_upstream_identity_names_the_registry_key(tmp_path) -> None:
+    reg = _shared_repo_registry(tmp_path)
+    up = lp.upstream_payload(model=reg.models["edited"], key="edited", ready=True, pid=1, adopted=False,
+                             ctx_tokens=4096, snapshot=None, argv=[], fallback_port=None, reason_when_down="")
+    assert up["identity"]["key"] == "edited" and up["identity"]["repo_id"] == "org/W"
+
+
+def test_start_with_a_key_launches_that_entry_not_the_first_on_the_repo(tmp_path) -> None:
+    from fastapi.testclient import TestClient
+    from servedeck import app as _app
+    from servedeck.settings import Settings
+
+    started: list[str] = []
+
+    class Ctl:
+        def live(self):
+            return []
+        def adopt(self, **_kw):
+            return None
+        def reconcile(self, *_a, **_kw):
+            return None
+        def start(self, key, **_kw):
+            started.append(key)
+            return None
+
+    reg = _shared_repo_registry(tmp_path)
+    settings = Settings(listen_host="127.0.0.1", listen_port=8099, models_path=tmp_path / "models.toml",
+                        state_dir=tmp_path / "state", unit_prefix="sd-test-")
+    app = _app.create_app(settings, registry=reg, control=Ctl(), reconcile=False, poll=False)
+    orig = _app._main_holder
+    _app._main_holder = lambda rt, live: None
+    try:
+        with TestClient(app) as c:
+            r = c.post("/api/server/start", json={"repo_id": "org/W", "backend": "stock", "key": "edited"})
+            assert r.status_code == 202 and r.json()["key"] == "edited"
+    finally:
+        _app._main_holder = orig
+    for _ in range(200):
+        if started:
+            break
+        time.sleep(0.01)
+    assert started == ["edited"]
+
+
 def test_cache_flags_come_from_the_registry_flags(tmp_path) -> None:
     reg = _registry(tmp_path)
     assert lp.cache_flags(reg.models["a"]) == (None, None)

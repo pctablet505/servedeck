@@ -332,8 +332,9 @@ Gone in v2 and not returning: `config.py`, `paths.py`, `supervisor.py`,
 
 **Two mutation API families.** `/api/models/{key}/*`, `/api/switch/{key}` and
 `/api/adopt` key on the registry key, precheck into typed refusals and take no
-body. `/api/server/{start,restart,stop,adopt}` key on `repo_id` + `backend`,
-return untyped `{"error": "…"}`, and are the **only** route that accepts the
+body. `/api/server/{start,restart,stop,adopt}` key on `repo_id` + `backend` (the
+page also sends the registry `key`, which wins: two entries can share one
+repo, and `repo_id` alone always names the first), return untyped `{"error": "…"}`, and are the **only** route that accepts the
 allocator's `util` and argv overrides — which is why they cannot be deleted
 while v1's Configure panel is the page. `/api/server/adopt` also answers
 synchronously where `/api/adopt` is 202 + SSE. Both families share
