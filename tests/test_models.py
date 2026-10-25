@@ -250,7 +250,7 @@ def test_real_models_toml_loads():
     reg = models.load(REPO_ROOT / "models.toml")
     assert set(reg.models) == {
         "qwen27b", "flashnext", "flashnext-batch", "fp4local", "glm53", "lfm2", "ornith",
-        "thinkingcap", "thinkingcap-abl", "nemotron-abl",
+        "nemotron-abl",
     }
     assert reg.gpu.total_mib == 97887
     assert reg.gpu.margin_mib == 1024
@@ -262,22 +262,6 @@ def test_real_models_toml_loads():
         # one on disk. models.toml carries the full history of this flag.
         "HF_HUB_OFFLINE": "1",
     }
-
-
-def test_thinkingcap_entries_parse_tools_and_keep_the_edit_apart():
-    """Both ThinkingCap entries serve one repo. Without a tool and a reasoning parser a Codex session
-    got the model's ``<tool_call>`` text back and ran nothing (2026-10-24); the edited entry must carry
-    its own id and the worker hook, or launching it serves the unedited model."""
-    reg = models.load(REPO_ROOT / "models.toml")
-    plain, edited = reg.models["thinkingcap"], reg.models["thinkingcap-abl"]
-    assert plain.repo == edited.repo and plain.id != edited.id
-    for m in (plain, edited):
-        assert m.tools is not None and m.tools.parser == "qwen3_coder"
-        assert m.reasoning is not None and m.reasoning.parser == "qwen3"
-    flags = list(edited.flags)
-    assert flags[flags.index("--worker-extension-cls") + 1] == "abl_serve.ServeWorker"
-    assert "--worker-extension-cls" not in plain.flags
-    assert {"ABL_PATCH", "ABL_RUNTIME"} <= set(edited.env) and not {"ABL_PATCH", "ABL_RUNTIME"} & set(plain.env)
 
 
 def test_nemotron_abl_entry_parses_tools_and_reasoning_on_a_build_that_knows_the_arch():
