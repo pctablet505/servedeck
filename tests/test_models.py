@@ -289,6 +289,8 @@ def test_nemotron_abl_entry_parses_tools_and_reasoning_on_a_build_that_knows_the
     assert m.repo == "armin1/Nemotron-3.5-Super-VL-120B-A12B-NVFP4-abliterated"
     assert m.ctx == "native", "native_ctx reads llm_config.max_position_embeddings (1,048,576)"
     assert "--trust-remote-code" in m.flags
+    spec = json.loads(m.flags[m.flags.index("--speculative-config") + 1])
+    assert spec == {"method": "mtp", "num_speculative_tokens": 5}, "the MTP head is the measured 2.8x single-request gain"
     assert m.tools is not None and m.tools.parser == "qwen3_coder"
     assert m.reasoning is not None and m.reasoning.parser == "nemotron_v3"
     assert m.env["VLLM_USE_DEEP_GEMM"] == "0" and m.env["VLLM_MOE_USE_DEEP_GEMM"] == "0"

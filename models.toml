@@ -726,8 +726,10 @@ PYTHONPATH = "/home/pctablet505/Projects/t0-work/thinkingcap-2026-10-24"
 # 0.32.0 register the architecture; the qwen38next fork does not, so build = stock032.
 # --trust-remote-code is needed for the HF config class only (vLLM brings its own model code); the repo's .py files
 # were read before the first boot: no os/subprocess/network/exec calls.
-# Flags: the card's vLLM recipe (reasoning parser nemotron_v3, tool parser qwen3_coder, 8,192 batched tokens). The
-# 16 sequences, util and host_ram_gib are first-boot guesses until measured. Checks and gaps: docs/models/nemotron.md.
+# Flags: the card's vLLM recipe (reasoning parser nemotron_v3, tool parser qwen3_coder, 8,192 batched tokens) plus
+# the checkpoint's own MTP head at 5 draft tokens, from a 2026-10-25 sweep of 36 variants on real agent prompts: one
+# request 110 -> 312 tok/s, 16 in flight 670 -> 1,232 tok/s (3 draft tokens: 249 and 1,266-1,396; more than 5 gains
+# nothing). util 0.90, 16 sequences and host_ram_gib are not tuned. Sweep, failures and gaps: docs/models/nemotron.md.
 [models.nemotron-abl]
 id           = "Nemotron-3.5-Super-VL-120B-A12B-NVFP4-abliterated"
 repo         = "armin1/Nemotron-3.5-Super-VL-120B-A12B-NVFP4-abliterated"
@@ -749,6 +751,7 @@ flags = [
     "--limit-mm-per-prompt", "{\"image\": 16, \"video\": 0}",
     "--kv-offloading-size", "12",
     "--shutdown-timeout", "30",
+    "--speculative-config", "{\"method\": \"mtp\", \"num_speculative_tokens\": 5}",
 ]
 
 [models.nemotron-abl.reasoning]
