@@ -100,4 +100,4 @@ deletes nothing it cannot prove is unused.
 ---
 
 <picture><source media="(prefers-color-scheme: dark)" srcset="assets/mark-dark.svg"><img src="assets/mark-light.svg" width="16" height="16" alt=""></picture>
-<sub>**Real numbers, failures left in.** Servedeck is one of the [open-source tools of RL Alpha Labs](https://rlalphalabs.com/tools/), a one-person research lab for Indian stock markets, built by [pctablet505](https://github.com/pctablet505). MIT licensed, see [LICENSE](LICENSE).</sub>
+<sub>**Big models, small places, real numbers** · Servedeck is one of the [open-source tools of RL Alpha Labs](https://rlalphalabs.com/tools/), automated trading research on Indian stocks, built by [pctablet505](https://github.com/pctablet505). MIT licensed, see [LICENSE](LICENSE).</sub>
