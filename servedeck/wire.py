@@ -27,7 +27,7 @@ import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import tomli_w
 
@@ -579,11 +579,17 @@ def unified_diff(name: str, before: str, after: str) -> str:
     )
 
 
+class WireRenderer(Protocol):
+    def __call__(
+        self, registry: _models.Registry, existing_text: str, *, resolve_ctx: CtxResolver
+    ) -> str: ...
+
+
 @dataclass(frozen=True)
 class WireTarget:
     name: str
     path: Path
-    render: Callable[[_models.Registry, str, CtxResolver], str]
+    render: WireRenderer
 
 
 WIRE_TARGETS: tuple[WireTarget, ...] = (

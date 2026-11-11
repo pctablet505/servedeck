@@ -426,9 +426,12 @@ def _load_builds(raw: dict[str, Any]) -> dict[str, Build]:
                 f"got {table!r}"
             )
         for required in ("venv", "cuda_home"):
-            if not table.get(required):
+            if required not in table or not table.get(required):
                 raise RegistryError(f"builds.{name}: missing {required!r}")
-        builds[name] = Build(venv=table["venv"], cuda_home=table["cuda_home"])
+        builds[name] = Build(
+            venv=_as_nonempty_str(table["venv"], f"builds.{name}.venv"),
+            cuda_home=_as_nonempty_str(table["cuda_home"], f"builds.{name}.cuda_home"),
+        )
     return builds
 
 
@@ -510,20 +513,16 @@ def _validate(models: dict[str, Model], gpu: GPU, builds: dict[str, Build]) -> N
         )
 
 
-def load(path: str | Path) -> Registry:
-    """Load and validate ``models.toml``. Raises :class:`RegistryError` on the
-    first problem found (never a bare KeyError/TypeError from tomllib's dict)."""
-    p = Path(path)
-    try:
-        with p.open("rb") as f:
-            data = tomllib.load(f)
-    except tomllib.TOMLDecodeError as e:
-        raise RegistryError(f"{p}: invalid TOML: {e}") from e
-    except OSError as e:
-        raise RegistryError(f"{p}: cannot read: {e}") from e
+def load_from_dict(data: Mapping[str, Any]) -> Registry:
+    """Validate an already-parsed TOML mapping into a :class:`Registry`.
 
+    Pure (no file I/O), raising ONLY :class:`RegistryError` on any schema or
+    type violation so property-based / formal fuzzers can exercise the validator
+    directly."""
+    if not isinstance(data, Mapping):
+        raise RegistryError("registry root must be a TOML table")
     gpu_raw = data.get("gpu")
-    if not isinstance(gpu_raw, dict) or "total_mib" not in gpu_raw or "margin_mib" not in gpu_raw:
+    if not isinstance(gpu_raw, Mapping) or "total_mib" not in gpu_raw or "margin_mib" not in gpu_raw:
         raise RegistryError("[gpu] table with total_mib and margin_mib is required")
     gpu = GPU(
         total_mib=_as_int(gpu_raw["total_mib"], "gpu.total_mib", minimum=1),
@@ -553,11 +552,27 @@ def load(path: str | Path) -> Registry:
 
     models: dict[str, Model] = {}
     for key, raw in models_raw.items():
+        if not isinstance(key, str):
+            raise RegistryError(f"model key {key!r} must be a string")
         models[key] = _load_model(key, raw, defaults_env)
 
     _validate(models, gpu, builds)
 
     return Registry(models=models, gpu=gpu, builds=builds, defaults_env=defaults_env)
+
+
+def load(path: str | Path) -> Registry:
+    """Load and validate ``models.toml``. Raises :class:`RegistryError` on the
+    first problem found (never a bare KeyError/TypeError from tomllib's dict)."""
+    p = Path(path)
+    try:
+        with p.open("rb") as f:
+            data = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        raise RegistryError(f"{p}: invalid TOML: {e}") from e
+    except OSError as e:
+        raise RegistryError(f"{p}: cannot read: {e}") from e
+    return load_from_dict(data)
 
 
 # --------------------------------------------------------------------------- #
@@ -579,7 +594,8 @@ def native_ctx(repo: str, hub_dir: str | Path | None = None) -> int:
             f"native_ctx({repo!r}): no config.json found in the local hub cache "
             "(model not downloaded, or repo id is wrong)"
         )
-    text_config = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else cfg
+    raw_tc = cfg.get("text_config")
+    text_config: Mapping[str, Any] = raw_tc if isinstance(raw_tc, dict) else cfg
     value = text_config.get("max_position_embeddings") or cfg.get("max_position_embeddings")
     if not value:
         raise RegistryError(

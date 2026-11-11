@@ -393,7 +393,7 @@ class XidWatcher:
 
     def _last_seen_ts(self) -> str | None:
         events = _telemetry.read_jsonl(self.xid_log_path())
-        ts_values = [e.get("ts") for e in events if isinstance(e.get("ts"), str)]
+        ts_values = [ts for e in events if isinstance((ts := e.get("ts")), str)]
         return max(ts_values) if ts_values else None
 
     def scan_once(self) -> list[dict[str, Any]]:

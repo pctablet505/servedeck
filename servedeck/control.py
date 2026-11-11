@@ -179,33 +179,20 @@ class ModelSpec(Protocol):
     name) is the gateway's business, not the supervisor's.
     """
 
-    #: Registry key; also the unit name suffix (``model-<key>``). Must match
-    #: ``[a-z0-9-]+`` or :func:`units.start_transient` will refuse it.
-    key: str
-    #: The model's canonical public id, e.g. ``"LFM2.5-350M"``. This is what
-    #: ``GET /v1/models`` must list for the model to count as ready.
-    id: str
-    #: ``"main"`` (exclusive GPU slot, one at a time) or ``"resident"``
-    #: (co-resident, budgeted, always on).
-    slot: str
-    #: Loopback port this model's own vLLM listens on. Clients never see it;
-    #: only the gateway and this module do.
-    port: int
-    #: For a resident: its VRAM budget in MiB, from which its utilisation is
-    #: derived. For a main model: None — a main model gets everything free.
-    vram_mib: int | None
-    #: Context length in tokens. REQUIRED, never None: "native" is resolved to
-    #: a number by the registry adapter before launch, and ``render_argv`` must
-    #: always emit ``--max-model-len``. Leaving it to vLLM means the dashboard
-    #: cannot size KV headroom and two callers disagree about the context a
-    #: client may ask for — R1 in miniature.
-    ctx_tokens: int
-    #: Absolute path to the venv's ``bin`` DIRECTORY (e.g.
-    #: ``/home/u/Projects/local_llm/.venv-llm-029/bin``). Control prepends it
-    #: to ``PATH`` in the unit environment so every subprocess vLLM spawns
-    #: resolves to the same interpreter. ``render_argv`` is still expected to
-    #: return an absolute argv[0]; PATH is for vLLM's children, not for us.
-    venv_bin: str
+    @property
+    def key(self) -> str: ...
+    @property
+    def id(self) -> str: ...
+    @property
+    def slot(self) -> str: ...
+    @property
+    def port(self) -> int: ...
+    @property
+    def vram_mib(self) -> int | None: ...
+    @property
+    def ctx_tokens(self) -> int: ...
+    @property
+    def venv_bin(self) -> str: ...
 
     def served_names(self) -> Sequence[str]:
         """Every name vLLM is told to serve (``--served-model-name``): the id
@@ -699,7 +686,7 @@ class Control:
         unit_prefix: str = UNIT_PREFIX,
         desired_path: str | Path | None = None,
         run: Runner | None = None,
-        spawn: Callable[[Sequence[str]], object] | None = None,
+        spawn: units._Spawner | None = None,
         probe: Probe | None = None,
         free_mib: Callable[[], int | None] | None = None,
         used_by_pids: Callable[[], dict[int, int] | None] | None = None,
@@ -709,7 +696,7 @@ class Control:
         listener_pid: Callable[[int], int | None] | None = None,
         kill: Callable[[int, int], None] | None = None,
         descendants: Callable[[int], list[int]] | None = None,
-        reap_offload: Callable[[], list[tuple[str, int]]] | None = None,
+        reap_offload: Callable[..., list[tuple[str, int]]] | None = None,
         mem_available_gib_fn: Callable[[], float | None] | None = None,
     ) -> None:
         if unit_prefix not in (UNIT_PREFIX, "sd-test-"):
@@ -848,7 +835,7 @@ class Control:
                 log.debug("boot of %s printed no KV figures; not recorded", key)
                 return
 
-            repo_id = getattr(spec, "repo", None) or getattr(spec, "id", key)
+            repo_id = str(getattr(spec, "repo", None) or getattr(spec, "id", key) or key)
             # The backend string the RESOLVER keys on, which is the one
             # discover_models() derives from the hub cache -- not models.toml's
             # `build`. They differ here: the hub says "flashnext" where the
@@ -1685,7 +1672,9 @@ class Control:
         except OSError as exc:
             return Refusal(reason="stop_failed", message=f"kill {model.pid}: {exc}", key=key)
         deadline = self._clock() + timeout_s
-        while self._probe(model.port) is not None or self._listener_pid(model.port) is not None:
+        while model.port is not None and (
+            self._probe(model.port) is not None or self._listener_pid(model.port) is not None
+        ):
             if self._clock() >= deadline:
                 for p in reversed(tree):
                     try:

@@ -29,7 +29,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-xdist>=3.5", "mkdocs>=1.6"]
+dev = [
+  "pytest>=8",
+  "pytest-xdist>=3.5",
+  "hypothesis>=6.100",
+  "z3-solver>=4.13",
+  "mypy>=1.10",
+  "mkdocs>=1.6",
+]
+# Formal & property-based verification suite alongside pytest (tests/test_formal_*.py).
+formal = ["hypothesis>=6.100", "z3-solver>=4.13", "mypy>=1.10"]
 # The documentation site (mkdocs.yml, docs-theme/): `mkdocs build --strict`.
 docs = ["mkdocs>=1.6"]
 

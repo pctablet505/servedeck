@@ -721,12 +721,8 @@ def run_doctor(
     results.extend(check_desired_is_live(registry, effective_desired, run=unit_run))
     results.extend(check_weights_present(registry, hub_dir))
     results.append(check_offload_buffers(shm_dir))
-    results.append(
-        check_power_cap(
-            registry.gpu.power_limit_w,
-            _gpu.power_limit_w() if power_limit_w is _UNSET else power_limit_w,
-        )
-    )
+    actual_power = _gpu.power_limit_w() if isinstance(power_limit_w, _Unset) else power_limit_w
+    results.append(check_power_cap(registry.gpu.power_limit_w, actual_power))
     results.append(_xid_watch.check_fatal_xid_needs_reboot(state_dir=state_dir))
     return results
 

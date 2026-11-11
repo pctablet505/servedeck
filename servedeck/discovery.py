@@ -655,7 +655,8 @@ def _estimate_kv_rate(
     for obs in all_observations:
         if obs.get("trust") not in ("measured", None) or not isinstance(obs.get("measured"), dict):
             continue
-        arch = reverse_archs.get(obs.get("backend"))
+        backend_name = obs.get("backend")
+        arch = reverse_archs.get(backend_name) if isinstance(backend_name, str) else None
         if arch != architectures0:
             continue
         rate = _kv_rate_of(obs)

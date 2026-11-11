@@ -245,6 +245,9 @@ class Runtime:
     #: English.
     busy: dict[str, str] | None = None
     reconcile_pending: bool = False
+    #: True once `_reconcile_after_bind` timed out without winning our own port,
+    #: preventing `_recover_desired` from launching models on a rival's box (R4).
+    bind_failed: bool = False
     first_state: asyncio.Event = field(default_factory=asyncio.Event)
     #: A nonce this process invents at startup and echoes from /api/health.
     #: ``_reconcile_after_bind`` requires it back before it will start a model.
@@ -648,7 +651,7 @@ def _recover_desired(rt: Runtime) -> None:
     documented Xid history, one persistent fault meant the box served nothing
     until somebody noticed.
     """
-    if rt.busy is not None or rt.reconcile_pending:  # a mutation or startup reconcile is in flight
+    if rt.busy is not None or rt.reconcile_pending or rt.bind_failed:  # a mutation or startup reconcile is in flight, or we never won the port
         return
     try:
         want = _desired.load(rt.settings.desired_path)
@@ -694,16 +697,20 @@ def _recover_desired(rt: Runtime) -> None:
         # launch requested nothing, start() did not record it either -- so
         # desired state still read 0.97 while the card ran 0.98.
         stored = want.launch_for(key)
+
+        def _recover_work(k: str = key, s: _desired.Launch = stored) -> Any:
+            return rt.control.start(
+                k,
+                on_progress=_progress_publisher(rt.hub, k, rt.boot),
+                util=s.util,
+                argv_overrides=s.argv or None,
+            )
+
         asyncio.create_task(
             _run_mutation(
                 rt,
                 f"recover {key}",
-                lambda k=key, s=stored: rt.control.start(
-                    k,
-                    on_progress=_progress_publisher(rt.hub, k, rt.boot),
-                    util=s.util,
-                    argv_overrides=s.argv or None,
-                ),
+                _recover_work,
                 action="start",
                 key=key,
             )
@@ -764,6 +771,7 @@ async def _reconcile_after_bind(
                 break
             await asyncio.sleep(interval_s)
         else:
+            rt.bind_failed = True
             rt.hub.publish(
                 "notice",
                 {
@@ -1424,13 +1432,14 @@ def create_app(
             await asyncio.to_thread(rt.routes.refresh)
         if run_telemetry:
             try:
-                sampler = await asyncio.to_thread(
+                built_sampler = await asyncio.to_thread(
                     lambda: _telemetry.Sampler(
                         state_dir=rt.settings.state_dir,
                         live_metrics_provider=lambda: _live_metrics_for_telemetry(rt),
                     )
                 )
-                sampler.start()
+                built_sampler.start()
+                sampler = built_sampler
             except Exception:  # noqa: BLE001 - telemetry must never block startup
                 log.exception("failed to start GPU telemetry sampler")
                 sampler = None
@@ -1471,8 +1480,8 @@ def create_app(
     app.middleware("http")(_same_origin_only)
 
     gw = _gateway.build_router(rt.routes, transport=gateway_transport)
-    app.state.gateway_client = gw.gateway_client
-    app.state.gateway_owns_client = gw.gateway_owns_client
+    app.state.gateway_client = getattr(gw, "gateway_client", None)
+    app.state.gateway_owns_client = getattr(gw, "gateway_owns_client", False)
     _register_api(app, rt)
     # The gateway LAST: its `/v1/{path:path}` is a catch-all, and Starlette
     # matches in registration order, so a route registered after it is dead.

@@ -473,7 +473,11 @@ def model_rows(
                 "quant": g("quant_algo") or "—",
                 "model_max_ctx": ctx or g("max_position_embeddings") or DEFAULT_MODEL_MAX_CTX,
                 "trust": "measured" if key in live_keys else "estimated",
-                "weights_gib": (round(float(g("safetensors_gib")), 2) if g("safetensors_gib") is not None else None),
+                "weights_gib": (
+                    round(float(st_gib), 2)
+                    if (st_gib := g("safetensors_gib")) is not None
+                    else None
+                ),
                 "serving": bool(live_keys.get(key)),
                 # The utilisation this model is proven at (models.toml `util`),
                 # so the allocator starts from it instead of a page-wide 0.95
@@ -893,7 +897,8 @@ def augment_state(
         "host": host_ram(),
         "uptime_s": int(time.time() - STARTED_AT),
         "server_uptime_s": (
-            int(uptimes[main_key]) if main_key and uptimes.get(main_key) is not None
+            int(up_val)
+            if main_key and (up_val := uptimes.get(main_key)) is not None
             else process_uptime_s(pid)
         ),
     }
