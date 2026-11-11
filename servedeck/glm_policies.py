@@ -340,9 +340,13 @@ DEFAULT_MAX_REASONING_ENTRIES = 400
 
 def safe_reasoning(text: str) -> str:
     """Make stored reasoning safe to put back into a prompt, and bound it."""
-    for tag in UNSAFE_IN_PROMPT:
-        if tag in text:
-            text = text.replace(tag, "")
+    for _ in range(_STRIP_PASSES):
+        prev = text
+        for tag in UNSAFE_IN_PROMPT:
+            if tag in text:
+                text = text.replace(tag, "")
+        if text == prev:
+            break
     text = text.strip()
     if len(text) > MAX_RESTORED_CHARS:
         text = text[:MAX_RESTORED_CHARS] + " ..."
@@ -953,7 +957,7 @@ class GlmHook:
             self._saw_answer = True
         if delta.get("tool_calls"):
             self._saw_answer = True
-        if self._restore:
+        if self._restore or self._ring is not None:
             r = delta.get("reasoning")
             if not isinstance(r, str) or not r:
                 r = delta.get("reasoning_content")

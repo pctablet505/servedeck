@@ -84,13 +84,20 @@ class Settings:
     unit_prefix: str
 
     @property
+    def _url_host(self) -> str:
+        host = self.listen_host
+        if ":" in host and not host.startswith("["):
+            return f"[{host}]"
+        return host
+
+    @property
     def gateway_url(self) -> str:
         """The URL clients are configured with: ``http://host:port/v1``."""
-        return f"http://{self.listen_host}:{self.listen_port}/v1"
+        return f"http://{self._url_host}:{self.listen_port}/v1"
 
     @property
     def base_url(self) -> str:
-        return f"http://{self.listen_host}:{self.listen_port}"
+        return f"http://{self._url_host}:{self.listen_port}"
 
     @property
     def health_url(self) -> str:
@@ -107,14 +114,18 @@ class Settings:
         return self.state_dir / "desired.json"
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
+def _env_int(name: str, default: int, env: dict[str, str] | os._Environ[str] | None = None) -> int:
+    source = os.environ if env is None else env
+    raw = source.get(name)
     if not raw:
         return default
     try:
-        return int(raw)
+        value = int(raw)
     except ValueError as exc:
         raise SettingsError(f"{name}={raw!r} is not an integer") from exc
+    if not 1 <= value <= 65535:
+        raise SettingsError(f"{name}={value} must be in 1..65535")
+    return value
 
 
 def load(environ: dict[str, str] | None = None) -> Settings:
@@ -140,7 +151,7 @@ def load(environ: dict[str, str] | None = None) -> Settings:
             "'sd-test-' is the test suite's, and units.py refuses anything else."
         )
 
-    port = _env_int("SERVEDECK_PORT", DEFAULT_LISTEN_PORT)
+    port = _env_int("SERVEDECK_PORT", DEFAULT_LISTEN_PORT, env)
     host = env.get("SERVEDECK_HOST") or DEFAULT_LISTEN_HOST
 
     return Settings(

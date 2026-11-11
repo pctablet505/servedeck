@@ -8,7 +8,7 @@
 #
 # The live venv was built by these steps by hand on 2026-10-22; this script
 # has been run only with --dry-run.
-set -uo pipefail
+set -euo pipefail
 
 DRY_RUN=0
 TARGET_DIR=""

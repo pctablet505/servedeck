@@ -213,7 +213,7 @@ def test_doctor_command_all_ok_with_safe_ports(safe_toml, isolated_doctor_client
         _doctor, "run_doctor",
         lambda path, **kw: real(
             path, unit_run=_no_units, hub_dir=str(hub), shm_dir=shm,
-            desired_path=desired, power_limit_w=None, **kw
+            desired_path=desired, power_limit_w=None, ptrace_scope=0, **kw
         ),
     )
     rc = cli.main(["doctor", "--models-toml", str(safe_toml)])

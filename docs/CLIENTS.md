@@ -121,9 +121,9 @@ was ever configured with stays resolvable, and the 404 body lists them all.
 `base_url = http://localhost:<model port>/v1` (`codex-qwen.sh:835,920-926`), undoing the
 conversion and dropping the mirror. Do not launch through that script. Converging the homes
 means moving ~1 GB of live session and thread history, so it waits for a moment when no
-codex is running. Note that `doctor`'s `codex config` row reads model references out of
-`[profiles]` only, so with the profiles retired it reports `present, no model references
-found` — an OK that does not check the top-level `model`/`model_provider`.
+codex is running. `doctor`'s `codex:` rows validate both the top-level
+`model`/`model_provider` (`[model_providers.<name>].base_url`) and any legacy `[profiles]`
+entries.
 
 ## Kimi CLI
 

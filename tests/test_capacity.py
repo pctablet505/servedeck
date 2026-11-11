@@ -19,11 +19,10 @@ from pathlib import Path
 
 import pytest
 
+from servedeck import capacity as cap
 from servedeck.capacity import (
     FLASHNEXT_MIN_UTIL,
     FRAG_MARGIN_GIB,
-    GPU_TOTAL_GIB,
-    GPU_TOTAL_MIB,
     MAMBA_MAX_NUM_SEQS_INLINE,
     OVERHEAD_GIB_DEFAULT,
     TRAINING_MARKER_PATHS,
@@ -99,9 +98,10 @@ def _has(findings, code: str) -> bool:
 
 
 def test_constants_match_spec():
-    assert GPU_TOTAL_MIB == 97887
-    assert GPU_TOTAL_GIB == pytest.approx(95.5927734375, abs=1e-9)
-    assert OVERHEAD_GIB_DEFAULT == 4.7
+    cap.refresh_limits()
+    assert cap.GPU_TOTAL_MIB == 97887
+    assert cap.GPU_TOTAL_GIB == pytest.approx(95.5927734375, abs=1e-9)
+    assert cap.OVERHEAD_GIB_DEFAULT == 4.7
     assert FRAG_MARGIN_GIB == 1.0
     assert UTIL_THIN_MARGIN == 0.97
     assert VRAM_GUARD_HEADROOM_MIB == 4096
@@ -162,11 +162,11 @@ def test_acceptance_budget_and_bar_formulas():
     # budget_gib = util * GPU_TOTAL_GIB; kv_gib = budget - weights - overhead;
     # bar percentages are of GPU_TOTAL_GIB and sum to <=100.
     r = compute(FLASHNEXT, util=0.96, ctx=262144, max_num_seqs=128)
-    assert r.budget_gib == pytest.approx(0.96 * GPU_TOTAL_GIB)
+    assert r.budget_gib == pytest.approx(0.96 * cap.GPU_TOTAL_GIB)
     assert r.kv_gib == pytest.approx(r.budget_gib - 78.47 - 4.47)
     total_pct = r.bar.weights_pct + r.bar.kv_pct + r.bar.overhead_pct + r.bar.free_pct
     assert total_pct == pytest.approx(100.0, abs=1e-6)
-    assert r.bar.weights_pct == pytest.approx(78.47 / GPU_TOTAL_GIB * 100.0)
+    assert r.bar.weights_pct == pytest.approx(78.47 / cap.GPU_TOTAL_GIB * 100.0)
 
 
 # ---------------------------------------------------------------------------
@@ -207,10 +207,10 @@ def test_blue_green_awq_mtp_feasible():
 def test_blue_green_fits_formula_is_weights_plus_overhead_plus_margin():
     # fits = (w_a + w_b + 2*overhead + FRAG_MARGIN) <= GPU_TOTAL_GIB (SPEC §3).
     v = blue_green(NVFP4_27B, FP8_27B, util_a=0.47, util_b=0.47, ctx=262144)
-    expected_combined = 20.75 + 28.51 + 2 * OVERHEAD_GIB_DEFAULT
+    expected_combined = 20.75 + 28.51 + 2 * cap.OVERHEAD_GIB_DEFAULT
     assert v.combined_gib == pytest.approx(expected_combined)
     assert v.required_gib == pytest.approx(expected_combined + FRAG_MARGIN_GIB)
-    assert v.feasible == (v.required_gib <= GPU_TOTAL_GIB)
+    assert v.feasible == (v.required_gib <= cap.GPU_TOTAL_GIB)
 
 
 # ---------------------------------------------------------------------------

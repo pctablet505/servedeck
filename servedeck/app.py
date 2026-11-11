@@ -74,8 +74,10 @@ from servedeck import models as _models
 from servedeck import parallelism as _parallelism
 from servedeck import routes as _routes
 from servedeck import settings as _settings
+from servedeck import telemetry as _telemetry
 from servedeck import units as _units
 from servedeck import wire as _wire
+from servedeck import xid_watch as _xid_watch
 
 log = logging.getLogger(__name__)
 
@@ -242,6 +244,7 @@ class Runtime:
     #: parsing that back out of "start flashnext" would be a client reading
     #: English.
     busy: dict[str, str] | None = None
+    reconcile_pending: bool = False
     first_state: asyncio.Event = field(default_factory=asyncio.Event)
     #: A nonce this process invents at startup and echoes from /api/health.
     #: ``_reconcile_after_bind`` requires it back before it will start a model.
@@ -343,6 +346,7 @@ def _headroom(
     snapshot: dict[str, Any] | None,
     full_ctx: int,
     free_mib: int | None,
+    max_num_seqs: int | None = None,
 ) -> dict[str, Any]:
     """How much more work the running engine can take on.
 
@@ -396,13 +400,18 @@ def _headroom(
             "checkpoint is not in the local hub cache)"
         )
         return base
+    effective_seqs = max_num_seqs if max_num_seqs is not None else (snapshot or {}).get("max_num_seqs")
     full = _parallelism.recommend(
-        pool_tokens=int(pool), prompt_tokens=full_ctx, basis="full context"
+        pool_tokens=int(pool),
+        prompt_tokens=full_ctx,
+        basis="full context",
+        max_num_seqs=max_num_seqs,
     )
     small = _parallelism.recommend(
         pool_tokens=int(pool),
         prompt_tokens=SMALL_REQUEST_TOKENS,
         basis=f"{SMALL_REQUEST_TOKENS}-token request",
+        max_num_seqs=max_num_seqs,
     )
     # The two figures above are ALTERNATIVES — each is what the whole pool
     # holds of one request shape. Printing them as "1 + 12" claimed a mix
@@ -412,14 +421,14 @@ def _headroom(
         pool_tokens=int(pool),
         full_ctx=full_ctx,
         sizes={"small": (float(SMALL_REQUEST_TOKENS), True)},
-        max_num_seqs=(snapshot or {}).get("max_num_seqs"),
+        max_num_seqs=effective_seqs,
     )
     beside = {big: row.get("small", 0) for big, row in mixed.rows}
     base.update(
         pool_tokens=int(pool),
-        full_context_requests=full.n_before_clamp,
+        full_context_requests=full.n,
         full_cost_tokens=full.cost_tokens,
-        small_requests=small.n_before_clamp,
+        small_requests=small.n,
         small_cost_tokens=small.cost_tokens,
         mixed=_mixed_sentence(beside, full_ctx),
         mixed_rows=beside,
@@ -514,6 +523,14 @@ async def build_state(rt: Runtime) -> dict[str, Any]:
         if view.unknown
     ]
 
+    main_seqs: int | None = None
+    if main_key and main_key in rt.registry.models:
+        main_view = live.get(main_key)
+        main_argv = _legacy.cmdline_of(main_view.pid) if (main_view and main_view.pid) else []
+        main_seqs = _legacy.int_flag(main_argv, "--max-num-seqs") or _legacy._registry_flag_int(
+            rt.registry.models[main_key], "--max-num-seqs"
+        )
+
     state = {
         "generated_at": time.time(),
         "gateway_url": rt.settings.gateway_url,
@@ -529,6 +546,7 @@ async def build_state(rt: Runtime) -> dict[str, Any]:
             snapshot=main_snapshot,
             full_ctx=main_ctx,
             free_mib=facts["gpu"]["free_mib"],
+            max_num_seqs=main_seqs,
         ),
     }
     # The v1 page's blocks, ADDED to the document (legacy_page): upstream,
@@ -630,7 +648,7 @@ def _recover_desired(rt: Runtime) -> None:
     documented Xid history, one persistent fault meant the box served nothing
     until somebody noticed.
     """
-    if rt.busy is not None:  # a mutation is already in flight
+    if rt.busy is not None or rt.reconcile_pending:  # a mutation or startup reconcile is in flight
         return
     try:
         want = _desired.load(rt.settings.desired_path)
@@ -739,41 +757,54 @@ async def _reconcile_after_bind(
 
     Returns the Reconciliation, or None if the port never answered.
     """
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if await _own_port_answers(rt.client, rt.settings.health_url, rt.instance_id):
-            break
-        await asyncio.sleep(interval_s)
-    else:
-        rt.hub.publish(
-            "notice",
-            {
-                "level": "error",
-                "reason": "bind_timeout",
-                "message": (
-                    f"{rt.settings.base_url} did not answer as THIS process within "
-                    f"{timeout_s:.0f}s; not reconciling. Either the bind failed, or "
-                    "another servedeck is holding the port."
-                ),
-            },
-        )
-        return None
+    try:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if await _own_port_answers(rt.client, rt.settings.health_url, rt.instance_id):
+                break
+            await asyncio.sleep(interval_s)
+        else:
+            rt.hub.publish(
+                "notice",
+                {
+                    "level": "error",
+                    "reason": "bind_timeout",
+                    "message": (
+                        f"{rt.settings.base_url} did not answer as THIS process within "
+                        f"{timeout_s:.0f}s; not reconciling. Either the bind failed, or "
+                        "another servedeck is holding the port."
+                    ),
+                },
+            )
+            return None
 
-    want = await asyncio.to_thread(_desired.load, rt.settings.desired_path)
-    rt.hub.publish(
-        "notice",
-        {
-            "level": "info",
-            "reason": "reconciling",
-            "message": f"listening on {rt.settings.base_url}; reconciling desired state",
-            "desired": {"main": want.main, "residents": list(want.residents)},
-        },
-    )
-    result = await asyncio.to_thread(
-        lambda: rt.control.reconcile(want, on_progress=_progress_publisher(rt.hub, "reconcile", rt.boot))
-    )
-    _publish_reconciliation(rt.hub, result)
-    return result
+        async with rt.lock:
+            want = await asyncio.to_thread(_desired.load, rt.settings.desired_path)
+            target_key = want.main or (want.residents[0] if want.residents else "reconcile")
+            rt.busy = {"action": "reconcile", "key": target_key, "label": "reconcile"}
+            rt.hub.publish(
+                "notice",
+                {
+                    "level": "info",
+                    "reason": "reconciling",
+                    "message": f"listening on {rt.settings.base_url}; reconciling desired state",
+                    "desired": {"main": want.main, "residents": list(want.residents)},
+                },
+            )
+            try:
+                result = await asyncio.to_thread(
+                    lambda: rt.control.reconcile(
+                        want, on_progress=_progress_publisher(rt.hub, target_key, rt.boot)
+                    )
+                )
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(rt.routes.refresh)
+                _publish_reconciliation(rt.hub, result)
+            finally:
+                rt.busy = None
+        return result
+    finally:
+        rt.reconcile_pending = False
 
 
 def _progress_publisher(
@@ -787,7 +818,7 @@ def _progress_publisher(
 
     def on_progress(event: Any) -> None:
         if boot is not None:
-            boot.record(key, event.kind, event.marker_index, event.elapsed_s)
+            boot.record(key, event.kind, event.marker_index, event.elapsed_s, getattr(event, "text", ""))
         hub.publish(
             "progress",
             {
@@ -1030,6 +1061,7 @@ async def _run_mutation(
             result = await asyncio.to_thread(work)
         except Exception as exc:  # noqa: BLE001 - a failed mutation is a notice
             log.exception("%s failed", label)
+            rt.boot.finish(failed=True)
             rt.hub.publish(
                 "notice",
                 {
@@ -1048,7 +1080,7 @@ async def _run_mutation(
             # "ready" got 503 "still starting" (2026-10-18).
             with contextlib.suppress(Exception):
                 await asyncio.to_thread(rt.routes.refresh)
-            _publish_result(rt.hub, label, result)
+            _publish_result(rt.hub, label, result, boot=rt.boot)
         finally:
             # `else` runs before `finally`, and the except branch publishes
             # before returning, so every exit path has announced its outcome by
@@ -1060,8 +1092,12 @@ async def _run_mutation(
         rt.hub.publish("state", state)
 
 
-def _publish_result(hub: Hub, label: str, result: Any) -> None:
+def _publish_result(
+    hub: Hub, label: str, result: Any, *, boot: _legacy.BootTracker | None = None
+) -> None:
     if isinstance(result, _control.Refusal):
+        if boot is not None:
+            boot.finish(clear=True)
         hub.publish(
             "notice",
             {
@@ -1075,6 +1111,11 @@ def _publish_result(hub: Hub, label: str, result: Any) -> None:
         return
     if isinstance(result, _control.StartResult):
         aborted = not result.ready and result.aborted
+        if boot is not None:
+            if aborted:
+                boot.finish(clear=True)
+            elif not result.ready:
+                boot.finish(failed=True)
         hub.publish(
             "notice",
             {
@@ -1092,6 +1133,8 @@ def _publish_result(hub: Hub, label: str, result: Any) -> None:
         )
         return
     if isinstance(result, _control.StopResult):
+        if boot is not None:
+            boot.finish(clear=True)
         hub.publish(
             "notice",
             {
@@ -1106,7 +1149,7 @@ def _publish_result(hub: Hub, label: str, result: Any) -> None:
         )
         return
     if isinstance(result, _control.SwitchResult):
-        _publish_result(hub, label, result.started)
+        _publish_result(hub, label, result.started, boot=boot)
         return
     if isinstance(result, _control.Adoption):
         hub.publish(
@@ -1335,6 +1378,17 @@ class _RegistryAdapter:
         return list(self.specs)
 
 
+def _live_metrics_for_telemetry(rt: Runtime) -> dict[str, Any] | None:
+    vllm = rt.state.get("vllm") if rt.state else None
+    if not isinstance(vllm, dict) or not vllm.get("reachable"):
+        return None
+    return {
+        "running": vllm.get("running"),
+        "waiting": vllm.get("waiting"),
+        "kv_usage_perc": vllm.get("kv_usage_perc"),
+    }
+
+
 def create_app(
     settings: _settings.Settings | None = None,
     *,
@@ -1344,24 +1398,48 @@ def create_app(
     gateway_transport: httpx.AsyncBaseTransport | None = None,
     reconcile: bool = True,
     poll: bool = True,
+    telemetry: bool | None = None,
 ) -> FastAPI:
     """Build the ASGI app.
 
     ``reconcile``/``poll`` default on and are turned off by tests that want the
-    routes without the background machinery. They are parameters rather than
-    environment variables because a test that has to set an env var to stop the
-    app launching a model is one forgotten fixture away from launching one.
+    routes without the background machinery. ``telemetry`` defaults to
+    ``reconcile`` so production runs the GPU telemetry sampler and Xid watcher
+    automatically while hermetic unit tests stay subprocess-free.
     """
     rt = build_runtime(settings, registry=registry, control=control, client=client)
+    run_telemetry = reconcile if telemetry is None else telemetry
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         rt.hub.bind(asyncio.get_running_loop())
         tasks: list[asyncio.Task[Any]] = []
+        sampler: Any | None = None
+        watcher: Any | None = None
+        if reconcile:
+            rt.reconcile_pending = True
         # One synchronous refresh before anything serves, so the first request
         # sees the truth rather than an empty table that 503s every model.
         with contextlib.suppress(Exception):
             await asyncio.to_thread(rt.routes.refresh)
+        if run_telemetry:
+            try:
+                sampler = await asyncio.to_thread(
+                    lambda: _telemetry.Sampler(
+                        state_dir=rt.settings.state_dir,
+                        live_metrics_provider=lambda: _live_metrics_for_telemetry(rt),
+                    )
+                )
+                sampler.start()
+            except Exception:  # noqa: BLE001 - telemetry must never block startup
+                log.exception("failed to start GPU telemetry sampler")
+                sampler = None
+            try:
+                watcher = _xid_watch.XidWatcher(state_dir=rt.settings.state_dir)
+                watcher.start()
+            except Exception:  # noqa: BLE001 - Xid watcher must never block startup
+                log.exception("failed to start GPU Xid watcher")
+                watcher = None
         if poll:
             tasks.append(asyncio.create_task(_poll_loop(rt), name="servedeck-poll"))
         if reconcile:
@@ -1372,6 +1450,12 @@ def create_app(
             # Subscribers first: a generator parked on queue.get() is what made
             # every shutdown take TimeoutStopSec.
             rt.hub.close()
+            if sampler is not None:
+                with contextlib.suppress(Exception):
+                    await sampler.stop()
+            if watcher is not None:
+                with contextlib.suppress(Exception):
+                    await watcher.stop()
             for task in tasks:
                 task.cancel()
             for task in tasks:
@@ -1610,9 +1694,7 @@ def _wire_payload(rt: Runtime, apply: bool) -> dict[str, Any]:
         backup: str | None = None
         if changed and apply:
             backup_dir = rt.settings.state_dir / "backups" / date.today().isoformat()
-            backup_dir.mkdir(parents=True, exist_ok=True)
-            backup_path = backup_dir / str(target.path).lstrip("/").replace("/", "_")
-            backup_path.write_text(before)
+            backup_path = _wire.write_backup(backup_dir, target.path, before)
             target.path.parent.mkdir(parents=True, exist_ok=True)
             target.path.write_text(after)
             backup = str(backup_path)

@@ -47,6 +47,7 @@ __all__ = [
     "render_kimi",
     "make_default_ctx_resolver",
     "read_existing",
+    "write_backup",
     "unified_diff",
     "WireTarget",
 ]
@@ -174,10 +175,34 @@ def render_vscode(
 # --------------------------------------------------------------------------- #
 
 
+def _section_end_line(lines: list[str], start: int) -> int:
+    """Line index where the table starting at ``lines[start]`` ends.
+
+    Internal ``#`` comments (above a ``key = value`` line inside the same
+    table) belong to this table; trailing ``#`` comments after this table's
+    last ``key = value`` line belong to whatever comes next (including our own
+    ``_OWNED_COMMENT`` above the following table).
+    """
+    table_end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if lines[j].startswith("["):
+            table_end = j
+            break
+    last_kv = start
+    for j in range(start + 1, table_end):
+        stripped = lines[j].strip()
+        if stripped and not stripped.startswith("#"):
+            last_kv = j
+    for j in range(last_kv + 1, table_end):
+        if lines[j].lstrip().startswith("#"):
+            return j
+    return table_end
+
+
 def _find_top_level_section(text: str, header: str) -> tuple[int, int] | None:
     """Byte span of the table starting at the line ``header`` (exact match,
-    trailing whitespace ignored), up to but not including the next line that
-    starts with ``[`` (any top-level or dotted table header) or EOF. ``None``
+    trailing whitespace ignored), up to the next ``[`` table header (excluding
+    any trailing comment block belonging to that next table) or EOF. ``None``
     if ``header`` does not appear as its own line."""
     lines = text.splitlines(keepends=True)
     start = None
@@ -187,17 +212,7 @@ def _find_top_level_section(text: str, header: str) -> tuple[int, int] | None:
             break
     if start is None:
         return None
-    end = len(lines)
-    for j in range(start + 1, len(lines)):
-        # ANY comment below the table ends its span, ours included. A foreign
-        # comment belongs to whatever comes next, so ending the span at the
-        # next "[" swallowed it and every `wire --apply` silently deleted the
-        # operator's notes between two tables; and swallowing OUR OWN marker
-        # un-owned the table below it, which is why retiring the Codex
-        # profiles removed only alternate ones. Both found 2026-09-18.
-        if lines[j].startswith("[") or lines[j].lstrip().startswith("#"):
-            end = j
-            break
+    end = _section_end_line(lines, start)
     start_off = sum(len(l) for l in lines[:start])
     end_off = sum(len(l) for l in lines[:end])
     return start_off, end_off
@@ -287,9 +302,12 @@ def _upsert_top_level(text: str, data: dict[str, Any]) -> str:
     return "".join(lines)
 
 
-def _remove_sections(text: str, prefix: str) -> str:
-    """Delete every table whose header starts with ``prefix`` AND is preceded
-    by our generated-by comment — tables servedeck wrote and no longer owns.
+def _remove_sections(
+    text: str, prefix: str, *, keep_headers: set[str] | None = None
+) -> str:
+    """Delete every table whose header starts with ``prefix`` (excluding any in
+    ``keep_headers``) AND is preceded by our generated-by comment — tables
+    servedeck wrote and no longer owns.
 
     An upsert-only generator cannot retire anything: the ``[profiles.<key>]``
     tables written before 2026-09-18 are the exact reason Codex refuses
@@ -301,8 +319,10 @@ def _remove_sections(text: str, prefix: str) -> str:
     out: list[str] = []
     i = 0
     while i < len(lines):
+        hdr = lines[i].rstrip("\n").rstrip("\r")
         is_ours = (
-            lines[i].startswith(prefix)
+            hdr.startswith(prefix)
+            and (keep_headers is None or hdr not in keep_headers)
             and out
             and out[-1].rstrip("\n") == _OWNED_COMMENT
         )
@@ -311,16 +331,7 @@ def _remove_sections(text: str, prefix: str) -> str:
             i += 1
             continue
         out.pop()  # drop our comment too
-        i += 1
-        while i < len(lines):
-            # ANY comment ends the span, our own included: the only comment
-            # inside a table's span is the one directly above its header (the
-            # pop above), and consuming the NEXT table's marker made this
-            # remove alternate tables only — qwen27b and glm53 went, flashnext
-            # and lfm2 stayed, because each removal ate the following marker.
-            if lines[i].startswith("[") or lines[i].lstrip().startswith("#"):
-                break
-            i += 1
+        i = _section_end_line(lines, i)
         while out and out[-1].strip() == "":
             out.pop()
         if out:
@@ -424,14 +435,24 @@ def render_kimi(
     """One ``[providers.servedeck]``, one ``[models."servedeck/<key>"]`` per
     model, and ``[thinking] enabled = true``. Everything else (the managed
     kimi-code provider, other models, oauth, services) is left untouched."""
-    text = existing_text
+    resolved = {key: resolve_ctx(m) for key, m in registry.models.items()}
+    main_models = [m for m in registry.models.values() if m.slot == "main" and resolved[m.key] > 0]
+    wanted_headers = {
+        f'[models."servedeck/{key}"]' for key, ctx in resolved.items() if ctx > 0
+    }
+    if main_models:
+        wanted_headers.add(f'[models."servedeck/{_MAIN_ROUTE}"]')
+
+    text = _remove_sections(
+        existing_text, '[models."servedeck/', keep_headers=wanted_headers
+    )
     text = _upsert_section(
         text,
         "[providers.servedeck]",
         {"type": "openai", "base_url": f"{GATEWAY_BASE_URL}/v1", "api_key": "local-no-auth"},
     )
     for key, m in registry.models.items():
-        ctx = resolve_ctx(m)
+        ctx = resolved[key]
         if ctx <= 0:
             continue
         data = {
@@ -448,7 +469,6 @@ def render_kimi(
     # switched, and the owner then has to edit three client configs to get a
     # working local model back.
     # A context of 0 is unknown (see make_default_ctx_resolver): left out.
-    main_models = [m for m in registry.models.values() if m.slot == "main" and resolve_ctx(m) > 0]
     if main_models:
         ctx = _slot_ctx(registry, resolve_ctx)
         caps: list[str] = []
@@ -523,6 +543,21 @@ def make_default_ctx_resolver(
         return cache[m.key]
 
     return resolve
+
+
+def write_backup(backup_dir: Path, target_path: Path, old_content: str) -> Path:
+    """Write ``old_content`` into ``backup_dir`` without overwriting an earlier
+    backup taken on the same day."""
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    base_name = str(target_path).lstrip("/").replace("/", "_")
+    candidate = backup_dir / base_name
+    if candidate.exists():
+        n = 1
+        while (backup_dir / f"{base_name}.{n}").exists():
+            n += 1
+        candidate = backup_dir / f"{base_name}.{n}"
+    candidate.write_text(old_content)
+    return candidate
 
 
 def read_existing(path: Path) -> str:

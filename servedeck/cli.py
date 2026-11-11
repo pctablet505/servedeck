@@ -53,6 +53,7 @@ _TERMINAL: dict[str, int] = {
     "ready": 0,
     "stopped": 0,
     "adopted": 0,
+    "aborted": 1,
     "boot_failed": 1,
     "exception": 1,
     # Every control.Refusal reason: the mutation was accepted and then refused
@@ -62,12 +63,18 @@ _TERMINAL: dict[str, int] = {
     "main_slot_busy": 1,
     "not_main_slot": 1,
     "not_enough_vram": 1,
+    "not_enough_host_ram": 1,
+    "conflicting_offload": 1,
+    "port_busy": 1,
+    "env_scan_failed": 1,
     "gpu_unavailable": 1,
     "no_vram_budget": 1,
     "start_failed": 1,
     "stop_failed": 1,
     "vram_not_released": 1,
+    "vram_accounting_unavailable": 1,
     "bad_key": 1,
+    "ctx_unresolved": 1,
 }
 
 
@@ -120,10 +127,7 @@ def _cmd_models(args: argparse.Namespace) -> int:
 
 def _backup_and_write(path: Path, old_content: str) -> Path:
     backup_dir = _wire.BACKUP_ROOT / date.today().isoformat()
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    backup_path = backup_dir / str(path).lstrip("/").replace("/", "_")
-    backup_path.write_text(old_content)
-    return backup_path
+    return _wire.write_backup(backup_dir, path, old_content)
 
 
 def _cmd_wire(args: argparse.Namespace) -> int:
@@ -282,7 +286,12 @@ def _cmd_log(args: argparse.Namespace) -> int:
         from . import units as _units
 
         unit = f"{_settings.get().unit_prefix}{args.key}"
-        for line in _units.journal_tail(unit, args.lines):
+        try:
+            lines = _units.journal_tail(unit, args.lines)
+        except _units.UnitError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        for line in lines:
             print(line)
         return 0
     for line in payload["lines"]:
@@ -314,22 +323,28 @@ def _drive_via_dashboard(base: str, action: str, key: str, timeout_s: float) -> 
         "switch": f"/api/switch/{key}",
     }[action]
 
-    with httpx.Client(timeout=_STREAM_TIMEOUT) as client:
-        with client.stream("GET", f"{base}/api/events") as stream:
-            if stream.status_code != 200:
-                print(f"error: /api/events answered {stream.status_code}", file=sys.stderr)
-                return 1
-            try:
-                response = client.post(f"{base}{path}", timeout=_QUICK_TIMEOUT)
-            except httpx.HTTPError as exc:
-                print(f"error: {exc}", file=sys.stderr)
-                return 1
-            if response.status_code != 202:
-                body = _error_of(response)
-                print(f"refused ({response.status_code}): {body}", file=sys.stderr)
-                return 1
-            print(f"{action} {key}: accepted", flush=True)
-            return _consume_events(stream, key, action)
+    read_timeout = max(5.0, float(timeout_s)) if timeout_s and timeout_s > 0 else None
+    stream_timeout = httpx.Timeout(connect=2.0, read=read_timeout, write=10.0, pool=10.0)
+    try:
+        with httpx.Client(timeout=stream_timeout) as client:
+            with client.stream("GET", f"{base}/api/events") as stream:
+                if stream.status_code != 200:
+                    print(f"error: /api/events answered {stream.status_code}", file=sys.stderr)
+                    return 1
+                try:
+                    response = client.post(f"{base}{path}", timeout=_QUICK_TIMEOUT)
+                except httpx.HTTPError as exc:
+                    print(f"error: {exc}", file=sys.stderr)
+                    return 1
+                if response.status_code != 202:
+                    body = _error_of(response)
+                    print(f"refused ({response.status_code}): {body}", file=sys.stderr)
+                    return 1
+                print(f"{action} {key}: accepted", flush=True)
+                return _consume_events(stream, key, action, timeout_s=timeout_s)
+    except httpx.TimeoutException:
+        print(f"error: timed out after {timeout_s:.0f}s waiting for {action} {key}", file=sys.stderr)
+        return 1
 
 
 def _error_of(response: httpx.Response) -> str:
@@ -343,7 +358,9 @@ def _error_of(response: httpx.Response) -> str:
     return json.dumps(payload)
 
 
-def _consume_events(stream: httpx.Response, key: str, action: str) -> int:
+def _consume_events(
+    stream: httpx.Response, key: str, action: str, *, timeout_s: float | None = None
+) -> int:
     """Print progress for ``key`` until a terminal notice arrives.
 
     Events for other models are ignored rather than printed: a resident
@@ -351,8 +368,14 @@ def _consume_events(stream: httpx.Response, key: str, action: str) -> int:
     the two is how an operator reads the wrong journal line as the cause of a
     failure.
     """
+    import time as _time
+
+    deadline = (_time.monotonic() + timeout_s) if (timeout_s and timeout_s > 0) else None
     event_type = ""
     for line in stream.iter_lines():
+        if deadline is not None and _time.monotonic() > deadline:
+            print(f"error: timed out after {timeout_s:.0f}s waiting for {action} {key}", file=sys.stderr)
+            return 1
         line = line.rstrip("\r")
         if line.startswith("event: "):
             event_type = line[7:].strip()
@@ -376,6 +399,8 @@ def _consume_events(stream: httpx.Response, key: str, action: str) -> int:
             if data.get("key") not in (key, None, ""):
                 continue
             code = _TERMINAL.get(reason)
+            if code is None and data.get("level") == "error":
+                code = 1
             if code is None:
                 continue
             message = data.get("message", reason)
@@ -408,12 +433,18 @@ def _drive_directly(action: str, key: str, timeout_s: float) -> int:
     def on_progress(event: Any) -> None:
         _print_progress(event.kind, event.text)
 
-    if action == "start":
-        result: Any = control.start(key, timeout_s=timeout_s, on_progress=on_progress)
-    elif action == "stop":
-        result = control.stop(key)
-    else:
-        result = control.switch(key, timeout_s=timeout_s, on_progress=on_progress)
+    from . import units as _units
+
+    try:
+        if action == "start":
+            result: Any = control.start(key, timeout_s=timeout_s, on_progress=on_progress)
+        elif action == "stop":
+            result = control.stop(key)
+        else:
+            result = control.switch(key, timeout_s=timeout_s, on_progress=on_progress)
+    except _units.UnitError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     if isinstance(result, _control.SwitchResult):
         if result.stopped is not None:
@@ -456,12 +487,17 @@ def _cmd_adopt(args: argparse.Namespace) -> int:
         return 0 if response.status_code == 202 else 1
     print("dashboard not running, acting directly", file=sys.stderr)
     from . import app as _app
+    from . import units as _units
 
     settings = _settings.get()
     registry = _load_or_report(settings.models_path)
     if registry is None:
         return 1
-    result = _app.build_control(settings, registry).adopt()
+    try:
+        result = _app.build_control(settings, registry).adopt()
+    except _units.UnitError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     print(f"adopted: {result.adopted or 'nothing'}")
     for unit in result.unknown_units:
         print(f"warning: {unit} is running but is not in models.toml", file=sys.stderr)
@@ -486,7 +522,9 @@ _SMOKE_TOOL = {
 }
 
 
-def _cmd_smoke(args: argparse.Namespace) -> int:
+def _cmd_smoke(
+    args: argparse.Namespace, *, transport: httpx.BaseTransport | None = None
+) -> int:
     """Two requests through the gateway: a plain chat and a tool call.
 
     Through the GATEWAY, on the model's public name — never at the model's own
@@ -495,77 +533,84 @@ def _cmd_smoke(args: argparse.Namespace) -> int:
     failure that produced two 404 outages (REDESIGN §4 R1). Hitting :8004
     directly would pass in exactly the situation the check exists to catch.
     """
+    from . import routes as _routes
+
     base = _base_url(args)
-    reg = _load_or_report(_settings.get().models_path)
+    models_path = getattr(args, "models_toml", None) or _settings.get().models_path
+    reg = _load_or_report(models_path)
     if reg is None:
         return 1
-    found = reg.resolve(args.key)
-    if found is None:
-        print(f"error: no model {args.key!r} in the registry", file=sys.stderr)
-        return 1
-    name = args.key if args.key != found.model.key else found.model.id
+    if args.key in _routes.MAIN_ALIASES:
+        name = args.key
+    else:
+        found = reg.resolve(args.key)
+        if found is None:
+            print(f"error: no model {args.key!r} in the registry", file=sys.stderr)
+            return 1
+        name = args.key if args.key != found.model.key else found.model.id
     url = f"{base}/v1/chat/completions"
     failures = 0
 
     print(f"smoke {name} via {url}")
-    try:
-        plain = httpx.post(
-            url,
-            json={
-                "model": name,
-                "messages": [{"role": "user", "content": "Reply with exactly: ok"}],
-                "max_tokens": 32,
-                "temperature": 0.0,
-            },
-            timeout=args.timeout,
-        )
-    except httpx.HTTPError as exc:
-        print(f"  FAIL chat: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return 1
-    if plain.status_code != 200:
-        print(f"  FAIL chat: HTTP {plain.status_code} {_error_of(plain)}", file=sys.stderr)
-        failures += 1
-    else:
-        message = (plain.json()["choices"][0] or {}).get("message") or {}
-        content = message.get("content")
-        if not content:
-            print("  FAIL chat: 200 but the message has no content", file=sys.stderr)
+    with httpx.Client(transport=transport, timeout=args.timeout) as client:
+        try:
+            plain = client.post(
+                url,
+                json={
+                    "model": name,
+                    "messages": [{"role": "user", "content": "Reply with exactly: ok"}],
+                    "max_tokens": 32,
+                    "temperature": 0.0,
+                },
+            )
+        except httpx.HTTPError as exc:
+            print(f"  FAIL chat: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        if plain.status_code != 200:
+            print(f"  FAIL chat: HTTP {plain.status_code} {_error_of(plain)}", file=sys.stderr)
             failures += 1
         else:
-            print(f"  ok   chat: {content.strip()[:60]!r}")
-        if message.get("reasoning_content"):
-            print("  ok   reasoning_content is present (the mirror is working)")
+            choices = plain.json().get("choices") or []
+            message = (choices[0] or {}).get("message") or {} if choices else {}
+            content = message.get("content")
+            if not content:
+                print("  FAIL chat: 200 but the message has no content", file=sys.stderr)
+                failures += 1
+            else:
+                print(f"  ok   chat: {content.strip()[:60]!r}")
+            if message.get("reasoning_content"):
+                print("  ok   reasoning_content is present (the mirror is working)")
 
-    try:
-        tooled = httpx.post(
-            url,
-            json={
-                "model": name,
-                "messages": [{"role": "user", "content": "What is the weather in Pune? Use the tool."}],
-                "tools": [_SMOKE_TOOL],
-                "tool_choice": "auto",
-                "max_tokens": 128,
-                "temperature": 0.0,
-            },
-            timeout=args.timeout,
-        )
-    except httpx.HTTPError as exc:
-        print(f"  FAIL tools: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return 1
-    if tooled.status_code != 200:
-        print(f"  FAIL tools: HTTP {tooled.status_code} {_error_of(tooled)}", file=sys.stderr)
-        failures += 1
-    else:
-        message = (tooled.json()["choices"][0] or {}).get("message") or {}
-        calls = message.get("tool_calls") or []
-        if calls:
-            print(f"  ok   tools: called {calls[0]['function']['name']}")
+        try:
+            tooled = client.post(
+                url,
+                json={
+                    "model": name,
+                    "messages": [{"role": "user", "content": "What is the weather in Pune? Use the tool."}],
+                    "tools": [_SMOKE_TOOL],
+                    "tool_choice": "auto",
+                    "max_tokens": 128,
+                    "temperature": 0.0,
+                },
+            )
+        except httpx.HTTPError as exc:
+            print(f"  FAIL tools: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        if tooled.status_code != 200:
+            print(f"  FAIL tools: HTTP {tooled.status_code} {_error_of(tooled)}", file=sys.stderr)
+            failures += 1
         else:
-            # Not a failure: whether a model chooses to call is the model's
-            # business. That the request was ACCEPTED and parsed is what this
-            # proves, and saying otherwise would make the check fail for
-            # reasons the operator cannot act on.
-            print("  warn tools: 200, but the model answered in prose (no tool call)")
+            choices = tooled.json().get("choices") or []
+            message = (choices[0] or {}).get("message") or {} if choices else {}
+            calls = message.get("tool_calls") or []
+            if calls:
+                print(f"  ok   tools: called {calls[0]['function']['name']}")
+            else:
+                # Not a failure: whether a model chooses to call is the model's
+                # business. That the request was ACCEPTED and parsed is what this
+                # proves, and saying otherwise would make the check fail for
+                # reasons the operator cannot act on.
+                print("  warn tools: 200, but the model answered in prose (no tool call)")
     return 1 if failures else 0
 
 
@@ -642,10 +687,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_log.add_argument("-n", "--lines", type=int, default=80)
     p_log.set_defaults(func=_cmd_log)
 
-    p_smoke = sub.add_parser("smoke", parents=[remote], help="one chat + one tool call via the gateway")
-    p_smoke.add_argument("key", help="registry key, id, alias or preset")
+    p_smoke = sub.add_parser("smoke", parents=[common, remote], help="one chat + one tool call via the gateway")
+    p_smoke.add_argument("key", help="registry key, id, alias, preset, or 'main'")
     p_smoke.add_argument("--timeout", type=float, default=120.0)
     p_smoke.set_defaults(func=_cmd_smoke)
+
+    from . import cli_gpu as _cli_gpu
+
+    _cli_gpu.add_parser(sub)
 
     return parser
 

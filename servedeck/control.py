@@ -446,6 +446,20 @@ def _engine_pids(proc: Path) -> tuple[list[Path], bool]:
     return out, True
 
 
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 def offload_scan(
     proc: Path = Path("/proc"),
     witness_pids: Collection[int] = (),
@@ -460,15 +474,22 @@ def offload_scan(
     handoff, not for this — so the scan states its own trustworthiness
     instead of letting a permission error read as an absent holder.
     """
+    if not proc.is_dir():
+        return OffloadScan(trusted=False, why=f"{proc} is not a directory")
     dirs, listed = engine_pids(proc)
     if not listed:
         return OffloadScan(trusted=False, why=f"{proc} could not be listed")
-    seen = {int(d.name) for d in dirs}
+    seen = {int(d.name) for d in dirs if d.name.isdigit()}
     for pid in witness_pids:
         if pid not in seen:
             path = proc / str(pid)
             if path.exists():
                 dirs.append(path)
+            elif _pid_alive(pid):
+                return OffloadScan(
+                    trusted=False,
+                    why=f"{path} is missing for live witness pid {pid}",
+                )
     paths: set[str] = set()
     for d in dirs:
         read_something = exited = False
@@ -479,7 +500,8 @@ def offload_scan(
                     paths.add(parts[5].removesuffix(" (deleted)"))
             read_something = True
         except FileNotFoundError:
-            exited = True  # it went away while we walked: it holds nothing now
+            if not d.exists() and (not d.name.isdigit() or not _pid_alive(int(d.name))):
+                exited = True  # it went away while we walked: it holds nothing now
         except OSError:
             pass  # a permission error, which is the case this guard is for
         try:
@@ -547,12 +569,19 @@ def apply_argv_overrides(argv: list[str], overrides: Mapping[str, str | None] | 
         return argv
     out = list(argv)
     for flag, value in overrides.items():
+        eq_prefix = f"{flag}="
         for i, a in enumerate(out):
             if a == flag and i + 1 < len(out):
                 if value is None:
                     del out[i : i + 2]
                 else:
                     out[i + 1] = str(value)
+                break
+            if a.startswith(eq_prefix):
+                if value is None:
+                    del out[i]
+                else:
+                    out[i : i + 1] = [flag, str(value)]
                 break
         else:
             if value is not None:
@@ -902,9 +931,11 @@ class Control:
         guessed at: no spec means no port to probe and no slot to reason about.
         """
         out: list[LiveModel] = []
-        for unit in units.list_units(f"{self.unit_prefix}*", run=self._run):
+        for unit in units.list_units(f"{self.unit_prefix}*", run=self._run, active_only=True):
             key = self.key_for(unit)
             state = units.show(unit, run=self._run)
+            if state.active_state in ("inactive", "failed"):
+                continue
             spec = self._spec(key)
             if spec is None:
                 out.append(
@@ -985,7 +1016,9 @@ class Control:
 
     # -- utilisation ------------------------------------------------------
 
-    def compute_util(self, spec: ModelSpec) -> float | Refusal:
+    def compute_util(
+        self, spec: ModelSpec, *, requested_util: float | None = None
+    ) -> float | Refusal:
         """``--gpu-memory-utilization`` for this model, right now.
 
         main:     floor2((free_mib - margin_mib) / total_mib)
@@ -1009,6 +1042,16 @@ class Control:
         function returns, at least 700 MiB of the free pool is still there for
         the worker that is about to claim it.
         """
+        if requested_util is not None and (
+            isinstance(requested_util, bool)
+            or not math.isfinite(requested_util)
+            or not (0.0 < requested_util <= 1.0)
+        ):
+            return Refusal(
+                reason="not_enough_vram",
+                message=f"requested utilisation {requested_util!r} must be in (0, 1]",
+                key=spec.key,
+            )
         total = self.total_mib()
         if total is None or total <= 0:
             return Refusal(
@@ -1023,7 +1066,7 @@ class Control:
                 message="nvidia-smi could not report free VRAM; refusing to guess a utilisation",
                 key=spec.key,
             )
-        if free <= self.margin_mib:
+        if free <= self.margin_mib and spec.slot == "main":
             return Refusal(
                 reason="not_enough_vram",
                 message=(
@@ -1033,62 +1076,78 @@ class Control:
                 key=spec.key,
             )
         if spec.slot == "main":
-            util = floor2((free - self.margin_mib) / total)
-            pinned = getattr(spec, "util", None)
-            if pinned is not None:
-                # A registry `util` is the value this model is PROVEN to serve
-                # at (models.toml says which launcher proved it). Handing it
-                # more because the card happens to be empty is how a launch
-                # ends up at 0.98 and dies of CUDA OOM once agents arrive; and
-                # silently handing it LESS would change the KV budget, the
-                # context that fits and the agent count with no mention of it,
-                # so that is a refusal naming what is holding the card.
-                if util < pinned:
+            max_fit = floor2((free - self.margin_mib) / total)
+            if requested_util is not None:
+                need = math.ceil(total * requested_util)
+                cushion = min(self.margin_mib, RESIDENT_CUSHION_MIB)
+                if need + cushion > free:
                     return Refusal(
                         reason="not_enough_vram",
                         message=(
-                            f"{spec.key} is proven at utilisation {pinned:.2f} but only "
-                            f"{util:.2f} fits right now ({free} MiB free of {total} MiB, "
-                            f"less the {self.margin_mib} MiB margin). Free the card, or "
-                            f"launch it explicitly at a lower utilisation"
+                            f"requested utilisation {requested_util:.2f} needs {need} MiB "
+                            f"plus {cushion} MiB CUDA-context cushion, and only {free} MiB "
+                            f"of {total} MiB is free"
                         ),
                         key=spec.key,
                     )
-                util = pinned
+                util = requested_util
+            else:
+                util = max_fit
+                pinned = getattr(spec, "util", None)
+                if pinned is not None:
+                    # A registry `util` is the value this model is PROVEN to serve
+                    # at (models.toml says which launcher proved it). Handing it
+                    # more because the card happens to be empty is how a launch
+                    # ends up at 0.98 and dies of CUDA OOM once agents arrive; and
+                    # silently handing it LESS would change the KV budget, the
+                    # context that fits and the agent count with no mention of it,
+                    # so that is a refusal naming what is holding the card.
+                    if util < pinned:
+                        return Refusal(
+                            reason="not_enough_vram",
+                            message=(
+                                f"{spec.key} is proven at utilisation {pinned:.2f} but only "
+                                f"{util:.2f} fits right now ({free} MiB free of {total} MiB, "
+                                f"less the {self.margin_mib} MiB margin). Free the card, or "
+                                f"launch it explicitly at a lower utilisation"
+                            ),
+                            key=spec.key,
+                        )
+                    util = pinned
         else:
-            if spec.vram_mib is None or spec.vram_mib <= 0:
-                return Refusal(
-                    reason="no_vram_budget",
-                    message=f"resident {spec.key} has no vram_mib budget; utilisation is underived",
-                    key=spec.key,
-                )
-            # A resident's utilisation comes from its budget, so nothing in the
-            # arithmetic above notices that the budget does not fit. Without
-            # this check the unit launches, vLLM asks for 3.3 GiB of a card
-            # with 2 GiB free, and the failure arrives minutes later as a CUDA
-            # OOM in journald with no mention of the number that was wrong.
-            # What the resident will actually take is its DERIVED fraction of
-            # the card, and the margin is the main model's cushion — it has
-            # already been spent by the main model that is running. Charging
-            # the resident for it too is what made the opt-in resident
-            # unstartable in exactly the situation it exists for: 3,300 MiB
-            # budget, 3,735 MiB free, refused as "not enough VRAM" while its
-            # own allocation is 2,937 MiB and the v1 unit demonstrably ran it
-            # co-resident with a 0.96 main model (its header records ~0.6 GiB
-            # of slack in both boot orders at util 0.03).
-            need = math.ceil(total * floor2(spec.vram_mib / total))
-            if need + RESIDENT_CUSHION_MIB > free:
-                return Refusal(
-                    reason="not_enough_vram",
-                    message=(
-                        f"resident {spec.key} needs {need} MiB at utilisation "
-                        f"{floor2(spec.vram_mib / total):.2f} plus a "
-                        f"{RESIDENT_CUSHION_MIB} MiB CUDA-context cushion, and only "
-                        f"{free} MiB is free"
-                    ),
-                    key=spec.key,
-                )
-            util = floor2(spec.vram_mib / total)
+            if requested_util is not None:
+                need = math.ceil(total * requested_util)
+                if need + RESIDENT_CUSHION_MIB > free:
+                    return Refusal(
+                        reason="not_enough_vram",
+                        message=(
+                            f"resident {spec.key} needs {need} MiB at utilisation "
+                            f"{requested_util:.2f} plus a {RESIDENT_CUSHION_MIB} MiB "
+                            f"CUDA-context cushion, and only {free} MiB is free"
+                        ),
+                        key=spec.key,
+                    )
+                util = requested_util
+            else:
+                if spec.vram_mib is None or spec.vram_mib <= 0:
+                    return Refusal(
+                        reason="no_vram_budget",
+                        message=f"resident {spec.key} has no vram_mib budget; utilisation is underived",
+                        key=spec.key,
+                    )
+                need = math.ceil(total * floor2(spec.vram_mib / total))
+                if need + RESIDENT_CUSHION_MIB > free:
+                    return Refusal(
+                        reason="not_enough_vram",
+                        message=(
+                            f"resident {spec.key} needs {need} MiB at utilisation "
+                            f"{floor2(spec.vram_mib / total):.2f} plus a "
+                            f"{RESIDENT_CUSHION_MIB} MiB CUDA-context cushion, and only "
+                            f"{free} MiB is free"
+                        ),
+                        key=spec.key,
+                    )
+                util = floor2(spec.vram_mib / total)
         if util <= 0:
             return Refusal(
                 reason="not_enough_vram",
@@ -1163,14 +1222,15 @@ class Control:
                 )
 
         requested_util = None if util is None else float(util)
-        computed = self.compute_util(spec)
+        computed = self.compute_util(spec, requested_util=requested_util)
         if isinstance(computed, Refusal):
             self._booting.discard(key)
             return computed
-        chosen = computed if util is None else float(util)
-        if util is not None and chosen != computed:
-            log.info("%s: launching at util %.2f (operator override; computed %.2f)", key, chosen, computed)
-        util = chosen
+        if requested_util is not None:
+            baseline = self.compute_util(spec)
+            if not isinstance(baseline, Refusal) and computed != baseline:
+                log.info("%s: launching at util %.2f (operator override; default %.2f)", key, computed, baseline)
+        util = computed
 
         argv = apply_argv_overrides(list(spec.render_argv(util, spec.port)), argv_overrides)
         env = dict(spec.render_env())
@@ -1324,7 +1384,7 @@ class Control:
             # utilisation recomputed from an idle card (0.98 — the value with
             # the OOM-under-concurrency history). Only a ready boot is stored:
             # a configuration that failed is not one to repeat unattended.
-            if requested_util is not None or argv_overrides:
+            if requested_util is not None or argv_overrides is not None:
                 current_desired = current_desired.with_launch(
                     key,
                     desired_mod.Launch(
@@ -1571,6 +1631,8 @@ class Control:
             self._aborted.add(key)
             targets = [key]
         else:
+            if not self._booting:
+                return False
             self._abort_all = True
             self._aborted.update(self._booting)
             targets = list(self._booting)
@@ -1748,6 +1810,23 @@ class Control:
                             journal=[],
                         ),
                     )
+                if reason == "aborted" and self._take_abort(key):
+                    return SwitchResult(
+                        stopped=stopped,
+                        released=False,
+                        waited_s=waited,
+                        free_after_mib=free_after,
+                        started=StartResult(
+                            key=key,
+                            unit=self.unit_for(key),
+                            ready=False,
+                            elapsed_s=waited,
+                            markers=[],
+                            failure=f"boot of {key} was cancelled by operator",
+                            aborted=True,
+                            journal=[],
+                        ),
+                    )
                 if reason == "vram_accounting_unavailable":
                     return SwitchResult(
                         stopped=stopped,
@@ -1862,6 +1941,8 @@ class Control:
     ) -> tuple[bool, float, int | None, str | None]:
         while True:
             free_now = self._free_mib()
+            if self._abort_all or bool(self._aborted):
+                return False, self._clock() - started, free_now, "aborted"
             if free_now is not None and free_now >= target:
                 return True, self._clock() - started, free_now, None
             waited = self._clock() - started
@@ -1888,6 +1969,8 @@ class Control:
         stable = 0
         while True:
             free_now = self._free_mib()
+            if self._abort_all or bool(self._aborted):
+                return False, self._clock() - started, free_now, "aborted"
             if free_now is None:
                 return False, self._clock() - started, None, "vram_accounting_unavailable"
             if best is None or free_now > best:

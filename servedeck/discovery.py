@@ -653,7 +653,7 @@ def _estimate_kv_rate(
     rates: list[float] = []
     reverse_archs = _reverse_arch_backends()
     for obs in all_observations:
-        if obs.get("trust") != "measured":
+        if obs.get("trust") not in ("measured", None) or not isinstance(obs.get("measured"), dict):
             continue
         arch = reverse_archs.get(obs.get("backend"))
         if arch != architectures0:
@@ -711,13 +711,47 @@ def resolve_inputs(
         if obs_ctx is not None and rate is not None:
             other_ctx_kv_rates[int(obs_ctx)] = rate
 
+    def _latest_measured(pool: list[dict[str, Any]], field_name: str) -> float | None:
+        for item in reversed(pool):
+            val = (item.get("measured") or {}).get(field_name)
+            if val is not None:
+                return float(val)
+        return None
+
+    def _fallback_kv(
+        primary: list[dict[str, Any]], secondary: list[dict[str, Any]]
+    ) -> tuple[float | None, KvSource, int | None]:
+        for item in reversed(primary):
+            r = _kv_rate_of(item)
+            if r is not None:
+                c = (item.get("inputs") or {}).get("max_model_len")
+                return r, "measured", int(c) if c is not None else None
+        for item in reversed(secondary):
+            r = _kv_rate_of(item)
+            if r is not None:
+                c = (item.get("inputs") or {}).get("max_model_len")
+                return r, "measured_other_ctx", int(c) if c is not None else None
+        raw_cfg = load_model_config(repo_id, hub_dir)
+        est_rate, est_src, _ = _estimate_kv_rate(
+            architectures0,
+            all_observations,
+            cfg=raw_cfg,
+            ctx=ctx,
+            kv_cache_dtype=kv_cache_dtype,
+            mamba_ssm_dtype=mamba_ssm_dtype,
+        )
+        return est_rate, est_src, None
+
     # Tier 1: exact ctx match.
     exact = [o for o in repo_obs if (o.get("inputs") or {}).get("max_model_len") == ctx]
     if exact:
-        obs = exact[-1]  # most recently appended wins
-        measured = obs.get("measured") or {}
-        weights_gib = measured.get("weights_gib")
-        kv_rate = _kv_rate_of(obs)
+        weights_gib = _latest_measured(exact, "weights_gib")
+        if weights_gib is None:
+            weights_gib = _latest_measured(repo_obs, "weights_gib")
+        overhead_gib = _latest_measured(exact, "overhead_gib")
+        if overhead_gib is None:
+            overhead_gib = _latest_measured(repo_obs, "overhead_gib")
+        kv_rate, kv_src, matched = _fallback_kv(exact, repo_obs)
         return ResolvedInputs(
             repo_id=repo_id,
             backend=backend,
@@ -726,23 +760,23 @@ def resolve_inputs(
             weights_gib=weights_gib,
             weights_source="measured" if weights_gib is not None else "unknown",
             kv_kib_per_token=kv_rate,
-            kv_source="measured" if kv_rate is not None else "unknown",
+            kv_source=kv_src,
             trust="measured",
-            overhead_gib=measured.get("overhead_gib"),
+            overhead_gib=overhead_gib,
             model_max_ctx=model_max_ctx,
             model_type=model_type,
             architectures0=architectures0,
-            matched_ctx=ctx,
+            matched_ctx=matched if matched is not None else ctx,
             other_ctx_kv_rates=other_ctx_kv_rates,
         )
 
     # Tier 2: same repo_id, any ctx.
     if repo_obs:
         obs = repo_obs[-1]
-        measured = obs.get("measured") or {}
-        weights_gib = measured.get("weights_gib")
-        kv_rate = _kv_rate_of(obs)
-        matched_ctx = (obs.get("inputs") or {}).get("max_model_len")
+        weights_gib = _latest_measured(repo_obs, "weights_gib")
+        overhead_gib = _latest_measured(repo_obs, "overhead_gib")
+        kv_rate, kv_src, matched = _fallback_kv([], repo_obs)
+        fallback_ctx = (obs.get("inputs") or {}).get("max_model_len")
         return ResolvedInputs(
             repo_id=repo_id,
             backend=backend,
@@ -751,13 +785,13 @@ def resolve_inputs(
             weights_gib=weights_gib,
             weights_source="measured" if weights_gib is not None else "unknown",
             kv_kib_per_token=kv_rate,
-            kv_source="measured_other_ctx" if kv_rate is not None else "unknown",
+            kv_source=kv_src,
             trust="measured_other_ctx",
-            overhead_gib=measured.get("overhead_gib"),
+            overhead_gib=overhead_gib,
             model_max_ctx=model_max_ctx,
             model_type=model_type,
             architectures0=architectures0,
-            matched_ctx=int(matched_ctx) if matched_ctx is not None else None,
+            matched_ctx=matched if matched is not None else (int(fallback_ctx) if fallback_ctx is not None else None),
             other_ctx_kv_rates=other_ctx_kv_rates,
         )
 

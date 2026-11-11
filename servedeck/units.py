@@ -417,6 +417,7 @@ def start_transient(
     timeout_stop_sec: int = DEFAULT_TIMEOUT_STOP_SEC,
     run: Runner | None = None,
     memory_max: str = DEFAULT_MEMORY_MAX,
+    cpu_weight: int = DEFAULT_CPU_WEIGHT,
 ) -> None:
     """Launch ``argv`` as the transient user unit ``<name>.service``.
 
@@ -449,6 +450,7 @@ def start_transient(
             start_limit_burst,
             timeout_stop_sec,
             memory_max,
+            cpu_weight,
         ),
     )
 
@@ -633,7 +635,7 @@ def list_model_units_argv() -> list[str]:
     return list_units_argv("model-*")
 
 
-def list_units(pattern: str, run: Runner | None = None) -> list[str]:
+def list_units(pattern: str, run: Runner | None = None, *, active_only: bool = False) -> list[str]:
     """Units matching ``pattern``, WITHOUT the ``.service`` suffix, and only
     those :func:`valid_unit_name` would let us act on.
 
@@ -654,6 +656,8 @@ def list_units(pattern: str, run: Runner | None = None) -> list[str]:
         fields = line.split()
         if not fields:
             continue
+        if active_only and len(fields) >= 3 and fields[2] in ("inactive", "failed"):
+            continue
         unit = fields[0].lstrip("●*").strip()
         if not unit.startswith(prefix):
             continue
@@ -664,7 +668,7 @@ def list_units(pattern: str, run: Runner | None = None) -> list[str]:
     return names
 
 
-def list_model_units(run: Runner | None = None) -> list[str]:
+def list_model_units(run: Runner | None = None, *, active_only: bool = False) -> list[str]:
     """Every ``model-*`` unit systemd currently knows, WITHOUT the ``.service``
     suffix (``["model-lfm2", "model-flashnext"]``), so the caller can slice the
     ``model-`` prefix off to get the registry key.
@@ -672,7 +676,7 @@ def list_model_units(run: Runner | None = None) -> list[str]:
     This replaces v1's ``/proc`` walk and its pattern matching entirely — and
     with it the ``pgrep -f`` self-match trap.
     """
-    return list_units("model-*", run=run)
+    return list_units("model-*", run=run, active_only=active_only)
 
 
 # --------------------------------------------------------------------------

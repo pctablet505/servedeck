@@ -101,7 +101,7 @@ fails, rather than systemd refusing three modules later.
 | `kv_cache_bytes_per_token` | int | no | unset | **Added 2026-09-18.** When set, `--kv-cache-memory-bytes` is emitted as `ctx_tokens * this`. The registry used to pin the product instead, so moving the context control left the KV cap sized for the old length and vLLM refused after a six-minute load. |
 | `min_output_tokens` | int | no | unset | Floor the gateway raises an explicitly small output budget to, clamped by resolved `ctx`. GLM sets `8192`: a small `max_tokens` truncates mid-`<think>` and both `content` and `reasoning_content` come back empty. |
 | `max_output_tokens` | int | no | unset | Advertised to clients by `servedeck wire` (VS Code's `maxOutputTokens`). |
-| `vision` | bool | no | `false` | Advertised by `servedeck wire`. Coerced with `bool()`, so `vision = "false"` is **true** — write a real TOML boolean. |
+| `vision` | bool | no | `false` | Advertised by `servedeck wire`. Validated as a strict TOML boolean (`vision = "false"` is rejected with `RegistryError`). |
 | `needs_tty` | bool | no | `false` | **Retired 2026-09-18.** Still parsed so an older `models.toml` loads, read by nothing. Nothing ever enforced it; `/etc/sysctl.d/90-servedeck.conf` pins `kernel.yama.ptrace_scope` to 0 at boot, which made "cannot boot unattended" false for the one model that set it, and doctor's `ptrace_scope (host)` row is now unconditional. Delete it from your entries. |
 
 `servedeck` never takes `--served-model-name`, `--host`, `--max-model-len`,
@@ -148,11 +148,9 @@ whose job is keeping request bodies off the disk.
 | `restore_reasoning` | `false` everywhere | no, but evidence | Puts reasoning back on the in-flight assistant turns of a request whose client echoed the `tool_call` ids and dropped the thinking; the output-side mirror cannot, because it can make thinking available to a client but not make the client send it back. Off because the proxy it is ported from records "three Xid 31 GPU faults followed within 40 minutes of it first firing, after 14 hours clean" — correlation, not proof, but this box has an active unrelated GPU-fault problem, so nothing that plausibly perturbs the GPU defaults to on. Turn it on for one session, watch telemetry, decide. |
 | `capture` | `false` | **yes** — `SERVEDECK_GLM_CAPTURE=1`, or `python -m servedeck --glm-capture` | Consent, not an enable. With both set, the gateway keeps a 6-turn ring of that route's request/response bodies under `state/captures/<model>/` (directory 0700, files 0600, credential headers redacted). Bodies contain everything the user typed, which is why one switch is in the registry and the other deliberately is not: the predecessor defaulted this on, writing full bodies to `/tmp` with no retention. |
 
-**Known gap, 2026-09-18:** `routes.py:255` assembles `RoutePolicies` from
-`mirror_content`, the preset overlay, `min_output_tokens` and `ctx` only, and
-does not copy these three fields, so all three are inert in the live gateway
-however `models.toml` sets them. Only tests construct a `RoutePolicies`
-carrying them; the fix belongs in `routes.py:route_for`.
+`routes.py:route_for` wires `sanitize_tool_tags`, `restore_reasoning` and `capture`
+directly into `RoutePolicies` for every served route (`glm_policies.py` still enforces
+the `SERVEDECK_GLM_CAPTURE` second-consent switch before writing any capture ring).
 
 ### What `_validate` enforces
 

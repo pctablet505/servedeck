@@ -19,6 +19,7 @@ come from ``disksize`` and ``discovery`` — the same modules v1 called.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from collections.abc import Mapping, Sequence
@@ -30,8 +31,10 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from servedeck import capacity, discovery, disksize, kvcalc, parallelism, reqstats
+from servedeck import control as _control
 from servedeck import gpu as _gpu
 from servedeck import models as _models
+from servedeck import units as _units
 
 log = logging.getLogger(__name__)
 
@@ -154,13 +157,27 @@ class BootTracker:
     def __init__(self) -> None:
         self.current: BootTrack | None = None
 
-    def record(self, key: str, kind: str, marker_index: int | None, elapsed_s: float) -> None:
+    def record(
+        self,
+        key: str,
+        kind: str,
+        marker_index: int | None,
+        elapsed_s: float,
+        text: str = "",
+    ) -> None:
         t = self.current
         if t is None or t.key != key or t.reached_ready or t.failed:
             t = BootTrack(key=key)
             self.current = t
         t.elapsed_s = float(elapsed_s or 0.0)
-        if kind == "marker" and marker_index is not None:
+        if kind == "line" and text:
+            if t.phase == "init" and ("Starting to load model" in text or "Loading weights" in text):
+                t.phase = "loading_weights"
+                t.phase_times.setdefault("loading_weights", t.elapsed_s)
+            elif ("torch.compile" in text or "Compiling" in text) and t.phase in ("init", "loading_weights"):
+                t.phase = "compiling"
+                t.phase_times.setdefault("compiling", t.elapsed_s)
+        elif kind == "marker" and marker_index is not None:
             phase = MARKER_PHASE.get(int(marker_index))
             if phase:
                 t.phase = phase
@@ -171,6 +188,22 @@ class BootTracker:
             t.reached_ready = True
         elif kind == "failed":
             t.failed = True
+
+    def on_progress(self, key: str, event: Any) -> None:
+        self.record(
+            key,
+            getattr(event, "kind", ""),
+            getattr(event, "marker_index", None),
+            getattr(event, "elapsed_s", 0.0),
+            getattr(event, "text", ""),
+        )
+
+    def finish(self, *, failed: bool = False, clear: bool = False) -> None:
+        if clear:
+            self.current = None
+            return
+        if self.current is not None and failed:
+            self.current.failed = True
 
     @property
     def booting(self) -> bool:
@@ -428,6 +461,7 @@ def model_rows(
                 "key": key,
                 "repo_id": model.repo,
                 "name": model.id,
+                "slot": model.slot,
                 "backend": model.build,
                 "servable": servable,
                 "unservable_reason": (
@@ -734,13 +768,20 @@ def estimate_payload(
 # --------------------------------------------------------------------------
 
 
-def key_for_repo(registry: _models.Registry, repo_id: str | None, backend: str | None) -> str | None:
-    """The page posts what v1 knew a model by: its repo id, or a name."""
+def key_for_repo(
+    registry: _models.Registry,
+    repo_id: str | None,
+    backend: str | None,
+    key: str | None = None,
+) -> str | None:
+    """The page posts ``key`` (for shared-repo profiles) alongside v1's ``repo_id``."""
+    if key and key in registry.models:
+        return key
     if not repo_id:
         return None
-    for key, m in registry.models.items():
-        if m.repo == repo_id or m.id == repo_id or key == repo_id:
-            return key
+    for candidate_key, m in registry.models.items():
+        if m.repo == repo_id or m.id == repo_id or candidate_key == repo_id:
+            return candidate_key
     if backend and backend in registry.models:
         return backend
     return None
@@ -759,14 +800,37 @@ def overrides_from(body: Mapping[str, Any]) -> tuple[float | None, dict[str, str
     """``util`` / ``ctx`` / ``max_num_seqs`` from the allocator's POST body."""
     util = None
     if body.get("util") is not None:
-        util = max(0.05, min(0.99, float(body["util"])))
+        raw_util = body["util"]
+        if isinstance(raw_util, bool):
+            raise ValueError("util must be a number")
+        f_util = float(raw_util)
+        if not math.isfinite(f_util):
+            raise ValueError(f"util={raw_util!r} must be finite")
+        util = max(0.05, min(0.99, f_util))
     argv: dict[str, str | None] = {}
     if body.get("ctx") is not None:
-        argv["--max-model-len"] = str(int(body["ctx"]))
+        raw_ctx = body["ctx"]
+        if isinstance(raw_ctx, bool):
+            raise ValueError("ctx must be an integer")
+        i_ctx = int(raw_ctx)
+        if i_ctx <= 0:
+            raise ValueError(f"ctx={raw_ctx!r} must be positive")
+        argv["--max-model-len"] = str(i_ctx)
     if body.get("max_num_seqs") is not None:
-        argv["--max-num-seqs"] = str(max(1, int(body["max_num_seqs"])))
+        raw_seqs = body["max_num_seqs"]
+        if isinstance(raw_seqs, bool):
+            raise ValueError("max_num_seqs must be an integer")
+        i_seqs = int(raw_seqs)
+        if i_seqs < 0:
+            raise ValueError(f"max_num_seqs={raw_seqs!r} must be non-negative")
+        argv["--max-num-seqs"] = str(max(1, i_seqs))
     if body.get("kv_offload_gib") is not None:
-        gib = max(0.0, float(body["kv_offload_gib"]))
+        raw_gib = body["kv_offload_gib"]
+        if isinstance(raw_gib, bool):
+            raise ValueError("kv_offload_gib must be a number")
+        gib = float(raw_gib)
+        if not math.isfinite(gib) or gib < 0:
+            raise ValueError(f"kv_offload_gib={raw_gib!r} must be >= 0")
         # 0 means no offload at all: the flag is removed, not passed as 0.
         argv["--kv-offloading-size"] = f"{gib:g}" if gib > 0 else None
     return util, argv
@@ -820,7 +884,8 @@ def augment_state(
         "supervisor": {
             "actual_state": word,
             "desired_state": "RUNNING" if desired_main else "STOPPED",
-            "phase": boot.current.phase if boot.current else None,
+            "phase": boot.current.phase if (boot.current and word == STARTING) else None,
+            "key": main_key,
             "repo_id": model.repo if model else None,
             "backend": model.build if model else None,
             "max_model_len": full_ctx,
@@ -855,16 +920,40 @@ def register(app: FastAPI, rt: Any) -> None:
         rows, _serving = await _rail()
         return await _app.asyncio.to_thread(disk_payload, rows)
 
+    def _view_pids(view: Any) -> list[int]:
+        if view is None:
+            return []
+        pid_set: set[int] = set()
+        if view.pid:
+            pid_set.add(int(view.pid))
+            try:
+                pid_set.update(_control.descendants(int(view.pid)))
+            except Exception:  # noqa: BLE001
+                pass
+        if view.unit and view.unit != _control.ADOPTED_UNIT:
+            try:
+                cg_fn = getattr(rt.control, "_cgroup_pids", None) or _control._cgroup_pids
+                pid_set.update(cg_fn(view.unit))
+            except Exception:  # noqa: BLE001
+                pass
+        return sorted(pid_set)
+
     @app.post("/api/capacity/estimate")
     async def api_estimate(body: dict[str, Any]) -> Any:
         repo = body.get("repo_id")
-        if not repo:
+        req_key = body.get("key")
+        if not repo and not req_key:
             return JSONResponse({"error": "repo_id is required"}, status_code=400)
-        key = key_for_repo(rt.registry, repo, body.get("backend"))
+        key = key_for_repo(rt.registry, repo, body.get("backend"), key=req_key)
         model = rt.registry.models.get(key) if key else None
-        holder = _app._main_holder(rt, rt.routes.live())
-        view = rt.routes.live_view(holder) if holder else None
-        pids = [view.pid] if view and view.pid else []
+        # If estimating a resident that is already live, discount ITS cgroup;
+        # for a main-slot estimate, discount whichever main model holds the slot.
+        if model is not None and model.slot == "resident":
+            view = rt.routes.live_view(model.key)
+        else:
+            holder = _app._main_holder(rt, rt.routes.live())
+            view = rt.routes.live_view(holder) if holder else None
+        pids = await _app.asyncio.to_thread(_view_pids, view)
         running_argv = cmdline_of(view.pid) if view and view.pid else []
         raw_off = body.get("kv_offload_gib")
         try:
@@ -886,16 +975,20 @@ def register(app: FastAPI, rt: Any) -> None:
             return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=400)
 
     def _launch(body: dict[str, Any], action: str) -> JSONResponse:
-        key = key_for_repo(rt.registry, body.get("repo_id"), body.get("backend"))
+        key = key_for_repo(rt.registry, body.get("repo_id"), body.get("backend"), key=body.get("key"))
         if key is None:
             return JSONResponse(
-                {"error": f"no registry model matches {body.get('repo_id')!r}"}, status_code=404
+                {"error": f"no registry model matches {body.get('key') or body.get('repo_id')!r}"},
+                status_code=404,
             )
         if rt.busy is not None:
             return JSONResponse(
                 {"error": f"servedeck is busy: {rt.busy.get('label')}"}, status_code=409
             )
-        util, argv = overrides_from(body)
+        try:
+            util, argv = overrides_from(body)
+        except (TypeError, ValueError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
         model = rt.registry.models[key]
         # A model whose registry ctx is a pinned number has that number as its
         # validated ceiling on this card (GLM: 327,680; the checkpoint claims
@@ -911,7 +1004,28 @@ def register(app: FastAPI, rt: Any) -> None:
                 status_code=409,
             )
         holder = _app._main_holder(rt, rt.routes.live())
-        if holder is not None and model.slot == "main":
+        if model.slot == "resident":
+            if key in rt.routes.live() and action != "restart":
+                return JSONResponse(
+                    {"error": f"{key} is already serving; POST /api/server/restart to apply "
+                              "new settings, or stop it first"},
+                    status_code=409,
+                )
+            if key in rt.routes.live() and action == "restart":
+                label, verb = f"restart {key}", "start"
+                def work() -> Any:
+                    rt.control.stop(key, forget_intent=False)
+                    return rt.control.start(
+                        key, on_progress=_app._progress_publisher(rt.hub, key, rt.boot),
+                        util=util, argv_overrides=argv,
+                    )
+            else:
+                label, verb = f"start {key}", "start"
+                work = lambda: rt.control.start(  # noqa: E731
+                    key, on_progress=_app._progress_publisher(rt.hub, key, rt.boot),
+                    util=util, argv_overrides=argv,
+                )
+        elif holder is not None and model.slot == "main":
             same = holder == key
             if same and action != "restart":
                 # v1's contract: a start on a model that is already serving
@@ -961,24 +1075,41 @@ def register(app: FastAPI, rt: Any) -> None:
         return _abort_busy()
 
     @app.post("/api/server/stop")
-    async def api_server_stop() -> Any:
+    async def api_server_stop(body: dict[str, Any] | None = None) -> Any:
         if rt.busy is not None:
             return _abort_busy()
-        holder = _app._main_holder(rt, rt.routes.live())
-        if holder is None:
+        live_map = rt.routes.live()
+        req_key = key_for_repo(
+            rt.registry,
+            (body or {}).get("repo_id"),
+            (body or {}).get("backend"),
+            key=(body or {}).get("key"),
+        ) if body else None
+        target = req_key if (req_key and req_key in live_map) else _app._main_holder(rt, live_map)
+        if target is None:
             return JSONResponse({"error": "nothing holds the main slot"}, status_code=409)
-        _app._claim(rt, "stop", holder, f"stop {holder}")
+        _app._claim(rt, "stop", target, f"stop {target}")
         _app.asyncio.create_task(
             _app._run_mutation(
-                rt, f"stop {holder}", lambda: rt.control.stop(holder), action="stop", key=holder
+                rt, f"stop {target}", lambda: rt.control.stop(target), action="stop", key=target
             )
         )
-        return JSONResponse({"accepted": True, "action": "stop", "key": holder}, status_code=202)
+        return JSONResponse({"accepted": True, "action": "stop", "key": target}, status_code=202)
 
     @app.post("/api/server/adopt")
     async def api_server_adopt(body: dict[str, Any] | None = None) -> Any:
-        result = await _app.asyncio.to_thread(rt.control.adopt)
-        holder = _app._main_holder(rt, rt.routes.refresh())
+        if rt.busy is not None:
+            return JSONResponse(
+                {"error": f"servedeck is busy: {rt.busy.get('label')}"}, status_code=409
+            )
+        async with rt.lock:
+            rt.busy = {"action": "adopt", "key": "", "label": "adopt"}
+            try:
+                result = await _app.asyncio.to_thread(rt.control.adopt)
+                live_after = await _app.asyncio.to_thread(rt.routes.refresh)
+            finally:
+                rt.busy = None
+        holder = _app._main_holder(rt, live_after)
         view = rt.routes.live_view(holder) if holder else None
         return {
             "adopted": list(getattr(result, "adopted", []) or []),
