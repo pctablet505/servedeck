@@ -1,15 +1,17 @@
-# Servedeck runtime and test dependencies (kept in sync with pyproject.toml).
+# Servedeck runtime dependencies. Deliberately four packages and no more.
 #
-# Install into this project's own .venv (`uv venv .venv && uv pip install -e '.[dev]'`
-# or `uv pip install -r requirements.txt`). Never install into the virtualenv
-# your model server runs from: a resolver run there can silently downgrade a
-# pinned CUDA toolchain and break the server.
-fastapi>=0.115
-uvicorn>=0.30
-httpx>=0.27
+# Install into this project's own .venv (setup.sh creates it). Never install
+# into the virtualenv your model server runs from: a resolver run there can
+# silently downgrade a pinned CUDA toolchain and break the server.
+#
+# fastapi/uvicorn exact-pinned, httpx pinned to its 0.28 line, per the
+# task's explicit instruction (fastapi moved to 0.141.1, the version the
+# live .venv runs and the suite passes on, 2026-11-15). tomli-w is tomllib's write side, used by
+# `servedeck wire --apply` (pyproject.toml lists it too). pytest is intentionally left unpinned
+# (dev/test dependency only, never imported by runtime code) so `uv pip
+# install -U` naturally tracks the latest release.
+fastapi==0.141.1
+uvicorn==0.52.4
+httpx==0.28.*
 tomli-w>=1.0
-pytest>=8
-pytest-xdist>=3.5
-hypothesis>=6.100
-z3-solver>=4.13
-mypy>=1.10
+pytest

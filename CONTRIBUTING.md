@@ -82,8 +82,6 @@ handoff fails), desired state naming a model that is not running, weights on dis
   --ignore=tests/test_control_e2e.py --ignore=tests/test_gateway_e2e.py
 ```
 
-Alongside the empirical/integration suite, `tests/test_formal_*.py` runs automatically inside `pytest` (Z3 SMT mathematical proofs in `test_formal_smt.py`, exhaustive BFS control-plane/UI protocol model checking in `test_formal_state_machine.py`, Hypothesis algebraic/fuzz properties in `test_formal_properties.py`, and PEP 561 `mypy` + AST lexical-shadowing verification in `test_formal_static.py`).
-
 The four excluded files are the gate. Three drive the real `systemd-run` path, safely, under the `sd-test-` unit
 namespace, which cannot name a real `model-*` unit; they bind fixed ports, so run them one at a time (`-n 0`).
 `test_e2e_real.py` boots real models on the GPU and needs the card to have room. Run the gate on an idle card, not

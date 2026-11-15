@@ -774,6 +774,10 @@ function renderModels() {
   const sig = railSigOf(MODELS) + ":" + q;
   if (sig === railSig) { updateRailSelection(); return; }
   railSig = sig;
+  // Which card had focus, and how far the list was scrolled, are restored after
+  // the rebuild. Focus is tracked by registry key (repo_id for a card without
+  // one) rather than index, because a model appearing earlier in the list would
+  // otherwise move the focus to a different model under the operator's keyboard.
   const focused = L.querySelector ? L.querySelector(":focus") : null;
   const focusKey = focused && focused.dataset ? (focused.dataset.key || focused.dataset.repo) : null;
   const scrollTop = L.scrollTop;
@@ -812,12 +816,21 @@ function renderModels() {
     b.querySelector(".note").textContent =
       m.unservable_reason || `${m.backend || "?"} · ${fmt(m.model_max_ctx)} ctx`;
     if (!m.servable) {
+      // aria-disabled, NOT the disabled attribute. A disabled button is skipped
+      // by Tab entirely, so an operator who cannot serve a model also cannot
+      // reach the card to read why -- and the reason lives on the card's own
+      // note line, which is only readable if the card can be focused. The
+      // click handler is simply not attached below, and .mcard[aria-disabled]
+      // in the stylesheet carries the dimmed look the attribute used to set.
       b.setAttribute("aria-disabled", "true");
       b.title = m.unservable_reason || "this model cannot be served here";
     } else {
       b.onclick = () => {
         sel = i;
         userPicked = true;
+        // A different model is a new context decision: its own default, or
+        // the running server's value if this is the model it serves. The last
+        // estimate described the previous model, so it bounds nothing now.
         ctxSource = "default";
         lastEstimate = null;
         syncRunCtx(lastState);
@@ -2208,6 +2221,8 @@ function paintState(s) {
         "w"
       );
     }
+    // Select what is ACTUALLY running, not whatever sorted first. Otherwise
+    // every panel describes a model the user is not using.
     if (servingIdx >= 0 && !userPicked && sel !== servingIdx) {
       sel = servingIdx;
       ctxSource = "default";
@@ -2358,6 +2373,13 @@ function wireControls() {
       const ok = await promptConfirm({ title, message: msg, confirmText, danger: isSwitch });
       if (!ok) return;
       apply.disabled = true;
+      // "Apply & restart" means RESTART when something is already serving.
+      // /api/server/start is idempotent on the supervisor's side -- it returns
+      // early when the server is READY -- so posting a new context length at a
+      // running server returned 202 "accepted" and changed nothing at all:
+      // same pid, same cmdline, same .config, and a success in the log.
+      // /api/server/restart is the only endpoint that relaunches, and it
+      // carries the same settings body. A resident restarts only itself.
       const sv = (lastState && lastState.supervisor) || {};
       const upNow = !!(lastState && lastState.upstream && lastState.upstream.up);
       const path = mSlot === "resident"

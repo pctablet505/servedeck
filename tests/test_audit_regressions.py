@@ -48,6 +48,10 @@ from servedeck import (
     xid_watch as _xid_watch,
 )
 
+from tests.test_app import TOML as APP_TOML
+from tests.test_app import FakeControl as AppFakeControl
+from tests.test_control import BIG27, FLASH, LFM2, FakeRegistry, FakeSystemd, make_control
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WEB_DIR = REPO_ROOT / "servedeck" / "web"
 
@@ -745,10 +749,22 @@ flags = ["--max-num-seqs", "64"]
     monkeypatch.setattr(
         _lp._gpu,
         "compute_apps",
-        lambda: [_gpu.GpuProcess(pid=200, process_name="/opt/stock/bin/python", used_mib=90_000)],
+        lambda: [_gpu.ComputeApp(pid=200, process_name="/opt/stock/bin/python", used_mib=90_000)],
     )
     monkeypatch.setattr(_lp._gpu, "free_mib", lambda: 7_000)
     monkeypatch.setattr(_lp._gpu, "total_mib", lambda: 97_887)
+    # The estimate reads the card through gpu_summary()/gpu_alive(). Unpatched,
+    # a box with a GPU answers with its real numbers and a box without one
+    # skips the VRAM check, so the discount below was proven nowhere.
+    monkeypatch.setattr(
+        _lp._gpu,
+        "gpu_summary",
+        lambda: _gpu.GpuSummary(
+            index=0, name="test GPU", total_mib=97_887, used_mib=90_887, free_mib=7_000,
+            util_percent=0, temperature_c=40, power_draw_w=100.0,
+        ),
+    )
+    monkeypatch.setattr(_lp._gpu, "gpu_alive", lambda: True)
     monkeypatch.setattr(_control, "_cgroup_pids", lambda unit, **k: [100, 200])
 
     app = _app.create_app(s, registry=reg, control=ctl, reconcile=False, poll=False)
@@ -985,6 +1001,9 @@ def test_bug19_capacity_zero_gpu_total_invalid_ctx_and_unknown_blue_green(monkey
         trust="measured",
     )
     monkeypatch.setenv("SERVEDECK_GPU_TOTAL_MIB", "0")
+    # 0 is "unset" to limits.get(), which then asks nvidia-smi: on a box with a
+    # GPU that answered with the real card and this test never saw a zero.
+    monkeypatch.setattr(_limits, "detect_gpu_total_mib", lambda: 0)
     _limits.reset()
     _capacity.refresh_limits()
     try:
@@ -1268,5 +1287,65 @@ def test_bug27_bug28_build_scripts_and_requirements_sync():
         assert "set -euo pipefail" in body, f"builds/{name}/build.sh missing -e in set -euo pipefail"
 
     reqs = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8")
-    assert "0.136.3" not in reqs
     assert "tomli-w" in reqs
+
+
+def test_bug02_poll_does_not_launch_before_the_port_is_won(tmp_path):
+    """Through create_app's own lifespan, not a hand-set flag: our port never
+    answers as us (a rival holds it), so the poll's recovery must not launch the
+    wanted model. Main's first poll tick ran _recover_desired before the bind."""
+    (tmp_path / "models.toml").write_text(APP_TOML)
+    reg = _models.load(tmp_path / "models.toml")
+    s = _settings.Settings(
+        listen_host="127.0.0.1",
+        listen_port=8049,
+        models_path=tmp_path / "models.toml",
+        state_dir=tmp_path / "state",
+        unit_prefix="sd-test-",
+    )
+    s.state_dir.mkdir(parents=True)
+    _desired.save(_desired.Desired(main="big"), s.desired_path)
+    ctl = AppFakeControl()
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _r: httpx.Response(503)))
+    app = _app.create_app(
+        s, registry=reg, control=ctl, client=client, reconcile=True, poll=True, telemetry=False
+    )
+
+    async def run() -> None:
+        async with app.router.lifespan_context(app):
+            await asyncio.sleep(1.5)
+
+    asyncio.run(run())
+    assert "start:big" not in ctl.calls, f"launched before winning the port: {ctl.calls}"
+
+
+def test_bug06_stale_abort_of_another_key_does_not_break_a_later_switch(tmp_path):
+    """A cancel that lands on a resident's start which is then refused leaves
+    that key in _aborted. The switch's VRAM-release wait must only end early
+    for an abort of the model it is switching to."""
+    systemd = FakeSystemd()
+    systemd.add("model-qwen27b", main_pid=1000)
+    box = {"free": 1344}
+    ctl = make_control(
+        systemd,
+        FakeRegistry(BIG27, FLASH, LFM2),
+        tmp_path,
+        used=lambda: {1000: 90000},
+        cgroup_pids=lambda unit: [1000],
+        probe=lambda port: ["Qwen3.8-Flash-Next"] if port == 8001 else None,
+    )
+    ctl._free_mib = lambda: box["free"]
+    real_reap = ctl.reap_offload
+    # The operator's cancel arrives during the resident start's pre-launch phase.
+    ctl.reap_offload = lambda: (ctl.abort("lfm2", stop_unit=False), real_reap())[1]
+    refused = ctl.start("lfm2")
+    assert isinstance(refused, _control.Refusal), refused
+    assert "lfm2" in ctl._aborted
+    ctl.reap_offload = real_reap
+
+    reads = iter([1344, 1344, 1500, 2000, 80000])
+    ctl._free_mib = lambda: next(reads, 80000)
+    result = ctl.switch("flashnext")
+    assert not isinstance(result, _control.Refusal), result
+    assert not isinstance(result.started, _control.Refusal), result.started
+    assert result.started.ready

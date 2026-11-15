@@ -437,11 +437,12 @@ def render_kimi(
     kimi-code provider, other models, oauth, services) is left untouched."""
     resolved = {key: resolve_ctx(m) for key, m in registry.models.items()}
     main_models = [m for m in registry.models.values() if m.slot == "main" and resolved[m.key] > 0]
-    wanted_headers = {
-        f'[models."servedeck/{key}"]' for key, ctx in resolved.items() if ctx > 0
-    }
-    if main_models:
-        wanted_headers.add(f'[models."servedeck/{_MAIN_ROUTE}"]')
+    # Retire only tables for models that left the registry. A model whose
+    # context is unknown right now (weights not in the hub cache, a disk not
+    # mounted) keeps its table: it is still a registry model, and dropping it
+    # would make the client forget a model that comes back on the next apply.
+    wanted_headers = {f'[models."servedeck/{key}"]' for key in registry.models}
+    wanted_headers.add(f'[models."servedeck/{_MAIN_ROUTE}"]')
 
     text = _remove_sections(
         existing_text, '[models."servedeck/', keep_headers=wanted_headers

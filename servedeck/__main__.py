@@ -119,7 +119,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    application = _app.create_app(reconcile=not args.no_reconcile)
+    # telemetry=True: the GPU sampler and Xid watcher record the card whether or
+    # not this run reconciles; --no-reconcile is about models, not instruments.
+    application = _app.create_app(reconcile=not args.no_reconcile, telemetry=True)
     config = uvicorn.Config(
         application,
         host=args.host,

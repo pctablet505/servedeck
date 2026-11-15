@@ -1066,6 +1066,10 @@ class Control:
             max_fit = floor2((free - self.margin_mib) / total)
             if requested_util is not None:
                 need = math.ceil(total * requested_util)
+                # An explicit util is checked against the resident cushion, not
+                # the full margin: Flash-Next at 0.96 beside a resident leaves
+                # ~0.6 GiB, a launch the dashboard (which always sends a util)
+                # has made daily, and main never checked explicit utils at all.
                 cushion = min(self.margin_mib, RESIDENT_CUSHION_MIB)
                 if need + cushion > free:
                     return Refusal(
@@ -1630,6 +1634,10 @@ class Control:
                     units.stop(unit, timeout_s=15.0, run=self._run)
         return bool(targets)
 
+    def _abort_pending(self, key: str | None) -> bool:
+        """An abort of ``key``'s boot, or of every boot, is waiting (not consumed)."""
+        return self._abort_all or (key is not None and key in self._aborted)
+
     def _take_abort(self, key: str) -> bool:
         """Consume an operator abort of ``key``'s boot, if there is one.
 
@@ -1781,28 +1789,12 @@ class Control:
                     held_mib=result.held_mib,
                     timeout_s=release_timeout_s,
                     on_progress=on_progress,
+                    key=key,
                 )
                 if self._take_abort(key):
                     return SwitchResult(
                         stopped=stopped,
                         released=released,
-                        waited_s=waited,
-                        free_after_mib=free_after,
-                        started=StartResult(
-                            key=key,
-                            unit=self.unit_for(key),
-                            ready=False,
-                            elapsed_s=waited,
-                            markers=[],
-                            failure=f"boot of {key} was cancelled by operator",
-                            aborted=True,
-                            journal=[],
-                        ),
-                    )
-                if reason == "aborted" and self._take_abort(key):
-                    return SwitchResult(
-                        stopped=stopped,
-                        released=False,
                         waited_s=waited,
                         free_after_mib=free_after,
                         started=StartResult(
@@ -1893,8 +1885,14 @@ class Control:
         held_mib: int | None,
         timeout_s: float,
         on_progress: ProgressCallback | None = None,
+        key: str | None = None,
     ) -> tuple[bool, float, int | None, str | None]:
         """``(released, waited_s, free_after_mib, reason)``.
+
+        ``key`` is the model the switch is about to start. Only an abort of
+        that boot (or of every boot) ends the wait early: an abort left over
+        from another key's refused start used to end every later switch's
+        wait after one read, with a false ``vram_not_released``.
 
         ``released=True`` is only ever returned by a wait that actually
         observed something. There is no "nothing to wait for, call it done"
@@ -1911,7 +1909,7 @@ class Control:
 
         if held_mib and free_before is not None:
             return self._wait_for_target(
-                free_before + RELEASE_FRACTION * held_mib, started, timeout_s, on_progress
+                free_before + RELEASE_FRACTION * held_mib, started, timeout_s, on_progress, key=key
             )
 
         # No attribution: nvidia-smi could not enumerate compute apps, or the
@@ -1919,7 +1917,7 @@ class Control:
         # but there is still a signal — memory comes back in steps and then
         # stops. Waiting for the plateau is weaker than waiting for a number
         # and much stronger than not waiting.
-        return self._wait_for_plateau(started, timeout_s, on_progress)
+        return self._wait_for_plateau(started, timeout_s, on_progress, key=key)
 
     def _wait_for_target(
         self,
@@ -1927,10 +1925,12 @@ class Control:
         started: float,
         timeout_s: float,
         on_progress: ProgressCallback | None,
+        *,
+        key: str | None = None,
     ) -> tuple[bool, float, int | None, str | None]:
         while True:
             free_now = self._free_mib()
-            if self._abort_all or bool(self._aborted):
+            if self._abort_pending(key):
                 return False, self._clock() - started, free_now, "aborted"
             if free_now is not None and free_now >= target:
                 return True, self._clock() - started, free_now, None
@@ -1953,12 +1953,14 @@ class Control:
         timeout_s: float,
         on_progress: ProgressCallback | None,
         stable_reads: int = 3,
+        *,
+        key: str | None = None,
     ) -> tuple[bool, float, int | None, str | None]:
         best: int | None = None
         stable = 0
         while True:
             free_now = self._free_mib()
-            if self._abort_all or bool(self._aborted):
+            if self._abort_pending(key):
                 return False, self._clock() - started, free_now, "aborted"
             if free_now is None:
                 return False, self._clock() - started, None, "vram_accounting_unavailable"

@@ -517,7 +517,7 @@ def load_from_dict(data: Mapping[str, Any]) -> Registry:
     """Validate an already-parsed TOML mapping into a :class:`Registry`.
 
     Pure (no file I/O), raising ONLY :class:`RegistryError` on any schema or
-    type violation so property-based / formal fuzzers can exercise the validator
+    type violation so tests can exercise the validator
     directly."""
     if not isinstance(data, Mapping):
         raise RegistryError("registry root must be a TOML table")
