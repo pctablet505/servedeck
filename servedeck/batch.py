@@ -284,6 +284,7 @@ def run(
     outcomes: list[Outcome[T, R]] = [Outcome(index=i, item=it) for i, it in enumerate(seq)]
     cond = threading.Condition()
     state = {"in_flight": 0, "next": 0, "done": 0}
+    fatal_errors: list[BaseException] = []
     stop = threading.Event()
     t0 = time.monotonic()
 
@@ -291,7 +292,7 @@ def run(
         while True:
             with cond:
                 while True:
-                    if state["next"] >= len(seq):
+                    if state["next"] >= len(seq) or fatal_errors:
                         return
                     warming = warm_first and state["done"] == 0 and state["next"] >= 1
                     if not warming and state["in_flight"] < limiter.limit:
@@ -304,11 +305,21 @@ def run(
                 out.admitted_after_s = time.monotonic() - t0
                 out.limit_at_admission = limiter.limit
             start = time.monotonic()
+            fatal: BaseException | None = None
             try:
                 out.result = call(out.item)
-            except BaseException as exc:  # noqa: BLE001 - recorded per item, the batch goes on
+            except Exception as exc:  # noqa: BLE001 - recorded per item, the batch goes on
                 out.error = exc
+            except BaseException as exc:
+                fatal = exc
             out.call_s = time.monotonic() - start
+            if fatal is not None:
+                with cond:
+                    fatal_errors.append(fatal)
+                    state["in_flight"] -= 1
+                    state["next"] = len(seq)
+                    cond.notify_all()
+                return
             if on_done is not None:
                 try:
                     on_done(out)
@@ -319,9 +330,11 @@ def run(
                 state["done"] += 1
                 cond.notify_all()
 
+    effective_poll_s = max(0.05, float(poll_s))
+
     def poller() -> None:
         assert metrics_url is not None
-        while not stop.wait(poll_s):
+        while not stop.wait(effective_poll_s):
             limiter.observe(fetch(metrics_url))
             with cond:
                 cond.notify_all()  # a grown limit admits waiting workers now
@@ -336,5 +349,7 @@ def run(
         t.join()
     stop.set()
     if poll_thread is not None:
-        poll_thread.join(timeout=poll_s + 1)
+        poll_thread.join(timeout=effective_poll_s + 1)
+    if fatal_errors:
+        raise fatal_errors[0]
     return outcomes

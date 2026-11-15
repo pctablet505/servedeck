@@ -498,7 +498,10 @@ class RequestWindow:
         his = sorted(o.hi for o in obs)
 
         def pct(p: float) -> Percentile:
-            return Percentile(lo=nearest_rank(los, p), hi=nearest_rank(his, p))
+            lo_v = nearest_rank(los, p)
+            hi_v = nearest_rank(his, p)
+            assert lo_v is not None and hi_v is not None
+            return Percentile(lo=lo_v, hi=hi_v)
 
         oldest = min(o.ts for o in obs)
         return WindowStats(

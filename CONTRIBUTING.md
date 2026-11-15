@@ -3,12 +3,12 @@
 ## Ground rules
 
 **Never use `pgrep -f` or `pkill -f`.** They match the calling process's own
-command line. A test (`tests/test_procctl_no_pattern_kill.py`) greps the
-package and fails on any occurrence. Use `ps -eo comm`, explicit PIDs, or
-`procctl`.
+command line. A test (`tests/test_hygiene.py`) AST-scans the
+package and test suite and fails on any occurrence. Use `ps -eo comm`, explicit PIDs, or
+unit cgroup inspection.
 
 **Never hardcode a path, GPU size, or model name.** Everything
-machine-specific belongs in `servedeck/config.py`.
+machine-specific belongs in `models.toml`, `servedeck/settings.py`, or `servedeck/limits.py`.
 
 **Never run `sudo`.** Where privilege is needed, emit a copyable command for
 the user to run.
@@ -79,13 +79,8 @@ handoff fails), desired state naming a model that is not running, weights on dis
 ```bash
 .venv/bin/python -m pytest -q -n 12 \
   --ignore=tests/test_e2e_real.py --ignore=tests/test_app_e2e.py \
-  --ignore=tests/test_control_e2e.py --ignore=tests/test_gateway_e2e.py \
-  --ignore=tests/test_cli_control.py
-.venv/bin/python -m pytest -q -n 0 tests/test_cli_control.py
+  --ignore=tests/test_control_e2e.py --ignore=tests/test_gateway_e2e.py
 ```
-
-`test_cli_control.py` runs on its own because it binds a fixed port; under `-n 12` its cases contend with each
-other and fail with `httpx.ConnectError` (10 of 16 on a clean tree). Nothing is skipped by splitting it out.
 
 The four excluded files are the gate. Three drive the real `systemd-run` path, safely, under the `sd-test-` unit
 namespace, which cannot name a real `model-*` unit; they bind fixed ports, so run them one at a time (`-n 0`).

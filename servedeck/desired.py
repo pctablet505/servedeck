@@ -134,12 +134,13 @@ def _from_v1(raw: dict[str, object], source: str) -> Desired:
     main = backend if (state == "RUNNING" and isinstance(backend, str) and backend) else None
     log.warning(
         "%s is schema version 1 (desired_state=%r backend=%r); migrating to "
-        "version 2 as main=%r, residents=[]. v1's `backend` was a launcher "
+        "version %d as main=%r, residents=[]. v1's `backend` was a launcher "
         "name, not a registry key — confirm it names a model in models.toml "
         "before trusting reconcile.",
         source,
         state,
         backend,
+        SCHEMA_VERSION,
         main,
     )
     return Desired(main=main, residents=[])

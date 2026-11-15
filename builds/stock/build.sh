@@ -11,7 +11,7 @@
 # it still was NOT run for real as part of packet P5 -- only --dry-run was,
 # per the packet's hard rules (no pip/uv install into any tracked venv, no
 # build). Read builds/README.md before running this against a real target.
-set -uo pipefail
+set -euo pipefail
 
 DRY_RUN=0
 TARGET_DIR=""
@@ -72,7 +72,7 @@ echo "# 3. lib64 shim -- see MANIFEST.toml [cuda].lib64_shim. Present in the"
 echo "#    live venv though this build's own launchers never create it (the"
 echo "#    packet could not pin down which step put it there); create it"
 echo "#    defensively so a rebuilt venv behaves the same way."
-run "CU=\"\$(dirname \"\$(find \\\"$TARGET_DIR\\\" -path '*/nvidia/cu13/lib' -maxdepth 6 -type d | head -1)\")\"; [ -e \"\$CU/cu13/lib64\" ] || ln -sfn lib \"\$CU/cu13/lib64\""
+run "CU_LIB=\"\$(find \\\"$TARGET_DIR\\\" -path '*/nvidia/cu13/lib' -maxdepth 6 -type d | head -1)\"; [ -n \"\$CU_LIB\" ] || { echo 'nvidia/cu13/lib not found' >&2; exit 1; }; CU=\"\$(dirname \"\$CU_LIB\")\"; [ -e \"\$CU/lib64\" ] || ln -sfn lib \"\$CU/lib64\""
 echo
 
 echo "# 4. Verify (same commands used to populate MANIFEST.toml):"

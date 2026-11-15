@@ -183,7 +183,9 @@ def parse_prometheus(text: str) -> dict[str, list[tuple[dict[str, str], float]]]
 
 def _split_labels(s: str) -> list[str]:
     """Split on commas that are not inside quotes."""
-    parts, cur, inq = [], [], False
+    parts: list[str] = []
+    cur: list[str] = []
+    inq = False
     for ch in s:
         if ch == '"':
             inq = not inq

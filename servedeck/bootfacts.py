@@ -235,6 +235,7 @@ def observation(
     return {
         "repo_id": repo_id,
         "backend": backend,
+        "trust": "measured",
         "ts": ts,
         "inputs": {
             "util": facts.util,

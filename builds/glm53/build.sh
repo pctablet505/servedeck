@@ -11,7 +11,7 @@
 #
 # <new-dir> becomes the wrapper directory: <new-dir>/src (fork checkout) and
 # <new-dir>/.venv-glm53 (the venv), mirroring ~/Projects/vllm-glm53/.
-set -uo pipefail
+set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
@@ -48,6 +48,9 @@ if [ -z "$TARGET_DIR" ]; then
         echo "usage: build.sh [--dry-run] <new-dir>" >&2
         exit 2
     fi
+elif [ "$DRY_RUN" -eq 0 ]; then
+    mkdir -p "$TARGET_DIR"
+    TARGET_DIR="$(cd "$TARGET_DIR" && pwd)"
 fi
 
 run() {
@@ -127,8 +130,8 @@ run "export TORCH_CUDA_ARCH_LIST=12.0f"
 run "export VLLM_FLASH_ATTN_SRC_DIR=\"$TARGET_DIR/fa-src\""
 run "export SETUPTOOLS_SCM_PRETEND_VERSION=0.29.0.dev0+glm53"
 run "export VLLM_TARGET_DEVICE=cuda"
-run "cd \"$TARGET_DIR/src\" && MAX_JOBS=\${MAX_JOBS:-40} NVCC_THREADS=\${NVCC_THREADS:-2} \\
-  uv pip install --python \"$TARGET_DIR/.venv-glm53/bin/python\" -e . --no-build-isolation --no-deps"
+run "(cd \"$TARGET_DIR/src\" && MAX_JOBS=\${MAX_JOBS:-40} NVCC_THREADS=\${NVCC_THREADS:-2} \\
+  uv pip install --python \"$TARGET_DIR/.venv-glm53/bin/python\" -e . --no-build-isolation --no-deps)"
 echo
 
 echo "# 9. Verify (same commands used to populate MANIFEST.toml)."

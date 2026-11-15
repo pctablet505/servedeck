@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 _NVIDIA_SMI_TIMEOUT_S = 5.0
@@ -341,16 +342,14 @@ def _classify_xid_code(code: int) -> tuple[str, bool, str]:
     )
 
 
-def xid_events(since: str) -> list[XidEvent]:
+def xid_events(since: str, *, run: Callable[[Sequence[str]], subprocess.CompletedProcess[str]] | None = None) -> list[XidEvent]:
     """NVRM Xid lines out of the kernel journal since `since`, classified
     per bin/qwen-server-record-death.sh:54-69.
 
-    `since` is passed straight through to `journalctl -k --no-pager
+    `since` is passed straight through to `journalctl -k -b all --no-pager
     --since <since>` — anything that flag accepts works ("30 min ago",
-    "2026-08-27 21:00:00", "today", ...). Equivalent to that script's
-    ``journalctl -k --since "..." | grep "NVRM: Xid"`` pipeline, just done
-    without shelling out to `grep` (the filter is a plain Python substring
-    check on each line).
+    "2026-08-27 21:00:00", "today", ...). `-b all` is mandatory because a
+    fatal Xid (79/154) is normally the event that forced the reboot.
 
     Empty list on any failure (missing journalctl, timeout, no persistent
     journal for the window asked) — never raises. An empty result means
@@ -358,14 +357,18 @@ def xid_events(since: str) -> list[XidEvent]:
     nothing happened": kernel Xid history is not guaranteed durable on
     this box across boots.
     """
+    argv = ["journalctl", "-k", "-b", "all", "--no-pager", "--since", since]
     try:
-        result = subprocess.run(
-            ["journalctl", "-k", "--no-pager", "--since", since],
-            capture_output=True,
-            text=True,
-            timeout=_JOURNALCTL_TIMEOUT_S,
-            check=False,
-        )
+        if run is not None:
+            result = run(argv)
+        else:
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=_JOURNALCTL_TIMEOUT_S,
+                check=False,
+            )
     except (OSError, subprocess.TimeoutExpired):
         return []
     if result.returncode != 0:

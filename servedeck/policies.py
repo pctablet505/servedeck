@@ -298,6 +298,24 @@ def _approx_prompt_tokens(body: Mapping[str, Any]) -> int:
     inp = body.get("input")
     if isinstance(inp, str):
         total += len(inp) // 4
+    elif isinstance(inp, list):
+        for item in inp:
+            if isinstance(item, str):
+                total += len(item) // 4
+            elif isinstance(item, dict):
+                if isinstance(item.get("text"), str):
+                    total += len(item["text"]) // 4
+                c = item.get("content")
+                if isinstance(c, str):
+                    total += len(c) // 4
+                elif isinstance(c, list):
+                    for part in c:
+                        if isinstance(part, dict) and isinstance(part.get("text"), str):
+                            total += len(part["text"]) // 4
+                if isinstance(item.get("arguments"), str):
+                    total += len(item["arguments"]) // 4
+                if isinstance(item.get("output"), str):
+                    total += len(item["output"]) // 4
     return total
 
 
