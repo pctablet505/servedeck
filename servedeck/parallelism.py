@@ -78,6 +78,15 @@ CALIBRATION_POOL_TOKENS = 280_813
 #: The model the anchors were measured on. Compared against the served name so
 #: the UI can downgrade its own claim when something else is running.
 CALIBRATION_MODEL = "qwen38-flash-next"
+_CALIBRATION_ALIASES = frozenset({
+    "qwen38-flash-next",
+    "flashnext",
+    "flashnext-batch",
+    "fp4local",
+    "Qwen3.8-Flash-Next-Uncensored-NVFP4",
+    "Qwen3.8-Flash-Next-batch",
+    "Qwen3.8-Flash-Next-FP4-Local",
+})
 
 #: (prompt tokens, fraction of the KV pool one such request occupies).
 KV_COST_ANCHORS: tuple[tuple[int, float], ...] = (
@@ -327,7 +336,10 @@ def mixed_capacity(
     )
     rows: list[tuple[int, dict[str, int]]] = []
     clamped: set[str] = set()
-    for big in range(1, min(full.n_before_clamp, big_rows) + 1):
+    max_big = min(full.n_before_clamp, big_rows)
+    if max_num_seqs is not None and max_num_seqs > 0:
+        max_big = min(max_big, max_num_seqs)
+    for big in range(1, max_big + 1):
         left = usable - big * cost_full
         alongside: dict[str, int] = {}
         for label, tok, _exact in ordered:
@@ -361,7 +373,7 @@ def calibration_note(served_model: str | None) -> str:
         f"KV cost curve calibrated on {CALIBRATION_MODEL} "
         f"({CALIBRATION_POOL_TOKENS:,}-token pool, 4 measured points)"
     )
-    if served_model and served_model != CALIBRATION_MODEL:
+    if served_model and served_model not in _CALIBRATION_ALIASES:
         return (
             f"{base}. The running model is {served_model} — a different "
             f"architecture has a different per-sequence cost, so treat this as "

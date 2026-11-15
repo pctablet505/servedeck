@@ -190,9 +190,14 @@ def test_upstream_when_nothing_runs_names_the_port_and_the_reason() -> None:
 
 def test_process_uptime_reads_proc_stat_for_an_adopted_pid() -> None:
     import os
+    from pathlib import Path
+    import pytest
+
+    assert lp.process_uptime_s(0) is None and lp.process_uptime_s(2**22 + 12345) is None
+    if not Path("/proc/uptime").exists():
+        pytest.skip("needs Linux /proc/uptime")
     up = lp.process_uptime_s(os.getpid())
     assert up is not None and 0 <= up < 24 * 3600
-    assert lp.process_uptime_s(0) is None and lp.process_uptime_s(2**22 + 12345) is None
 
 
 def test_a_pinned_ptrace_scope_is_the_configured_state(tmp_path) -> None:

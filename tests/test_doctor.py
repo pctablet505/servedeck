@@ -464,6 +464,7 @@ def test_check_model_units_list_failure_is_reported_not_raised():
     assert "could not list model-* units" in results[0].detail
 
 
+@pytest.mark.skipif(__import__("shutil").which("systemctl") is None, reason="needs systemctl")
 def test_check_model_units_live_real_systemctl():
     """Against the box's OWN systemctl --user (read-only `list-units`, never
     start/stop/enable/disable — the same carve-out the live :8007/:8010 GETs
@@ -504,6 +505,8 @@ def test_run_doctor_full_pass_with_stubbed_network(tmp_path, monkeypatch):
         for m in reg.models.values()
     }
     get = _stub_get(responses)
+    shm = tmp_path / "shm"
+    shm.mkdir()
     results = doctor.run_doctor(
         REPO_ROOT / "models.toml",
         client_files={
@@ -520,6 +523,9 @@ def test_run_doctor_full_pass_with_stubbed_network(tmp_path, monkeypatch):
         # states a correctly-configured host is in (REDESIGN §6).
         marker_paths=(),
         ptrace_scope=0,
+        desired_path=tmp_path / "desired.json",
+        shm_dir=shm,
+        power_limit_w=None,
     )
     # Every port reports "not listening" (ok=True); every model reports "not
     # running" (ok=True; no stray units in the stub); missing client files are

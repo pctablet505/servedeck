@@ -299,8 +299,10 @@ Every request fails and `nvidia-smi` is slow or errors. Confirm with
 
 If `nvidia-smi -L` fails at all, never restart: a reboot is the only fix. Six restarts
 in 21 s once burned the systemd burst budget against a card that was off the bus.
-`servedeck/xid_watch.py` can classify these and write `state/crash_reports/<ts>.json`,
-but nothing starts it, so read the kernel journal. Xid history: [HOST.md](HOST.md).
+`servedeck/xid_watch.py` runs inside the dashboard poller to classify these and write
+`state/crash_reports/<ts>.json` alongside `telemetry`'s 5 s ring (`servedeck gpu-log`),
+and `servedeck doctor` reports a red `gpu fatal xid` row whenever a reboot-required Xid
+ occurred during the current boot. Xid history: [HOST.md](HOST.md).
 
 ### A client says the model is not running
 
@@ -343,10 +345,11 @@ row, not the summary.
 | `weights (<key>)` | the checkpoint is missing or unservable in the local hub cache; with `HF_HUB_OFFLINE=1` that is a dead launch, not a slow one | fetch the named repo |
 | `offload buffers` | `vllm_offload_*.mmap` files hold host RAM no engine maps | a stop or start reaps them; if they survive, check `ptrace_scope` |
 | `power cap` | the live cap disagrees with `models.toml [gpu] power_limit_w` | a boot unit re-applies its own value: `/etc/systemd/system/nvidia-power-limit.service` |
+| `gpu fatal xid` | a reboot-required Xid (such as 79 or 154) occurred since boot | reboot the host before attempting another model launch |
 
-`<kind> config` and `<kind> config (remote)` never go red: a missing client file is
-nothing to check yet, and entries pointing off this box are listed but deliberately
-not probed. `power cap` cannot go red until `[gpu] power_limit_w` is set — as of
+A missing `<kind> config` file stays green (nothing to check yet), while an unreadable or
+unparseable config file turns red; `<kind> config (remote)` never goes red because entries
+pointing off this box are listed and deliberately not probed. `power cap` cannot go red until `[gpu] power_limit_w` is set — as of
 2026-09-18 it is not, and the row reports the live value only (375 W).
 `unit (model-<key>)` deliberately does not look for a unit file: v2's models are
 transient units under `/run/user/<uid>/systemd/transient`, so a file check there could

@@ -9,6 +9,7 @@ route the app registers.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -22,6 +23,18 @@ WEB = Path(_app.__file__).parent / "web"
 INDEX = (WEB / "index.html").read_text(encoding="utf-8")
 APP_JS = (WEB / "app.js").read_text(encoding="utf-8")
 
+
+def _node_bin() -> str | None:
+    found = shutil.which("node")
+    if found:
+        return found
+    local = Path.home() / ".local" / "bin" / "node"
+    return str(local) if local.is_file() and os.access(local, os.X_OK) else None
+
+
+GJS = shutil.which("gjs")
+NODE = _node_bin()
+
 #: Parses the page script without running it (``new Function`` compiles its
 #: body; the two lines it wraps around the source are taken off the line).
 _PARSE_ONLY = (
@@ -30,18 +43,25 @@ _PARSE_ONLY = (
     "catch (e) { print(`${e.name}: ${e.message} (line ${e.lineNumber - 2})`);"
     " imports.system.exit(1); }"
 )
+_PARSE_ONLY_NODE = (
+    'const fs = require("fs");'
+    'try { new Function(fs.readFileSync(process.argv[1], "utf8")); }'
+    'catch (e) { console.error(e); process.exit(1); }'
+)
 
 
-@pytest.mark.skipif(shutil.which("gjs") is None, reason="needs gjs, GNOME's SpiderMonkey shell")
+@pytest.mark.skipif(GJS is None and NODE is None, reason="needs gjs or node")
 def test_the_page_script_parses() -> None:
     """A script that does not parse runs none of itself. On 2026-10-19 a second
     ``const stopBtn`` in paintState left the live page at "connecting..." with
     an empty model list, and every other test here passed, because they read
     app.js as text."""
-    r = subprocess.run(
-        ["gjs", "-c", _PARSE_ONLY, str(WEB / "app.js")],
-        capture_output=True, text=True, timeout=60,
+    cmd = (
+        [GJS, "-c", _PARSE_ONLY, str(WEB / "app.js")]
+        if GJS is not None
+        else [NODE, "-e", _PARSE_ONLY_NODE, str(WEB / "app.js")]
     )
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stdout + r.stderr
 
 
@@ -191,7 +211,26 @@ print(JSON.stringify([els.apply.textContent, els.apply.title]));
 """
 
 
-@pytest.mark.skipif(shutil.which("gjs") is None, reason="needs gjs, GNOME's SpiderMonkey shell")
+_PAINT_TARGET_BANNER_NODE = r"""
+const fs = require("fs");
+const src = fs.readFileSync(process.argv[1], "utf8");
+const start = src.indexOf("function paintTargetBanner()");
+eval(src.slice(start, src.indexOf("\n}\n", start) + 2));
+const el = () => ({ textContent: "", className: "", title: "", style: {}, disabled: false });
+const els = { stagedPill: el(), cfgModelName: el(), cfgStateTag: el(), cfgBannerSub: el(),
+              revertActiveBtn: el(), apply: el() };
+els.apply.textContent = "Apply & restart";
+els.apply.disabled = true;
+els.apply.title = "busy: STARTING";
+var $ = (id) => els[id];
+var sel = 0;
+var MODELS = JSON.parse(process.argv[2]);
+paintTargetBanner();
+console.log(JSON.stringify([els.apply.textContent, els.apply.title]));
+"""
+
+
+@pytest.mark.skipif(GJS is None and NODE is None, reason="needs gjs or node")
 @pytest.mark.parametrize(
     "models, label",
     [
@@ -208,9 +247,11 @@ def test_the_apply_button_names_its_action_even_while_disabled(models, label) ->
     title stays paintState's: it says why the button is disabled."""
     import json
 
-    r = subprocess.run(
-        ["gjs", "-c", _PAINT_TARGET_BANNER, str(WEB / "app.js"), json.dumps(models)],
-        capture_output=True, text=True, timeout=60,
+    cmd = (
+        [GJS, "-c", _PAINT_TARGET_BANNER, str(WEB / "app.js"), json.dumps(models)]
+        if GJS is not None
+        else [NODE, "-e", _PAINT_TARGET_BANNER_NODE, str(WEB / "app.js"), json.dumps(models)]
     )
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stdout + r.stderr
     assert json.loads(r.stdout) == [label, "busy: STARTING"]

@@ -1661,6 +1661,18 @@ def test_an_untrusted_scan_reaps_nothing(tmp_path) -> None:
     assert buf.exists(), "a buffer must survive a scan that could not see every engine"
 
 
+def test_offload_scan_sees_a_synthetic_proc_mapping_a_buffer(tmp_path) -> None:
+    """Portable check for /proc/<pid>/maps parsing on any POSIX host."""
+    fake_proc = tmp_path / "proc"
+    pid_dir = fake_proc / "5150"
+    (pid_dir / "fd").mkdir(parents=True)
+    buf_path = "/dev/shm/vllm_offload_synth.mmap"
+    (pid_dir / "maps").write_text(f"7f000000-7f001000 rw-s 00000000 00:01 12345 {buf_path}\n")
+    found = control.offload_scan(proc=fake_proc, engine_pids=lambda _p: ([pid_dir], True))
+    assert found.trusted and buf_path in found.paths
+
+
+@pytest.mark.skipif(not pathlib.Path("/proc/self/maps").exists(), reason="needs Linux /proc/self/maps")
 def test_offload_scan_sees_a_vllm_process_mapping_a_buffer(tmp_path) -> None:
     """The scan reads only vLLM processes, so it must find this one by argv."""
     import mmap
@@ -1722,6 +1734,7 @@ def test_witnesses_are_the_live_engines_pids(tmp_path) -> None:
     assert ctl.offload_witnesses() == [1000, 1001, 1002]
 
 
+@pytest.mark.skipif(not pathlib.Path("/proc/self/maps").exists(), reason="needs Linux /proc/self/maps")
 def test_a_witness_that_is_not_a_vllm_process_is_still_read(tmp_path) -> None:
     """The witness list is how a model whose argv does not say "vllm" (an
     adopted or renamed engine) still gets its mappings counted."""

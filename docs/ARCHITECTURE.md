@@ -247,7 +247,7 @@ handoff needs; doctor reports it as a host row. See [HOST.md](HOST.md).
 | `desired.json.v1` | the v1 migration | The pre-migration file, kept for the runbook's rollback. |
 | `backups/<date>/<flattened path>` | `wire --apply` | Prior content of every client config a write changed. |
 | `measurements.json` | `discovery` | Append-only store of boot-measured KV rates and contexts. |
-| `telemetry/*.jsonl`, `crash_reports/*.json` | `telemetry`, `xid_watch` | GPU samples, Xid events, one report per fatal Xid — written only when something runs the sampler, and the app does not (see debt). |
+| `telemetry/*.jsonl`, `crash_reports/*.json` | `telemetry`, `xid_watch` | GPU samples, Xid events, one report per fatal Xid — recorded in the background by `telemetry.Sampler` and `xid_watch.XidWatcher` inside `app.py`'s lifespan. |
 
 v1 leftovers, referenced by no code in `servedeck/` and readable as history
 only: `server.json` (+ `.bak-dead-glm53-pid214759`), `ack.json`,
@@ -307,7 +307,7 @@ about to say ready.
 | `legacy_page.py` | v1-shaped payloads and `/api/server/*` on the v2 runtime, because v1's page is the page. |
 | `__main__.py` | `python -m servedeck`: servedeck's own logs into the journal, then uvicorn with a shutdown that closes the hub first. |
 | `cli.py` | The `servedeck` console script; control commands drive the server over HTTP, falling back to in-process `Control`. |
-| `cli_gpu.py` | `servedeck gpu-log`'s parser over `telemetry`/`xid_watch` — one call from being wired into `cli.py`, and not wired. |
+| `cli_gpu.py` | `servedeck gpu-log`: queries `state/telemetry/` and `state/crash_reports/` recorded by `telemetry` and `xid_watch`. |
 | `wire.py` | Rewrites VS Code / Codex / Kimi configs from the registry, in place, its own tables only, with a diff. |
 | `doctor.py` | Proves the registry against reality: registry, client configs, ports, units, and host rows (ptrace_scope, desired, weights, offload buffers, power cap). |
 | `discovery.py` | The local hub cache — downloaded, servable, how big — plus `measurements.json`. |
@@ -342,13 +342,6 @@ one meaning.
 
 **The single point of failure**: nothing serves `/v1` while the process is
 down, and every client knows only that URL.
-
-**Unwired instrumentation.** `telemetry.py` and `xid_watch.py` are written and
-tested, but nothing starts the sampler (the `telemetry` SSE event is
-`legacy_page`'s strip, a different thing) and `cli_gpu.py` is not registered in
-`cli.py`, so `servedeck gpu-log` does not exist. The reason they were written —
-2026-09-12, the GPU fell off the bus and nothing on the box had recorded its
-temperature — is still unaddressed on the running box.
 
 **`needs_tty`** was retired from `models.toml` on 2026-09-18. It survives as a
 `Model` field defaulting to `False`, so an older registry still loads; nothing

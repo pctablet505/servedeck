@@ -35,7 +35,8 @@ def _configure_logging() -> None:
     every line, and two timestamps per line is how a log becomes unreadable.
     """
     level_name = os.environ.get(LOG_LEVEL_ENV, "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
+    candidate = getattr(logging, level_name, logging.INFO)
+    level = candidate if isinstance(candidate, int) and not isinstance(candidate, bool) else logging.INFO
     logger = logging.getLogger("servedeck")
     logger.setLevel(level)
     if not any(getattr(h, "_servedeck", False) for h in logger.handlers):
@@ -93,8 +94,6 @@ def main(argv: list[str] | None = None) -> int:
     # listen URL before reconciling, and a factory that read only the
     # environment would poll :8010 while uvicorn bound something else — the
     # reconcile would then wait out its timeout and start nothing.
-    import os
-
     os.environ["SERVEDECK_HOST"] = args.host
     os.environ["SERVEDECK_PORT"] = str(args.port)
     _settings.reset()
@@ -120,7 +119,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    application = _app.create_app(reconcile=not args.no_reconcile)
+    # telemetry=True: the GPU sampler and Xid watcher record the card whether or
+    # not this run reconciles; --no-reconcile is about models, not instruments.
+    application = _app.create_app(reconcile=not args.no_reconcile, telemetry=True)
     config = uvicorn.Config(
         application,
         host=args.host,

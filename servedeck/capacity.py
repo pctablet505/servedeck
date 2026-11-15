@@ -202,13 +202,19 @@ class BlueGreenVerdict:
 # ---------------------------------------------------------------------------
 
 
-def _pct(gib: float) -> float:
-    return gib / GPU_TOTAL_GIB * 100.0
+def _pct(gib: float, total_gib: float | None = None) -> float:
+    denom = GPU_TOTAL_GIB if total_gib is None else total_gib
+    if denom <= 0:
+        return 0.0
+    return gib / denom * 100.0
 
 
-def _util_min_for(weights_gib: float, overhead_gib: float) -> float:
+def _util_min_for(weights_gib: float, overhead_gib: float, total_gib: float | None = None) -> float:
     """Smallest util (rounded up to 2dp) that gives kv_gib > 0."""
-    raw = (weights_gib + overhead_gib) / GPU_TOTAL_GIB
+    denom = GPU_TOTAL_GIB if total_gib is None else total_gib
+    if denom <= 0:
+        return 1.0
+    raw = (weights_gib + overhead_gib) / denom
     bumped = raw + 1e-9
     return min(1.0, math.ceil(bumped * 100.0) / 100.0)
 
@@ -253,8 +259,48 @@ def compute(
             can_apply=False,
         )
 
+    # Sync module-level limits if limits.reset() ran after import (e.g. conftest).
+    cur_limits = _limits.get()
+    if cur_limits is not _cfg:
+        refresh_limits()
+
+    total_mib_basis = (
+        live.total_mib
+        if (live is not None and live.total_mib is not None and live.total_mib > 0)
+        else GPU_TOTAL_MIB
+    )
+    if total_mib_basis <= 0:
+        findings.append(
+            Finding(
+                code="GPU_TOTAL_UNKNOWN",
+                level="block",
+                title="Total GPU VRAM unknown",
+                detail=(
+                    "Neither nvidia-smi nor SERVEDECK_GPU_TOTAL_MIB reported a usable "
+                    "total VRAM size; refusing to guess KV capacity."
+                ),
+                fix="Ensure nvidia-smi works, or set SERVEDECK_GPU_TOTAL_MIB.",
+            )
+        )
+        empty_bar = CapacityBar(weights_pct=0.0, kv_pct=0.0, overhead_pct=0.0, free_pct=0.0)
+        return CapacityResult(
+            budget_gib=0.0,
+            kv_gib=0.0,
+            kv_tokens=0,
+            concurrency_x=0.0,
+            agents_at_ctx=0,
+            effective_parallel=0,
+            max_single_ctx=0,
+            ctx_max_model=m.model_max_ctx,
+            ctx_max_fit=0,
+            confidence="unknown",
+            bar=empty_bar,
+            findings=tuple(findings),
+            can_apply=False,
+        )
+
     # ---------------------------------------------------------- validation
-    if not (0.0 < util <= 1.0):
+    if isinstance(util, bool) or not isinstance(util, (int, float)) or not math.isfinite(util) or not (0.0 < util <= 1.0):
         findings.append(
             Finding(
                 code="UTIL_OUT_OF_RANGE",
@@ -265,7 +311,18 @@ def compute(
             )
         )
 
-    if not isinstance(max_num_seqs, int) or max_num_seqs < 1:
+    if isinstance(ctx, bool) or not isinstance(ctx, int) or ctx < 1:
+        findings.append(
+            Finding(
+                code="CTX_INVALID",
+                level="block",
+                title="Context length invalid",
+                detail=f"ctx={ctx!r} must be a positive integer.",
+                fix="Set ctx to a positive token count.",
+            )
+        )
+
+    if isinstance(max_num_seqs, bool) or not isinstance(max_num_seqs, int) or max_num_seqs < 1:
         findings.append(
             Finding(
                 code="MAX_NUM_SEQS_INVALID",
@@ -438,8 +495,7 @@ def compute(
                         detail=(
                             f"free {free_mib:,} MiB (total {total_mib:,}, used "
                             f"{live.used_mib:,}, our own {own_mib:,} discounted) < "
-                            f"need {need_mib:,} MiB = {want_mib:,} at util {util:.2f} "
-                            f"+ {VRAM_GUARD_HEADROOM_MIB:,} headroom."
+                            f"need {need_mib:,} MiB at util {util:.2f}."
                         ),
                         fix="Lower util, or stop a holder, then try again.",
                     )
@@ -742,8 +798,35 @@ def blue_green(
     either model's individually measured overhead — verified against the
     §3 worked table: 2*78.47+9.4=166.3 (2*OVERHEAD_GIB_DEFAULT == 9.4 exactly).
     """
-    w_a = a.weights_gib or 0.0
-    w_b = b.weights_gib or 0.0
+    cur_limits = _limits.get()
+    if cur_limits is not _cfg:
+        refresh_limits()
+
+    if (
+        a.weights_gib is None
+        or a.weights_source == "unknown"
+        or b.weights_gib is None
+        or b.weights_source == "unknown"
+        or GPU_TOTAL_GIB <= 0
+    ):
+        return BlueGreenVerdict(
+            feasible=False,
+            combined_gib=0.0,
+            required_gib=0.0,
+            gpu_total_gib=GPU_TOTAL_GIB,
+            remaining_kv_gib=0.0,
+            kv_tokens=0,
+            concurrency_x=0.0,
+            budget_gib_a=util_a * GPU_TOTAL_GIB,
+            budget_gib_b=util_b * GPU_TOTAL_GIB,
+            reason=(
+                "Weight size (or total GPU VRAM) is unknown for one or both models — "
+                "blue-green feasibility cannot be predicted until both have been measured."
+            ),
+        )
+
+    w_a = a.weights_gib
+    w_b = b.weights_gib
 
     combined_gib = w_a + w_b + 2 * OVERHEAD_GIB_DEFAULT
     required_gib = combined_gib + FRAG_MARGIN_GIB

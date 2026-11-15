@@ -404,6 +404,21 @@ function ctxTop(ceiling) {
   return MIN_CTX + Math.max(0, steps) * CTX_STEP;
 }
 
+function snapCtxToSlider(val, minVal, maxVal) {
+  if (val >= maxVal) return maxVal;
+  if (val <= minVal) return minVal;
+  return minVal + Math.floor((val - minVal) / CTX_STEP) * CTX_STEP;
+}
+
+function escHtml(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 /* The slider's range: {min, max, ceiling, binding}.
  *
  *   binding "model"   — the top is the model's own max_position_embeddings
@@ -632,7 +647,7 @@ let railSig = "";
    becoming servable, nor repo_id alone, which would miss a model changing size
    or gaining its blobs. */
 function railSigOf(models) {
-  return (models || []).map((m) => `${m.repo_id}|${m.servable ? 1 : 0}|${m.disk_bytes}`).join(";");
+  return (models || []).map((m) => `${m.key || m.repo_id}|${m.repo_id}|${m.servable ? 1 : 0}|${m.disk_bytes}`).join(";");
 }
 
 /* "N models" alone hid the number that actually matters: how many of them this
@@ -647,6 +662,9 @@ function promptConfirm({ title = "Confirm", message = "", confirmText = "Confirm
   const dlg = $("confirmDialog");
   if (!dlg || typeof dlg.showModal !== "function") {
     return Promise.resolve(window.confirm(`${title}\n\n${message}`));
+  }
+  if (dlg.open && typeof dlg.close === "function") {
+    dlg.close();
   }
   set("confirmTitle", title);
   set("confirmBody", message);
@@ -674,7 +692,10 @@ function promptConfirm({ title = "Confirm", message = "", confirmText = "Confirm
 function paintTargetBanner() {
   const m = MODELS[sel];
   if (!m) return;
-  const servingModel = MODELS.find((mod) => mod.serving);
+  const mSlot = m.slot || "main";
+  const servingModel = mSlot === "main"
+    ? MODELS.find((mod) => mod.serving && (mod.slot || "main") === "main")
+    : null;
   const pill = $("stagedPill");
   const nameEl = $("cfgModelName");
   const tagEl = $("cfgStateTag");
@@ -734,7 +755,7 @@ function paintTargetBanner() {
 function renderCardTags(m, isSelected) {
   const isServing = !!m.serving;
   const tags = [];
-  tags.push(`<span class="tag">${m.quant || "—"}</span>`);
+  tags.push(`<span class="tag">${escHtml(m.quant || "—")}</span>`);
   if (isServing) tags.push('<span class="tag live">serving</span>');
   else if (isSelected) tags.push('<span class="tag staged">staged</span>');
   if (!m.servable) tags.push('<span class="tag est">unservable</span>');
@@ -754,21 +775,24 @@ function renderModels() {
   if (sig === railSig) { updateRailSelection(); return; }
   railSig = sig;
   // Which card had focus, and how far the list was scrolled, are restored after
-  // the rebuild. Focus is tracked by repo_id rather than index, because a model
-  // appearing earlier in the list would otherwise move the focus to a different
-  // model under the operator's keyboard.
+  // the rebuild. Focus is tracked by registry key (repo_id for a card without
+  // one) rather than index, because a model appearing earlier in the list would
+  // otherwise move the focus to a different model under the operator's keyboard.
   const focused = L.querySelector ? L.querySelector(":focus") : null;
-  const focusRepo = focused && focused.dataset ? focused.dataset.repo : null;
+  const focusKey = focused && focused.dataset ? (focused.dataset.key || focused.dataset.repo) : null;
   const scrollTop = L.scrollTop;
   L.innerHTML = "";
+  let rendered = 0;
   MODELS.forEach((m, i) => {
     if (q) {
       const match = (m.name || "").toLowerCase().includes(q) ||
+                    (m.key || "").toLowerCase().includes(q) ||
                     (m.repo_id || "").toLowerCase().includes(q) ||
                     (m.quant || "").toLowerCase().includes(q) ||
                     (m.backend || "").toLowerCase().includes(q);
       if (!match) return;
     }
+    rendered += 1;
     const b = document.createElement("button");
     const isServing = !!m.serving;
     const isSelected = i === sel;
@@ -778,16 +802,17 @@ function renderModels() {
     else b.className = "mcard";
 
     b.type = "button";
-    b.setAttribute("aria-pressed", isSelected ? "true" : "false");
     b.setAttribute("aria-selected", isSelected ? "true" : "false");
     // The rail is a list of choices, not a list of unrelated buttons.
     b.setAttribute("role", "option");
+    b.dataset.key = m.key || m.repo_id || "";
     b.dataset.repo = m.repo_id || "";
     b.innerHTML =
-      `<span class="r1"><span class="nm"></span><span class="sz mono" title="${diskTitle(m)}">${bytesTxt(m.disk_bytes)}${m.disk_bytes > m.disk_local_bytes ? '<span class="off">↗</span>' : ""}</span></span>
+      `<span class="r1"><span class="nm"></span><span class="sz mono">${bytesTxt(m.disk_bytes)}${m.disk_bytes > m.disk_local_bytes ? '<span class="off">↗</span>' : ""}</span></span>
        <span class="r2">${renderCardTags(m, isSelected)}</span>
        <span class="note"></span>`;
     b.querySelector(".nm").textContent = m.name;
+    b.querySelector(".sz").title = diskTitle(m);
     b.querySelector(".note").textContent =
       m.unservable_reason || `${m.backend || "?"} · ${fmt(m.model_max_ctx)} ctx`;
     if (!m.servable) {
@@ -816,9 +841,17 @@ function renderModels() {
     }
     L.appendChild(b);
   });
+  if (rendered === 0 && q) {
+    const empty = document.createElement("div");
+    empty.className = "pad dim";
+    empty.textContent = "No models match filter.";
+    L.appendChild(empty);
+  }
   L.scrollTop = scrollTop;
-  if (focusRepo && L.querySelector) {
-    const back = L.querySelector(`[data-repo="${focusRepo}"]`);
+  if (focusKey && L.querySelector) {
+    const back = Array.from(L.children || []).find(
+      (el) => el.dataset && (el.dataset.key === focusKey || el.dataset.repo === focusKey)
+    );
     if (back && back.focus) back.focus();
   }
 }
@@ -830,8 +863,9 @@ function updateRailSelection() {
   if (!L || !L.children) return;
   paintTargetBanner();
   Array.from(L.children).forEach((b) => {
-    const repo = b.dataset.repo;
-    const i = MODELS.findIndex((mod) => mod.repo_id === repo);
+    const rowKey = b.dataset ? (b.dataset.key || b.dataset.repo) : null;
+    if (!rowKey) return;
+    const i = MODELS.findIndex((mod) => (mod.key || mod.repo_id) === rowKey);
     if (i < 0) return;
     const m = MODELS[i];
     const isServing = !!m.serving;
@@ -841,7 +875,6 @@ function updateRailSelection() {
     else if (isSelected) b.className = "mcard selected-staged";
     else b.className = "mcard";
     b.setAttribute("aria-selected", isSelected ? "true" : "false");
-    b.setAttribute("aria-pressed", isSelected ? "true" : "false");
     const r2 = b.querySelector ? b.querySelector(".r2") : null;
     if (r2) r2.innerHTML = renderCardTags(m, isSelected);
   });
@@ -863,7 +896,7 @@ async function doEstimate() {
     const r = await fetch("/api/capacity/estimate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ repo_id: m.repo_id, util, ctx, max_num_seqs: agents,
+      body: JSON.stringify({ key: m.key, repo_id: m.repo_id, backend: m.backend, util, ctx, max_num_seqs: agents,
                              kv_offload_gib: offloadGib }),
     });
     var d = await r.json();
@@ -1017,8 +1050,10 @@ function paintEstimate(d) {
   const seg = (id, pct, label) => {
     const e = $(id);
     if (!e) return;
-    e.style.width = (pct || 0) + "%";
-    if (label !== undefined) e.textContent = (pct > 10 ? label : "");
+    const p = pct || 0;
+    e.style.width = p + "%";
+    if (e.classList) e.classList.toggle("zero", p <= 0);
+    if (label !== undefined) e.textContent = (p > 10 ? label : "");
   };
   paintPreflight(d, showFindings(d.findings || []));
   seg("segW", bar.weights_pct, "weights");
@@ -1038,6 +1073,12 @@ function paintEstimate(d) {
   const poolTok = measured ? `${fmt(measured)} tokens` : `${fmt(d.kv_tokens)} tokens`;
   set("vramTxt",
     `weights ${gib(d.weights_gib)} · KV ${gib(d.kv_gib)} (${poolTok}) · budget ${gib(d.budget_gib)}`);
+  const vt = $("vramTxt");
+  if (vt) {
+    const rateTxt = typeof d.kv_kib_per_token === "number" ? `${d.kv_kib_per_token.toFixed(2)} KiB/tok (${d.kv_source || d.confidence || "unknown"})` : "";
+    const calTxt = (liveSizing && liveSizing.calibration_note) ? liveSizing.calibration_note : "";
+    vt.title = [rateTxt, calTxt].filter(Boolean).join(" · ");
+  }
   // The offload field: what this many GiB parks, and how much host RAM is
   // free for it. First estimate seeds the field from the registry's flag.
   if (offloadGib === null && typeof d.offload_gib === "number") {
@@ -1058,16 +1099,19 @@ function showFindings(findings) {
   if (!crit || !warn) return [];
   crit.classList.remove("on");
   warn.classList.remove("on");
-  const block = findings.find((f) => f.level === "block");
-  const wf = findings.find((f) => f.level === "warn");
+  const list = Array.isArray(findings) ? findings : [];
+  const block = list.find((f) => (f.level || f.severity) === "block");
+  const wf = list.find((f) => (f.level || f.severity) === "warn");
   if (block) {
     crit.classList.add("on");
-    $("alertCT").innerHTML = `<b>${block.title}</b> ${block.detail}`;
+    const ct = $("alertCT");
+    if (ct) ct.innerHTML = `<b>${escHtml(block.title)}</b> ${escHtml(block.detail)}`;
     return [block.code];
   }
   if (wf) {
     warn.classList.add("on");
-    $("alertWT").innerHTML = `<b>${wf.title}</b> ${wf.detail}`;
+    const wt = $("alertWT");
+    if (wt) wt.innerHTML = `<b>${escHtml(wf.title)}</b> ${escHtml(wf.detail)}`;
     return [wf.code];
   }
   return [];
@@ -1342,8 +1386,14 @@ function paintTelemetry(t) {
   // index.html used to name one specific GPU and one specific total, which is
   // a claim about the machine that the page has no way to know is still true.
   if (g.used_mib != null) set("gpuUsed", fmt(g.used_mib));
+  else if (g.total_mib == null) set("gpuUsed", "—");
   if (g.total_mib != null) set("gpuTotal", fmt(g.total_mib));
+  else if (g.used_mib == null) set("gpuTotal", "—");
   if (g.name) set("gpuName", g.name);
+  const gu = $("gpuUsed");
+  if (gu && gu.parentElement && gu.parentElement.classList) {
+    gu.parentElement.classList.toggle("err", g.used_mib == null && g.total_mib == null);
+  }
 
   const reachable = liveMetrics.reachable;
   const kvp = reachable ? liveMetrics.kv_usage_perc : 0;
@@ -2146,13 +2196,23 @@ function paintState(s) {
   // was a dashboard that could not name the model it was serving.
   const ident = up.identity || {};
   const names = ident.served_names || (up.model ? [up.model] : []);
-  if (MODELS.length && (ident.repo_id || names.length)) {
+  const stateModels = Array.isArray(s.models) ? s.models : null;
+  if (MODELS.length && (stateModels || ident.repo_id || names.length)) {
+    const liveByKey = stateModels
+      ? new Map(stateModels.map((r) => [r.key, !!(r.live || r.ready)]))
+      : null;
     let servingIdx = -1;
     MODELS.forEach((m, i) => {
-      m.serving = ident.repo_id
-        ? m.repo_id === ident.repo_id
-        : names.includes(m.repo_id) || names.includes(m.name);
-      if (m.serving) servingIdx = i;
+      if (liveByKey && m.key && liveByKey.has(m.key)) {
+        m.serving = liveByKey.get(m.key);
+      } else {
+        m.serving = ident.repo_id
+          ? m.repo_id === ident.repo_id
+          : names.includes(m.repo_id) || names.includes(m.name);
+      }
+      if (m.serving && ((m.slot || "main") === "main" || servingIdx < 0)) {
+        servingIdx = i;
+      }
     });
     if (ident.mismatch) {
       log(
@@ -2171,6 +2231,30 @@ function paintState(s) {
       estimate();
     }
     renderModels();
+  }
+
+  const isStarting = sv.actual_state === "STARTING" || sv.actual_state === "PREFLIGHT";
+  const isStopping = sv.actual_state === "STOPPING" || sv.actual_state === "DRAINING";
+  const selServing = !!(MODELS[sel] && MODELS[sel].serving);
+  if (stopBtn) {
+    if (isStarting) {
+      stopBtn.disabled = !controlEnabled;
+      stopBtn.textContent = "Force stop boot";
+      stopBtn.className = "btn danger";
+      stopBtn.title = "Cancel in-progress boot immediately";
+    } else if (isStopping) {
+      stopBtn.disabled = true;
+      stopBtn.textContent = "Stopping…";
+      stopBtn.className = "btn";
+      stopBtn.title = "Model stop is already in progress";
+    } else if (!unadopted) {
+      stopBtn.textContent = "Stop";
+      stopBtn.className = "btn";
+      stopBtn.disabled = !controlEnabled || !(upNow || selServing);
+      stopBtn.title = !controlEnabled
+        ? (s.control_note || "supervisor unavailable")
+        : (!(upNow || selServing) ? "nothing running" : "");
+    }
   }
 
   // The context control reads back the running server's real --max-model-len
@@ -2209,7 +2293,12 @@ function wireControls() {
   const stop = $("stop");
   if (stop) {
     stop.onclick = async () => {
-      const isBooting = !!(lastState?.supervisor?.phase || (lastState?.boot && bootActive(lastState.boot)));
+      const svNow = (lastState && lastState.supervisor) || {};
+      const isBooting = !!(
+        svNow.actual_state === "STARTING" ||
+        svNow.actual_state === "PREFLIGHT" ||
+        (lastState?.boot && bootActive(lastState.boot))
+      );
       if (isBooting) {
         const ok = await promptConfirm({
           title: "Force stop model boot?",
@@ -2225,8 +2314,12 @@ function wireControls() {
       }
       // Stopping frees the GPU and kills in-flight requests. Confirm, and say
       // exactly what is running so the click is informed.
-      const running = liveMetrics.running || 0;
-      const what = liveFacts.kv_tokens ? ` (${fmt(liveFacts.kv_tokens)} KV tokens allocated)` : "";
+      const selModel = MODELS[sel];
+      const targetResident = selModel && selModel.serving && (selModel.slot || "main") === "resident" ? selModel : null;
+      const running = targetResident ? 0 : (liveMetrics.running || 0);
+      const what = targetResident
+        ? ` (${targetResident.name})`
+        : (liveFacts.kv_tokens ? ` (${fmt(liveFacts.kv_tokens)} KV tokens allocated)` : "");
       const extra = running > 0 ? `\n\n${running} request(s) are in flight and will fail.` : "";
       const ok = await promptConfirm({
         title: "Stop model server?",
@@ -2236,7 +2329,8 @@ function wireControls() {
       });
       if (!ok) return;
       stop.disabled = true;
-      try { await post("/api/server/stop"); log("stop requested", "w"); }
+      const stopBody = targetResident ? { key: targetResident.key, repo_id: targetResident.repo_id } : {};
+      try { await post("/api/server/stop", stopBody); log("stop requested", "w"); }
       catch (e) { log("stop failed: " + e.message, "e"); stop.disabled = false; }
     };
   }
@@ -2251,7 +2345,10 @@ function wireControls() {
         return;
       }
       const unknown = lastEstimate && lastEstimate.confidence === "unknown";
-      const curServing = MODELS.find((mod) => mod.serving);
+      const mSlot = m.slot || "main";
+      const curServing = mSlot === "main"
+        ? MODELS.find((mod) => mod.serving && (mod.slot || "main") === "main")
+        : null;
       const isSwitch = !m.serving && !!curServing;
       const isFreshStart = !m.serving && !curServing;
       const title = isSwitch ? `Switch to ${m.name}?` : isFreshStart ? `Start ${m.name}?` : `Restart ${m.name}?`;
@@ -2282,14 +2379,15 @@ function wireControls() {
       // running server returned 202 "accepted" and changed nothing at all:
       // same pid, same cmdline, same .config, and a success in the log.
       // /api/server/restart is the only endpoint that relaunches, and it
-      // carries the same settings body.
+      // carries the same settings body. A resident restarts only itself.
       const sv = (lastState && lastState.supervisor) || {};
       const upNow = !!(lastState && lastState.upstream && lastState.upstream.up);
-      const path = (upNow || sv.actual_state === "READY")
-        ? "/api/server/restart" : "/api/server/start";
+      const path = mSlot === "resident"
+        ? (m.serving ? "/api/server/restart" : "/api/server/start")
+        : ((upNow || sv.actual_state === "READY") ? "/api/server/restart" : "/api/server/start");
       try {
         await post(path, {
-          repo_id: m.repo_id, backend: m.backend, util, ctx, max_num_seqs: agents,
+          key: m.key, repo_id: m.repo_id, backend: m.backend, util, ctx, max_num_seqs: agents,
           kv_offload_gib: offloadGib,
         });
         log(`applying ${m.name} …`, "g");
@@ -2362,14 +2460,14 @@ async function init() {
     const commitCtxNum = (snapInput) => {
       const n = Math.round(+cxNum.value);
       if (!isFinite(n) || n <= 0) return;
-      const minVal = +cxNum.min || MIN_CTX;
-      const maxVal = +cxNum.max || DEFAULT_MAX_CTX;
+      const cxSlider = $("ctx");
+      const minVal = +cxNum.min || (cxSlider && +cxSlider.min) || MIN_CTX;
+      const maxVal = +cxNum.max || (cxSlider && +cxSlider.max) || DEFAULT_MAX_CTX;
       if (!snapInput && (n < minVal || n > maxVal)) return;
       userPicked = true;
       ctxSource = "operator";
       const clamped = Math.max(minVal, Math.min(maxVal, n));
-      ctx = ctxTop(clamped);
-      const cxSlider = $("ctx");
+      ctx = snapCtxToSlider(clamped, minVal, maxVal);
       if (cxSlider) cxSlider.value = String(ctx);
       if (snapInput) cxNum.value = String(ctx);
       set("ctxV", fmt(ctx));
@@ -2389,7 +2487,7 @@ async function init() {
       const maxVal = cxSlider ? +cxSlider.max : DEFAULT_MAX_CTX;
       let target = maxVal;
       if (btn.dataset.preset === "min") target = minVal;
-      else if (btn.dataset.preset === "half") target = ctxTop(Math.round(maxVal / 2));
+      else if (btn.dataset.preset === "half") target = snapCtxToSlider(Math.round(maxVal / 2), minVal, maxVal);
       else if (btn.dataset.preset === "max") target = maxVal;
       userPicked = true;
       ctxSource = "operator";
@@ -2493,6 +2591,12 @@ async function init() {
   const es = new EventSource("/api/events");
   es.addEventListener("state", (ev) => paintState(JSON.parse(ev.data)));
   es.addEventListener("telemetry", (ev) => paintTelemetry(JSON.parse(ev.data)));
+  es.addEventListener("progress", (ev) => {
+    const p = JSON.parse(ev.data);
+    if (p && p.text) {
+      log(p.text, p.kind === "failed" ? "e" : p.kind === "marker" || p.kind === "ready" ? "g" : "");
+    }
+  });
   es.addEventListener("notice", (ev) => {
     const n = JSON.parse(ev.data);
     const bad = n.level === "error" && !n.replay;

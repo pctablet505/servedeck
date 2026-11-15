@@ -12,7 +12,7 @@
 #
 # <new-dir> becomes the wrapper directory: <new-dir>/src (fork checkout) and
 # <new-dir>/.venv-next (the venv), mirroring ~/Projects/vllm-qwen38next/.
-set -uo pipefail
+set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
@@ -49,6 +49,9 @@ if [ -z "$TARGET_DIR" ]; then
         echo "usage: build.sh [--dry-run] <new-dir>" >&2
         exit 2
     fi
+elif [ "$DRY_RUN" -eq 0 ]; then
+    mkdir -p "$TARGET_DIR"
+    TARGET_DIR="$(cd "$TARGET_DIR" && pwd)"
 fi
 
 run() {
@@ -115,7 +118,7 @@ echo
 
 echo "# 7. Unversioned .so symlinks CMake's FindCUDA needs, and the lib64"
 echo "#    shim (SETUP.md §6, Blockers 3 and 5/6; MANIFEST.toml [cuda])."
-run "CU=\"$TARGET_DIR/.venv-next/lib/python3.13/site-packages/nvidia/cu13/lib\"; cd \"\$CU\" && for f in *.so.*; do base=\$(echo \"\$f\" | sed 's/\\.so\\..*/.so/'); [ -e \"\$base\" ] || ln -s \"\$f\" \"\$base\"; done"
+run "(CU=\"$TARGET_DIR/.venv-next/lib/python3.13/site-packages/nvidia/cu13/lib\" && cd \"\$CU\" && for f in *.so.*; do base=\$(echo \"\$f\" | sed 's/\\.so\\..*/.so/'); [ -e \"\$base\" ] || ln -s \"\$f\" \"\$base\"; done)"
 run "ln -sfn lib \"$TARGET_DIR/.venv-next/lib/python3.13/site-packages/nvidia/cu13/lib64\""
 echo
 
@@ -128,8 +131,8 @@ run "export TORCH_CUDA_ARCH_LIST=12.0f"
 run "export VLLM_FLASH_ATTN_SRC_DIR=\"$TARGET_DIR/flash-attn\""
 run "export SETUPTOOLS_SCM_PRETEND_VERSION=0.29.0.dev0+qwen38next"
 run "export VLLM_TARGET_DEVICE=cuda"
-run "cd \"$TARGET_DIR/src\" && MAX_JOBS=\${MAX_JOBS:-40} NVCC_THREADS=\${NVCC_THREADS:-2} \\
-  uv pip install --python \"$TARGET_DIR/.venv-next/bin/python\" -e . --no-build-isolation --no-deps"
+run "(cd \"$TARGET_DIR/src\" && MAX_JOBS=\${MAX_JOBS:-40} NVCC_THREADS=\${NVCC_THREADS:-2} \\
+  uv pip install --python \"$TARGET_DIR/.venv-next/bin/python\" -e . --no-build-isolation --no-deps)"
 echo
 
 echo "# 9. Verify (SETUP.md §8's own verification block)."

@@ -161,7 +161,11 @@ def _parse_short_precise_ts(line: str, *, year: int, tzinfo: Any) -> tuple[datet
 
 
 def parse_xid_lines(
-    text: str, *, year: int | None = None, tzinfo: Any = None
+    text: str,
+    *,
+    year: int | None = None,
+    tzinfo: Any = None,
+    now: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """Every Xid / companion line in ``text`` (raw ``journalctl -o
     short-precise`` output, or any text shaped like it), classified, deduped
@@ -176,8 +180,10 @@ def parse_xid_lines(
     event rather than dropping the line — a raw Xid line with no usable
     timestamp is still evidence worth keeping.
     """
-    year = year if year is not None else datetime.now().year
     tzinfo = tzinfo if tzinfo is not None else _telemetry.local_tz()
+    ref_now = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
+    explicit_year = year is not None
+    inferred_year = year if year is not None else ref_now.astimezone(tzinfo).year
 
     events: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
@@ -192,7 +198,11 @@ def parse_xid_lines(
         elif not any(phrase in line for phrase in _COMPANION_PHRASES):
             continue  # not an Xid-related line
 
-        ts_dt, raw_ts = _parse_short_precise_ts(line, year=year, tzinfo=tzinfo)
+        ts_dt, raw_ts = _parse_short_precise_ts(line, year=inferred_year, tzinfo=tzinfo)
+        if not explicit_year and ts_dt is not None and ts_dt > ref_now + timedelta(days=2):
+            # New Year's rollover: e.g. scanning a 24h window on Jan 1 encounters
+            # year-less "Dec 31 23:55:00" lines that belong to the previous year.
+            ts_dt, raw_ts = _parse_short_precise_ts(line, year=inferred_year - 1, tzinfo=tzinfo)
         ts_iso = ts_dt.isoformat() if ts_dt is not None else None
 
         dedupe_key = (ts_iso or "", line)
@@ -383,7 +393,7 @@ class XidWatcher:
 
     def _last_seen_ts(self) -> str | None:
         events = _telemetry.read_jsonl(self.xid_log_path())
-        ts_values = [e.get("ts") for e in events if isinstance(e.get("ts"), str)]
+        ts_values = [ts for e in events if isinstance((ts := e.get("ts")), str)]
         return max(ts_values) if ts_values else None
 
     def scan_once(self) -> list[dict[str, Any]]:
@@ -394,9 +404,13 @@ class XidWatcher:
         """
         tzinfo = _telemetry.local_tz()
         last_seen_iso = self._last_seen_ts()
+        since_dt: datetime | None = None
         if last_seen_iso is not None:
-            since_dt = datetime.fromisoformat(last_seen_iso) - timedelta(seconds=1)
-        else:
+            try:
+                since_dt = datetime.fromisoformat(last_seen_iso) - timedelta(seconds=1)
+            except ValueError:
+                last_seen_iso = None
+        if since_dt is None:
             since_dt = datetime.now(timezone.utc) - _telemetry.parse_duration(self.bootstrap_window)
         since_str = _journalctl_since_str(since_dt, tzinfo=tzinfo)
 
@@ -406,7 +420,7 @@ class XidWatcher:
         if proc.returncode != 0:
             return []
 
-        events = parse_xid_lines(proc.stdout or "", year=datetime.now().year, tzinfo=tzinfo)
+        events = parse_xid_lines(proc.stdout or "", tzinfo=tzinfo)
         if last_seen_iso is not None:
             events = [e for e in events if e.get("ts") and e["ts"] > last_seen_iso]
 

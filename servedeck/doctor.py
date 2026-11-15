@@ -132,59 +132,78 @@ def check_registry(path: str | Path) -> CheckResult:
 # --------------------------------------------------------------------------- #
 
 
-def _refs_from_vscode(text: str) -> list[tuple[str, str]]:
+def _refs_from_vscode(text: str) -> tuple[list[tuple[str, str]], str | None]:
     try:
         data = json.loads(text)
-    except json.JSONDecodeError:
-        return []
+    except json.JSONDecodeError as exc:
+        return [], f"invalid JSON: {exc}"
+    if not isinstance(data, list):
+        return [], "top-level value is not a JSON array"
     refs: list[tuple[str, str]] = []
-    if isinstance(data, list):
-        for group in data:
-            if not isinstance(group, dict):
-                continue
-            for m in group.get("models") or []:
-                if isinstance(m, dict) and isinstance(m.get("id"), str) and isinstance(m.get("url"), str):
-                    models_url = m["url"].rsplit("/chat/completions", 1)[0].rstrip("/") + "/models"
-                    refs.append((m["id"], models_url))
-    return refs
+    for group in data:
+        if not isinstance(group, dict):
+            continue
+        for m in group.get("models") or []:
+            if isinstance(m, dict) and isinstance(m.get("id"), str) and isinstance(m.get("url"), str):
+                models_url = m["url"].rsplit("/chat/completions", 1)[0].rstrip("/") + "/models"
+                refs.append((m["id"], models_url))
+    return refs, None
 
 
 def _refs_via_provider_table(
-    text: str, *, providers_key: str, entries_key: str, provider_field: str, model_field: str
-) -> list[tuple[str, str]]:
-    """Shared shape of Codex (model_providers/profiles) and Kimi
-    (providers/models): a table of named providers with base_url, and a table
-    of named entries each naming one provider and one model."""
+    text: str,
+    *,
+    providers_key: str,
+    entries_key: str,
+    provider_field: str,
+    model_field: str,
+    include_top_level: bool = False,
+) -> tuple[list[tuple[str, str]], str | None]:
+    """Shared shape of Codex (model_providers/profiles + top-level) and Kimi
+    (providers/models): a table of named providers with base_url, and named
+    entries (or top-level keys) each naming one provider and one model."""
     try:
         data = tomllib.loads(text)
-    except tomllib.TOMLDecodeError:
-        return []
-    providers = data.get(providers_key) or {}
+    except tomllib.TOMLDecodeError as exc:
+        return [], f"invalid TOML: {exc}"
+    providers = data.get(providers_key)
+    if not isinstance(providers, dict):
+        providers = {}
     refs: list[tuple[str, str]] = []
-    for entry in (data.get(entries_key) or {}).values():
-        if not isinstance(entry, dict):
-            continue
-        provider_name = entry.get(provider_field)
-        model_name = entry.get(model_field)
-        provider = providers.get(provider_name) if isinstance(provider_name, str) else None
-        if not (isinstance(model_name, str) and isinstance(provider, dict) and provider.get("base_url")):
-            continue
-        base = str(provider["base_url"]).rstrip("/")
-        refs.append((model_name, f"{base}/models"))
-    return refs
+    if include_top_level:
+        top_provider = data.get(provider_field)
+        top_model = data.get(model_field)
+        provider_obj = providers.get(top_provider) if isinstance(top_provider, str) else None
+        if isinstance(top_model, str) and isinstance(provider_obj, dict) and provider_obj.get("base_url"):
+            base = str(provider_obj["base_url"]).rstrip("/")
+            refs.append((top_model, f"{base}/models"))
+    entries = data.get(entries_key)
+    if isinstance(entries, dict):
+        for entry in entries.values():
+            if not isinstance(entry, dict):
+                continue
+            provider_name = entry.get(provider_field)
+            model_name = entry.get(model_field)
+            provider = providers.get(provider_name) if isinstance(provider_name, str) else None
+            if not (isinstance(model_name, str) and isinstance(provider, dict) and provider.get("base_url")):
+                continue
+            base = str(provider["base_url"]).rstrip("/")
+            refs.append((model_name, f"{base}/models"))
+    return refs, None
 
 
-def _refs_from_codex(text: str) -> list[tuple[str, str]]:
+def _refs_from_codex(text: str) -> tuple[list[tuple[str, str]], str | None]:
     return _refs_via_provider_table(
         text,
         providers_key="model_providers",
         entries_key="profiles",
         provider_field="model_provider",
         model_field="model",
+        include_top_level=True,
     )
 
 
-def _refs_from_kimi(text: str) -> list[tuple[str, str]]:
+def _refs_from_kimi(text: str) -> tuple[list[tuple[str, str]], str | None]:
     return _refs_via_provider_table(
         text,
         providers_key="providers",
@@ -194,7 +213,7 @@ def _refs_from_kimi(text: str) -> list[tuple[str, str]]:
     )
 
 
-_PARSERS: dict[str, Callable[[str], list[tuple[str, str]]]] = {
+_PARSERS: dict[str, Callable[[str], tuple[list[tuple[str, str]], str | None]]] = {
     "vscode": _refs_from_vscode,
     "codex": _refs_from_codex,
     "kimi": _refs_from_kimi,
@@ -258,8 +277,13 @@ def check_client_config(
     p = Path(path)
     if not p.is_file():
         return [CheckResult(f"{kind} config", True, f"{p} not present")]
-    text = p.read_text()
-    refs = _PARSERS[kind](text)
+    try:
+        text = p.read_text()
+    except OSError as exc:
+        return [CheckResult(f"{kind} config", False, f"{p} unreadable: {exc}")]
+    refs, parse_err = _PARSERS[kind](text)
+    if parse_err is not None:
+        return [CheckResult(f"{kind} config", False, f"{p} is malformed ({parse_err})")]
     if not refs:
         return [CheckResult(f"{kind} config", True, f"{p} present, no model references found")]
 
@@ -350,7 +374,7 @@ def check_model_units(
     stray — started by a since-removed registry entry, or a typo'd key).
     """
     try:
-        live = set(_units.list_model_units(run=run))
+        live = set(_units.list_model_units(run=run, active_only=True))
     except _units.UnitError as e:
         return [CheckResult("model units", False, f"could not list model-* units: {e}")]
 
@@ -506,9 +530,24 @@ def check_offload_buffers(
         return CheckResult("offload buffers", False, f"could not read {directory}: {exc}")
     if not found:
         return CheckResult("offload buffers", True, f"none in {directory}")
-    mapped = in_use() if in_use is not None else _control.offload_scan().paths
+    if in_use is not None:
+        mapped = in_use()
+    else:
+        scan = _control.offload_scan()
+        if not scan.trusted:
+            return CheckResult(
+                "offload buffers",
+                True,
+                f"{len(found)} buffer(s) in {directory}; holder scan untrusted ({scan.why})",
+            )
+        mapped = scan.paths
     orphans = [f for f in found if str(f) not in mapped]
-    total = sum(f.stat().st_size for f in orphans if f.exists())
+    total = 0
+    for f in orphans:
+        try:
+            total += f.stat().st_size
+        except OSError:
+            continue
     if not orphans:
         return CheckResult(
             "offload buffers",
@@ -546,7 +585,7 @@ def check_desired_is_live(
     try:
         units_present = {
             u.removeprefix(_control.UNIT_PREFIX).removesuffix(".service")
-            for u in _units.list_units(f"{_control.UNIT_PREFIX}*", run=run)
+            for u in _units.list_units(f"{_control.UNIT_PREFIX}*", run=run, active_only=True)
         }
     except _units.UnitError as exc:
         return [CheckResult("desired state", False, f"could not list model units: {exc}")]
@@ -651,8 +690,12 @@ def run_doctor(
             "kimi": _wire.KIMI_CONFIG_PATH,
         }
     )
-    known_names: set[str] = set()
+    from . import routes as _routes
+    from . import xid_watch as _xid_watch
+
+    known_names: set[str] = set(_routes.MAIN_ALIASES)
     for m in registry.models.values():
+        known_names.add(m.key)
         known_names.add(m.id)
         known_names.update(m.aliases)
         known_names.update(m.presets)
@@ -673,15 +716,14 @@ def run_doctor(
     # `run_doctor`'s result depend on the machine the suite happens to run on.
     results.append(check_training_marker(marker_paths))
     results.extend(check_ptrace_scope(registry, ptrace_scope))
-    results.extend(check_desired_is_live(registry, desired_path or _settings.get().desired_path, run=unit_run))
+    effective_desired = desired_path or _settings.get().desired_path
+    state_dir = desired_path.parent if desired_path is not None else _settings.get().state_dir
+    results.extend(check_desired_is_live(registry, effective_desired, run=unit_run))
     results.extend(check_weights_present(registry, hub_dir))
     results.append(check_offload_buffers(shm_dir))
-    results.append(
-        check_power_cap(
-            registry.gpu.power_limit_w,
-            _gpu.power_limit_w() if power_limit_w is _UNSET else power_limit_w,
-        )
-    )
+    actual_power = _gpu.power_limit_w() if isinstance(power_limit_w, _Unset) else power_limit_w
+    results.append(check_power_cap(registry.gpu.power_limit_w, actual_power))
+    results.append(_xid_watch.check_fatal_xid_needs_reboot(state_dir=state_dir))
     return results
 
 

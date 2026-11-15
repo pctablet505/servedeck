@@ -12,6 +12,7 @@ The dashboard's Control is a fake, so nothing here touches systemd or the GPU.
 
 from __future__ import annotations
 
+import socket
 import subprocess
 import sys
 import threading
@@ -33,8 +34,18 @@ from servedeck.settings import Settings
 
 ROOT = Path(__file__).resolve().parent.parent
 SERVEDECK_BIN = ROOT / ".venv" / "bin" / "servedeck"
-PORT = 8041
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+PORT = _free_port()
+DEAD_PORT = _free_port()
 BASE = f"http://127.0.0.1:{PORT}"
+DEAD_BASE = f"http://127.0.0.1:{DEAD_PORT}"
 
 TOML = """
 [gpu]
@@ -246,7 +257,7 @@ def test_status_prints_a_table_of_every_model(server) -> None:
     assert result.returncode == 0, result.stderr
     assert "Big-Model" in result.stdout
     assert "Small-Model" in result.stdout
-    assert "gateway  http://127.0.0.1:8041/v1" in result.stdout
+    assert f"gateway  {BASE}/v1" in result.stdout
     assert "42,000 MiB free of 100,000" in result.stdout
 
 
@@ -269,7 +280,7 @@ def test_status_json_is_the_state_document_verbatim(server) -> None:
 
 
 def test_status_against_a_dead_dashboard_exits_1_and_says_so() -> None:
-    result = run_cli("status", "--url", "http://127.0.0.1:8048")
+    result = run_cli("status", "--url", DEAD_BASE)
     assert result.returncode == 1
     assert "dashboard not running" in result.stderr
 
@@ -378,7 +389,7 @@ def test_start_falls_back_to_driving_control_directly(tmp_path) -> None:
         "SERVEDECK_UNIT_PREFIX": "sd-test-",
     }
     result = subprocess.run(
-        [str(SERVEDECK_BIN), "start", "definitely-not-a-model", "--url", "http://127.0.0.1:8048"],
+        [str(SERVEDECK_BIN), "start", "definitely-not-a-model", "--url", DEAD_BASE],
         capture_output=True,
         text=True,
         timeout=60,
@@ -404,7 +415,7 @@ def test_the_fallback_says_which_path_it_took(tmp_path) -> None:
         "SERVEDECK_UNIT_PREFIX": "sd-test-",
     }
     result = subprocess.run(
-        [str(SERVEDECK_BIN), "adopt", "--url", "http://127.0.0.1:8048"],
+        [str(SERVEDECK_BIN), "adopt", "--url", DEAD_BASE],
         capture_output=True, text=True, timeout=60, env=env, cwd=str(ROOT),
     )
     assert "dashboard not running, acting directly" in result.stderr

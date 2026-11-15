@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import re
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -269,7 +270,7 @@ def _as_str_tuple(value: Any, where: str) -> tuple[str, ...]:
     return tuple(value)
 
 
-def _as_bool(raw: dict[str, Any], key: str, field_name: str) -> bool:
+def _as_bool(raw: Mapping[str, Any], where: str, field_name: str) -> bool:
     """A registry switch must be a real TOML boolean.
 
     Not ``bool(value)``: ``capture = "false"`` is a truthy string, and a switch
@@ -282,12 +283,43 @@ def _as_bool(raw: dict[str, Any], key: str, field_name: str) -> bool:
     value = raw[field_name]
     if not isinstance(value, bool):
         raise RegistryError(
-            f"models.{key}.{field_name} must be true or false, got {value!r}"
+            f"{where}.{field_name} must be true or false, got {value!r}"
         )
     return value
 
 
+def _as_int(value: Any, where: str, *, minimum: int | None = None, maximum: int | None = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RegistryError(f"{where} must be an integer, got {value!r}")
+    if minimum is not None and value < minimum:
+        raise RegistryError(f"{where} must be >= {minimum}, got {value}")
+    if maximum is not None and value > maximum:
+        raise RegistryError(f"{where} must be <= {maximum}, got {value}")
+    return value
+
+
+def _as_opt_int(
+    raw: Mapping[str, Any],
+    where: str,
+    field_name: str,
+    *,
+    minimum: int | None = 1,
+    maximum: int | None = None,
+) -> int | None:
+    if raw.get(field_name) is None:
+        return None
+    return _as_int(raw[field_name], f"{where}.{field_name}", minimum=minimum, maximum=maximum)
+
+
+def _as_nonempty_str(value: Any, where: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise RegistryError(f"{where} must be a non-empty string, got {value!r}")
+    return value
+
+
 def _load_model(key: str, raw: dict[str, Any], defaults_env: dict[str, str]) -> Model:
+    if not isinstance(raw, dict):
+        raise RegistryError(f"models.{key} must be a table, got {raw!r}")
     for required in ("id", "repo", "slot", "port", "build", "ctx"):
         if required not in raw:
             raise RegistryError(f"models.{key}: missing required field {required!r}")
@@ -295,22 +327,28 @@ def _load_model(key: str, raw: dict[str, Any], defaults_env: dict[str, str]) -> 
     reasoning_raw = raw.get("reasoning")
     reasoning = None
     if reasoning_raw is not None:
+        if not isinstance(reasoning_raw, dict):
+            raise RegistryError(f"models.{key}.reasoning must be a table")
         if "parser" not in reasoning_raw:
             raise RegistryError(f"models.{key}.reasoning: missing 'parser'")
         reasoning = Reasoning(
-            parser=reasoning_raw["parser"],
-            mirror_content=bool(reasoning_raw.get("mirror_content", False)),
+            parser=_as_nonempty_str(reasoning_raw["parser"], f"models.{key}.reasoning.parser"),
+            mirror_content=_as_bool(reasoning_raw, f"models.{key}.reasoning", "mirror_content"),
         )
 
     tools_raw = raw.get("tools")
     tools = None
     if tools_raw is not None:
+        if not isinstance(tools_raw, dict):
+            raise RegistryError(f"models.{key}.tools must be a table")
         if "parser" not in tools_raw:
             raise RegistryError(f"models.{key}.tools: missing 'parser'")
-        tools = Tools(parser=tools_raw["parser"])
+        tools = Tools(parser=_as_nonempty_str(tools_raw["parser"], f"models.{key}.tools.parser"))
 
-    presets_raw = raw.get("presets") or {}
-    if not isinstance(presets_raw, dict):
+    presets_raw = raw.get("presets")
+    if presets_raw is None:
+        presets_raw = {}
+    elif not isinstance(presets_raw, dict):
         raise RegistryError(f"models.{key}.presets must be a table")
     presets: dict[str, dict[str, Any]] = {}
     for pname, overlay in presets_raw.items():
@@ -318,28 +356,44 @@ def _load_model(key: str, raw: dict[str, Any], defaults_env: dict[str, str]) -> 
             raise RegistryError(f"models.{key}.presets.{pname} must be a table")
         presets[pname] = dict(overlay)
 
+    env_raw = raw.get("env")
+    if env_raw is not None and not isinstance(env_raw, dict):
+        raise RegistryError(f"models.{key}.env must be a table")
     merged_env: dict[str, str] = dict(defaults_env)
-    merged_env.update(raw.get("env") or {})
+    for ek, ev in (env_raw or {}).items():
+        if not isinstance(ek, str) or not isinstance(ev, str):
+            raise RegistryError(f"models.{key}.env.{ek} must be a string, got {ev!r}")
+        merged_env[ek] = ev
 
     slot = raw["slot"]
     if slot not in ("main", "resident"):
         raise RegistryError(f"models.{key}.slot must be 'main' or 'resident', got {slot!r}")
 
-    vram_mib = raw.get("vram_mib")
+    vram_mib = _as_opt_int(raw, f"models.{key}", "vram_mib", minimum=1)
     if slot == "resident" and vram_mib is None:
         raise RegistryError(f"models.{key}: slot='resident' requires vram_mib")
 
     ctx = raw["ctx"]
-    if not (ctx == "native" or isinstance(ctx, int)):
-        raise RegistryError(f"models.{key}.ctx must be an int or 'native', got {ctx!r}")
+    if ctx != "native":
+        if isinstance(ctx, bool) or not isinstance(ctx, int):
+            raise RegistryError(f"models.{key}.ctx must be an int or 'native', got {ctx!r}")
+        if ctx <= 0:
+            raise RegistryError(f"models.{key}.ctx must be > 0, got {ctx}")
+
+    min_out = _as_opt_int(raw, f"models.{key}", "min_output_tokens", minimum=1)
+    max_out = _as_opt_int(raw, f"models.{key}", "max_output_tokens", minimum=1)
+    if min_out is not None and max_out is not None and min_out > max_out:
+        raise RegistryError(
+            f"models.{key}: min_output_tokens ({min_out}) > max_output_tokens ({max_out})"
+        )
 
     return Model(
         key=key,
-        id=raw["id"],
-        repo=raw["repo"],
+        id=_as_nonempty_str(raw["id"], f"models.{key}.id"),
+        repo=_as_nonempty_str(raw["repo"], f"models.{key}.repo"),
         slot=slot,
-        port=int(raw["port"]),
-        build=raw["build"],
+        port=_as_int(raw["port"], f"models.{key}.port", minimum=1, maximum=65535),
+        build=_as_nonempty_str(raw["build"], f"models.{key}.build"),
         ctx=ctx,
         aliases=_as_str_tuple(raw.get("aliases"), f"models.{key}.aliases"),
         reasoning=reasoning,
@@ -347,23 +401,19 @@ def _load_model(key: str, raw: dict[str, Any], defaults_env: dict[str, str]) -> 
         flags=_as_str_tuple(raw.get("flags"), f"models.{key}.flags"),
         env=merged_env,
         presets=presets,
-        vram_mib=int(vram_mib) if vram_mib is not None else None,
+        vram_mib=vram_mib,
         util=_as_util(raw, key),
-        host_ram_gib=(
-            int(raw["host_ram_gib"]) if raw.get("host_ram_gib") is not None else None
+        host_ram_gib=_as_opt_int(raw, f"models.{key}", "host_ram_gib", minimum=1),
+        kv_cache_bytes_per_token=_as_opt_int(
+            raw, f"models.{key}", "kv_cache_bytes_per_token", minimum=1
         ),
-        kv_cache_bytes_per_token=(
-            int(raw["kv_cache_bytes_per_token"])
-            if raw.get("kv_cache_bytes_per_token") is not None
-            else None
-        ),
-        min_output_tokens=raw.get("min_output_tokens"),
-        max_output_tokens=raw.get("max_output_tokens"),
-        vision=bool(raw.get("vision", False)),
-        needs_tty=bool(raw.get("needs_tty", False)),
-        sanitize_tool_tags=_as_bool(raw, key, "sanitize_tool_tags"),
-        restore_reasoning=_as_bool(raw, key, "restore_reasoning"),
-        capture=_as_bool(raw, key, "capture"),
+        min_output_tokens=min_out,
+        max_output_tokens=max_out,
+        vision=_as_bool(raw, f"models.{key}", "vision"),
+        needs_tty=_as_bool(raw, f"models.{key}", "needs_tty"),
+        sanitize_tool_tags=_as_bool(raw, f"models.{key}", "sanitize_tool_tags"),
+        restore_reasoning=_as_bool(raw, f"models.{key}", "restore_reasoning"),
+        capture=_as_bool(raw, f"models.{key}", "capture"),
     )
 
 
@@ -376,9 +426,12 @@ def _load_builds(raw: dict[str, Any]) -> dict[str, Build]:
                 f"got {table!r}"
             )
         for required in ("venv", "cuda_home"):
-            if not table.get(required):
+            if required not in table or not table.get(required):
                 raise RegistryError(f"builds.{name}: missing {required!r}")
-        builds[name] = Build(venv=table["venv"], cuda_home=table["cuda_home"])
+        builds[name] = Build(
+            venv=_as_nonempty_str(table["venv"], f"builds.{name}.venv"),
+            cuda_home=_as_nonempty_str(table["cuda_home"], f"builds.{name}.cuda_home"),
+        )
     return builds
 
 
@@ -420,6 +473,13 @@ def _validate(models: dict[str, Model], gpu: GPU, builds: dict[str, Build]) -> N
         for p in m.presets:
             claim(p, "preset", key)
 
+    for key in models:
+        owner = owners.get(key)
+        if owner is not None and owner[0] != key:
+            raise RegistryError(
+                f"models.{owner[0]}: {owner[1]} {key!r} collides with registry key models.{key}"
+            )
+
     # -- ports: unique, and never 8000/8010.
     port_owners: dict[int, str] = {}
     for key, m in models.items():
@@ -453,6 +513,54 @@ def _validate(models: dict[str, Model], gpu: GPU, builds: dict[str, Build]) -> N
         )
 
 
+def load_from_dict(data: Mapping[str, Any]) -> Registry:
+    """Validate an already-parsed TOML mapping into a :class:`Registry`.
+
+    Pure (no file I/O), raising ONLY :class:`RegistryError` on any schema or
+    type violation so tests can exercise the validator
+    directly."""
+    if not isinstance(data, Mapping):
+        raise RegistryError("registry root must be a TOML table")
+    gpu_raw = data.get("gpu")
+    if not isinstance(gpu_raw, Mapping) or "total_mib" not in gpu_raw or "margin_mib" not in gpu_raw:
+        raise RegistryError("[gpu] table with total_mib and margin_mib is required")
+    gpu = GPU(
+        total_mib=_as_int(gpu_raw["total_mib"], "gpu.total_mib", minimum=1),
+        margin_mib=_as_int(gpu_raw["margin_mib"], "gpu.margin_mib", minimum=0),
+        power_limit_w=_as_opt_int(gpu_raw, "gpu", "power_limit_w", minimum=1),
+    )
+
+    builds_raw = data.get("builds")
+    if builds_raw is not None and not isinstance(builds_raw, dict):
+        raise RegistryError("[builds] must be a table")
+    builds = _load_builds(builds_raw or {})
+    defaults_raw = data.get("defaults")
+    if defaults_raw is not None and not isinstance(defaults_raw, dict):
+        raise RegistryError("[defaults] must be a table")
+    defaults_env_raw = (defaults_raw or {}).get("env")
+    if defaults_env_raw is not None and not isinstance(defaults_env_raw, dict):
+        raise RegistryError("[defaults.env] must be a table")
+    defaults_env: dict[str, str] = {}
+    for ek, ev in (defaults_env_raw or {}).items():
+        if not isinstance(ek, str) or not isinstance(ev, str):
+            raise RegistryError(f"defaults.env.{ek} must be a string, got {ev!r}")
+        defaults_env[ek] = ev
+
+    models_raw = data.get("models")
+    if not isinstance(models_raw, dict) or not models_raw:
+        raise RegistryError("[models.*] — at least one model is required")
+
+    models: dict[str, Model] = {}
+    for key, raw in models_raw.items():
+        if not isinstance(key, str):
+            raise RegistryError(f"model key {key!r} must be a string")
+        models[key] = _load_model(key, raw, defaults_env)
+
+    _validate(models, gpu, builds)
+
+    return Registry(models=models, gpu=gpu, builds=builds, defaults_env=defaults_env)
+
+
 def load(path: str | Path) -> Registry:
     """Load and validate ``models.toml``. Raises :class:`RegistryError` on the
     first problem found (never a bare KeyError/TypeError from tomllib's dict)."""
@@ -464,32 +572,7 @@ def load(path: str | Path) -> Registry:
         raise RegistryError(f"{p}: invalid TOML: {e}") from e
     except OSError as e:
         raise RegistryError(f"{p}: cannot read: {e}") from e
-
-    gpu_raw = data.get("gpu")
-    if gpu_raw is None or "total_mib" not in gpu_raw or "margin_mib" not in gpu_raw:
-        raise RegistryError("[gpu] table with total_mib and margin_mib is required")
-    gpu = GPU(
-        total_mib=int(gpu_raw["total_mib"]),
-        margin_mib=int(gpu_raw["margin_mib"]),
-        power_limit_w=(
-            int(gpu_raw["power_limit_w"]) if gpu_raw.get("power_limit_w") is not None else None
-        ),
-    )
-
-    builds = _load_builds(data.get("builds") or {})
-    defaults_env = dict((data.get("defaults") or {}).get("env") or {})
-
-    models_raw = data.get("models") or {}
-    if not models_raw:
-        raise RegistryError("[models.*] — at least one model is required")
-
-    models: dict[str, Model] = {}
-    for key, raw in models_raw.items():
-        models[key] = _load_model(key, raw, defaults_env)
-
-    _validate(models, gpu, builds)
-
-    return Registry(models=models, gpu=gpu, builds=builds, defaults_env=defaults_env)
+    return load_from_dict(data)
 
 
 # --------------------------------------------------------------------------- #
@@ -511,7 +594,8 @@ def native_ctx(repo: str, hub_dir: str | Path | None = None) -> int:
             f"native_ctx({repo!r}): no config.json found in the local hub cache "
             "(model not downloaded, or repo id is wrong)"
         )
-    text_config = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else cfg
+    raw_tc = cfg.get("text_config")
+    text_config: Mapping[str, Any] = raw_tc if isinstance(raw_tc, dict) else cfg
     value = text_config.get("max_position_embeddings") or cfg.get("max_position_embeddings")
     if not value:
         raise RegistryError(
