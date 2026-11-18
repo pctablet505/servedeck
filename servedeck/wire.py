@@ -86,6 +86,12 @@ _VSCODE_OWNED_NAMES = frozenset({_VSCODE_GROUP_NAME, "local_llm"})
 _DEFAULT_MAX_OUTPUT_TOKENS = 4096
 
 
+def _chats(m: _models.Model) -> bool:
+    """Whether a client can chat with the model. A pooling model (an embedder or a reranker, served with
+    ``--runner pooling``) answers /v1/embeddings or /v1/rerank and never chat completions, so no client config lists it."""
+    return not any(flag == "--runner" and value == "pooling" for flag, value in zip(m.flags, m.flags[1:]))
+
+
 def _vscode_entry(served_name: str, m: _models.Model, ctx: int) -> dict[str, Any]:
     max_out = m.max_output_tokens if m.max_output_tokens is not None else _DEFAULT_MAX_OUTPUT_TOKENS
     return {
@@ -142,7 +148,7 @@ def render_vscode(
         entries.append(_vscode_entry(_MAIN_ROUTE, narrowest, ctx))
     for m in registry.models.values():
         ctx = resolve_ctx(m)
-        if ctx <= 0:
+        if ctx <= 0 or not _chats(m):
             continue
         entries.append(_vscode_entry(m.id, m, ctx))
         for preset_name in m.presets:
@@ -437,11 +443,12 @@ def render_kimi(
     kimi-code provider, other models, oauth, services) is left untouched."""
     resolved = {key: resolve_ctx(m) for key, m in registry.models.items()}
     main_models = [m for m in registry.models.values() if m.slot == "main" and resolved[m.key] > 0]
-    # Retire only tables for models that left the registry. A model whose
-    # context is unknown right now (weights not in the hub cache, a disk not
-    # mounted) keeps its table: it is still a registry model, and dropping it
-    # would make the client forget a model that comes back on the next apply.
-    wanted_headers = {f'[models."servedeck/{key}"]' for key in registry.models}
+    # Retire only tables for models that left the registry, or that no client
+    # can chat with (a pooling model). A model whose context is unknown right
+    # now (weights not in the hub cache, a disk not mounted) keeps its table:
+    # it is still a registry model, and dropping it would make the client
+    # forget a model that comes back on the next apply.
+    wanted_headers = {f'[models."servedeck/{key}"]' for key, m in registry.models.items() if _chats(m)}
     wanted_headers.add(f'[models."servedeck/{_MAIN_ROUTE}"]')
 
     text = _remove_sections(
@@ -454,7 +461,7 @@ def render_kimi(
     )
     for key, m in registry.models.items():
         ctx = resolved[key]
-        if ctx <= 0:
+        if ctx <= 0 or not _chats(m):
             continue
         data = {
             "provider": "servedeck",
