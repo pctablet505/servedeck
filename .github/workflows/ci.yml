@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Core test suite & docs strict build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install package and dev dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Run non-e2e test suite
+        run: >
+          python -m pytest -q -n auto --maxprocesses=12 -p no:cacheprovider
+          --ignore=tests/test_e2e_real.py
+          --ignore=tests/test_app_e2e.py
+          --ignore=tests/test_control_e2e.py
+          --ignore=tests/test_gateway_e2e.py
+
+      - name: Build documentation site (strict)
+        run: python -m mkdocs build --strict
