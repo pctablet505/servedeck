@@ -42,4 +42,4 @@ jobs:
           --ignore=tests/test_gateway_e2e.py
 
       - name: Build documentation site (strict, out-of-tree)
-        run: .venv/bin/python -m mkdocs build --strict -d "${RUNNER_TEMP}/site"
+        run: .venv/bin/python -m mkdocs build --strict -d "${RUNNER_TEMP:?RUNNER_TEMP must be set}/site"
