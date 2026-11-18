@@ -92,3 +92,26 @@ as part of a normal check. How to contribute: [CONTRIBUTING.md](CONTRIBUTING.md)
 | Use it | [Operations](https://servedeck.rlalphalabs.com/operations/) · [Clients](https://servedeck.rlalphalabs.com/clients/) · [Configuration](https://servedeck.rlalphalabs.com/configuration/) |
 | How it is built | [Architecture](https://servedeck.rlalphalabs.com/architecture/) · [Builds](https://servedeck.rlalphalabs.com/builds/) · [Host](https://servedeck.rlalphalabs.com/host/) · [Decisions](https://servedeck.rlalphalabs.com/decisions/) |
 | Each model, measured | [Flash-Next](https://servedeck.rlalphalabs.com/models/flashnext/) · [Qwen3.8-27B](https://servedeck.rlalphalabs.com/models/qwen27b/) · [GLM-5.3](https://servedeck.rlalphalabs.com/models/glm53/) · [LFM2.5-350M](https://servedeck.rlalphalabs.com/models/lfm2/) |
+
+## Review & Verification Gate
+
+Every pull request clears three sequential stages before being marked ready for review:
+
+1. **Deterministic gate:**
+   - CI workflow `.github/workflows/ci.yml` passes: editable install inside repo-local `.venv` (ensuring `tests/test_cli_control.py` executes all 16 console-script tests instead of skipping), `.venv/bin/python -m pytest -q -rs -n auto --maxprocesses=12 -p no:cacheprovider` excluding the 4 GPU/systemd e2e modules (covering all 35 non-e2e test modules including `tests/test_cli_control.py`, `tests/test_hygiene.py`, and `tests/test_site.py`), plus out-of-tree `.venv/bin/python -m mkdocs build --strict -d <out-dir>` (preventing generated HTML under `site/` from tripping `tests/test_hygiene.py`).
+   - Behavioral changes include an executable `fail-before` proof (test fails against the base tree or reverted code) or `mutant-kill` proof (a one-line defect in a throwaway copy causes assertion exit `1`).
+   - GitHub Actions workflows stay pinned to exact 40-character commit SHAs with minimal `permissions` and `persist-credentials: false` strictly on `actions/checkout`.
+2. **Pass-1 author-blind diff audit:**
+   - Start a fresh reviewer with zero authoring history and **without** reading PR rationalization prose first.
+   - Read the diff and referenced callers directly, emit a **2-sentence paraphrase** of what the diff changes (catching unspoken assumptions early), audit correctness, systemd/process control safety, concurrency, packaging/hygiene invariants, and docs, and record every unrun check (e.g., GPU e2e gate or missing local `mkdocs`) under `COULD NOT VERIFY`.
+   - Severity labels: **`Blocker:`** (correctness, safety, security, test-gate weakening, or ledger counter-shape — must fix), **`Warning:`** (high-risk defect or missing edge-case coverage — must fix or clear via Pass-2 proof), **`Nit:`** (non-blocking polish).
+3. **Pass-2 proof-backed verification:**
+   - No candidate `Blocker:` or `Warning:` finding may be dismissed with prose alone. Every disputed finding maps strictly to `VERIFIED` (must fix or escalate) or `DISPUTED_WITH_PROOF` backed by one of: (a) an executable counter-probe against the exact trigger input, (b) a caller-complete invariant proof quoting exact `file:line` guards across the repo, (c) a matching row in the `<base>` branch's `### Negative-Rule Ledger` below (never from self-edited PR lines), or (d) an exact verbatim documentation clause for non-executable `.md` prose.
+
+### Negative-Rule Ledger
+
+| Allowed Exact Shape (symbol/invariant) | Still-A-Bug Counter-Shape (never dismiss) |
+| :--- | :--- |
+| `systemctl --user` (for manual operator lifecycle of persistent `servedeck.service`), `servedeck/units.py` using `systemctl --user` / `systemd-run --user` / `journalctl --user` **exclusively** for transient `model-*` / `sd-test-*` user units (explicitly refusing `servedeck` and all other names via `_NAME_RE`), and read-only kernel Xid polling via `journalctl -k -b all --no-pager` (`servedeck/gpu.py`, `servedeck/xid_watch.py`). | Any invocation of `sudo`, `su`, or system-wide `systemctl` / `systemd-run` (without `--user`), widening `servedeck/units.py` `_NAME_RE` beyond `model-*` / `sd-test-*` (e.g., permitting `servedeck` or other persistent units), or wildcard unit stop globs such as `systemctl --user stop 'sd-test-*'` (`Blocker:`). |
+| `sd-test-` transient unit prefix in isolated systemd e2e tests (`test_app_e2e.py`, `test_control_e2e.py`, `test_e2e_real.py`), plus the read-only `sd-netns-probe-<pid>` helper in `tests/conftest.py` (kept outside `sd-test-*` so e2e teardown sweeps do not race or stop it). | Starting, stopping, or mutating any live `model-*` unit or non-test production user unit (`servedeck`, `lfm2-350m`, `qwen-vllm`, `*-reasoning-proxy`) from automated tests (`Blocker:`). |
+| Excluding the 4 fixed-port/GPU e2e modules (`test_e2e_real.py`, `test_app_e2e.py`, `test_control_e2e.py`, `test_gateway_e2e.py`) from the everyday `ci.yml` runner, and host-hardware/cache-gated individual test skips surfaced transparently by `-rs` (GPU/HF cache/multi-filesystem checks). | Weakening, causing module-/dependency-level skips (e.g., omitting `.venv` so `tests/test_cli_control.py` silently skips, or omitting `mkdocs` so `TestTheBuiltSite` in `tests/test_site.py` skips), or excluding any of the 35 non-e2e unit/hygiene/site test modules (`Blocker:`). |
