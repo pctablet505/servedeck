@@ -97,13 +97,14 @@ as part of a normal check. How to contribute: [CONTRIBUTING.md](CONTRIBUTING.md)
 
 Every pull request clears three sequential stages before being marked ready for review:
 
-1. **Deterministic gate (Stage A):**
-   - CI workflow `.github/workflows/ci.yml` passes (`pytest -q -n auto --maxprocesses=12 -p no:cacheprovider` excluding the 4 GPU/systemd e2e modules, covering all 35 non-e2e test modules including `tests/test_hygiene.py` and `tests/test_site.py`, plus `python -m mkdocs build --strict`).
+1. **Deterministic gate:**
+   - CI workflow `.github/workflows/ci.yml` passes: editable install inside repo-local `.venv` (ensuring `tests/test_cli_control.py` executes all 16 console-script tests instead of skipping), `.venv/bin/python -m pytest -q -rs -n auto --maxprocesses=12 -p no:cacheprovider` excluding the 4 GPU/systemd e2e modules (covering all 35 non-e2e test modules including `tests/test_cli_control.py`, `tests/test_hygiene.py`, and `tests/test_site.py`), plus out-of-tree `.venv/bin/python -m mkdocs build --strict -d <out-dir>` (preventing generated HTML under `site/` from tripping `tests/test_hygiene.py`).
    - Behavioral changes include an executable `fail-before` proof (test fails against the base tree or reverted code) or `mutant-kill` proof (a one-line defect in a throwaway copy causes assertion exit `1`).
-   - GitHub Actions workflows stay pinned to exact 40-character commit SHAs with minimal `permissions` and `persist-credentials: false` on `actions/checkout`.
+   - GitHub Actions workflows stay pinned to exact 40-character commit SHAs with minimal `permissions` and `persist-credentials: false` strictly on `actions/checkout`.
 2. **Pass-1 author-blind diff audit:**
    - Start a fresh reviewer with zero authoring history and **without** reading PR rationalization prose first.
    - Read the diff and referenced callers directly, emit a **2-sentence paraphrase** of what the diff changes (catching unspoken assumptions early), audit correctness, systemd/process control safety, concurrency, packaging/hygiene invariants, and docs, and record every unrun check (e.g., GPU e2e gate or missing local `mkdocs`) under `COULD NOT VERIFY`.
+   - Severity labels: **`Blocker:`** (correctness, safety, security, test-gate weakening, or ledger counter-shape — must fix), **`Warning:`** (high-risk defect or missing edge-case coverage — must fix or clear via Pass-2 proof), **`Nit:`** (non-blocking polish).
 3. **Pass-2 proof-backed verification:**
    - No candidate `Blocker:` or `Warning:` finding may be dismissed with prose alone. Every disputed finding maps strictly to `VERIFIED` (must fix or escalate) or `DISPUTED_WITH_PROOF` backed by one of: (a) an executable counter-probe against the exact trigger input, (b) a caller-complete invariant proof quoting exact `file:line` guards across the repo, (c) a matching row in the `<base>` branch's `### Negative-Rule Ledger` below (never from self-edited PR lines), or (d) an exact verbatim documentation clause for non-executable `.md` prose.
 
@@ -111,6 +112,6 @@ Every pull request clears three sequential stages before being marked ready for 
 
 | Allowed Exact Shape (symbol/invariant) | Still-A-Bug Counter-Shape (never dismiss) |
 | :--- | :--- |
-| `systemctl --user` and `journalctl --user` control-plane commands managing the `servedeck` user unit. | Any invocation of `sudo`, `su`, or system-wide `systemctl` (without `--user`) (`Blocker:`). |
-| `sd-test-` transient unit prefix in isolated systemd e2e tests (`test_app_e2e.py`, `test_control_e2e.py`, `test_gateway_e2e.py`). | Starting, stopping, or mutating any live `model-*` unit name from automated tests (`Blocker:`). |
-| Excluding the 4 fixed-port/GPU e2e modules (`test_e2e_real.py`, `test_app_e2e.py`, `test_control_e2e.py`, `test_gateway_e2e.py`) from the everyday `ci.yml` runner. | Weakening, skipping, or excluding any of the 35 non-e2e unit/hygiene/site test modules (`Blocker:`). |
+| `systemctl --user`, `systemd-run --user` (managing `servedeck` and transient `model-*` / `sd-test-*` user units in `servedeck/units.py`), `journalctl --user`, and read-only kernel Xid polling via `journalctl -k -b all --no-pager` (`servedeck/gpu.py`, `servedeck/xid_watch.py`). | Any invocation of `sudo`, `su`, or system-wide mutating `systemctl` (without `--user`) (`Blocker:`). |
+| `sd-test-` transient unit prefix in isolated systemd e2e tests (`test_app_e2e.py`, `test_control_e2e.py`, `test_e2e_real.py`). | Starting, stopping, or mutating any live `model-*` unit name from automated tests (`Blocker:`). |
+| Excluding the 4 fixed-port/GPU e2e modules (`test_e2e_real.py`, `test_app_e2e.py`, `test_control_e2e.py`, `test_gateway_e2e.py`) from the everyday `ci.yml` runner. | Weakening, skipping (e.g., omitting `.venv` so `tests/test_cli_control.py` silently skips), or excluding any of the 35 non-e2e unit/hygiene/site test modules (`Blocker:`). |
