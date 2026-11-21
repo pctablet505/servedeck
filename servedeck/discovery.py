@@ -46,6 +46,10 @@ KNOWN_ARCHS: dict[str, str] = {
     # since Flash-Next was removed; served from the stock build. Its own label,
     # not "stock": the map must stay 1:1 for _reverse_arch_backends().
     "Qwen3_5MoeForConditionalGeneration": "ornith",
+    # Qwen/Qwen3-Embedding-8B and Qwen/Qwen3-Reranker-4B config.json (2026-11-21),
+    # the knowledge base's pooling pair; served from the stock032 build with
+    # --runner pooling. Its own label: the map must stay 1:1.
+    "Qwen3ForCausalLM": "qwen3",
 }
 
 def arch_backends() -> dict[str, str]:

@@ -81,6 +81,31 @@ def test_no_client_lists_a_pooling_model(registry, resolve_ctx):
     assert all(f'servedeck/{key}"' not in kimi and name not in kimi for key, name in pooling.items()), kimi
 
 
+@pytest.mark.parametrize("extra, chats", [
+    (("--runner", "pooling"), False),
+    (("--runner=pooling",), False),
+    (("--convert", "embed"), False),
+    (("--convert=classify",), False),
+    (("--convert", "reward"), False),
+    (("--runner", "generate"), True),
+    (("--runner=generate",), True),
+    (("--convert", "none"), True),
+    (("--runner", "pooling", "--runner", "generate"), True),       # the last one wins, as vLLM's argparse reads it
+])
+def test_a_model_is_wired_unless_its_flags_make_it_a_pooling_model(registry, resolve_ctx, extra, chats):
+    """vLLM serves a pooling model for `--runner pooling` or `--convert embed|classify|reward`, written with a space or
+    with `=`; any other runner chats. A resident chat model given each set of flags is in the VS Code and Kimi configs
+    exactly when it chats."""
+    import dataclasses
+
+    lfm2 = registry.models["lfm2"]
+    changed = dataclasses.replace(lfm2, flags=lfm2.flags + extra)
+    reg = dataclasses.replace(registry, models={**registry.models, "lfm2": changed})
+    vscode = [e["id"] for e in json.loads(wire.render_vscode(reg, "", resolve_ctx=resolve_ctx))[0]["models"]]
+    kimi = wire.render_kimi(reg, "", resolve_ctx=resolve_ctx)
+    assert (lfm2.id in vscode, 'servedeck/lfm2"' in kimi) == (chats, chats)
+
+
 def test_vscode_entry_fields(registry, resolve_ctx):
     out = wire.render_vscode(registry, "", resolve_ctx=resolve_ctx)
     data = json.loads(out)

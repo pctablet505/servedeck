@@ -86,10 +86,27 @@ _VSCODE_OWNED_NAMES = frozenset({_VSCODE_GROUP_NAME, "local_llm"})
 _DEFAULT_MAX_OUTPUT_TOKENS = 4096
 
 
+#: ``--convert`` values with which vLLM serves a generation checkpoint as a pooling model.
+_POOLING_CONVERTS = frozenset({"embed", "classify", "reward"})
+
+
+def _flag_value(flags: tuple[str, ...], name: str) -> str | None:
+    """The value ``flags`` give to ``name``, written ``name value`` or ``name=value``; the last one wins, as in argparse.
+    None when the flag is absent."""
+    value = None
+    for i, arg in enumerate(flags):
+        if arg == name and i + 1 < len(flags):
+            value = flags[i + 1]
+        elif arg.startswith(name + "="):
+            value = arg[len(name) + 1:]
+    return value
+
+
 def _chats(m: _models.Model) -> bool:
     """Whether a client can chat with the model. A pooling model (an embedder or a reranker, served with
-    ``--runner pooling``) answers /v1/embeddings or /v1/rerank and never chat completions, so no client config lists it."""
-    return not any(flag == "--runner" and value == "pooling" for flag, value in zip(m.flags, m.flags[1:]))
+    ``--runner pooling`` or ``--convert embed|classify|reward``, in either spelling) answers /v1/embeddings or
+    /v1/rerank and never chat completions, so no client config lists it."""
+    return _flag_value(m.flags, "--runner") != "pooling" and _flag_value(m.flags, "--convert") not in _POOLING_CONVERTS
 
 
 def _vscode_entry(served_name: str, m: _models.Model, ctx: int) -> dict[str, Any]:

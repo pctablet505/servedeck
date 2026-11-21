@@ -412,8 +412,21 @@ def test_known_archs_map_is_exactly_the_two_documented_entries() -> None:
         "Glm5NextForConditionalGeneration": "glm53",
         "Lfm2ForCausalLM": "stock",
         "Qwen3_5MoeForConditionalGeneration": "ornith",
+        "Qwen3ForCausalLM": "qwen3",
     }
     assert len(set(KNOWN_ARCHS.values())) == len(KNOWN_ARCHS), "map must stay 1:1"
+
+
+def test_the_knowledge_base_pooling_checkpoints_are_servable(tmp_path: Path) -> None:
+    """The KB's embedder and reranker are Qwen3ForCausalLM checkpoints. Unmapped, `doctor` failed both weights rows and
+    the dashboard offered neither, although both were complete in the hub cache."""
+    config = {"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3", "max_position_embeddings": 40960,
+              "num_hidden_layers": 36, "num_key_value_heads": 8, "head_dim": 128}
+    for repo in ("models--Qwen--Qwen3-Embedding-8B", "models--Qwen--Qwen3-Reranker-4B"):
+        _make_repo(tmp_path, repo, config=config, safetensors={"model-1.safetensors": GIB})
+    entries = discover_models(tmp_path)
+    assert [(e.repo_id, e.servable, e.reason) for e in entries] == [
+        ("Qwen/Qwen3-Embedding-8B", True, None), ("Qwen/Qwen3-Reranker-4B", True, None)]
 
 
 def test_arch_map_is_the_built_in_map_and_nothing_layers_over_it() -> None:

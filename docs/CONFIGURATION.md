@@ -92,7 +92,7 @@ fails, rather than systemd refusing three modules later.
 | `build` | string | yes | — | A key in `[builds]`. |
 | `ctx` | int \| `"native"` | yes | — | `"native"` resolves to the checkpoint's own `max_position_embeddings` from the local hub cache (never fetched). An int pins a validated ceiling below it — GLM is `327680` because its context here is bounded by VRAM headroom, not by the checkpoint's 1,048,576. |
 | `aliases` | list of strings | no | `[]` | Every name a client has ever used. Appended to `--served-model-name` and advertised in `GET /v1/models`. |
-| `flags` | list of strings | no | `[]` | Appended verbatim to the argv after the computed flags. |
+| `flags` | list of strings | no | `[]` | Appended verbatim to the argv after the computed flags. `--runner pooling` or `--convert embed\|classify\|reward` (with a space or `=`) makes the model a pooling model, an embedder or a reranker, which `servedeck wire` keeps out of every client config. |
 | `env` | table of strings | no | `{}` | The model's own environment, merged over `[defaults.env]`. |
 | `presets` | table of tables | no | `{}` | See below. |
 | `vram_mib` | int | residents only | — | The resident's VRAM budget, from which its utilisation is derived. |

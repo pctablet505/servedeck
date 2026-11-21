@@ -128,8 +128,9 @@ entries.
 ## Kimi CLI
 
 `~/.kimi-code/config.toml`, partly generated: `default_model = "servedeck/main"`, one
-`[providers.servedeck]`, one `[models."servedeck/<key>"]` per registry model plus
-`servedeck/main`, and `[thinking] enabled = true`.
+`[providers.servedeck]`, one `[models."servedeck/<key>"]` per registry chat model plus
+`servedeck/main`, and `[thinking] enabled = true`. A pooling model (an embedder or a reranker; see
+[Configuration](CONFIGURATION.md)) gets no table, and a table written for one before is retired.
 
 Capabilities are derived from the registry — `tool_use` for a tool parser, `thinking` +
 `always_thinking` for a reasoning parser, `image_in` when `vision` is true. `servedeck/main`
@@ -225,9 +226,12 @@ policies, it dies the moment `servedeck switch` changes the card, and it is invi
 ats-optimizer's own service, binds `0.0.0.0` rather than loopback, and servedeck never
 touches it; `models.toml` validation rejects 8000 and 8010 as model ports outright.
 
-What the gateway does not speak today: **no `/v1/embeddings`** — the request is forwarded and
-the engine 404s `{"detail":"Not Found"}`, because a generation model registers no embeddings
-route (verified live 2026-09-18), and nothing on this box serves embeddings. **`/v1/messages`
+What the gateway does not speak today: **`/v1/embeddings` from a chat model** — the request is
+forwarded and the engine 404s `{"detail":"Not Found"}`, because a generation model registers no
+embeddings route (verified live 2026-09-18). The one model here that serves embeddings is the
+knowledge base's `Qwen3-Embedding-8B` (a pooling model on :8021, started on demand), which no
+client config lists; the hub calls its port directly, and a request through the gateway that
+names it was not checked live. **`/v1/messages`
 exists but is undocumented and unverified** — the engine registers it (with
 `/v1/messages/count_tokens`) and the catch-all forwards it, but no client here uses it, no
 policy is written for its shape, and a GET returns 405 from upstream. **No Ollama surface**,

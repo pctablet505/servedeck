@@ -262,6 +262,14 @@ def test_real_models_toml_loads():
     }
 
 
+def test_the_kb_reranker_chat_template_is_a_file_this_repo_keeps():
+    """The reranker's --chat-template names config/qwen3_reranker.jinja in the control plane's checkout: servedeck.service
+    runs from ~/Projects/servedeck and reads that checkout's models.toml, so the file must ship in the same commit."""
+    flags = models.load(REPO_ROOT / "models.toml").models["kb-rr-qwen3-4b"].flags
+    assert flags[flags.index("--chat-template") + 1] == "/home/pctablet505/Projects/servedeck/config/qwen3_reranker.jinja"
+    assert (REPO_ROOT / "config" / "qwen3_reranker.jinja").stat().st_size > 0
+
+
 # --------------------------------------------------------------------------- #
 # Validation — one failing fixture per rule
 # --------------------------------------------------------------------------- #
