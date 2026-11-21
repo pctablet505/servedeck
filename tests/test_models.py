@@ -248,7 +248,8 @@ def test_the_agent_profile_admits_a_browser_sessions_screenshots():
 def test_real_models_toml_loads():
     """The repo-root models.toml (the actual deliverable) must load and validate."""
     reg = models.load(REPO_ROOT / "models.toml")
-    assert set(reg.models) == {"qwen27b", "flashnext", "flashnext-batch", "fp4local", "glm53", "lfm2", "ornith"}
+    assert set(reg.models) == {"qwen27b", "flashnext", "flashnext-batch", "fp4local", "glm53", "lfm2", "ornith",
+                               "kb-emb-qwen3-8b", "kb-rr-qwen3-4b"}
     assert reg.gpu.total_mib == 97887
     assert reg.gpu.margin_mib == 1024
     assert reg.defaults_env == {
@@ -259,6 +260,18 @@ def test_real_models_toml_loads():
         # one on disk. models.toml carries the full history of this flag.
         "HF_HUB_OFFLINE": "1",
     }
+
+
+def test_the_kb_reranker_chat_template_is_a_file_this_repo_keeps():
+    """The reranker's --chat-template names config/qwen3_reranker.jinja in the control plane's checkout: servedeck.service
+    runs from ~/Projects/servedeck and reads that checkout's models.toml, so the file must ship in the same commit. It is
+    vLLM v0.32.0's examples/pooling/score/template/qwen3_reranker.jinja, byte for byte."""
+    import hashlib
+
+    flags = models.load(REPO_ROOT / "models.toml").models["kb-rr-qwen3-4b"].flags
+    assert flags[flags.index("--chat-template") + 1] == "/home/pctablet505/Projects/servedeck/config/qwen3_reranker.jinja"
+    assert hashlib.sha256((REPO_ROOT / "config" / "qwen3_reranker.jinja").read_bytes()).hexdigest() == (
+        "e1ee98e69aab7b2da366edf1c50efcef37e34b4a0c50fb816336213e68d9047a")
 
 
 # --------------------------------------------------------------------------- #

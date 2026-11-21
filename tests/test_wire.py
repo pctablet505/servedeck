@@ -40,6 +40,11 @@ def resolve_ctx(registry):
     )
 
 
+def _pooling(m: models.Model) -> bool:
+    """Served with `--runner pooling`: an embedder or a reranker, which answers no chat completions."""
+    return "--runner" in m.flags and m.flags[m.flags.index("--runner") + 1] == "pooling"
+
+
 # --------------------------------------------------------------------------- #
 # VS Code
 # --------------------------------------------------------------------------- #
@@ -54,12 +59,51 @@ def test_vscode_empty_existing_creates_group(registry, resolve_ctx):
     assert data[0]["apiType"] == "chat-completions"
     ids = [e["id"] for e in data[0]["models"]]
     # The slot first (the stable pick), then one per id and per preset:
-    # 1 + 7 base ids + 3 glm53 presets = 11.
+    # 1 + 7 chat ids + 3 glm53 presets = 11; the KB embedder and reranker are pooling models, never listed.
     assert ids[0] == "main", "the entry that survives a switch is the obvious pick"
     assert ids.count("Qwen3.8-27B-NVFP4") == 1
     assert ids.count("Ornith-1.5-122B-NVFP4") == 1
     assert "glm53-flash-low" in ids and "glm53-flash-high" in ids and "glm53-flash-max" in ids
     assert len(ids) == 11
+
+
+def test_no_client_lists_a_pooling_model(registry, resolve_ctx):
+    """An embedder or a reranker (`--runner pooling`) answers /v1/embeddings or /v1/rerank, never chat completions: neither
+    VS Code nor Kimi lists one, and a Kimi table written for one before is retired."""
+    pooling = {key: m.id for key, m in registry.models.items() if _pooling(m)}
+    assert pooling == {"kb-emb-qwen3-8b": "Qwen3-Embedding-8B", "kb-rr-qwen3-4b": "Qwen3-Reranker-4B"}
+    assert all(resolve_ctx(registry.models[key]) > 0 for key in pooling)          # a known context: only the runner keeps them out
+    vscode = [e["id"] for e in json.loads(wire.render_vscode(registry, "", resolve_ctx=resolve_ctx))[0]["models"]]
+    stale = "".join(f'{wire._OWNED_COMMENT}\n[models."servedeck/{key}"]\nprovider = "servedeck"\nmodel = "{name}"\n\n'
+                    for key, name in pooling.items())                              # tables an earlier `servedeck wire` wrote
+    kimi = wire.render_kimi(registry, stale, resolve_ctx=resolve_ctx)
+    assert set(pooling.values()).isdisjoint(vscode), vscode
+    assert all(f'servedeck/{key}"' not in kimi and name not in kimi for key, name in pooling.items()), kimi
+
+
+@pytest.mark.parametrize("extra, chats", [
+    (("--runner", "pooling"), False),
+    (("--runner=pooling",), False),
+    (("--convert", "embed"), False),
+    (("--convert=classify",), False),
+    (("--convert", "reward"), False),
+    (("--runner", "generate"), True),
+    (("--runner=generate",), True),
+    (("--convert", "none"), True),
+    (("--runner", "pooling", "--runner", "generate"), True),       # the last one wins, as vLLM's argparse reads it
+])
+def test_a_model_is_wired_unless_its_flags_make_it_a_pooling_model(registry, resolve_ctx, extra, chats):
+    """vLLM serves a pooling model for `--runner pooling` or `--convert embed|classify|reward`, written with a space or
+    with `=`; any other runner chats. A resident chat model given each set of flags is in the VS Code and Kimi configs
+    exactly when it chats."""
+    import dataclasses
+
+    lfm2 = registry.models["lfm2"]
+    changed = dataclasses.replace(lfm2, flags=lfm2.flags + extra)
+    reg = dataclasses.replace(registry, models={**registry.models, "lfm2": changed})
+    vscode = [e["id"] for e in json.loads(wire.render_vscode(reg, "", resolve_ctx=resolve_ctx))[0]["models"]]
+    kimi = wire.render_kimi(reg, "", resolve_ctx=resolve_ctx)
+    assert (lfm2.id in vscode, 'servedeck/lfm2"' in kimi) == (chats, chats)
 
 
 def test_vscode_entry_fields(registry, resolve_ctx):
@@ -441,7 +485,7 @@ def test_wire_leaves_out_a_model_whose_weights_are_not_downloaded(tmp_path, monk
     client. Now each such model is left out, and the rest are written."""
     monkeypatch.setenv("SERVEDECK_HF_HUB_DIR", str(tmp_path))  # nothing downloaded
     native = [m for m in registry.models.values() if not isinstance(m.ctx, int)]
-    pinned = [m for m in registry.models.values() if isinstance(m.ctx, int)]
+    pinned = [m for m in registry.models.values() if isinstance(m.ctx, int) and not _pooling(m)]   # chat models: a pooling model is never wired
     assert native and pinned  # the registry exercises both kinds
 
     resolver = wire.make_default_ctx_resolver(registry)

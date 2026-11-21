@@ -630,3 +630,47 @@ flags = [
 
 [models.lfm2.tools]
 parser = "lfm2"
+
+# --------------------------------------------------------------------------------
+# Knowledge base (kcc kb, 2026-10-29): the embedder and reranker that the hub's data/kb/retrieval.json names, the pair
+# the hub's model-size grid chose (KB design, 2026-10-29). Pooling models on stock032 (vLLM 0.32.0), each on its own
+# loopback port, started on demand; `servedeck wire` keeps them out of every client config (--runner pooling). When
+# they are down, a pack uses the hub's CPU embedder (bge-m3 on :8031, the fallback_embed of retrieval.json), then words
+# and the graph. The reranker reads vLLM v0.32.0's qwen3_reranker.jinja (sha256 e1ee98e6...), kept in this repo as
+# config/qwen3_reranker.jinja; its flag names the control plane's copy, the checkout servedeck.service runs from.
+# Opt-in, like lfm2: at utils 0.21 and 0.12 the pair holds about 32,304 MiB, so a main model that wants most of the
+# card refuses to start beside them (not_enough_vram).
+# --------------------------------------------------------------------------------
+# Qwen/Qwen3-Embedding-8B, apache-2.0, 15.1 GB BF16, 4,096 dims, last-token pooling.
+[models.kb-emb-qwen3-8b]
+id       = "Qwen3-Embedding-8B"
+repo     = "Qwen/Qwen3-Embedding-8B"
+slot     = "resident"
+vram_mib = 21000                   # estimated budget; util floor2(21000/97887) = 0.21: 15.1 GB weights + activations + KV
+port     = 8021
+build    = "stock032"
+ctx      = 8192                    # not native (40,960): claims and questions are short
+flags = [
+    "--runner", "pooling",
+    "--dtype", "bfloat16",
+    "--max-num-seqs", "64",
+    "--max-num-batched-tokens", "16384",
+]
+
+# Qwen/Qwen3-Reranker-4B, apache-2.0, 8.04 GB BF16, scored through the sequence-classification view, as vLLM documents.
+[models.kb-rr-qwen3-4b]
+id       = "Qwen3-Reranker-4B"
+repo     = "Qwen/Qwen3-Reranker-4B"
+slot     = "resident"
+vram_mib = 12000                   # estimated budget; util 0.12: 8.04 GB weights + activations
+port     = 8029
+build    = "stock032"
+ctx      = 8192                    # native 40,960
+flags = [
+    "--runner", "pooling",
+    "--dtype", "bfloat16",
+    "--max-num-seqs", "64",
+    "--max-num-batched-tokens", "16384",
+    "--hf-overrides", "{\"architectures\": [\"Qwen3ForSequenceClassification\"], \"classifier_from_token\": [\"no\", \"yes\"], \"is_original_qwen3_reranker\": true}",
+    "--chat-template", "/home/pctablet505/Projects/servedeck/config/qwen3_reranker.jinja",
+]
